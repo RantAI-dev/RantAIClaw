@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **pulldown-cmark 0.13.5, for RUSTSEC-2026-0414.** The advisory (exponential event growth
+  with `ENABLE_WIKILINKS`, CVSS 7.5 HIGH) is a denial of service: parsing untrusted Markdown with
+  that option grows the event list exponentially and exhausts memory. The lockfile takes
+  `pulldown-cmark` 0.13.4 → 0.13.5. RantaiClaw never enabled the affected option.
+  `src/channels/format/ast.rs` sets `Options::empty()` plus `ENABLE_TABLES` and
+  `ENABLE_STRIKETHROUGH`, so the vulnerable path was not reachable. A patched release exists, so
+  no advisory waiver was added to `deny.toml` or the Security Audit job's ignore list; the bump
+  clears the finding instead of waiving it. `Cargo.toml` is unchanged, because 0.13.5 stays inside
+  the existing `0.13` requirement. `Cargo.lock` only.
+
 - **RUSTSEC-2026-0387 fixed: the `ssh` transport runs on the patched crypto stack.** The advisory
   (timing variability in operations intended to be constant-time) is fixed only in
   `crypto-bigint` >= 0.7.6, which `russh` 0.60.3 could never select: it pins
@@ -161,6 +171,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a DOCX with a note that says why. Every other channel keeps ignoring documents, and no document
   is ever written to disk. The full rules are in `docs/security/inbound-media-policy.md`.
 
+- `rantaiclaw personality set` takes `--name` and `--timezone` next to the
+  positional preset, so the persona's owner name and its timezone can be set
+  from the shell without a console. The preset stays the positional argument,
+  and the two flags can also be used on their own. The timezone must be an
+  IANA name the build knows (`Asia/Jakarta`, `UTC`); an empty value clears it.
+
 ### Changed
 
 - The config loader now warns about an unknown key at any depth, not only at
@@ -198,6 +214,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answers that the model is changed with `/model`, and the debug toggle is removed with the `/config debug`
   key, the `/debug` command and the `/status` Debug row. `/model <provider:model>` changes the model.
 - `[browser] allowed_domains` now defaults to `["*"]` (config schema 38 → 39), so `browser` and `browser_open` take a public host on a fresh install. An existing config is left as written.
+- `rantaiclaw service install` pins a profile only when one was chosen
+  explicitly. A unit installed with `-p <name>` or `RANTAICLAW_PROFILE` set
+  carries `RANTAICLAW_PROFILE` as before; a unit installed without either now
+  carries no profile and the daemon follows the active-profile marker, so
+  `rantaiclaw profile use <name>` restarts it onto the profile it switches
+  to. The install output names the binding either way. An already installed
+  unit keeps its current binding until the next `service install`.
+- The operator's `[[model_routes]]` table now applies to every door that runs
+  an agent turn — the gateway's webhook, the chat channels and the delegate
+  tool — not only to the CLI/TUI agent and cron. A chat runtime picks the
+  table up on a config reload like any other setting, so adding a route takes
+  effect on the next message without restarting the channel runtime.
 
 ### Removed
 
@@ -473,6 +501,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   could never seed a new file. The upload now opens the remote file with create-and-truncate
   semantics, so a push creates a missing file and overwrites an existing one in full; a
   missing remote directory or a server-denied write still fails with the server's reason.
+- A daemon that followed an active-profile marker wrote its `.daemon_active`
+  sentinel under `default`: the sentinel was keyed on `RANTAICLAW_PROFILE`
+  alone, so the record of which process owns the channels landed next to a
+  config the daemon was not running. The daemon now resolves its profile the
+  same way the config loader does (env var, then the active-profile marker,
+  then `default`), once per process, and every sentinel write and the
+  shutdown clear land under the profile whose config the daemon actually
+  loaded — a marker that changes while the daemon runs can no longer make
+  the shutdown clear a sentinel the daemon did not write.
+- `profile use` restarted the wrong daemon, when it restarted one at all. It
+  read the sentinel of the profile being switched to and restarted
+  `rantaiclaw@<new>.service`, falling back to that template name when the
+  sentinel named no unit — so the daemon actually serving the previous
+  profile kept its stale config, a template unit the installer never created
+  was a restart target, and a daemon pinned to its profile would have been
+  cycled to no effect. The handoff now runs against the previous profile:
+  the unit named by that profile's live sentinel is restarted only when the
+  init system reports it active; a daemon whose launcher pinned its profile
+  is left alone and the switch says how to move it; a daemon started by hand
+  is left to the operator; a stale sentinel is cleared instead of
+  resurrecting a daemon the operator is not running; and the
+  `rantaiclaw@<profile>.service` fallback is gone.
+- A profile switch while a config-directory override was in effect moved the
+  per-profile stores (sessions, knowledge base, policy, persona, skills,
+  secrets) but not the config, the workspace, the memory database or the cron
+  store, leaving one install pointing at two profiles: `RANTAICLAW_CONFIG_DIR`
+  and `RANTAICLAW_WORKSPACE` and the `active_workspace.toml` marker pin the
+  config directory, and `profile use` moved everything else anyway. A switch
+  that names a profile other than the one the override keeps in effect is now
+  refused with a one-line message naming the override and how to clear it, and
+  the same refusal covers a profile selected by `--profile` or by
+  `RANTAICLAW_PROFILE`, at the door where the selection is made. The profile
+  commands (`profile list`, `profile current`, `profile create`, `profile
+  delete`) stay available under an override — they are the way out of a
+  selection that cannot be used. A marker that names a profile directory of
+  this root (`~/.rantaiclaw/profiles/<name>`) is a profile pointer, not an
+  override: the onboarding wizard writes that shape, and it yields to the
+  active profile, so `profile use` moves the whole install as before. Two
+  name-handling holes closed on the way: `profile create` and `profile clone`
+  now hold a NEW profile name to the unit-safe rules (letters, digits, `-`,
+  `_`, at most 64 characters), while profiles that already exist under older
+  naming keep loading; and a clone source that does not exist is an error
+  that creates nothing, where `clone nosuch copy` used to build `nosuch` as
+  an empty profile and copy that. A name read from the marker or the
+  environment that could escape the profiles directory falls back to
+  `default` with a warning instead of becoming a path.
+- `--profile <name>` and `RANTAICLAW_PROFILE=<name>` silently created a
+  profile that did not exist: any command that resolves the active profile
+  ran `ensure` on the name, so a typo built an empty `profiles/<name>/`
+  directory — no config, persona or secrets of its own — and ran against
+  it. A flag or environment variable naming a profile that does not exist
+  is now refused with the remedy (`create it with rantaiclaw profile
+  create <name>`); the same refusal covers an active-profile marker naming
+  a deleted profile, and `default` keeps self-bootstrapping on the first
+  run. The check runs when the flag is applied, before the subcommand, so
+  `--profile work profile create work` is refused — create the profile
+  first, without the flag. A command whose config resolution misses the
+  profile (the flat `~/.rantaiclaw/config.toml` fallback) is unchanged: it
+  creates nothing under `profiles/`. The help no longer claims a `-p`
+  short flag: no such flag exists (`agent -p` is `--provider`), and every
+  help and doc mention of one is now `--profile`.
+- A migration dropped the operator's price table without a word. The v24 → v25
+  step removed the old-shape `[cost.prices]` table — a row held `input` and
+  `output`, and the schema now keys a price per model as
+  `input_per_million`/`output_per_million` — and a config that carried prices
+  for a model lost them on the next launch with no signal, no warning and no
+  pointer to the copy that still held them. The load now says what was
+  dropped: it names every model whose price was in the table, tells the
+  operator to re-add each as `[cost.prices."<model>"]` with the current field
+  names, and points at `config.toml.bak`, where the original file sits until
+  the next config save replaces it. The values are not converted: a wrong
+  price is worse than none. A config that already carries the current shape
+  keeps its table and raises no warning.
 - The MCP provisioner claimed a server was authed without a finished login. Selecting an OAuth
   server (Google Drive) registered it and counted it under "N authed" even when no credential
   was ever obtained: a session that could not show a URL and wait for the browser skipped the
@@ -496,6 +597,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   finishes the setup; the curated servers it lists come from the registry. The docs page for
   the MCP pillar counts the curated picker as six servers again (2 zero-auth, 4 needing
   auth) instead of eight or nine.
+- A persona could store a timezone no timestamp could use. Every door that
+  writes one took any string: the console's `PUT /api/v1/personality`, the
+  onboarding wizard's free-text prompt, and the `persona.toml` writer itself.
+  A typo (`Not/AZone`) was stored and read back into the prompt that renders
+  the owner's timezone, where it means nothing. Every door now refuses a
+  timezone the timezone database does not hold, and refuses it before anything
+  is written: the HTTP API answers `400` and names the bad value, the CLI exits
+  non-zero, and the wizard asks again. The empty value still means "unset" and
+  is accepted. A `persona.toml` that was hand-edited into an unusable value
+  reads as unset, with one warning, and the file is left exactly as the
+  operator wrote it — nothing rewrites it behind their back.
+- An expired Gemini CLI login was sent to Google, which answered with a 401.
+  The token in `~/.gemini/oauth_creds.json` was read from a field Gemini CLI
+  does not write, so the expiry check never ran: Gemini CLI stores the expiry
+  as `expiry_date`, in milliseconds since the epoch, and the reader only knew
+  `expiry`. The token was valid for about an hour and then went on being sent
+  for as long as the file existed. The reader now reads the shape Gemini CLI
+  writes, treats a token that dies within 30 seconds as expired, and refuses
+  the login before any request with the fix named: run `gemini` to renew it,
+  or set `GEMINI_API_KEY`. The reader lives in one place, so the provider and
+  the factory cannot drift apart again.
+- `rantaiclaw uninstall` could say it had preserved a file it had deleted,
+  and `--purge` could delete a binary this account did not own. The report
+  named `~/.rantaiclaw/.secret_key`, a path the profile layout no longer
+  uses: the key lives next to the config it protects, at
+  `<profile>/.secret_key`. So `--keep-secrets` printed "preserving" for a file
+  that was never there, the real key went with the profile, and the operator's
+  encrypted credentials could not be decrypted after a re-install. The
+  uninstall now keeps every secret key it says it keeps, names only the keys
+  that exist, and says in the default scope that the profile's key goes with
+  the profile. `--purge` removes the binary only when it can prove it owns it:
+  the cargo registry is looked up where the binary itself lives, not under
+  `$HOME`, and a binary outside this account's home directory is left alone
+  with the `rm` command printed instead. `--keep-secrets` walks the tree
+  without following symlinks: a link in the tree is removed as itself, so
+  nothing outside the tree is ever deleted.
+- A `hint:` model reached the provider as a literal model name. Only the
+  CLI/TUI agent and cron read `[[model_routes]]`; every other door that runs
+  an agent turn — the gateway's webhook, the chat channels and the delegate
+  tool — sent the string as it stood, and the provider answered with a model
+  that does not exist. Every door that builds a provider for an agent turn now
+  builds it through the routed factory with the operator's table, so a hint
+  resolves to the provider and the model the operator configured, everywhere.
+  A hint no route names is refused before any request is sent and the refusal
+  names the hint and the hints that are configured; a route whose provider
+  could not be built is refused as configured-but-unavailable, so a broken
+  provider is no longer reported as an unknown hint; and a door with no table
+  at all refuses a `hint:` model with `no [[model_routes]] configured` instead
+  of sending the literal string.
 
 ## [0.33.0-alpha] — 2026-10-08
 

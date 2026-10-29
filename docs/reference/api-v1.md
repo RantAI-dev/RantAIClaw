@@ -991,13 +991,18 @@ is created first.
     (three distinct behaviors for one field — not "empty means unset").
   - `name`/`timezone`/`tone` are capped at 80/64/80 characters, `role`/`avoid`
     at 400; a value over its cap or containing control characters is a `400`.
+  - `timezone` must be an IANA name this build knows (`Asia/Jakarta`, `UTC`).
+    Any other value is a `400` that names the bad value, and the persona file
+    is left as it was. An empty string clears the timezone — it means "unset",
+    which is allowed.
 - **Response** `200`: the persisted persona (`preset`, `name`, `role`, `tone`,
   `avoid`, `timezone`, `always_on_kbs`).
 - **Scope of effect**: a change takes effect immediately on the **web chat**
   and on the next **channel** message (Telegram/Discord/…). A **TUI** session
   that is already open picks it up on its next new conversation (`/new`) or a
   config reload, not mid-conversation.
-- **Status codes**: `200`, `400` (unknown `preset` or invalid field), `401`.
+- **Status codes**: `200`, `400` (unknown `preset`, invalid field, or a
+  timezone this build cannot use), `401`.
 
 ### GET /api/v1/personality/presets
 

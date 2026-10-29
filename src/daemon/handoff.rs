@@ -166,19 +166,40 @@ pub fn detect_init_system() -> Box<dyn DaemonControl> {
 /// Matches the systemd `rantaiclaw@.service` template convention: a single
 /// template unit takes the profile as its instance argument so users can
 /// run multiple profiles simultaneously.
+///
+/// This is a *probe candidate* only (the doctor asks the manager for it);
+/// the handoff below never falls back to it — a daemon whose sentinel names
+/// no unit was started by hand, and restarting a template unit the installer
+/// never created would cycle a unit the operator does not have.
 pub fn default_unit_name(profile: &str) -> String {
     format!("rantaiclaw@{profile}.service")
 }
 
-/// Top-level entry point — invoked from `ProfileManager::use_profile`.
-///
-/// Flow:
-/// 1. If no daemon sentinel exists for this profile → no-op.
-/// 2. Detect init system; if none → print friendly skip notice, return Ok.
-/// 3. Resolve unit name (sentinel override, falling back to default).
-/// 4. Restart via the resolved `DaemonControl`.
-/// 5. Print a one-line success message.
-pub fn restart_daemon_for_profile(profile: &str) -> Result<()> {
+/// What a profile switch did with the daemon that was serving the previous
+/// profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandoffOutcome {
+    /// The unit was restarted; the daemon comes back following the new
+    /// profile.
+    Restarted { unit: String },
+    /// The daemon keeps serving the profile it is on: its launcher pinned
+    /// it (`RANTAICLAW_PROFILE`), so a restart would change nothing.
+    Pinned { profile: String, unit: String },
+    /// The daemon was started by hand — no unit is recorded, so there is
+    /// nothing any init system can restart.
+    HandStarted { profile: String },
+    /// No live daemon was registered for that profile (no sentinel, a stale
+    /// one, or a unit the manager does not report as active).
+    NotRunning,
+    /// A live daemon was registered, but the host has no init system this
+    /// code can drive (neither `systemctl` nor `launchctl`).
+    NoInit { profile: String, pid: u32 },
+}
+
+/// Top-level entry point — invoked from `ProfileManager::use_profile` with
+/// the PREVIOUS profile: the daemon serving the old profile is the one a
+/// switch has to hand over.
+pub fn restart_daemon_for_profile(profile: &str) -> Result<HandoffOutcome> {
     let control = detect_init_system();
     restart_daemon_for_profile_with(profile, control.as_ref())
 }
@@ -186,14 +207,28 @@ pub fn restart_daemon_for_profile(profile: &str) -> Result<()> {
 /// Test seam — same as `restart_daemon_for_profile` but with a caller-chosen
 /// `DaemonControl`. Exposed `pub` so integration tests can substitute a
 /// recording stub.
-pub fn restart_daemon_for_profile_with(profile: &str, control: &dyn DaemonControl) -> Result<()> {
+///
+/// Decision order, first match wins:
+/// 1. no (or unparseable) sentinel for this profile → `NotRunning`;
+/// 2. sentinel whose pid is not a live daemon → stale: clear it,
+///    `NotRunning`;
+/// 3. sentinel with no unit → `HandStarted` (no init system is contacted);
+/// 4. sentinel that says `profile_pinned` → `Pinned` (no restart — the
+///    daemon's launcher named its profile and a restart cannot move it);
+/// 5. no usable init system → `NoInit`;
+/// 6. unit not active → `NotRunning`;
+/// 7. otherwise restart the recorded unit → `Restarted`.
+pub fn restart_daemon_for_profile_with(
+    profile: &str,
+    control: &dyn DaemonControl,
+) -> Result<HandoffOutcome> {
     let Some(sentinel) = sentinel::read_sentinel(profile).ok().flatten() else {
         // Either no sentinel, or unparseable — both mean "nothing live for
         // this profile". `read_sentinel` returns Ok(None) for absent;
         // `.ok().flatten()` also handles parse failures the same way
         // (advisory file).
         tracing::debug!("No daemon sentinel for profile {profile:?}; skipping handoff");
-        return Ok(());
+        return Ok(HandoffOutcome::NotRunning);
     };
 
     // The recorded daemon is gone (crashed, or the operator stopped it) — the
@@ -206,24 +241,34 @@ pub fn restart_daemon_for_profile_with(profile: &str, control: &dyn DaemonContro
             sentinel.pid
         );
         let _ = sentinel::clear_sentinel(profile);
-        return Ok(());
+        return Ok(HandoffOutcome::NotRunning);
+    }
+
+    // A daemon whose sentinel names no unit was started by hand. There is no
+    // unit to restart, and the `rantaiclaw@<profile>.service` template the
+    // installer never creates is not a substitute.
+    let Some(unit) = sentinel.unit.clone() else {
+        return Ok(HandoffOutcome::HandStarted {
+            profile: profile.to_string(),
+        });
+    };
+
+    // A pinned daemon serves the profile its launcher named, whatever the
+    // marker says. Restarting it would not move it, so the caller says so
+    // instead.
+    if sentinel.profile_pinned {
+        return Ok(HandoffOutcome::Pinned {
+            profile: profile.to_string(),
+            unit,
+        });
     }
 
     if control.name() == "none" {
-        eprintln!(
-            "Note: profile {profile:?} has a registered daemon (pid {pid}) but no \
-             supported init system was detected (systemd / launchd). \
-             If the daemon is running manually, restart it yourself to pick up \
-             the new profile.",
-            pid = sentinel.pid,
-        );
-        return Ok(());
+        return Ok(HandoffOutcome::NoInit {
+            profile: profile.to_string(),
+            pid: sentinel.pid,
+        });
     }
-
-    let unit = sentinel
-        .unit
-        .clone()
-        .unwrap_or_else(|| default_unit_name(profile));
 
     // Only cycle a unit the init system reports as active. Some controllers
     // treat `restart` as start-if-stopped, so an unconditional restart could
@@ -233,15 +278,14 @@ pub fn restart_daemon_for_profile_with(profile: &str, control: &dyn DaemonContro
         .with_context(|| format!("query active state of {unit} via {}", control.name()))?
     {
         tracing::debug!("Unit {unit} is not active; skipping restart for {profile:?}");
-        return Ok(());
+        return Ok(HandoffOutcome::NotRunning);
     }
 
     control
         .restart(&unit)
         .with_context(|| format!("restart {unit} via {}", control.name()))?;
 
-    println!("Restarted {unit}");
-    Ok(())
+    Ok(HandoffOutcome::Restarted { unit })
 }
 
 /// Best-effort current uid for launchd `gui/<uid>/<label>` targeting. We
@@ -273,10 +317,14 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
 
-    /// Recording stub — counts restart calls and logs the unit names.
+    /// Recording stub — counts restart and is-active calls and logs the unit
+    /// names. `is_active_calls` exists so a test can prove NO init-system
+    /// call happened at all (the hand-started and pinned decisions must not
+    /// even ask the manager).
     pub struct RecordingControl {
         pub name: String,
         pub restarts: AtomicUsize,
+        pub is_active_calls: AtomicUsize,
         pub units: Mutex<Vec<String>>,
         pub fail_with: Mutex<Option<String>>,
         /// What `is_active` reports. Defaults to `true` so restart-path tests
@@ -289,6 +337,7 @@ mod tests {
             Arc::new(Self {
                 name: name.into(),
                 restarts: AtomicUsize::new(0),
+                is_active_calls: AtomicUsize::new(0),
                 units: Mutex::new(vec![]),
                 fail_with: Mutex::new(None),
                 active: AtomicBool::new(true),
@@ -313,6 +362,7 @@ mod tests {
             Ok(())
         }
         fn is_active(&self, _unit: &str) -> Result<bool> {
+            self.is_active_calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.active.load(Ordering::SeqCst))
         }
     }
@@ -335,7 +385,7 @@ mod tests {
         }
     }
 
-    fn write_sentinel_for(profile: &str, pid: u32, unit: Option<&str>) {
+    fn write_sentinel_for(profile: &str, pid: u32, unit: Option<&str>, pinned: bool) {
         crate::profile::ProfileManager::ensure(profile).unwrap();
         crate::profile::sentinel::write_sentinel(
             profile,
@@ -343,6 +393,7 @@ mod tests {
                 pid,
                 unit: unit.map(str::to_string),
                 started_at: None,
+                profile_pinned: pinned,
             },
         )
         .unwrap();
@@ -352,9 +403,10 @@ mod tests {
     fn dead_pid_does_not_restart_and_clears_sentinel() {
         with_home(|| {
             // 2^31-2 is effectively never a live PID.
-            write_sentinel_for("alpha", 2_147_483_646, Some("rantaiclaw.service"));
+            write_sentinel_for("alpha", 2_147_483_646, Some("rantaiclaw.service"), false);
             let stub = RecordingControl::new("systemd");
-            restart_daemon_for_profile_with("alpha", stub.as_ref()).unwrap();
+            let outcome = restart_daemon_for_profile_with("alpha", stub.as_ref()).unwrap();
+            assert_eq!(outcome, HandoffOutcome::NotRunning);
             assert_eq!(stub.restarts.load(Ordering::SeqCst), 0);
             assert!(
                 !crate::profile::sentinel::is_daemon_active("alpha"),
@@ -366,10 +418,16 @@ mod tests {
     #[test]
     fn inactive_unit_does_not_restart() {
         with_home(|| {
-            write_sentinel_for("alpha", std::process::id(), Some("rantaiclaw.service"));
+            write_sentinel_for(
+                "alpha",
+                std::process::id(),
+                Some("rantaiclaw.service"),
+                false,
+            );
             let stub = RecordingControl::new("systemd");
             stub.set_active(false);
-            restart_daemon_for_profile_with("alpha", stub.as_ref()).unwrap();
+            let outcome = restart_daemon_for_profile_with("alpha", stub.as_ref()).unwrap();
+            assert_eq!(outcome, HandoffOutcome::NotRunning);
             assert_eq!(stub.restarts.load(Ordering::SeqCst), 0);
         });
     }
@@ -379,14 +437,76 @@ mod tests {
         with_home(|| {
             // The current test process is a RantaiClaw binary from the guard's
             // point of view (comm matches self), so it counts as a live daemon.
-            write_sentinel_for("alpha", std::process::id(), Some("rantaiclaw.service"));
+            write_sentinel_for(
+                "alpha",
+                std::process::id(),
+                Some("rantaiclaw.service"),
+                false,
+            );
             let stub = RecordingControl::new("systemd");
             stub.set_active(true);
-            restart_daemon_for_profile_with("alpha", stub.as_ref()).unwrap();
+            let outcome = restart_daemon_for_profile_with("alpha", stub.as_ref()).unwrap();
+            assert_eq!(
+                outcome,
+                HandoffOutcome::Restarted {
+                    unit: "rantaiclaw.service".to_string()
+                }
+            );
             assert_eq!(stub.restarts.load(Ordering::SeqCst), 1);
             assert_eq!(
                 stub.units.lock().unwrap().clone(),
                 vec!["rantaiclaw.service".to_string()]
+            );
+        });
+    }
+
+    /// A pinned daemon serves the profile its launcher named. The handoff
+    /// must not cycle its unit (a restart cannot move it), and the outcome
+    /// carries the profile + unit so the caller can print one line saying
+    /// so.
+    #[test]
+    fn a_pinned_daemon_is_not_restarted() {
+        with_home(|| {
+            write_sentinel_for(
+                "alpha",
+                std::process::id(),
+                Some("rantaiclaw.service"),
+                true,
+            );
+            let stub = RecordingControl::new("systemd");
+            let outcome = restart_daemon_for_profile_with("alpha", stub.as_ref()).unwrap();
+            assert_eq!(
+                outcome,
+                HandoffOutcome::Pinned {
+                    profile: "alpha".to_string(),
+                    unit: "rantaiclaw.service".to_string()
+                }
+            );
+            assert_eq!(stub.restarts.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    /// A sentinel with no unit is a hand-started daemon. No init-system
+    /// call may happen — not even `is-active`: the `rantaiclaw@<p>.service`
+    /// template the installer never creates is not a substitute for the
+    /// unit that isn't recorded.
+    #[test]
+    fn a_sentinel_with_no_unit_gets_no_init_system_call() {
+        with_home(|| {
+            write_sentinel_for("alpha", std::process::id(), None, false);
+            let stub = RecordingControl::new("systemd");
+            let outcome = restart_daemon_for_profile_with("alpha", stub.as_ref()).unwrap();
+            assert_eq!(
+                outcome,
+                HandoffOutcome::HandStarted {
+                    profile: "alpha".to_string()
+                }
+            );
+            assert_eq!(stub.restarts.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                stub.is_active_calls.load(Ordering::SeqCst),
+                0,
+                "a hand-started daemon must not reach the init system at all"
             );
         });
     }

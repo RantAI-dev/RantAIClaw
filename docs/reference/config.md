@@ -8,7 +8,7 @@ Config path resolution at startup:
 
 1. `RANTAICLAW_CONFIG_DIR` override (if set) — the whole config directory; the workspace becomes `<dir>/workspace`
 2. `RANTAICLAW_WORKSPACE` override (if set)
-3. persisted `~/.rantaiclaw/active_workspace.toml` marker (if present) — unless the marker names the `profiles/<name>` directory of a different root while the local root has its own `config.toml` for that profile (a tree that was copied, moved or restored to another path); in that case the marker is set aside and the local profile wins, and a single warning names the marker, the directory it pointed at, and the directory used instead
+3. persisted `~/.rantaiclaw/active_workspace.toml` marker (if present) — with two exceptions: a marker that names the `profiles/<name>` directory of a different root while the local root has its own `config.toml` for that profile (a tree that was copied, moved or restored to another path) is set aside and the local profile wins, with a single warning naming the marker, the directory it pointed at, and the directory used instead; and a marker that names a profile directory **of this root** (`~/.rantaiclaw/profiles/<name>`) is a *profile pointer* — it means "the active profile", so it pins nothing and resolution continues with step 4
 4. default: the **active profile's directory** — `~/.rantaiclaw/profiles/<name>/config.toml` (profile `default` unless `RANTAICLAW_PROFILE` or the `~/.rantaiclaw/active_profile` marker selects another). A flat `~/.rantaiclaw/config.toml` is used only as a fallback if profile resolution fails.
 
 `RANTAICLAW_CONFIG_DIR` moves **config and workspace only**. The profile root —
@@ -17,6 +17,24 @@ databases, the persona, and the `.daemon_active` sentinel — is keyed on `$HOME
 and is deliberately unaffected. So are the logs, at `~/.rantaiclaw/logs/`.
 Setting only `RANTAICLAW_CONFIG_DIR` therefore gives you a split state: config
 from the custom directory, approval policy and profile data from the real home.
+
+**Overrides pin the profile.** While `RANTAICLAW_CONFIG_DIR`, `RANTAICLAW_WORKSPACE`
+or a non-pointer marker is in effect, it keeps the current profile in effect:
+`profile use <other>`, `--profile <other>` and `RANTAICLAW_PROFILE=<other>` are
+refused with a one-line message naming the override and how to clear it. Without
+this rule a switch would move the per-profile stores (sessions, knowledge base,
+policy, persona, secrets) but not the config, the workspace, the memory database
+or the cron store — one install pointing at two profiles. A switch to the profile
+the override already keeps in effect is a no-op and is allowed; to switch for
+real, clear the override first (`unset RANTAICLAW_CONFIG_DIR`, or remove the
+marker). The onboarding wizard writes a pointer marker (one that names
+`profiles/<name>` of this root), which pins nothing.
+
+The refusal sits at the three doors that switch or select a profile — `profile
+use`, the `--profile` flag and the `RANTAICLAW_PROFILE` environment variable.
+The profile commands (`profile list`, `profile current`, `profile create`,
+`profile delete`) stay available under an override: they are the way out of a
+selection that cannot be used.
 
 The sentinel is the one that surprises people. It records which process owns the
 channels for a profile, and it is keyed on the profile *name*, not on the config
@@ -475,6 +493,17 @@ a token to the browser.
 
 Notes:
 
+- **A curated server that needs a credential is configured by `rantaiclaw setup mcp`
+  (or the onboard wizard's MCP section), not by hand.** The token is pasted into a
+  masked prompt, and an OAuth server — Google Drive today — completes a real OAuth
+  flow in the operator's local browser. The OAuth callback is bound to the login
+  that started it (a one-time `state` and an S256 PKCE code challenge) and is
+  accepted only from the loopback listener on `127.0.0.1:11500`; a callback that
+  does not match the active login is answered and ignored. A server is registered
+  in the config only after its credential was really obtained, so a config that
+  lists a server means the server is authed. There is no refresh flow yet: the
+  stored access token is used until it expires — roughly an hour for Google —
+  after which re-running `rantaiclaw setup mcp` logs in again.
 - A tool that an MCP server provides needs approval under `supervised` like any other tool. To let one run without a prompt, list its name in `[autonomy].auto_approve` as `mcp__<server>__<tool>`; the refusal on a surface with no approver, and how to allow it, is described in the `auto_approve` note under [`[autonomy]`](#autonomy).
 - **MCP tools reach the TUI/CLI agent, the gateway's `/api/v1` chat, chat channels
   and cron.** The last two were added by closing issue #283: the channel runtime
@@ -861,6 +890,21 @@ Use route hints so integrations can keep stable names while model IDs evolve.
 | `model` | _required_ | Model to use with that provider |
 | `api_key` | unset | Optional API key override for this route's provider (stored encrypted when `secrets.encrypt = true`) |
 
+The table applies at every door that runs an agent turn: the CLI and TUI agent, a
+scheduled cron job, the daemon's heartbeat, the console chat, the gateway's webhook, a
+chat channel's turns and the delegate tool. A model string that starts with `hint:`
+resolves to the provider and the model the route names, at every one of them.
+
+A hint no route names is refused before any request is sent, and the refusal names the
+hint and the hints that are configured. A route whose provider could not be built is
+refused as configured but its provider is not available, so a broken provider is never
+reported as an unknown hint. With no `[[model_routes]]` table configured at all, a
+`hint:` model is refused with `no [[model_routes]] configured`.
+
+A route never receives the default provider's API key. It resolves its own credential —
+its own `api_key` in the route entry, or that provider's own environment variable —
+while a route that names the default provider keeps that provider's key.
+
 ### `[[embedding_routes]]`
 
 | Key | Default | Purpose |
@@ -1099,6 +1143,11 @@ is refused rather than half-understood.
 Migrations only move forward. There is no automatic downgrade, so reverting to a
 binary older than your config's `schema_version` needs a manual edit.
 
+A migration moves config keys, not your data: the stores that live under the
+workspace — the memory database at `workspace/memory/brain.db` among them —
+travel with the workspace directory, so no migration renames, drops or rewrites
+your notes.
+
 ### v40: the `[channels_config].cli` key retired
 
 `[channels_config].cli` is removed. It did not gate the CLI channel and no
@@ -1207,6 +1256,20 @@ Upgrading rewrites a v31 WhatsApp section:
 3. Set `schema_version = 31`.
 
 Keeping a copy of `config.toml` before a major upgrade is cheaper than step 1.
+
+### v25: the old `[cost.prices]` table retired
+
+Before v25 a price was one row of `input`/`output` fields under
+`[cost.prices."<model>"]`; the table was removed as dead, and the key came
+back later in a new shape (`input_per_million`/`output_per_million`) once
+something read it. An upgrade from a pre-v25 config therefore drops the old
+table, and the load says so: the warning names every model whose price was in
+it, tells you to re-add each as `[cost.prices."<model>"]` with
+`input_per_million` and `output_per_million`, and points at `config.toml.bak`,
+where the original file — prices and all — sits until the next config save
+replaces it. The values are not converted for you: a wrong price is worse
+than none. A config that already carries the current shape keeps its table and
+raises no warning.
 
 ## KB (Knowledge Base)
 

@@ -38,6 +38,38 @@ fn scheduler_enabled(config: &Config) -> bool {
     config.cron.enabled && config.scheduler.enabled
 }
 
+/// The profile this daemon serves, and whether that profile is pinned.
+///
+/// `pinned` is true when the launcher named the profile explicitly
+/// (`RANTAICLAW_PROFILE` — the line a service unit carries when the operator
+/// chose a profile at install time) and false when the daemon follows the
+/// active-profile marker. `profile use` restarts only a daemon that follows
+/// the marker, and the sentinel records which kind this daemon is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DaemonProfile {
+    /// The profile whose config this daemon loaded.
+    pub(crate) name: String,
+    /// True when the profile came from `RANTAICLAW_PROFILE`.
+    pub(crate) pinned: bool,
+}
+
+/// Resolve the profile this process serves, once per process.
+///
+/// The same resolution the config loader uses (env → active-profile marker →
+/// "default") — a daemon must write, read and clear its sentinel under the
+/// profile whose config it actually loaded, and the two resolutions used to
+/// disagree (the sentinel used to key on the env var alone, so a daemon
+/// following a non-default marker wrote its sentinel under `default`).
+pub(crate) fn resolve_daemon_profile() -> DaemonProfile {
+    let pinned = std::env::var("RANTAICLAW_PROFILE")
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    DaemonProfile {
+        name: crate::profile::ProfileManager::resolve_active_name(),
+        pinned,
+    }
+}
+
 pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config
@@ -62,13 +94,20 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 
     // Write per-profile sentinel so `profile use` knows a daemon is bound.
     // Best-effort — failure to write must not block the daemon.
-    let active_profile = std::env::var("RANTAICLAW_PROFILE").unwrap_or_else(|_| "default".into());
+    //
+    // `daemon_profile` is resolved ONCE here and kept for the life of the
+    // process: every sentinel write AND the shutdown clear must land under
+    // the profile whose config this daemon loaded. Re-resolving at shutdown
+    // could clear a sentinel that belongs to a different profile than the
+    // one this daemon wrote (the marker may have changed in between).
+    let daemon_profile = resolve_daemon_profile();
     if let Err(e) = crate::profile::sentinel::write_sentinel(
-        &active_profile,
+        &daemon_profile.name,
         &crate::profile::sentinel::DaemonSentinel {
             pid: std::process::id(),
             unit: std::env::var("RANTAICLAW_UNIT").ok(),
             started_at: Some(Utc::now().to_rfc3339()),
+            profile_pinned: daemon_profile.pinned,
         },
     ) {
         tracing::warn!("Failed to write daemon sentinel: {e}");
@@ -246,7 +285,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 channels_handle,
                 handles,
                 &services,
-                &active_profile,
+                &daemon_profile,
                 &state_file,
             )
             .await;
@@ -259,7 +298,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 channels_handle,
                 handles,
                 &services,
-                &active_profile,
+                &daemon_profile,
                 &state_file,
             )
             .await;
@@ -293,7 +332,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         channels_handle,
         handles,
         &services,
-        &active_profile,
+        &daemon_profile,
         &state_file,
     )
     .await;
@@ -321,7 +360,7 @@ async fn drain_and_cleanup(
     channels_handle: Option<JoinHandle<()>>,
     handles: Vec<JoinHandle<()>>,
     services: &[Box<dyn crate::services::Service>],
-    active_profile: &str,
+    profile: &DaemonProfile,
     state_file_path: &Path,
 ) {
     // One deadline for both drains, so the time the gateway does not use is
@@ -384,9 +423,12 @@ async fn drain_and_cleanup(
         crate::services::stop_all(services).await;
     }
 
-    // Clear sentinel — best-effort; a stale sentinel from a crash is ignored by
-    // handoff anyway since the unit will not be active.
-    if let Err(e) = crate::profile::sentinel::clear_sentinel(active_profile) {
+    // Clear the sentinel THIS daemon wrote — under the profile resolved at
+    // start, never re-resolved now: the marker may have changed while the
+    // daemon ran, and the sentinel that belongs to another profile is not
+    // this daemon's to clear. Best-effort; a stale sentinel from a crash is
+    // ignored by handoff anyway since the unit will not be active.
+    if let Err(e) = crate::profile::sentinel::clear_sentinel(&profile.name) {
         tracing::warn!("Failed to clear daemon sentinel: {e}");
     }
 }
@@ -889,7 +931,10 @@ mod tests {
             Some(channels),
             Vec::new(),
             &[],
-            "drain-test",
+            &DaemonProfile {
+                name: "drain-test".to_string(),
+                pinned: false,
+            },
             &home.path().join("daemon_state.json"),
         )
         .await;
@@ -918,7 +963,10 @@ mod tests {
             Some(channels),
             Vec::new(),
             &[],
-            "drain-test",
+            &DaemonProfile {
+                name: "drain-test".to_string(),
+                pinned: false,
+            },
             &home.path().join("daemon_state.json"),
         )
         .await;
@@ -966,7 +1014,10 @@ mod tests {
             None,
             vec![writer],
             &[],
-            "drain-test",
+            &DaemonProfile {
+                name: "drain-test".to_string(),
+                pinned: false,
+            },
             &state_path,
         )
         .await;
@@ -982,6 +1033,111 @@ mod tests {
         assert!(
             other_pid_tmp.exists(),
             "another pid's temp file is not ours to remove"
+        );
+    }
+
+    /// The reproduction: the marker names `work`, the env var is unset, so
+    /// the daemon's sentinel must be keyed on `work` — the profile whose
+    /// config the loader actually resolved. The daemon used to key its
+    /// sentinel on the env var alone and fell back to `"default"`, so this
+    /// daemon's sentinel landed under the wrong profile and `profile use`
+    /// never saw it.
+    #[test]
+    fn the_daemon_resolves_the_profile_the_marker_names() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let tmp = TempDir::new().expect("temp home");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let _profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
+
+        crate::profile::ProfileManager::ensure("work").unwrap();
+        std::fs::write(crate::profile::paths::active_profile_file(), "work\n").unwrap();
+
+        let resolved = resolve_daemon_profile();
+        assert_eq!(resolved.name, "work");
+        assert!(!resolved.pinned, "a marker-resolved profile is not pinned");
+    }
+
+    /// The pinned twin: a launcher that names the profile explicitly pins
+    /// the daemon to it.
+    #[test]
+    fn the_daemon_is_pinned_when_the_env_var_names_a_profile() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let tmp = TempDir::new().expect("temp home");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let _profile = crate::test_env::EnvGuard::set("RANTAICLAW_PROFILE", "work");
+
+        crate::profile::ProfileManager::ensure("work").unwrap();
+
+        let resolved = resolve_daemon_profile();
+        assert_eq!(resolved.name, "work");
+        assert!(resolved.pinned, "an env-var profile is pinned");
+    }
+
+    /// The daemon clears the sentinel IT wrote — under the profile resolved
+    /// at start — even though the marker changed while it ran. Re-resolving
+    /// at shutdown would clear (or keep) the wrong file: here the sentinel
+    /// under the NEW marker's profile belongs to another daemon and must
+    /// survive this daemon's teardown.
+    #[tokio::test]
+    async fn the_daemon_clears_the_sentinel_it_wrote_even_after_the_marker_changes() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = TempDir::new().expect("temp home");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let _profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
+
+        crate::profile::ProfileManager::ensure("work").unwrap();
+        crate::profile::ProfileManager::ensure("play").unwrap();
+
+        // The daemon started while the marker named `work`.
+        let identity = DaemonProfile {
+            name: "work".to_string(),
+            pinned: false,
+        };
+        crate::profile::sentinel::write_sentinel(
+            &identity.name,
+            &crate::profile::sentinel::DaemonSentinel {
+                pid: std::process::id(),
+                unit: None,
+                started_at: None,
+                profile_pinned: identity.pinned,
+            },
+        )
+        .unwrap();
+        // Mid-run, the operator switches the marker to `play`, and a daemon
+        // serving `play` writes its own sentinel there.
+        std::fs::write(crate::profile::paths::active_profile_file(), "play\n").unwrap();
+        crate::profile::sentinel::write_sentinel(
+            "play",
+            &crate::profile::sentinel::DaemonSentinel {
+                pid: 2_147_483_646,
+                unit: None,
+                started_at: None,
+                profile_pinned: false,
+            },
+        )
+        .unwrap();
+
+        drain_and_cleanup(
+            tokio::spawn(async {}),
+            None,
+            vec![],
+            &[],
+            &identity,
+            &tmp.path().join("daemon_state.json"),
+        )
+        .await;
+
+        assert!(
+            !crate::profile::sentinel::sentinel_path("work")
+                .expect("a valid profile name")
+                .exists(),
+            "this daemon must clear the sentinel it wrote"
+        );
+        assert!(
+            crate::profile::sentinel::sentinel_path("play")
+                .expect("a valid profile name")
+                .exists(),
+            "the sentinel under the NEW marker's profile is not this daemon's to clear"
         );
     }
 

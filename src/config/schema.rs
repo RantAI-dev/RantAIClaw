@@ -3586,6 +3586,25 @@ async fn load_persisted_workspace_dirs(
         return Ok(None);
     }
 
+    // A marker that names a profile directory of THIS root is a profile
+    // pointer: it says "the active profile", not "this directory". The
+    // active profile wins, so `profile use` moves the config, the workspace,
+    // the memory database and the cron store with it instead of leaving
+    // them behind. The onboarding wizard writes exactly this shape, and
+    // honoring it as an override is what kept a real install from ever
+    // moving off the profile it was on.
+    if crate::profile::config_override::profile_pointer_name(&config_dir, default_config_dir)
+        .is_some()
+    {
+        tracing::info!(
+            "Active workspace marker {} names the profile directory {}; using the active \
+             profile instead.",
+            state_path.display(),
+            config_dir.display()
+        );
+        return Ok(None);
+    }
+
     Ok(Some((config_dir.clone(), config_dir.join("workspace"))))
 }
 
@@ -4509,6 +4528,11 @@ impl Config {
             // here is the only signal we have to tell the operator that their
             // notes stayed in Postgres and the local sqlite store starts empty.
             let postgres_pre_migration = raw_memory_backend_was_postgres(&raw);
+            // Same trick for the v25 cost-price drop: `migrate_v25` removes
+            // the old-shape `[cost.prices]` table, whose rows the operator
+            // entered. Reading the model names before the call is the only
+            // point at which we know which models lost their prices.
+            let cost_prices_pre_migration = raw_cost_price_models_before_migration(&raw);
             let migrated = crate::config::migrations::migrate(&mut raw)
                 .context("Failed to migrate config schema")?;
             // A credential that ended up in `api_url` sits on disk in plaintext
@@ -4704,6 +4728,29 @@ impl Config {
                     "postgres memory was retired; your notes stay in Postgres and \
                      the local sqlite store starts empty"
                 );
+            }
+            // The v24 → v25 bump dropped the old-shape `[cost.prices]` table:
+            // a row held `input`/`output`, and the schema now keys a price
+            // per model as `input_per_million`/`output_per_million`. Those
+            // rows were operator-entered, so say which models lost their
+            // prices and where the original file still is. The values are
+            // not converted — the operator re-adds them by hand. Gated on
+            // `migrated`, like the postgres warning above.
+            if migrated {
+                if let Some(models) = cost_prices_pre_migration.as_ref() {
+                    let mut backup: std::path::PathBuf = config_path.clone();
+                    backup.as_mut_os_string().push(".bak");
+                    tracing::warn!(
+                        "the pre-v25 [cost.prices] table was dropped by this migration because \
+                         its row shape changed (input/output became input_per_million and \
+                         output_per_million); it listed prices for: {}. Re-add each as \
+                         [cost.prices.\"<model>\"] with input_per_million and output_per_million \
+                         — the values are not converted. The original config is at {} until the \
+                         next config save replaces it.",
+                        models.join(", "),
+                        backup.display()
+                    );
+                }
             }
             let mut config: Config = raw.try_into().with_context(|| {
                 format!(
@@ -5582,6 +5629,27 @@ fn raw_memory_backend_was_postgres(raw: &toml::Value) -> bool {
         .and_then(|c| c.get("provider"))
         .and_then(toml::Value::as_str)
         .is_some_and(is_postgres)
+}
+
+/// The model names a pre-migration `[cost.prices]` table listed, when the
+/// v25 migration is about to drop that table.
+///
+/// `None` when the table is absent, when it is empty, or when the config
+/// is already at v25 or later — there the migration keeps the table, in
+/// its current shape. Names only: the warning says which models lost
+/// their prices, never the prices themselves.
+fn raw_cost_price_models_before_migration(raw: &toml::Value) -> Option<Vec<String>> {
+    let from = raw
+        .get(crate::config::migrations::SCHEMA_VERSION_KEY)
+        .and_then(toml::Value::as_integer)
+        .unwrap_or(0);
+    if from >= 25 {
+        return None;
+    }
+    let prices = raw.get("cost")?.get("prices")?.as_table()?;
+    let mut names: Vec<String> = prices.keys().cloned().collect();
+    names.sort();
+    (!names.is_empty()).then_some(names)
 }
 
 /// One-time markdown → sqlite import for a config that used the retired
@@ -9335,12 +9403,14 @@ level = "full"
         let _ = fs::remove_dir_all(default_config_dir).await;
     }
 
+    /// A marker that names a directory that is NOT a profile directory of
+    /// this root stays an override and is honored.
     #[test]
     async fn resolve_runtime_config_dirs_uses_active_workspace_marker() {
         let _env_guard = env_override_lock().await;
         let default_config_dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
         let default_workspace_dir = default_config_dir.join("workspace");
-        let marker_config_dir = default_config_dir.join("profiles").join("alpha");
+        let marker_config_dir = default_config_dir.join("workspaces").join("alpha");
         let state_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
 
         // Pin HOME to a tempdir before opting out of the isolation guard: if
@@ -9652,11 +9722,14 @@ level = "full"
         assert_eq!(config_dir, b_root.join("profiles/default"));
     }
 
-    /// Regression: a marker that names a directory inside its own root
-    /// (case (a)) must still be honored. The local `profiles/default` is
-    /// where the marker points and where the config lives.
+    /// A marker that names a profile directory of THIS root is a profile
+    /// pointer, not an override: it says "the active profile", and the
+    /// active profile wins. With the active profile at `default` the
+    /// resolved directory is the very directory the marker names, so an
+    /// install on `default` keeps loading the same config — the rule
+    /// changes which profile is followed, never the directory.
     #[tokio::test]
-    async fn marker_pointing_inside_its_own_root_is_honored() {
+    async fn a_marker_naming_this_roots_profile_yields_to_the_active_profile() {
         let _env_guard = env_override_lock().await;
         let temp_home = tempfile::TempDir::new().unwrap();
         let default = temp_home.path().join(".rantaiclaw");
@@ -9678,13 +9751,73 @@ level = "full"
         let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
         let _g_allow = crate::test_env::EnvGuard::set("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR", "1");
 
-        let (config_dir, _resolved_workspace_dir, source) =
+        let (config_dir, resolved_workspace_dir, source) =
             resolve_runtime_config_dirs(&default, &default.join("workspace"))
                 .await
                 .unwrap();
 
-        assert_eq!(source, ConfigResolutionSource::ActiveWorkspaceMarker);
+        assert_eq!(source, ConfigResolutionSource::DefaultConfigDir);
         assert_eq!(config_dir, marker_dir);
+        assert_eq!(
+            resolved_workspace_dir,
+            marker_dir.join("workspace"),
+            "the workspace follows the active profile too"
+        );
+    }
+
+    /// The wizard's marker shape: `config_dir` naming `profiles/default`.
+    /// With the active profile at `work`, the resolution follows the active
+    /// profile, so config, workspace and everything keyed on them move with
+    /// `profile use` — which the marker, honored as an override, used to
+    /// pin in place.
+    #[tokio::test]
+    async fn a_profile_pointer_marker_follows_the_active_profile() {
+        let _env_guard = env_override_lock().await;
+        let temp_home = tempfile::TempDir::new().unwrap();
+        let default = temp_home.path().join(".rantaiclaw");
+        let wizard_marker_dir = default.join("profiles/default");
+        fs::create_dir_all(&wizard_marker_dir).await.unwrap();
+        fs::write(wizard_marker_dir.join("config.toml"), "")
+            .await
+            .unwrap();
+        let marker_state = ActiveWorkspaceState {
+            config_dir: wizard_marker_dir.to_string_lossy().into_owned(),
+        };
+        fs::write(
+            default.join(ACTIVE_WORKSPACE_STATE_FILE),
+            toml::to_string(&marker_state).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let _g_home = crate::test_env::EnvGuard::set("HOME", temp_home.path());
+        let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
+        let _g_profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
+        let _g_allow = crate::test_env::EnvGuard::set("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR", "1");
+
+        // The active profile is `work`; the pointer marker names `default`.
+        crate::profile::ProfileManager::ensure("work").unwrap();
+        fs::write(crate::profile::paths::active_profile_file(), "work\n")
+            .await
+            .unwrap();
+
+        let (config_dir, resolved_workspace_dir, source) =
+            resolve_runtime_config_dirs(&default, &default.join("workspace"))
+                .await
+                .unwrap();
+
+        assert_eq!(
+            config_dir,
+            default.join("profiles/work"),
+            "the active profile wins over the pointer marker"
+        );
+        assert_eq!(
+            resolved_workspace_dir,
+            default.join("profiles/work/workspace"),
+            "the workspace follows the active profile"
+        );
+        assert_eq!(source, ConfigResolutionSource::DefaultConfigDir);
     }
 
     /// Regression: a marker that names a custom, non-`profiles/<name>`
@@ -13165,6 +13298,92 @@ default_model = "legacy-model"
     }
 
     /// The gate skips the backup when a complete one exists, and says so when
+    /// The v25 migration drops the old-shape `[cost.prices]` table, and
+    /// those rows were operator-entered. The load says which models lost
+    /// their prices and where the original file still is.
+    #[tokio::test]
+    async fn load_or_init_warns_when_the_migration_dropped_the_cost_price_table() {
+        let _env_guard = env_override_lock().await;
+        let sandbox = load_sandbox(
+            "schema_version = 24\n\n\
+             [cost.prices.\"anthropic/claude-sonnet-4\"]\ninput = 3.0\noutput = 15.0\n\n\
+             [cost.prices.\"openai/gpt-4\"]\ninput = 30.0\noutput = 60.0\n",
+        );
+        let (logs, _guard) = capture_logs();
+        let _config = Config::load_or_init().await.unwrap();
+        let logged = logs.contents();
+        assert!(
+            logged.contains("[cost.prices]"),
+            "the warning must name the table: {logged}"
+        );
+        assert!(
+            logged.contains("anthropic/claude-sonnet-4") && logged.contains("openai/gpt-4"),
+            "the warning must name every model that lost its prices: {logged}"
+        );
+        assert!(
+            logged.contains("config.toml.bak"),
+            "the warning must name the backup: {logged}"
+        );
+        // The backup really holds the original rows, prices and all.
+        let backup = sandbox.config_dir.join("config.toml.bak");
+        assert!(
+            backup.exists(),
+            "the migration must leave the original behind"
+        );
+        let original = std::fs::read_to_string(&backup).unwrap();
+        assert!(
+            original.contains("input = 3.0"),
+            "the backup must hold the original prices: {original}"
+        );
+    }
+
+    /// A config older than v25 that never carried a price table has nothing
+    /// to lose: the warning must not fire on the version alone.
+    #[tokio::test]
+    async fn load_or_init_does_not_warn_about_a_price_table_that_never_existed() {
+        let _env_guard = env_override_lock().await;
+        let _sandbox = load_sandbox(
+            "schema_version = 24\n\n[agent]\nmax_history_messages = 20\n\n\
+             [cost]\nmax_tokens_per_day = 2000000\n",
+        );
+        let (logs, _guard) = capture_logs();
+        let _config = Config::load_or_init().await.unwrap();
+        let logged = logs.contents();
+        assert!(
+            !logged.contains("cost.prices"),
+            "a config without a price table must not warn about one: {logged}"
+        );
+    }
+
+    /// A config that already carries the current price shape keeps it, and
+    /// the load does not warn about a table it never dropped.
+    #[tokio::test]
+    async fn load_or_init_keeps_a_current_shape_price_table_without_warning() {
+        let _env_guard = env_override_lock().await;
+        let sandbox = load_sandbox(
+            "schema_version = 40\n\n\
+             [cost.prices.\"anthropic/claude-sonnet-4\"]\n\
+             input_per_million = 3.0\noutput_per_million = 15.0\n",
+        );
+        let (logs, _guard) = capture_logs();
+        let config = Config::load_or_init().await.unwrap();
+        let logged = logs.contents();
+        assert!(
+            !logged.contains("cost.prices"),
+            "a table the migration never dropped must not warn: {logged}"
+        );
+        assert_eq!(
+            config.cost.prices.len(),
+            1,
+            "the price table must survive the load"
+        );
+        let contents = std::fs::read_to_string(sandbox.config_dir.join("config.toml")).unwrap();
+        assert!(
+            contents.contains("input_per_million"),
+            "the file must still hold the price: {contents}"
+        );
+    }
+
     /// the live markdown files hold notes newer than that backup.
     #[tokio::test]
     async fn load_or_init_warns_when_it_skips_the_backup_but_markdown_notes_are_newer() {

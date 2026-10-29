@@ -113,9 +113,10 @@ pub fn run(cmd: ProfileCommand) -> Result<()> {
             Ok(())
         }
         ProfileCommand::Current => {
-            // Side-effect: ensure the active profile dir exists, so
-            // `--profile foo profile current` self-bootstraps `foo` per
-            // the agent task verification list.
+            // `active()` ensures the resolved profile exists. A `--profile`
+            // naming a profile that does not exist is refused before any
+            // command runs, so the only profile this bootstraps is
+            // `default` on the first run.
             let p = ProfileManager::active()?;
             println!("{}", p.name);
             // Touch path so callers can see what's resolved (optional debug).

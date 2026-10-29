@@ -45,6 +45,7 @@ unverified rather than current._
 ├── profiles/
 │   ├── default/
 │   │   ├── config.toml
+│   │   ├── .secret_key     ← key that encrypts this profile's credentials
 │   │   ├── workspace/
 │   │   ├── memory/         ← sqlite
 │   │   ├── audit/
@@ -53,8 +54,7 @@ unverified rather than current._
 │   │   └── skills/
 │   └── work/
 │       └── ...
-├── active_profile          ← name of profile in use
-└── .secret_key             ← shared secret store
+└── active_profile          ← name of profile in use
 
 src/memory/
 ├── traits.rs               ← Memory trait

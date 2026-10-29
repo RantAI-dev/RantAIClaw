@@ -6,6 +6,11 @@
 //! can handle each install kind appropriately (`update` swaps binary and cargo
 //! installs in place and refuses only workspace runs; `uninstall` defers cargo
 //! removals to `cargo uninstall`).
+//!
+//! The cargo registry is looked up where the binary itself lives, never under
+//! `$HOME`: the question this file answers — "did the installer of this
+//! account put this binary here?" — must not change when the process runs
+//! with a different `$HOME`.
 
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
@@ -28,6 +33,12 @@ pub enum InstallKind {
 pub struct BinaryInfo {
     pub path: PathBuf,
     pub kind: InstallKind,
+    /// Whether the installer of this account placed the binary where it is.
+    ///
+    /// `uninstall --purge` removes only a binary it can prove it owns. A
+    /// binary this account did not install belongs to whoever put it there:
+    /// it is left alone and the uninstall prints the `rm` command instead.
+    pub owned: bool,
 }
 
 impl BinaryInfo {
@@ -35,7 +46,13 @@ impl BinaryInfo {
         let path = std::env::current_exe().context("resolve current_exe")?;
         let path = path.canonicalize().unwrap_or(path);
         let kind = classify(&path);
-        Ok(Self { path, kind })
+        let owned = kind != InstallKind::Workspace
+            && owned_by_this_account(
+                &path,
+                &crate::profile::paths::home_dir(),
+                cargo_tracks_binary,
+            );
+        Ok(Self { path, kind, owned })
     }
 }
 
@@ -74,25 +91,50 @@ fn classify_with(path: &Path, cargo_tracks: impl Fn(&Path) -> bool) -> InstallKi
 
 /// True when cargo's install registry records a binary with this file name.
 ///
-/// Cargo tracks installs in `$CARGO_HOME/.crates2.json` (modern) and
-/// `$CARGO_HOME/.crates.toml` (legacy v1). If neither lists the binary,
+/// Cargo tracks installs in `<registry>/.crates2.json` (modern) and
+/// `<registry>/.crates.toml` (legacy v1). If neither lists the binary,
 /// `cargo uninstall` cannot remove it, so the file must be treated as a plain
-/// binary the caller can delete directly.
+/// binary the caller can delete directly — when this account owns it.
 fn cargo_tracks_binary(path: &Path) -> bool {
     let Some(bin) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
-    let home = cargo_home();
-    crates2_lists_bin(&home.join(".crates2.json"), bin)
-        || crates_v1_lists_bin(&home.join(".crates.toml"), bin)
+    let Some(registry) = registry_for(path) else {
+        return false;
+    };
+    crates2_lists_bin(&registry.join(".crates2.json"), bin)
+        || crates_v1_lists_bin(&registry.join(".crates.toml"), bin)
 }
 
-/// `$CARGO_HOME`, falling back to `~/.cargo`.
-fn cargo_home() -> PathBuf {
-    if let Some(h) = std::env::var_os("CARGO_HOME") {
-        return PathBuf::from(h);
+/// The cargo registry that could have installed `path`.
+///
+/// `$CARGO_HOME/bin/<bin>` gives `$CARGO_HOME`; `<dir>/.cargo/bin/<bin>`
+/// gives `<dir>/.cargo`. Nothing else is a cargo location. The registry is
+/// derived from where the binary itself lives and never from `$HOME`, so a
+/// sandbox or another account's `$HOME` cannot change the answer.
+fn registry_for(path: &Path) -> Option<PathBuf> {
+    if let Some(cargo_home) = std::env::var_os("CARGO_HOME") {
+        let cargo_home = PathBuf::from(cargo_home);
+        if path.starts_with(cargo_home.join("bin")) {
+            return Some(cargo_home);
+        }
     }
-    crate::profile::paths::home_dir().join(".cargo")
+    let bin_dir = path.parent()?;
+    let registry = bin_dir.parent()?;
+    if registry.file_name().is_some_and(|name| name == ".cargo") {
+        return Some(registry.to_path_buf());
+    }
+    None
+}
+
+/// Whether the installer of this account placed the binary where it is.
+///
+/// Cargo's registry records the install, and the registry is looked up where
+/// the binary itself lives, so a different `$HOME` cannot hide it. Any
+/// other binary is owned only when it lives under this account's home
+/// directory; a binary outside it belongs to whoever put it there.
+fn owned_by_this_account(path: &Path, home: &Path, cargo_tracks: impl Fn(&Path) -> bool) -> bool {
+    cargo_tracks(path) || path.starts_with(home)
 }
 
 /// Does `.crates2.json` record an install whose `bins` array contains `bin`?
@@ -239,6 +281,67 @@ mod tests {
     }
 
     #[test]
+    fn the_registry_is_looked_up_where_the_binary_lives() {
+        // A registry under the binary's own `.cargo` records it — whatever
+        // `$HOME` the process runs with.
+        let dir = tempfile::tempdir().unwrap();
+        let cargo_home = dir.path().join(".cargo");
+        let bin = cargo_home.join("bin/rantaiclaw");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "x").unwrap();
+        // No registry yet: cargo does not record this install.
+        assert!(!cargo_tracks_binary(&bin));
+        std::fs::write(
+            cargo_home.join(".crates2.json"),
+            r#"{"installs":{"rantaiclaw 0.6.0 (path+file:///x)":{"bins":["rantaiclaw"]}}}"#,
+        )
+        .unwrap();
+        assert!(cargo_tracks_binary(&bin));
+    }
+
+    #[test]
+    fn a_plain_install_directory_has_no_cargo_registry() {
+        assert_eq!(
+            registry_for(Path::new("/home/u/.local/bin/rantaiclaw")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_binary_outside_this_home_is_not_owned() {
+        // The operator's `~/.cargo/bin/rantaiclaw`, seen from a sandbox whose
+        // `$HOME` is elsewhere. Cargo's registry does not record it, so this
+        // account did not install it and must not delete it.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join(".cargo/bin/rantaiclaw");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "x").unwrap();
+        assert_eq!(classify_with(&bin, |_| false), InstallKind::Binary);
+        assert!(!owned_by_this_account(&bin, Path::new("/sandbox"), |_| {
+            false
+        }));
+    }
+
+    #[test]
+    fn a_cargo_install_is_owned_even_outside_this_home() {
+        // A readable registry that lists the binary proves the install, so
+        // the binary is this account's — and it is a cargo install, which the
+        // uninstall defers to `cargo uninstall`.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join(".cargo/bin/rantaiclaw");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "x").unwrap();
+        assert_eq!(classify_with(&bin, |_| true), InstallKind::Cargo);
+        assert!(owned_by_this_account(&bin, Path::new("/sandbox"), |_| true));
+    }
+
+    #[test]
+    fn a_binary_inside_this_home_is_owned() {
+        let bin = PathBuf::from("/home/u/.local/bin/rantaiclaw");
+        assert!(owned_by_this_account(&bin, Path::new("/home/u"), |_| false));
+    }
+
+    #[test]
     fn require_self_modifiable_allows_cargo() {
         // `update` swaps the binary in place; a cargo-installed binary under
         // ~/.cargo/bin is user-owned and safe to replace (the only cost is
@@ -248,6 +351,7 @@ mod tests {
         let info = BinaryInfo {
             path: path.clone(),
             kind: InstallKind::Cargo,
+            owned: true,
         };
         let resolved = require_self_modifiable(&info, "update").expect("cargo must be allowed");
         assert_eq!(resolved, path);
@@ -260,6 +364,7 @@ mod tests {
         let info = BinaryInfo {
             path: PathBuf::from("/repo/target/release/rantaiclaw"),
             kind: InstallKind::Workspace,
+            owned: false,
         };
         assert!(require_self_modifiable(&info, "update").is_err());
     }
@@ -269,6 +374,7 @@ mod tests {
         let info = BinaryInfo {
             path: PathBuf::from("/usr/local/bin/rantaiclaw"),
             kind: InstallKind::Binary,
+            owned: false,
         };
         assert!(require_self_modifiable(&info, "update").is_ok());
     }

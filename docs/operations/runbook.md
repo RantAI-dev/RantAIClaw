@@ -23,6 +23,12 @@ For first-time installation, start from [one-click-bootstrap.md](../start/one-cl
 | Foreground gateway only | `rantaiclaw gateway` | webhook endpoint testing |
 | User service | `rantaiclaw service install && rantaiclaw service start` | persistent operator-managed runtime |
 
+Profiles and the installed service: a service installed without an explicit profile
+(`-p` / `RANTAICLAW_PROFILE`) follows the active-profile marker, so `rantaiclaw profile use <name>`
+restarts the unit onto the new profile. A service installed with an explicit profile is
+pinned to it — `profile use` leaves it running and says so; reinstall from the other
+profile to move it.
+
 ## Baseline Operator Checklist
 
 1. Validate configuration:

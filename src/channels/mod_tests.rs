@@ -3032,6 +3032,7 @@ async fn process_channel_message_uses_runtime_default_model_from_store() {
                 temperature: 0.5,
                 api_key: None,
                 provider_api_keys: Arc::new(HashMap::new()),
+                model_routes: Arc::new(Vec::new()),
                 api_url: None,
                 reliability: crate::config::ReliabilityConfig::default(),
                 approval_owners: Arc::new(Vec::new()),
@@ -3973,6 +3974,9 @@ async fn the_startup_channel_prompt_names_no_preset_the_gate_does_not_enforce() 
     let _home = crate::test_env::HomeGuard::set(home.path());
     let _profile_env =
         crate::test_env::EnvGuard::set("RANTAICLAW_PROFILE", "rt-preset-drift-startup");
+    // The profile this test names in the environment has to exist: the
+    // existence door refuses a name that names nothing.
+    crate::profile::ProfileManager::ensure("rt-preset-drift-startup").expect("profile tree");
     let profile = crate::profile::ProfileManager::active().expect("profile tree");
 
     // The shipped default level: the gate every production caller seeds this
@@ -4396,15 +4400,17 @@ async fn maybe_apply_runtime_config_update_keeps_provider_and_records_reason_on_
     let temp = tempfile::TempDir::new().expect("temp dir");
     let config_path = temp.path().join("config.toml");
 
-    let write_config = |provider: &str, model: &str| {
-        let mut config = crate::config::Config::default();
-        config.default_provider = Some(provider.to_string());
-        config.default_model = Some(model.to_string());
-        let toml = toml::to_string(&config).expect("serialize config");
-        std::fs::write(&config_path, toml).expect("write config");
-    };
+    let write_config =
+        |provider: &str, model: &str, routes: Vec<crate::config::ModelRouteConfig>| {
+            let mut config = crate::config::Config::default();
+            config.default_provider = Some(provider.to_string());
+            config.default_model = Some(model.to_string());
+            config.model_routes = routes;
+            let toml = toml::to_string(&config).expect("serialize config");
+            std::fs::write(&config_path, toml).expect("write config");
+        };
 
-    write_config("openrouter", "model-a");
+    write_config("openrouter", "model-a", vec![fast_route()]);
 
     let mut channels_by_name = HashMap::new();
     let channel: Arc<dyn Channel> = Arc::new(TelegramRecordingChannel::default());
@@ -4457,10 +4463,29 @@ async fn maybe_apply_runtime_config_update_keeps_provider_and_records_reason_on_
         routing::runtime_defaults_snapshot(&ctx).default_provider,
         "openrouter"
     );
+    assert_eq!(
+        routing::runtime_defaults_snapshot(&ctx)
+            .model_routes
+            .iter()
+            .map(|route| route.hint.as_str())
+            .collect::<Vec<_>>(),
+        vec!["fast"],
+        "the applied defaults carry the route table the file named"
+    );
 
-    // Switch to a provider that cannot be built.
+    // Switch to a provider that cannot be built, and to a DIFFERENT route
+    // table while we are at it.
     std::thread::sleep(std::time::Duration::from_millis(10));
-    write_config("nonexistent-provider-xyz", "whatever");
+    write_config(
+        "nonexistent-provider-xyz",
+        "whatever",
+        vec![crate::config::ModelRouteConfig {
+            hint: "slow".to_string(),
+            provider: "test-recording".to_string(),
+            model: "slow-model".to_string(),
+            api_key: None,
+        }],
+    );
     // Must return Ok (kept the old provider), not propagate the build error.
     routing::maybe_apply_runtime_config_update(&ctx)
         .await
@@ -4474,6 +4499,18 @@ async fn maybe_apply_runtime_config_update_keeps_provider_and_records_reason_on_
     assert!(
         routing::last_reload_error(&ctx).is_some(),
         "recorded the reload failure reason for surfacing"
+    );
+    // The provider that is still running is the OLD router, built with the OLD
+    // table. The applied defaults must name the same table, or they would
+    // describe routes the running router cannot resolve.
+    assert_eq!(
+        routing::runtime_defaults_snapshot(&ctx)
+            .model_routes
+            .iter()
+            .map(|route| route.hint.as_str())
+            .collect::<Vec<_>>(),
+        vec!["fast"],
+        "the route table stays frozen with the provider that could not be replaced"
     );
 }
 
@@ -7830,6 +7867,7 @@ async fn threading_off_clears_both_the_thread_and_the_quote() {
                 temperature: 0.0,
                 api_key: None,
                 provider_api_keys: Arc::new(HashMap::new()),
+                model_routes: Arc::new(Vec::new()),
                 api_url: None,
                 reliability: crate::config::ReliabilityConfig::default(),
                 approval_owners: Arc::new(Vec::new()),
@@ -15295,5 +15333,394 @@ async fn the_channel_door_offers_the_skill_tool_to_a_guest_with_a_grant() {
             .iter()
             .any(|tool| tool.name() == "skill_greeter_greet"),
         "a guest granted the skill's tool by name did not reach it"
+    );
+}
+
+// ── The channel doors apply the operator's `[[model_routes]]` ───────────────
+//
+// A `[[model_routes]]` table maps a hint to a provider and a model. Every door
+// that builds a provider for an agent turn has to build it through the routed
+// factory with that table, or a `hint:` model reaches the provider as a literal
+// model name and the answer names a model that does not exist.
+
+/// A primary provider that points at a dead local endpoint.
+///
+/// A turn must NOT reach the primary when the route names another provider: a
+/// primary that answered would hide a turn that went the wrong way. This one
+/// fails instead — and nothing leaves the machine either way.
+const DEAD_PRIMARY: &str = "custom:http://127.0.0.1:9";
+
+/// The route the operator wrote: `hint:fast` goes to the recording provider,
+/// as the model `routed-model`.
+fn fast_route() -> crate::config::ModelRouteConfig {
+    crate::config::ModelRouteConfig {
+        hint: "fast".to_string(),
+        provider: "test-recording".to_string(),
+        model: "routed-model".to_string(),
+        api_key: None,
+    }
+}
+
+/// A config whose default model is `model`, with the route table that resolves
+/// `hint:fast`, and one attempt per provider.
+///
+/// One attempt, because what these tests are about is WHICH provider is asked,
+/// not how often a failure is retried.
+fn routing_config(workspace: &std::path::Path, model: &str) -> crate::config::Config {
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.to_path_buf();
+    config.default_provider = Some(DEAD_PRIMARY.to_string());
+    config.default_model = Some(model.to_string());
+    config.model_routes = vec![fast_route()];
+    config.reliability.provider_retries = 0;
+    config
+}
+
+/// The boot door builds its provider through the routed factory, so the
+/// operator's `[[model_routes]]` decide which provider and which model the
+/// turn reaches. Before this the door sent the literal string `hint:fast` to
+/// the primary as a model name, and the answer named a model that does not
+/// exist.
+#[tokio::test]
+async fn the_channel_boot_door_reaches_the_provider_and_model_the_hint_names() {
+    // The recording provider counts its calls in one process-wide place,
+    // so the tests that read it run one at a time.
+    let _recording = crate::providers::tests::RECORDING_LOCK.lock().await;
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let home = TempDir::new().expect("temp home");
+    let config_dir = TempDir::new().expect("temp config dir");
+    let workspace = TempDir::new().expect("temp workspace");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+    let _config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", config_dir.path());
+    crate::providers::tests::RecordingProvider::reset();
+
+    let mut config = routing_config(workspace.path(), "hint:fast");
+    config.config_path = config_dir.path().join("config.toml");
+    // A configured channel is what makes the runtime exist at all.
+    config.channels_config.telegram = Some(crate::config::TelegramConfig {
+        bot_token: "111111111:not-a-real-token".into(),
+        allowed_users: vec!["*".into()],
+        stream_mode: crate::config::StreamMode::default(),
+        draft_update_interval_ms: 1000,
+        interrupt_on_new_message: false,
+        mention_only: false,
+    });
+
+    let runtime = build_channel_runtime(&config, None)
+        .await
+        .expect("the runtime builds")
+        .expect("a configured channel means a runtime");
+
+    runtime
+        .ctx
+        .provider
+        .simple_chat("hello", "hint:fast", 0.0)
+        .await
+        .expect("the turn reaches the route");
+
+    assert_eq!(
+        crate::providers::tests::RecordingProvider::calls(),
+        1,
+        "the turn must reach the provider the route names"
+    );
+    let call = crate::providers::tests::RecordingProvider::last_call()
+        .expect("the routed provider saw the turn");
+    assert_eq!(
+        call.model, "routed-model",
+        "the turn must carry the model the route names, not the hint"
+    );
+}
+
+/// A channel runtime context whose per-message door builds a provider whose
+/// PRIMARY is the dead endpoint, with the route table that resolves
+/// `hint:fast`.
+///
+/// `ctx.default_provider` names a provider that is never asked for, on
+/// purpose: `get_or_create_provider` answers the boot provider when the
+/// requested name matches `ctx.default_provider`, so the BUILD path is only
+/// reachable with a name that differs from it.
+fn routing_test_ctx(
+    dir: &std::path::Path,
+    api_key: Option<String>,
+    routes: Vec<crate::config::ModelRouteConfig>,
+) -> ChannelRuntimeContext {
+    let defaults = ChannelRuntimeDefaults {
+        default_provider: DEAD_PRIMARY.to_string(),
+        model: "hint:fast".to_string(),
+        temperature: 0.0,
+        api_key: api_key.clone(),
+        provider_api_keys: Arc::new(HashMap::new()),
+        model_routes: Arc::new(routes),
+        api_url: None,
+        reliability: crate::config::ReliabilityConfig::default(),
+        approval_owners: Arc::new(Vec::new()),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        allowed_commands: Arc::new(Vec::new()),
+        autonomy_level: crate::security::AutonomyLevel::Supervised,
+        autonomy_preset: None,
+        allowlists: Arc::new(HashMap::new()),
+        message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        max_tool_iterations: 5,
+        min_relevance_score: 0.0,
+        autonomous_tools: false,
+        mention_only: Arc::new(HashMap::new()),
+        thread_replies: Arc::new(HashMap::new()),
+    };
+    ChannelRuntimeContext {
+        runtime_config: Arc::new(Mutex::new(routing::RuntimeConfigSlot {
+            state: Some(routing::RuntimeConfigState {
+                defaults,
+                last_applied_stamp: None,
+                last_reload_error: None,
+            }),
+            ..routing::RuntimeConfigSlot::default()
+        })),
+        channels_by_name: Arc::new(HashMap::new()),
+        provider: Arc::new(DummyProvider),
+        default_provider: Arc::new("openrouter".to_string()),
+        memory: Arc::new(NoopMemory),
+        tools_registry: Arc::new(vec![]),
+        observer: Arc::new(NoopObserver),
+        owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
+        guest_system_prompt: Arc::new("test-system-prompt".to_string()),
+        model: Arc::new("hint:fast".to_string()),
+        temperature: 0.0,
+
+        max_tool_iterations: 5,
+        min_relevance_score: 0.0,
+        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        history_store: None,
+        session_store: None,
+        ledger: None,
+        provider_cache: Arc::new(Mutex::new(HashMap::new())),
+        route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        api_key,
+        api_url: None,
+        reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+        provider_runtime_options: providers::ProviderRuntimeOptions {
+            rantaiclaw_dir: Some(dir.to_path_buf()),
+            ..providers::ProviderRuntimeOptions::default()
+        },
+        workspace_dir: Arc::new(std::env::temp_dir()),
+        message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        interrupt_on_new_message: false,
+        multimodal: crate::config::MultimodalConfig::default(),
+        security: Arc::new(crate::security::SecurityPolicy::default()),
+        channel_approval: None,
+        approval_owners: Arc::new(Vec::new()),
+        tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(&[], &[])),
+        in_flight_counter: Arc::new(Mutex::new(HashMap::new())),
+    }
+}
+
+/// The per-message door — the one the `/provider` command and the per-message
+/// path use — builds its provider through the routed factory too, so the same
+/// `[[model_routes]]` decide which provider and which model the turn reaches.
+#[tokio::test]
+async fn the_channel_per_message_door_reaches_the_provider_and_model_the_hint_names() {
+    // The recording provider counts its calls in one process-wide place,
+    // so the tests that read it run one at a time.
+    let _recording = crate::providers::tests::RECORDING_LOCK.lock().await;
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    let home = TempDir::new().expect("temp home");
+    let config_dir = TempDir::new().expect("temp config dir");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+    let _config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", config_dir.path());
+    let dir = TempDir::new().expect("temp dir");
+    crate::providers::tests::RecordingProvider::reset();
+
+    let ctx = routing_test_ctx(dir.path(), None, vec![fast_route()]);
+    let provider = routing::get_or_create_provider(&ctx, DEAD_PRIMARY)
+        .await
+        .expect("the provider builds");
+
+    provider
+        .simple_chat("hello", "hint:fast", 0.0)
+        .await
+        .expect("the turn reaches the route");
+
+    assert_eq!(
+        crate::providers::tests::RecordingProvider::calls(),
+        1,
+        "the turn must reach the provider the route names, not the dead primary"
+    );
+    let call = crate::providers::tests::RecordingProvider::last_call()
+        .expect("the routed provider saw the turn");
+    assert_eq!(
+        call.model, "routed-model",
+        "the turn must carry the model the route names, not the hint"
+    );
+}
+
+/// Rule #191: a route that names a DIFFERENT provider, and carries no key of
+/// its own, must never receive the primary provider's key. A key for one
+/// endpoint sent to another is a credential leak.
+#[tokio::test]
+async fn a_channel_route_without_its_own_key_never_receives_the_primary_key() {
+    // The recording provider counts its calls in one process-wide place,
+    // so the tests that read it run one at a time.
+    let _recording = crate::providers::tests::RECORDING_LOCK.lock().await;
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    // No credential may reach the route's provider from the environment
+    // either, so the assertion below is about the primary's key and nothing
+    // else.
+    let _scrub = crate::test_env::CredentialEnvScrub::new();
+    let home = TempDir::new().expect("temp home");
+    let config_dir = TempDir::new().expect("temp config dir");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+    let _config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", config_dir.path());
+    let dir = TempDir::new().expect("temp dir");
+    crate::providers::tests::RecordingProvider::reset();
+
+    let ctx = routing_test_ctx(
+        dir.path(),
+        Some("primary-secret-key".to_string()),
+        vec![fast_route()],
+    );
+    let provider = routing::get_or_create_provider(&ctx, DEAD_PRIMARY)
+        .await
+        .expect("the provider builds");
+
+    provider
+        .simple_chat("hello", "hint:fast", 0.0)
+        .await
+        .expect("the turn reaches the route");
+
+    let call = crate::providers::tests::RecordingProvider::last_call()
+        .expect("the routed provider saw the turn");
+    assert_eq!(call.model, "routed-model");
+    assert_ne!(
+        call.credential.as_deref(),
+        Some("primary-secret-key"),
+        "a route without its own key must not receive the primary's key"
+    );
+    assert_eq!(
+        call.credential, None,
+        "the route's provider must be built with no credential at all"
+    );
+}
+
+/// The hot-reload door rebuilds the default provider through the routed
+/// factory, so a route the operator added to `config.toml` takes effect on the
+/// next message.
+#[tokio::test]
+async fn a_channel_reload_that_adds_a_route_makes_the_next_turn_use_it() {
+    // The recording provider counts its calls in one process-wide place,
+    // so the tests that read it run one at a time.
+    let _recording = crate::providers::tests::RECORDING_LOCK.lock().await;
+    let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    // The environment may name a provider or a model of its own, and the
+    // reload reads the environment over the file — so the file must be what
+    // this test is about.
+    let _scrub = crate::test_env::CredentialEnvScrub::new();
+    let _model_env = crate::test_env::EnvGuard::unset("RANTAICLAW_MODEL");
+    let _model_env = crate::test_env::EnvGuard::unset("MODEL");
+    let _provider_env = crate::test_env::EnvGuard::unset("RANTAICLAW_PROVIDER");
+    let _provider_env = crate::test_env::EnvGuard::unset("PROVIDER");
+    let home = TempDir::new().expect("temp home");
+    let config_dir = TempDir::new().expect("temp config dir");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+    let _config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", config_dir.path());
+    let dir = TempDir::new().expect("temp dir");
+    let config_path = dir.path().join("config.toml");
+    crate::providers::tests::RecordingProvider::reset();
+
+    // The config, with or without the route table.
+    let write_config = |with_route: bool| {
+        let mut config = crate::config::Config::default();
+        config.default_provider = Some("test-recording".to_string());
+        config.default_model = Some("hint:fast".to_string());
+        if with_route {
+            config.model_routes = vec![fast_route()];
+        }
+        config.reliability.provider_retries = 0;
+        std::fs::write(
+            &config_path,
+            toml::to_string(&config).expect("serialize config"),
+        )
+        .expect("write config");
+    };
+
+    let ctx = routing_test_ctx(dir.path(), None, Vec::new());
+
+    // First apply: a config with NO route table. The provider the reload
+    // builds has nothing to resolve a hint against, so the hint is refused
+    // before any request.
+    write_config(false);
+    routing::maybe_apply_runtime_config_update(&ctx)
+        .await
+        .expect("initial apply");
+
+    let without_route = {
+        ctx.provider_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get("test-recording")
+            .cloned()
+            .expect("the reload built the provider")
+    };
+    let refusal = without_route
+        .simple_chat("hello", "hint:fast", 0.0)
+        .await
+        .expect_err("a hint with no route table is refused");
+    assert!(
+        refusal
+            .to_string()
+            .contains(crate::providers::router::NO_ROUTES_REFUSAL),
+        "{refusal}"
+    );
+    assert_eq!(
+        crate::providers::tests::RecordingProvider::calls(),
+        0,
+        "a refused hint must not reach a provider"
+    );
+    assert!(
+        routing::runtime_defaults_snapshot(&ctx)
+            .model_routes
+            .is_empty(),
+        "a config with no route table applies no routes"
+    );
+
+    // Second apply: the operator ADDS the route. The stamp changed, so the
+    // reload runs and rebuilds the provider — this time as a router.
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    write_config(true);
+    routing::maybe_apply_runtime_config_update(&ctx)
+        .await
+        .expect("reload apply");
+
+    let defaults = routing::runtime_defaults_snapshot(&ctx);
+    assert_eq!(
+        defaults.model_routes.len(),
+        1,
+        "the reloaded defaults carry the route the operator added"
+    );
+    assert_eq!(defaults.model_routes[0].hint, "fast");
+    assert_eq!(defaults.model_routes[0].model, "routed-model");
+
+    let with_route = {
+        ctx.provider_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get("test-recording")
+            .cloned()
+            .expect("the reload built the provider")
+    };
+    with_route
+        .simple_chat("hello", "hint:fast", 0.0)
+        .await
+        .expect("the turn reaches the route");
+
+    assert_eq!(
+        crate::providers::tests::RecordingProvider::calls(),
+        1,
+        "the turn must reach the provider the added route names"
+    );
+    let call = crate::providers::tests::RecordingProvider::last_call()
+        .expect("the routed provider saw the turn");
+    assert_eq!(
+        call.model, "routed-model",
+        "the turn must carry the model the added route names, not the hint"
     );
 }
