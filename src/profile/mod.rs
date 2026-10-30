@@ -97,6 +97,36 @@ pub struct CloneOpts {
     pub include_memory: bool,
 }
 
+/// The existence door's refusal: the name names no profile on disk.
+///
+/// Typed so a caller can tell it apart from a failure that could pass on a
+/// retry (a profile directory that could not be created): the config loader
+/// maps this one to a config failure a restart cannot fix, and leaves the
+/// other alone.
+#[derive(Debug)]
+pub struct MissingProfileError {
+    name: String,
+    dir: PathBuf,
+}
+
+impl std::fmt::Display for MissingProfileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // ONE sentence, and it names BOTH ways out: the name usually came
+        // from the active-profile marker, and the operator who follows it
+        // wants an existing profile as much as they want this one created.
+        write!(
+            f,
+            "profile {:?} does not exist at {}; select another profile with \
+             `rantaiclaw profile use <name>`, or create it with `rantaiclaw profile create {}`",
+            self.name,
+            self.dir.display(),
+            self.name
+        )
+    }
+}
+
+impl std::error::Error for MissingProfileError {}
+
 /// Stateless façade over the profiles directory.
 ///
 /// All entry points are static — there is one process-wide profile root
@@ -276,10 +306,11 @@ impl ProfileManager {
             return Ok(());
         }
         let dir = paths::profile_dir(name);
-        bail!(
-            "profile {name:?} does not exist at {}; create it with `rantaiclaw profile create {name}`",
-            dir.display()
-        )
+        Err(MissingProfileError {
+            name: name.to_string(),
+            dir,
+        }
+        .into())
     }
 
     /// The door a profile *selection* passes: the `--profile` flag and the
@@ -383,6 +414,11 @@ impl ProfileManager {
     /// A marker that cannot be read fails the delete: it may name this
     /// profile, and a delete that cannot see it would leave the marker
     /// naming a profile that no longer exists.
+    ///
+    /// A profile a LIVE DAEMON is serving is never removed, with or without
+    /// `force`: the daemon rewrites its directory every few seconds and
+    /// would recreate a half profile, whatever the operator acknowledged.
+    /// A stale sentinel (the daemon is gone) does not block the delete.
     pub fn delete(name: &str, force: bool) -> Result<()> {
         validate_profile_name(name)?;
         let dir = paths::profile_dir(name);
@@ -404,13 +440,25 @@ impl ProfileManager {
                 );
             }
         }
+        let live_daemons = sentinel::running_daemons(&[name.to_string()]);
+        if let Some(daemon) = live_daemons.first() {
+            bail!(
+                "refusing to delete profile {name:?}: a daemon is running on it (pid {}); \
+                 stop it with `rantaiclaw service stop` (or stop the daemon by hand) first",
+                daemon.pid
+            );
+        }
         fs::remove_dir_all(&dir)
             .with_context(|| format!("remove profile dir {}", dir.display()))?;
         // Clear the marker when it named the deleted profile, so no command
-        // leaves the marker naming a profile that does not exist. A removal
-        // that fails is reported, not swallowed: the profile is already gone,
-        // and the marker still names it.
-        if active == name || marker_names {
+        // leaves the marker naming a profile that does not exist. The
+        // marker alone decides: the environment naming the deleted
+        // profile says nothing about what the marker names, and taking
+        // the marker with it would move every marker-following process
+        // off the profile it names. A removal that fails is reported, not
+        // swallowed: the profile is already gone, and the marker still
+        // names it.
+        if marker_names {
             let marker = paths::active_profile_file();
             match fs::remove_file(&marker) {
                 Ok(()) => {}
@@ -418,11 +466,8 @@ impl ProfileManager {
                 // is left naming a profile that does not exist.
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    let consequence = if marker_names {
-                        format!("the marker still names the deleted profile {name:?}")
-                    } else {
-                        "the marker was left in place".to_string()
-                    };
+                    let consequence =
+                        format!("the marker still names the deleted profile {name:?}");
                     return Err(error).with_context(|| {
                         format!(
                             "the profile {name:?} was deleted, but the active-profile marker {} \
@@ -1002,6 +1047,31 @@ mod profile_root_tests {
         ProfileManager::require_existing("work").expect("an existing profile passes the door");
     }
 
+    /// The existence door names BOTH ways out: another profile to select,
+    /// and this profile to create. The name usually came from the
+    /// active-profile marker, and the operator who follows it wants an
+    /// existing profile — so one remedy is not enough.
+    #[test]
+    fn the_missing_profile_refusal_names_both_ways_out() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _g_home = crate::test_env::EnvGuard::set("HOME", tmp.path());
+        let _g_profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
+        let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+
+        let error = ProfileManager::require_existing("work").expect_err("work does not exist");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("rantaiclaw profile use"),
+            "the refusal must name the way out to another profile: {message}"
+        );
+        assert!(
+            message.contains("rantaiclaw profile create work"),
+            "the refusal must name the way out to create this profile: {message}"
+        );
+    }
+
     /// `active()` refuses a resolved name that does not exist — from the
     /// environment or from the marker — where it used to create the
     /// directory. A stale marker is healed by switching back to `default`,
@@ -1078,6 +1148,122 @@ mod profile_root_tests {
         assert!(
             !paths::active_profile_file().exists(),
             "a forced delete must not leave the marker naming a profile that does not exist"
+        );
+    }
+
+    /// A profile a live daemon is serving is never removed: the daemon
+    /// keeps writing into the directory and would recreate a half profile.
+    /// `--force` does not buy a delete under a live daemon — the operator
+    /// has to stop the daemon first.
+    #[test]
+    fn a_profile_a_live_daemon_is_serving_cannot_be_deleted() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _g_home = crate::test_env::EnvGuard::set("HOME", tmp.path());
+        let _g_profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
+        let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+
+        ProfileManager::ensure("work").unwrap();
+        // The sentinel of a daemon that is running right now: this test's
+        // own process.
+        crate::profile::sentinel::write_sentinel(
+            "work",
+            &crate::profile::sentinel::DaemonSentinel {
+                pid: std::process::id(),
+                unit: Some("rantaiclaw@work.service".to_string()),
+                started_at: None,
+                profile_pinned: true,
+            },
+        )
+        .unwrap();
+
+        for force in [false, true] {
+            let error = ProfileManager::delete("work", force)
+                .expect_err("a live daemon must refuse the delete");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("work"),
+                "the refusal must name the profile: {message}"
+            );
+            assert!(
+                message.contains(&std::process::id().to_string()),
+                "the refusal must name the pid: {message}"
+            );
+            assert!(
+                message.contains("rantaiclaw service stop"),
+                "the refusal must say how to stop the daemon: {message}"
+            );
+            assert!(
+                paths::profile_dir("work").exists(),
+                "a refused delete must keep the profile"
+            );
+        }
+    }
+
+    /// A sentinel whose process is gone is stale: it does not block the
+    /// delete. A crashed daemon must not hold a profile hostage.
+    #[test]
+    fn a_profile_whose_daemon_is_gone_can_be_deleted() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _g_home = crate::test_env::EnvGuard::set("HOME", tmp.path());
+        let _g_profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
+        let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+
+        ProfileManager::ensure("work").unwrap();
+        // A sentinel pointing at a PID that is not running.
+        crate::profile::sentinel::write_sentinel(
+            "work",
+            &crate::profile::sentinel::DaemonSentinel {
+                pid: 0x7fff_fffe,
+                unit: Some("rantaiclaw@work.service".to_string()),
+                started_at: None,
+                profile_pinned: false,
+            },
+        )
+        .unwrap();
+
+        ProfileManager::delete("work", false).expect("a stale sentinel must not block the delete");
+        assert!(!paths::profile_dir("work").exists(), "the profile is gone");
+    }
+
+    /// A forced delete removes the marker only when the marker names the
+    /// deleted profile. The environment naming another profile must not take
+    /// the marker with it: every marker-following process (a systemd unit
+    /// without a pin) would move off the profile the marker names.
+    #[test]
+    fn a_forced_delete_keeps_a_marker_that_names_another_profile() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _g_home = crate::test_env::EnvGuard::set("HOME", tmp.path());
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
+        let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+        // The environment names `work`; the marker names `default`.
+        let _g_profile = crate::test_env::EnvGuard::set("RANTAICLAW_PROFILE", "work");
+
+        ProfileManager::ensure("work").unwrap();
+        ProfileManager::ensure("default").unwrap();
+        std::fs::write(paths::active_profile_file(), "default\n").unwrap();
+
+        ProfileManager::delete("work", true).expect("the forced delete goes through");
+
+        assert!(!paths::profile_dir("work").exists(), "the profile is gone");
+        // The marker FILE, not `marker_profile()`: that helper falls back
+        // to "default" when the marker is gone, which is the name the
+        // marker had here — the assertion would pass either way.
+        let marker = paths::active_profile_file();
+        assert!(
+            marker.exists(),
+            "the marker must survive a delete of another profile"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker)
+                .expect("the marker is readable")
+                .trim(),
+            "default",
+            "the marker must still name the profile it named"
         );
     }
 

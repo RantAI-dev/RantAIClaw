@@ -804,7 +804,7 @@ config, persona, workspace, memory, skills, sessions, policy, secrets and runtim
 | `create <name> [--clone <src>]` | Create, optionally cloning an existing profile |
 | `use <name>` | Switch the active profile; restarts a background daemon that followed the previous profile (a daemon pinned to its profile by a service install stays put and the switch says so). Refused while a config-directory override keeps another profile in effect (see the config reference, "Overrides pin the profile") |
 | `clone <src> <dst>` | Clone under a new name |
-| `delete <name>` | Delete; refuses the active profile unless `--force` |
+| `delete <name>` | Delete; refuses the active profile unless `--force`, and refuses a profile a live daemon is using with or without `--force` |
 | `current` | Print the active profile name |
 
 To switch for a single invocation without moving the active marker, use the global
@@ -826,6 +826,16 @@ unit's `RestartPreventExitStatus=78` stops on: on systemd the unit stays stopped
 instead of being restarted every few seconds and the journal keeps the sentence that
 says why, while launchd restarts the job anyway because it cannot exclude a single
 exit code. Every other command exits 1.
+
+A daemon whose config cannot be loaded exits 78 for the same reason. The load fails
+the same way on every start when it follows from the files on disk alone: the
+active-profile marker names a profile directory that does not exist, `config.toml`
+does not parse as TOML or does not fit the schema, it holds a value the schema
+refuses, it holds a secret the `.secret_key` on disk cannot decrypt, or
+`schema_version` is negative, malformed or newer than the binary supports. The
+daemon prints the sentence that says why on stderr and exits 78, so the unit stays
+stopped and the journal keeps the sentence. Every other command keeps exit 1 for the
+same broken config.
 
 ### `session`
 

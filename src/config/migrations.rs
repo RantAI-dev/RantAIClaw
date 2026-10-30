@@ -54,16 +54,22 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
     // integer falls through to the too-new guard below.
     let from = match raw.get(SCHEMA_VERSION_KEY) {
         None => 0,
-        Some(Value::Integer(i)) if *i < 0 => anyhow::bail!(
-            "config.toml {SCHEMA_VERSION_KEY}={i} is negative; expected an integer 0..={CURRENT_VERSION}. \
-             Fix or remove the line and re-run."
-        ),
+        Some(Value::Integer(i)) if *i < 0 => {
+            return Err(crate::config::persistent::PersistentConfigError::new(format!(
+                "config.toml {SCHEMA_VERSION_KEY}={i} is negative; expected an integer 0..={CURRENT_VERSION}. \
+                 Fix or remove the line and re-run."
+            ))
+            .into());
+        }
         Some(Value::Integer(i)) => u32::try_from(*i).unwrap_or(CURRENT_VERSION + 1),
-        Some(other) => anyhow::bail!(
-            "config.toml {SCHEMA_VERSION_KEY} is malformed ({}); expected an integer 0..={CURRENT_VERSION}. \
-             Fix or remove the line and re-run.",
-            other.type_str()
-        ),
+        Some(other) => {
+            return Err(crate::config::persistent::PersistentConfigError::new(format!(
+                "config.toml {SCHEMA_VERSION_KEY} is malformed ({}); expected an integer 0..={CURRENT_VERSION}. \
+                 Fix or remove the line and re-run.",
+                other.type_str()
+            ))
+            .into());
+        }
     };
 
     if from == CURRENT_VERSION {
@@ -72,10 +78,16 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
     if from > CURRENT_VERSION {
         // Config was written by a newer binary than this one. Don't
         // attempt to downgrade — that's lossy in general. Surface a
-        // clear error so the user knows to upgrade their binary.
-        anyhow::bail!(
-            "config.toml schema_version={from} is newer than this binary supports \
+        // clear error so the user knows to upgrade their binary. It
+        // follows from the file on disk, so it is marked as a failure a
+        // restart cannot fix: the same file fails the same way until the
+        // binary is upgraded.
+        return Err(
+            crate::config::persistent::PersistentConfigError::new(format!(
+                "config.toml schema_version={from} is newer than this binary supports \
              (max={CURRENT_VERSION}). Update rantaiclaw before continuing."
+            ))
+            .into(),
         );
     }
 

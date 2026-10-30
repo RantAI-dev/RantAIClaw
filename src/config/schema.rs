@@ -1,3 +1,4 @@
+use crate::config::persistent::PersistentConfigError;
 use crate::providers::{is_glm_alias, is_zai_alias};
 use crate::security::AutonomyLevel;
 use anyhow::{Context, Result};
@@ -3412,11 +3413,30 @@ impl Default for Config {
 /// An active profile that names nothing is an ERROR, not a reason to read the
 /// flat layout: the flat layout would silently shadow the profile the
 /// operator chose. The error is the existence door's sentence — it names the
-/// profile and how to create it.
+/// profile and both ways out.
 fn profile_default_config_and_workspace_dirs() -> Result<(PathBuf, PathBuf)> {
-    let profile = crate::profile::ProfileManager::active()?;
+    let profile =
+        crate::profile::ProfileManager::active().map_err(mark_persistent_config_failure)?;
     let workspace = profile.workspace_dir();
     Ok((profile.root, workspace))
+}
+
+/// Mark the config failures that a restart cannot fix.
+///
+/// A profile that names nothing is a fact on disk: the same marker, the
+/// same missing directory, the same refusal on every start, so the daemon
+/// must stop instead of being restarted into the same failure. Every other
+/// failure the profile resolver can raise — a profile directory that could
+/// not be created — can pass on a retry and keeps its own error.
+fn mark_persistent_config_failure(error: anyhow::Error) -> anyhow::Error {
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::profile::MissingProfileError>()
+            .is_some()
+    }) {
+        return anyhow::Error::new(PersistentConfigError::from_error(&error));
+    }
+    error
 }
 
 const ACTIVE_WORKSPACE_STATE_FILE: &str = "active_workspace.toml";
@@ -3647,28 +3667,31 @@ impl ConfigResolutionSource {
 async fn resolve_runtime_config_dirs(
     default_rantaiclaw_dir: &Path,
 ) -> Result<(PathBuf, PathBuf, ConfigResolutionSource)> {
-    if let Ok(custom_config_dir) = std::env::var("RANTAICLAW_CONFIG_DIR") {
-        let custom_config_dir = custom_config_dir.trim();
-        if !custom_config_dir.is_empty() {
-            let rantaiclaw_dir = PathBuf::from(custom_config_dir);
-            return Ok((
-                rantaiclaw_dir.clone(),
-                rantaiclaw_dir.join("workspace"),
-                ConfigResolutionSource::EnvConfigDir,
-            ));
-        }
+    // The override variables are read with the ONE rule that decides whether
+    // an override is set: a trimmed, non-empty value. The override check at
+    // the profile doors uses the same helper, so the loader and the door can
+    // never disagree about a value of spaces.
+    if let Some(custom_config_dir) =
+        crate::profile::config_override::non_empty_env("RANTAICLAW_CONFIG_DIR")
+    {
+        let rantaiclaw_dir = PathBuf::from(custom_config_dir);
+        return Ok((
+            rantaiclaw_dir.clone(),
+            rantaiclaw_dir.join("workspace"),
+            ConfigResolutionSource::EnvConfigDir,
+        ));
     }
 
-    if let Ok(custom_workspace) = std::env::var("RANTAICLAW_WORKSPACE") {
-        if !custom_workspace.is_empty() {
-            let (rantaiclaw_dir, workspace_dir) =
-                resolve_config_dir_for_workspace(&PathBuf::from(custom_workspace));
-            return Ok((
-                rantaiclaw_dir,
-                workspace_dir,
-                ConfigResolutionSource::EnvWorkspace,
-            ));
-        }
+    if let Some(custom_workspace) =
+        crate::profile::config_override::non_empty_env("RANTAICLAW_WORKSPACE")
+    {
+        let (rantaiclaw_dir, workspace_dir) =
+            resolve_config_dir_for_workspace(&PathBuf::from(custom_workspace));
+        return Ok((
+            rantaiclaw_dir,
+            workspace_dir,
+            ConfigResolutionSource::EnvWorkspace,
+        ));
     }
 
     // Debug-build guard: refuse to fall back to a path derived from the
@@ -4440,7 +4463,11 @@ impl Config {
             // If anything changed, persist the migrated form to disk
             // so subsequent loads skip the work.
             let mut raw: toml::Value = toml::from_str(&contents)
-                .with_context(|| format!("Failed to parse {} as TOML", config_path.display()))?;
+                .with_context(|| format!("Failed to parse {} as TOML", config_path.display()))
+                // A config that does not parse is a fact on disk: the same
+                // file fails the same way on every start, so it is marked
+                // as a failure a restart cannot fix.
+                .map_err(|error| anyhow::Error::new(PersistentConfigError::from_error(&error)))?;
             // Capture the pre-migration memory backend so the v34 markdown
             // import can be triggered after migration stamps the new version.
             // `migrate_v34` rewrites `markdown` → `sqlite`; reading the value
@@ -4676,19 +4703,35 @@ impl Config {
                     );
                 }
             }
-            let mut config: Config = raw.try_into().with_context(|| {
-                format!(
-                    "Failed to deserialise (post-migration) config at {}",
-                    config_path.display()
-                )
-            })?;
+            let mut config: Config = raw
+                .try_into()
+                .with_context(|| {
+                    format!(
+                        "Failed to deserialise (post-migration) config at {}",
+                        config_path.display()
+                    )
+                })
+                // A config that parses but does not fit the schema is a fact
+                // on disk, like one that does not parse: the same file
+                // fails the same way on every start, so it is marked as a
+                // failure a restart cannot fix.
+                .map_err(|error| anyhow::Error::new(PersistentConfigError::from_error(&error)))?;
             // Set computed paths that are skipped during serialization
             config.config_path = config_path.clone();
             config.workspace_dir = workspace_dir;
             let store = crate::security::SecretStore::new(&rantaiclaw_dir, config.secrets.encrypt);
-            decrypt_config_secrets(&store, &mut config)?;
+            // A ciphertext the key on disk cannot decrypt is a fact on disk:
+            // the same value and the same key fail the same way on every
+            // start, so it is marked as a failure a restart cannot fix.
+            decrypt_config_secrets(&store, &mut config)
+                .map_err(|error| anyhow::Error::new(PersistentConfigError::from_error(&error)))?;
             config.apply_env_overrides();
-            config.validate()?;
+            // A value that does not fit the schema is a fact on disk too: the
+            // same file fails the same way on every start, so it is marked as a
+            // failure a restart cannot fix.
+            config
+                .validate()
+                .map_err(|error| anyhow::Error::new(PersistentConfigError::from_error(&error)))?;
             // Retry any markdown import that has not finished — including a
             // backup made above and any left over from an earlier failed
             // run of this or another process. Runs on every load, not only
@@ -4728,7 +4771,13 @@ impl Config {
             }
 
             config.apply_env_overrides();
-            config.validate()?;
+            // A value that does not fit the schema fails the same way on every
+            // start: it comes from the environment or from the defaults, and
+            // neither changes on a restart, so it is marked as a failure a
+            // restart cannot fix.
+            config
+                .validate()
+                .map_err(|error| anyhow::Error::new(PersistentConfigError::from_error(&error)))?;
             tracing::info!(
                 path = %config.config_path.display(),
                 workspace = %config.workspace_dir.display(),
@@ -4984,13 +5033,17 @@ impl Config {
         // it here produced a split brain — `config_path` under CONFIG_DIR but
         // `workspace_dir` under WORKSPACE — so skills/memory/policy resolved
         // against a different tree than the config.
-        if std::env::var_os("RANTAICLAW_CONFIG_DIR").is_none() {
-            if let Ok(workspace) = std::env::var("RANTAICLAW_WORKSPACE") {
-                if !workspace.is_empty() {
-                    let (_, workspace_dir) =
-                        resolve_config_dir_for_workspace(&PathBuf::from(workspace));
-                    self.workspace_dir = workspace_dir;
-                }
+        //
+        // "Set" means the same thing here as in the loader: a trimmed,
+        // non-empty value. A whitespace-only CONFIG_DIR pins nothing, so it
+        // must not shadow a workspace that does name a directory.
+        if crate::profile::config_override::non_empty_env("RANTAICLAW_CONFIG_DIR").is_none() {
+            if let Some(workspace) =
+                crate::profile::config_override::non_empty_env("RANTAICLAW_WORKSPACE")
+            {
+                let (_, workspace_dir) =
+                    resolve_config_dir_for_workspace(&PathBuf::from(workspace));
+                self.workspace_dir = workspace_dir;
             }
         }
 
@@ -9288,6 +9341,63 @@ level = "full"
         assert_eq!(resolved_workspace_dir, workspace_dir.join("workspace"));
 
         let _ = fs::remove_dir_all(default_config_dir).await;
+    }
+
+    /// A whitespace-only override variable is NOT set.
+    ///
+    /// The loader and the override check must agree on that: when they do
+    /// not, the door lets through a profile switch the loader will not
+    /// read, and the operator gets a config from a directory nobody named.
+    #[test]
+    async fn a_whitespace_only_workspace_override_is_unset_for_the_loader_and_the_door() {
+        let _env_guard = env_override_lock().await;
+        // Pin HOME so the default-resolution branch lands in a tempdir we
+        // control instead of the real ~/.rantaiclaw.
+        let temp_home =
+            std::env::temp_dir().join(format!("rantaiclaw_test_home_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&temp_home).await.unwrap();
+        let _g_home = crate::test_env::EnvGuard::set("HOME", &temp_home);
+        let _g_profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
+        // The default-resolution branch is the one under test, so opt out of
+        // the test isolation guard.
+        let _g_allow = crate::test_env::EnvGuard::set("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR", "1");
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
+        let _g_workspace = crate::test_env::EnvGuard::set("RANTAICLAW_WORKSPACE", "  ");
+
+        // The door: no override is in effect, so nothing is refused.
+        assert!(
+            crate::profile::config_override::override_in_effect().is_none(),
+            "a whitespace-only RANTAICLAW_WORKSPACE is not an override"
+        );
+
+        // The loader: the same value is not a workspace either.
+        let default_config_dir = temp_home.join(".rantaiclaw");
+        let (config_dir, _workspace_dir, source) = resolve_runtime_config_dirs(&default_config_dir)
+            .await
+            .unwrap();
+        assert_ne!(
+            source,
+            ConfigResolutionSource::EnvWorkspace,
+            "the loader must not treat a whitespace-only RANTAICLAW_WORKSPACE as a workspace"
+        );
+        assert_eq!(source, ConfigResolutionSource::DefaultConfigDir);
+        assert_eq!(config_dir, temp_home.join(".rantaiclaw/profiles/default"));
+
+        let _ = fs::remove_dir_all(temp_home).await;
+    }
+
+    /// A whitespace-only `RANTAICLAW_CONFIG_DIR` does not pin the config
+    /// directory, so it must not shadow a `RANTAICLAW_WORKSPACE` that does.
+    #[test]
+    async fn a_whitespace_only_config_dir_does_not_shadow_the_workspace_override() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+
+        let _g_config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", "  ");
+        let _g_workspace =
+            crate::test_env::EnvGuard::set("RANTAICLAW_WORKSPACE", "/custom/workspace");
+        config.apply_env_overrides();
+        assert_eq!(config.workspace_dir, PathBuf::from("/custom/workspace"));
     }
 
     #[test]

@@ -170,6 +170,43 @@ pub fn active_daemon_pid(profile: &str) -> Option<u32> {
     }
 }
 
+/// A daemon found bound to a profile via its `.daemon_active` sentinel, whose
+/// process is still alive.
+#[derive(Debug, Clone)]
+pub struct RunningDaemon {
+    /// The profile the daemon serves.
+    pub profile: String,
+    /// The daemon's process id.
+    pub pid: u32,
+    /// `Some` when registered with a service manager (systemd/launchd); such
+    /// daemons are removed via `service uninstall`, not a direct signal.
+    pub unit: Option<String>,
+}
+
+/// Read each profile's sentinel and keep the ones whose PID is still alive.
+///
+/// Stale sentinels (crashed daemon, reused-or-dead PID) are dropped so we
+/// never claim to stop — or signal — a process that isn't there.
+///
+/// One implementation, two callers: the uninstall flow (which stops what it
+/// finds) and the profile delete (which refuses to remove a directory a live
+/// daemon is serving).
+pub fn running_daemons(profiles: &[String]) -> Vec<RunningDaemon> {
+    let mut out = vec![];
+    for profile in profiles {
+        if let Ok(Some(s)) = read_sentinel(profile) {
+            if pid_is_live_daemon(s.pid) {
+                out.push(RunningDaemon {
+                    profile: profile.clone(),
+                    pid: s.pid,
+                    unit: s.unit,
+                });
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

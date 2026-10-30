@@ -49,7 +49,7 @@ pub fn run(opts: UninstallOpts) -> Result<()> {
     // workspace), so removing data without stopping it leaves the install
     // looking "not uninstalled". Read sentinels now, before any deletion
     // removes them.
-    let daemons = running_daemons(&scope.profiles);
+    let daemons = sentinel::running_daemons(&scope.profiles);
     print_plan(&scope, &opts, &info, &daemons);
 
     if !opts.yes && !opts.dry_run && !confirm(&scope, &daemons) {
@@ -286,39 +286,9 @@ fn subtree_holds_a_secret_key(dir: &Path) -> bool {
     })
 }
 
-/// A daemon found bound to a profile via its `.daemon_active` sentinel, whose
-/// process is still alive.
-#[derive(Debug, Clone)]
-struct RunningDaemon {
-    profile: String,
-    pid: u32,
-    /// `Some` when registered with a service manager (systemd/launchd); such
-    /// daemons are removed via `service uninstall`, not a direct signal.
-    unit: Option<String>,
-}
-
-/// Read each profile's sentinel and keep the ones whose PID is still alive.
-/// Stale sentinels (crashed daemon, reused-or-dead PID) are dropped so we
-/// never claim to stop — or signal — a process that isn't there.
-fn running_daemons(profiles: &[String]) -> Vec<RunningDaemon> {
-    let mut out = vec![];
-    for profile in profiles {
-        if let Ok(Some(s)) = sentinel::read_sentinel(profile) {
-            if process_is_alive(s.pid) {
-                out.push(RunningDaemon {
-                    profile: profile.clone(),
-                    pid: s.pid,
-                    unit: s.unit,
-                });
-            }
-        }
-    }
-    out
-}
-
 /// Signal foreground (non-service-managed) daemons to stop. Service-managed
 /// units are left to `try_uninstall_daemon` / `service uninstall`.
-fn stop_foreground_daemons(daemons: &[RunningDaemon]) {
+fn stop_foreground_daemons(daemons: &[sentinel::RunningDaemon]) {
     for d in daemons {
         if d.unit.is_some() {
             continue;
@@ -415,7 +385,12 @@ fn stop_daemon_process(pid: u32) -> bool {
     }
 }
 
-fn print_plan(scope: &Scope, opts: &UninstallOpts, info: &BinaryInfo, daemons: &[RunningDaemon]) {
+fn print_plan(
+    scope: &Scope,
+    opts: &UninstallOpts,
+    info: &BinaryInfo,
+    daemons: &[sentinel::RunningDaemon],
+) {
     for line in plan_lines(scope, opts, info, daemons) {
         println!("{line}");
     }
@@ -430,7 +405,7 @@ fn plan_lines(
     scope: &Scope,
     opts: &UninstallOpts,
     info: &BinaryInfo,
-    daemons: &[RunningDaemon],
+    daemons: &[sentinel::RunningDaemon],
 ) -> Vec<String> {
     let mut lines = vec!["rantaiclaw uninstall plan:".to_string()];
     for d in daemons {
@@ -498,7 +473,7 @@ fn binary_plan_line(info: &BinaryInfo) -> String {
     }
 }
 
-fn confirm(scope: &Scope, daemons: &[RunningDaemon]) -> bool {
+fn confirm(scope: &Scope, daemons: &[sentinel::RunningDaemon]) -> bool {
     if scope.dirs_to_remove.is_empty() && scope.files_to_remove.is_empty() && daemons.is_empty() {
         return true;
     }
@@ -1323,7 +1298,7 @@ mod tests {
             )
             .unwrap();
 
-            let found = running_daemons(&[
+            let found = sentinel::running_daemons(&[
                 "alive".to_string(),
                 "stale".to_string(),
                 "no-sentinel".to_string(),

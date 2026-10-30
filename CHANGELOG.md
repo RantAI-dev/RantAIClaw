@@ -273,9 +273,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   daemon refused at a profile door now exits 78 (`EX_CONFIG`) instead of 1 — the code a systemd
   unit's `RestartPreventExitStatus=78` stops on — so a systemd unit that cannot start stays stopped
   and the journal keeps the sentence that says why, while launchd restarts the job anyway because it
-  cannot exclude a single exit code; every other command keeps exit 1. An OpenRC unit written before
-  this fix whose pinned profile is not the active one now exits 78 at start, so re-run
-  `rantaiclaw service install` without a profile in the environment to write the unit without one.
+  cannot exclude a single exit code; every other command keeps exit 1. A daemon whose config cannot
+  be loaded exits 78 as well. The load fails the same way on every start when it follows from the
+  files on disk alone: the active-profile marker names a profile directory that does not exist,
+  `config.toml` does not parse as TOML, it parses but does not fit the schema, it holds a value the
+  schema refuses, it holds a secret the `.secret_key` on disk cannot decrypt, or `schema_version` is
+  negative, malformed or newer than the binary supports. The daemon prints the sentence that says
+  why on stderr and exits 78, so the unit stays stopped and the journal keeps the sentence. The
+  exit code follows the kind of the failure, not the text of its message. Every other command keeps
+  exit 1 for the same broken config. The failures that can pass on a retry keep exit 1 too — a
+  config directory or workspace that could not be created, a config file that could not be read, a
+  write that failed for disk space during the first-run init — so systemd keeps retrying them. An
+  OpenRC unit written before this fix whose pinned profile is not the active one now exits 78 at
+  start, so re-run `rantaiclaw service install` without a profile in the environment to write the
+  unit without one.
   The systemd and launchd units still pin a profile when one was
   chosen.
 - The profile door and the config loader disagreed about the `active_workspace.toml` marker, and
@@ -290,25 +301,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   override, so the split is still refused. Nothing for the operator to do — the marker shapes an
   install already had keep working, and the ones that were locked out can switch again. No config
   key, no default and no schema change.
+- The config loader and the profile door read the override variables differently. The loader took
+  `RANTAICLAW_WORKSPACE` as set when it was not empty, the door took it as set when its trimmed
+  value was not empty, so a value of spaces was an override for the loader and not for the door:
+  the door let through a profile the loader would not read, and the config came from a directory
+  nobody named. The loader and the workspace override disagreed about `RANTAICLAW_CONFIG_DIR` the
+  same way — a value of spaces pinned the workspace for one and not for the other. One rule decides
+  for all of them now: an override variable is set when its trimmed value is not empty. A value of
+  spaces resolved to a directory literally named `"  "` before, so no working install reads its
+  config from a different place now. No config key, no default and no schema change.
 - A missing active profile was a silent fallback to the flat layout, not an error. When the active
   profile named a directory that did not exist, the config resolution swallowed the error and fell
   back to `~/.rantaiclaw/config.toml` and `~/.rantaiclaw/workspace`, so the flat files silently
-  shadowed the profile the operator had chosen. The load now fails and names the profile and how
-  to create it (`rantaiclaw profile create <name>`). The flat-layout fallback is gone: the config
-  lives in the active profile's directory, with no other path. An install whose profile exists is
-  unaffected — what is stored and where it is stored did not change for it.
+  shadowed the profile the operator had chosen. The load now fails and names the profile and both
+  ways out: select another profile with `rantaiclaw profile use <name>`, or create this one with
+  `rantaiclaw profile create <name>`. The name usually came from the active-profile marker, and the
+  operator who follows it usually wants an existing profile as much as this one created. The
+  flat-layout fallback is gone: the config lives in the active profile's directory, with no other
+  path. An install whose profile exists is unaffected — what is stored and where it is stored did
+  not change for it.
 - `profile delete` could leave the active-profile marker naming a profile that does not exist. The
   delete compared the name only against the profile the environment named (`RANTAICLAW_PROFILE`), so
   with the environment on one profile and the marker on another, deleting the marker-named profile
   succeeded and left the marker naming a profile that does not exist. The delete now refuses the
   profile the marker names too, exactly like it refuses the environment-named one, and `--force`
-  clears the marker instead. The message names the fix: pass `--force`, or
+  clears the marker instead — but only when the marker names the deleted profile. The environment
+  naming the deleted profile says nothing about what the marker names, so a forced delete of the
+  environment-named profile no longer takes the marker with it: every process that follows the
+  marker stays on the profile it names. The message names the fix: pass `--force`, or
   `rantaiclaw profile use <other>` first. A marker that exists but cannot be read now fails the
   delete instead of passing for one that names nothing, and `--force` does not help here: the marker
   is read for every delete, and the code cannot tell whether an unreadable marker names that
   profile, so the delete fails, removes nothing and says why. A marker that cannot be cleared is
-  reported: the profile is already gone and the marker still names
-  it.
+  reported: the profile is already gone and the marker still names it. A profile a live daemon is
+  serving is not deleted either: the daemon rewrites its directory every few seconds, so a delete
+  under it leaves a half directory behind whatever the operator acknowledged. The refusal names the
+  profile, the PID and the way out (`rantaiclaw service stop`, or stop the daemon by hand), and
+  `--force` does not override it — it still means the active-profile checks only. A stale sentinel,
+  a daemon that is gone, does not block the delete.
 - The launchd unit escaped the profile name twice. The profile was escaped when the plist was
   written and escaped again inside the plist writer, so a profile whose name holds `&` was written
   as `&amp;amp;` and the daemon looked for a profile that does not exist. New profile names are
