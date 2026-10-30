@@ -3403,20 +3403,20 @@ impl Default for Config {
     }
 }
 
-fn default_config_and_workspace_dirs() -> Result<(PathBuf, PathBuf)> {
-    let config_dir = default_config_dir()?;
-    Ok((config_dir.clone(), config_dir.join("workspace")))
-}
-
 /// Profile-aware default that the runtime resolver falls back to when no
 /// `RANTAICLAW_CONFIG_DIR`, `RANTAICLAW_WORKSPACE`, or `active_workspace.toml`
 /// override is present. The active_workspace marker still lives at the
 /// flat root so existing per-workspace overrides continue to work; only the
 /// final fallback now points at `~/.rantaiclaw/profiles/<active>/`.
-fn profile_default_config_and_workspace_dirs() -> Option<(PathBuf, PathBuf)> {
-    let profile = crate::profile::ProfileManager::active().ok()?;
+///
+/// An active profile that names nothing is an ERROR, not a reason to read the
+/// flat layout: the flat layout would silently shadow the profile the
+/// operator chose. The error is the existence door's sentence — it names the
+/// profile and how to create it.
+fn profile_default_config_and_workspace_dirs() -> Result<(PathBuf, PathBuf)> {
+    let profile = crate::profile::ProfileManager::active()?;
     let workspace = profile.workspace_dir();
-    Some((profile.root, workspace))
+    Ok((profile.root, workspace))
 }
 
 const ACTIVE_WORKSPACE_STATE_FILE: &str = "active_workspace.toml";
@@ -3437,175 +3437,107 @@ fn active_workspace_state_path(default_dir: &Path) -> PathBuf {
     default_dir.join(ACTIVE_WORKSPACE_STATE_FILE)
 }
 
-/// Whether an active-workspace marker's `config_dir` looks like a leaked
-/// ephemeral workspace: it points under the OS temp dir while the real default
-/// config dir does not. A genuine install never keeps its workspace under the
-/// temp dir, but a non-hermetic test can leave a marker in the real
-/// `~/.rantaiclaw` pointing at a since-deleted tempdir — honoring it silently
-/// shadows the real config (a split-brain where owner/config edits "don't
-/// apply" until the marker is removed). Pure for testing; production passes
-/// `std::env::temp_dir()`. Test setups (default dir also under temp) are exempt.
-fn active_workspace_marker_is_temp_leak(
-    config_dir: &Path,
-    default_config_dir: &Path,
-    temp_dir: &Path,
-) -> bool {
-    config_dir.starts_with(temp_dir) && !default_config_dir.starts_with(temp_dir)
-}
-
-/// Whether an active-workspace marker names the `profiles/<name>` directory
-/// of a *different* config root, while the root that holds the marker has
-/// its own `config.toml` for that profile. That is the shape of a marker
-/// that was faithfully copied or moved along with the tree (a backup
-/// archive, a home directory that moved to another machine, a `rollback`
-/// snapshot restored under a different path). Honoring it would have the
-/// run follow the marker back to the original location and migrate a
-/// config the operator never asked to touch; setting it aside lets the
-/// local profile win.
-///
-/// Returns `Some(local_profile_dir)` when the guard fires, where
-/// `local_profile_dir` is `default_config_dir/profiles/<name>`. The caller
-/// logs a single warning per process and falls back to the
-/// default-resolution branch, which lands on the active profile under the
-/// local root.
-///
-/// Takes only paths and consults the filesystem once, for the profile
-/// `config.toml` existence check.
-///
-/// Three cases must not fire (they keep today's behavior):
-/// - marker naming a directory inside its own root (case (a));
-/// - marker naming a custom directory that is not shaped like
-///   `<some root>/profiles/<name>` (case (b));
-/// - marker naming another root's profile when the local root has no
-///   `config.toml` for that profile (case (c)).
-fn active_workspace_marker_names_another_roots_profile(
-    default_config_dir: &Path,
-    marker_config_dir: &Path,
-) -> Option<PathBuf> {
-    let profile_name = marker_config_dir.file_name()?;
-    let profiles_dir = marker_config_dir.parent()?.file_name()?;
-    if profiles_dir != "profiles" {
-        return None;
-    }
-    // Case (a): the marker points inside the default config root (a relative
-    // marker dir resolved earlier, or an absolute path under the default
-    // config dir). Honor it as today.
-    if marker_config_dir.starts_with(default_config_dir) {
-        return None;
-    }
-    let local_profile = default_config_dir.join("profiles").join(profile_name);
-    // Case (c): the local root has no config of its own for that profile,
-    // so the marker is the only way to reach it. Honor it.
-    if !local_profile.join("config.toml").exists() {
-        return None;
-    }
-    Some(local_profile)
-}
-
 /// Warn-once latch for the cross-root-marker guard: the daemon reloads its
 /// config on a 15-second tick, so the warning must not repeat every reload.
 static CROSS_ROOT_MARKER_WARN: OnceLock<()> = OnceLock::new();
 
+/// Read the `active_workspace.toml` marker of `default_config_dir` and decide
+/// what it means.
+///
+/// The decision itself lives in [`crate::profile::config_override::marker_decision`],
+/// so the loader and the override check cannot drift apart: an override is in
+/// effect exactly when the loader honors the marker as one. This function
+/// owns the loader's side of it — the read, the warnings and the
+/// once-per-process latch — and returns the directories the marker names, or
+/// `None` when the marker is set aside.
 async fn load_persisted_workspace_dirs(
     default_config_dir: &Path,
 ) -> Result<Option<(PathBuf, PathBuf)>> {
-    let state_path = active_workspace_state_path(default_config_dir);
-    if !state_path.exists() {
-        return Ok(None);
-    }
+    use crate::profile::config_override::{MarkerDecision, MarkerProblem};
 
+    let state_path = active_workspace_state_path(default_config_dir);
     let contents = match fs::read_to_string(&state_path).await {
-        Ok(contents) => contents,
+        Ok(contents) => Some(contents),
+        // A missing marker is the normal case, not an anomaly: no warning.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
             tracing::warn!(
                 "Failed to read active workspace marker {}: {error}",
                 state_path.display()
             );
-            return Ok(None);
+            None
         }
     };
-
-    let state: ActiveWorkspaceState = match toml::from_str(&contents) {
-        Ok(state) => state,
-        Err(error) => {
+    match crate::profile::config_override::marker_decision(default_config_dir, contents.as_deref())
+    {
+        MarkerDecision::Unusable(MarkerProblem::Missing) => Ok(None),
+        MarkerDecision::Unusable(MarkerProblem::Unparseable(error)) => {
             tracing::warn!(
                 "Failed to parse active workspace marker {}: {error}",
                 state_path.display()
             );
-            return Ok(None);
+            Ok(None)
         }
-    };
-
-    let raw_config_dir = state.config_dir.trim();
-    if raw_config_dir.is_empty() {
-        tracing::warn!(
-            "Ignoring active workspace marker {} because config_dir is empty",
-            state_path.display()
-        );
-        return Ok(None);
-    }
-
-    let parsed_dir = PathBuf::from(raw_config_dir);
-    let config_dir = if parsed_dir.is_absolute() {
-        parsed_dir
-    } else {
-        default_config_dir.join(parsed_dir)
-    };
-
-    // The marker was faithfully copied or moved along with the tree and now
-    // names another root's profile; the local root has its own config for
-    // that profile. Setting the marker aside lets the local profile win.
-    // Logged once per process because the daemon reloads its config on a
-    // 15-second tick and would otherwise warn on every reload.
-    if let Some(local_profile) =
-        active_workspace_marker_names_another_roots_profile(default_config_dir, &config_dir)
-    {
-        if CROSS_ROOT_MARKER_WARN.set(()).is_ok() {
+        MarkerDecision::Unusable(MarkerProblem::Empty) => {
             tracing::warn!(
-                "Ignoring active workspace marker {} because {} names another root's profile; \
-                 using {} under the local root {} instead. The marker was copied or moved along \
-                 with the tree; set RANTAICLAW_CONFIG_DIR to point at a specific directory to \
-                 keep the original location in use.",
-                state_path.display(),
-                config_dir.display(),
-                local_profile.display(),
-                default_config_dir.display()
+                "Ignoring active workspace marker {} because config_dir is empty",
+                state_path.display()
             );
+            Ok(None)
         }
-        return Ok(None);
+        // A marker that names a profile directory of THIS root is a profile
+        // pointer: it says "the active profile", not "this directory". The
+        // active profile wins, so `profile use` moves the config, the
+        // workspace, the memory database and the cron store with it instead
+        // of leaving them behind.
+        MarkerDecision::ProfilePointer { config_dir } => {
+            tracing::info!(
+                "Active workspace marker {} names the profile directory {}; using the active \
+                 profile instead.",
+                state_path.display(),
+                config_dir.display()
+            );
+            Ok(None)
+        }
+        // The marker was faithfully copied or moved along with the tree and now
+        // names another root's profile; the local root has its own config for
+        // that profile. Setting the marker aside lets the local profile win.
+        // Logged once per process because the daemon reloads its config on a
+        // 15-second tick and would otherwise warn on every reload.
+        MarkerDecision::AnotherRootsProfile {
+            config_dir,
+            local_profile,
+        } => {
+            if CROSS_ROOT_MARKER_WARN.set(()).is_ok() {
+                tracing::warn!(
+                    "Ignoring active workspace marker {} because {} names another root's profile; \
+                     using {} under the local root {} instead. The marker was copied or moved along \
+                     with the tree; set RANTAICLAW_CONFIG_DIR to point at a specific directory to \
+                     keep the original location in use.",
+                    state_path.display(),
+                    config_dir.display(),
+                    local_profile.display(),
+                    default_config_dir.display()
+                );
+            }
+            Ok(None)
+        }
+        // A marker under the OS temp dir points at a leaked ephemeral
+        // workspace: honoring it silently shadows the real config.
+        MarkerDecision::TempLeak { config_dir } => {
+            tracing::warn!(
+                "Ignoring active workspace marker {} because {} is under the OS temp dir — this \
+                 usually means a leaked ephemeral/test workspace. Falling back to the default profile.",
+                state_path.display(),
+                config_dir.display()
+            );
+            Ok(None)
+        }
+        // Every other directory is honored as an override.
+        MarkerDecision::Override(config_dir) => {
+            Ok(Some((config_dir.clone(), config_dir.join("workspace"))))
+        }
     }
-
-    if active_workspace_marker_is_temp_leak(&config_dir, default_config_dir, &std::env::temp_dir())
-    {
-        tracing::warn!(
-            "Ignoring active workspace marker {} because {} is under the OS temp dir — this \
-             usually means a leaked ephemeral/test workspace. Falling back to the default profile.",
-            state_path.display(),
-            config_dir.display()
-        );
-        return Ok(None);
-    }
-
-    // A marker that names a profile directory of THIS root is a profile
-    // pointer: it says "the active profile", not "this directory". The
-    // active profile wins, so `profile use` moves the config, the workspace,
-    // the memory database and the cron store with it instead of leaving
-    // them behind. The onboarding wizard writes exactly this shape, and
-    // honoring it as an override is what kept a real install from ever
-    // moving off the profile it was on.
-    if crate::profile::config_override::profile_pointer_name(&config_dir, default_config_dir)
-        .is_some()
-    {
-        tracing::info!(
-            "Active workspace marker {} names the profile directory {}; using the active \
-             profile instead.",
-            state_path.display(),
-            config_dir.display()
-        );
-        return Ok(None);
-    }
-
-    Ok(Some((config_dir.clone(), config_dir.join("workspace"))))
 }
 
 pub(crate) async fn persist_active_workspace_config_dir(config_dir: &Path) -> Result<()> {
@@ -3714,7 +3646,6 @@ impl ConfigResolutionSource {
 
 async fn resolve_runtime_config_dirs(
     default_rantaiclaw_dir: &Path,
-    default_workspace_dir: &Path,
 ) -> Result<(PathBuf, PathBuf, ConfigResolutionSource)> {
     if let Ok(custom_config_dir) = std::env::var("RANTAICLAW_CONFIG_DIR") {
         let custom_config_dir = custom_config_dir.trim();
@@ -3776,21 +3707,14 @@ async fn resolve_runtime_config_dirs(
         ));
     }
 
-    // v0.5.0+: if no explicit override and no per-workspace marker,
-    // resolve to the active profile's directory. Falls back to the flat
-    // layout if profile resolution fails (defensive — should be unreachable
-    // because ProfileManager::active() auto-creates `default`).
-    if let Some((profile_root, profile_workspace)) = profile_default_config_and_workspace_dirs() {
-        return Ok((
-            profile_root,
-            profile_workspace,
-            ConfigResolutionSource::DefaultConfigDir,
-        ));
-    }
-
+    // v0.5.0+: with no explicit override and no per-workspace marker, the
+    // config lives in the active profile's directory. There is no flat-layout
+    // fallback: an active profile that names nothing is an error, because
+    // the flat layout would silently shadow the profile the operator chose.
+    let (profile_root, profile_workspace) = profile_default_config_and_workspace_dirs()?;
     Ok((
-        default_rantaiclaw_dir.to_path_buf(),
-        default_workspace_dir.to_path_buf(),
+        profile_root,
+        profile_workspace,
         ConfigResolutionSource::DefaultConfigDir,
     ))
 }
@@ -4444,9 +4368,9 @@ impl Config {
     /// Telegram owner-persist path) yet still target the daemon's real config
     /// file, not a hardcoded legacy location.
     pub async fn resolve_active_paths() -> Result<(PathBuf, PathBuf)> {
-        let (default_dir, default_ws) = default_config_and_workspace_dirs()?;
+        let default_dir = default_config_dir()?;
         let (rantaiclaw_dir, workspace_dir, _src) =
-            resolve_runtime_config_dirs(&default_dir, &default_ws).await?;
+            resolve_runtime_config_dirs(&default_dir).await?;
         Ok((rantaiclaw_dir.join("config.toml"), workspace_dir))
     }
 
@@ -4473,10 +4397,10 @@ impl Config {
             tracing::warn!("kb.db migration failed: {e:#}; continuing with current layout");
         }
 
-        let (default_rantaiclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
+        let default_rantaiclaw_dir = default_config_dir()?;
 
         let (rantaiclaw_dir, workspace_dir, resolution_source) =
-            resolve_runtime_config_dirs(&default_rantaiclaw_dir, &default_workspace_dir).await?;
+            resolve_runtime_config_dirs(&default_rantaiclaw_dir).await?;
 
         let config_path = rantaiclaw_dir.join("config.toml");
 
@@ -9347,7 +9271,6 @@ level = "full"
     async fn resolve_runtime_config_dirs_uses_env_workspace_first() {
         let _env_guard = env_override_lock().await;
         let default_config_dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-        let default_workspace_dir = default_config_dir.join("workspace");
         let workspace_dir = default_config_dir.join("profile-a");
 
         // Unset so a parent-shell `RANTAICLAW_CONFIG_DIR` does not shadow the
@@ -9356,7 +9279,7 @@ level = "full"
         let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
         let _g_workspace = crate::test_env::EnvGuard::set("RANTAICLAW_WORKSPACE", &workspace_dir);
         let (config_dir, resolved_workspace_dir, source) =
-            resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
+            resolve_runtime_config_dirs(&default_config_dir)
                 .await
                 .unwrap();
 
@@ -9371,7 +9294,6 @@ level = "full"
     async fn resolve_runtime_config_dirs_uses_env_config_dir_first() {
         let _env_guard = env_override_lock().await;
         let default_config_dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-        let default_workspace_dir = default_config_dir.join("workspace");
         let explicit_config_dir = default_config_dir.join("explicit-config");
         let marker_config_dir = default_config_dir.join("profiles").join("alpha");
         let state_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
@@ -9389,7 +9311,7 @@ level = "full"
         let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
 
         let (config_dir, resolved_workspace_dir, source) =
-            resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
+            resolve_runtime_config_dirs(&default_config_dir)
                 .await
                 .unwrap();
 
@@ -9409,7 +9331,6 @@ level = "full"
     async fn resolve_runtime_config_dirs_uses_active_workspace_marker() {
         let _env_guard = env_override_lock().await;
         let default_config_dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-        let default_workspace_dir = default_config_dir.join("workspace");
         let marker_config_dir = default_config_dir.join("workspaces").join("alpha");
         let state_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
 
@@ -9438,7 +9359,7 @@ level = "full"
             .unwrap();
 
         let (config_dir, resolved_workspace_dir, source) =
-            resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
+            resolve_runtime_config_dirs(&default_config_dir)
                 .await
                 .unwrap();
 
@@ -9451,32 +9372,7 @@ level = "full"
     }
 
     #[test]
-    async fn active_workspace_marker_temp_leak_is_detected_only_for_real_installs() {
-        let temp = std::env::temp_dir();
-        // Real install whose marker points into the OS temp dir → leaked
-        // ephemeral/test workspace; must be ignored so it can't shadow config.
-        assert!(active_workspace_marker_is_temp_leak(
-            &temp.join(".tmpABC").join(".rantaiclaw"),
-            Path::new("/home/rantaiclaw_user/.rantaiclaw"),
-            &temp,
-        ));
-        // Test harness: the default dir is ALSO under temp → legitimate, honored.
-        let test_default = temp.join("rantaiclaw_test_root");
-        assert!(!active_workspace_marker_is_temp_leak(
-            &test_default.join("profiles").join("alpha"),
-            &test_default,
-            &temp,
-        ));
-        // Ordinary install (nothing under temp) → not a leak.
-        assert!(!active_workspace_marker_is_temp_leak(
-            Path::new("/home/rantaiclaw_user/.rantaiclaw/profiles/alpha"),
-            Path::new("/home/rantaiclaw_user/.rantaiclaw"),
-            &temp,
-        ));
-    }
-
-    #[test]
-    async fn resolve_runtime_config_dirs_falls_back_to_default_layout() {
+    async fn resolve_runtime_config_dirs_resolves_the_active_profile() {
         let _env_guard = env_override_lock().await;
         // Pin HOME so the v0.5.0 profile-aware fallback resolves into a
         // tempdir we control instead of the real ~/.rantaiclaw.
@@ -9487,7 +9383,6 @@ level = "full"
         let _g_profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
 
         let default_config_dir = temp_home.join(".rantaiclaw");
-        let default_workspace_dir = default_config_dir.join("workspace");
 
         // This test is the canonical exercise of the default-resolution
         // branch — opt out of the test isolation guard for this one call.
@@ -9495,7 +9390,7 @@ level = "full"
         let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
         let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
         let (config_dir, resolved_workspace_dir, source) =
-            resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
+            resolve_runtime_config_dirs(&default_config_dir)
                 .await
                 .unwrap();
 
@@ -9521,90 +9416,9 @@ level = "full"
     // the operator never asked to touch. When the local root has its own
     // `config.toml` for that profile, the local profile wins; the marker is
     // set aside with a single warning per process.
-
-    /// Pure unit test: the guard fires when the marker names another root's
-    /// profile and the local root has its own config for that profile.
-    /// (The `cross_root_guard_*` siblings need `TempDir` because the guard
-    /// reads `config.toml` from the local root.)
-    #[tokio::test]
-    async fn cross_root_guard_fires_when_marker_targets_another_root_with_local_config() {
-        let local_root = tempfile::TempDir::new().unwrap();
-        let default = local_root.path().join(".rantaiclaw");
-        fs::create_dir_all(default.join("profiles").join("default"))
-            .await
-            .unwrap();
-        fs::write(default.join("profiles/default/config.toml"), "")
-            .await
-            .unwrap();
-        let other_root = tempfile::TempDir::new().unwrap();
-        let marker_dir = other_root.path().join(".rantaiclaw/profiles/default");
-
-        let fired = active_workspace_marker_names_another_roots_profile(&default, &marker_dir);
-        assert_eq!(
-            fired,
-            Some(default.join("profiles").join("default")),
-            "marker pointing at another root's profile must be set aside when the local root has its own config"
-        );
-    }
-
-    /// Pure unit test: the guard does NOT fire when the marker points inside
-    /// the local root (case (a) — a relative marker path or an absolute one
-    /// under the default config dir).
-    #[tokio::test]
-    async fn cross_root_guard_does_not_fire_when_marker_is_inside_its_own_root() {
-        let local_root = tempfile::TempDir::new().unwrap();
-        let default = local_root.path().join(".rantaiclaw");
-        fs::create_dir_all(default.join("profiles/default"))
-            .await
-            .unwrap();
-        fs::write(default.join("profiles/default/config.toml"), "")
-            .await
-            .unwrap();
-        let marker_dir = default.join("profiles/default");
-
-        let fired = active_workspace_marker_names_another_roots_profile(&default, &marker_dir);
-        assert_eq!(
-            fired, None,
-            "a marker pointing inside its own root must be honored as today"
-        );
-    }
-
-    /// Pure unit test: the guard does NOT fire when the marker names a
-    /// custom directory that is NOT shaped like `<some root>/profiles/<name>`
-    /// (case (b) — a workspace elsewhere on disk that the operator chose
-    /// explicitly).
-    #[tokio::test]
-    async fn cross_root_guard_does_not_fire_when_marker_targets_a_custom_directory() {
-        let local_root = tempfile::TempDir::new().unwrap();
-        let default = local_root.path().join(".rantaiclaw");
-        let marker_dir = Path::new("/srv/workspaces/custom-thing");
-
-        let fired = active_workspace_marker_names_another_roots_profile(&default, marker_dir);
-        assert_eq!(
-            fired, None,
-            "a marker naming a custom directory must be honored as today"
-        );
-    }
-
-    /// Pure unit test: the guard does NOT fire when the marker names another
-    /// root's profile but the local root has NO config of its own for that
-    /// profile (case (c) — the marker is the only way to reach that profile,
-    /// so it must still be honored).
-    #[tokio::test]
-    async fn cross_root_guard_does_not_fire_when_marker_targets_another_root_without_local_config()
-    {
-        let local_root = tempfile::TempDir::new().unwrap();
-        let default = local_root.path().join(".rantaiclaw");
-        // Deliberately do NOT create `default/profiles/default/config.toml`.
-        let other_root = tempfile::TempDir::new().unwrap();
-        let marker_dir = other_root.path().join(".rantaiclaw/profiles/default");
-
-        let fired = active_workspace_marker_names_another_roots_profile(&default, &marker_dir);
-        assert_eq!(
-            fired, None,
-            "a marker naming another root's profile must be honored when the local root has no config for it"
-        );
-    }
+    //
+    // The decision itself lives in `crate::profile::config_override`, next to
+    // the override check that has to agree with it.
 
     /// End-to-end: copy `A` (with its marker pointing at `A/profiles/default`)
     /// to `B`. Resolving with `B` as the default config root must pick the
@@ -9653,9 +9467,7 @@ level = "full"
         let _g_allow = crate::test_env::EnvGuard::set("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR", "1");
 
         let (config_dir, _resolved_workspace_dir, source) =
-            resolve_runtime_config_dirs(&b_root, &b_root.join("workspace"))
-                .await
-                .unwrap();
+            resolve_runtime_config_dirs(&b_root).await.unwrap();
 
         assert_eq!(
             source,
@@ -9714,9 +9526,7 @@ level = "full"
         let _g_allow = crate::test_env::EnvGuard::set("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR", "1");
 
         let (config_dir, _resolved_workspace_dir, source) =
-            resolve_runtime_config_dirs(&b_root, &b_root.join("workspace"))
-                .await
-                .unwrap();
+            resolve_runtime_config_dirs(&b_root).await.unwrap();
 
         assert_eq!(source, ConfigResolutionSource::DefaultConfigDir);
         assert_eq!(config_dir, b_root.join("profiles/default"));
@@ -9752,9 +9562,7 @@ level = "full"
         let _g_allow = crate::test_env::EnvGuard::set("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR", "1");
 
         let (config_dir, resolved_workspace_dir, source) =
-            resolve_runtime_config_dirs(&default, &default.join("workspace"))
-                .await
-                .unwrap();
+            resolve_runtime_config_dirs(&default).await.unwrap();
 
         assert_eq!(source, ConfigResolutionSource::DefaultConfigDir);
         assert_eq!(config_dir, marker_dir);
@@ -9803,9 +9611,7 @@ level = "full"
             .unwrap();
 
         let (config_dir, resolved_workspace_dir, source) =
-            resolve_runtime_config_dirs(&default, &default.join("workspace"))
-                .await
-                .unwrap();
+            resolve_runtime_config_dirs(&default).await.unwrap();
 
         assert_eq!(
             config_dir,
@@ -9848,9 +9654,7 @@ level = "full"
         let _g_allow = crate::test_env::EnvGuard::set("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR", "1");
 
         let (config_dir, _resolved_workspace_dir, source) =
-            resolve_runtime_config_dirs(&default, &default.join("workspace"))
-                .await
-                .unwrap();
+            resolve_runtime_config_dirs(&default).await.unwrap();
 
         assert_eq!(source, ConfigResolutionSource::ActiveWorkspaceMarker);
         assert_eq!(config_dir, custom);
@@ -9885,12 +9689,200 @@ level = "full"
         let _g_allow = crate::test_env::EnvGuard::set("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR", "1");
 
         let (config_dir, _resolved_workspace_dir, source) =
-            resolve_runtime_config_dirs(&default, &default.join("workspace"))
-                .await
-                .unwrap();
+            resolve_runtime_config_dirs(&default).await.unwrap();
 
         assert_eq!(source, ConfigResolutionSource::ActiveWorkspaceMarker);
         assert_eq!(config_dir, marker_dir);
+    }
+
+    /// The loader and the override check must agree on every marker shape.
+    ///
+    /// The loader honors a marker as an override or sets it aside; the
+    /// override check refuses a profile switch while an override is in
+    /// effect. A door that refuses a pin the loader never applies locks the
+    /// operator out of the profile they are on; a door that allows one the
+    /// loader applies lets the install split in two.
+    #[tokio::test]
+    async fn the_loader_and_the_override_check_agree_on_every_marker_shape() {
+        let _env_guard = env_override_lock().await;
+        // A home OUTSIDE the OS temp dir: the temp-leak rule only fires for a
+        // root that is not under the temp dir, so a root under it could not
+        // exercise that shape at all.
+        let home = home_outside_the_temp_dir();
+        let _g_home = crate::test_env::EnvGuard::set("HOME", &home);
+        let _g_allow = crate::test_env::EnvGuard::set("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR", "1");
+        let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
+
+        let root = home.join(".rantaiclaw");
+        fs::create_dir_all(&root).await.unwrap();
+        // This root has a config of its own for `work`, so a marker naming
+        // another root's `work` is set aside.
+        fs::create_dir_all(root.join("profiles/work"))
+            .await
+            .unwrap();
+        fs::write(root.join("profiles/work/config.toml"), "")
+            .await
+            .unwrap();
+        // `lonely` is a profile of another root that this root knows nothing
+        // about, so a marker naming it is honored: it is the only way to
+        // reach that profile.
+        let other_root = home.join("other-home/.rantaiclaw");
+        let other_work = other_root.join("profiles/work");
+        let other_lonely = other_root.join("profiles/lonely");
+        fs::create_dir_all(&other_work).await.unwrap();
+        fs::create_dir_all(&other_lonely).await.unwrap();
+        let custom = root.join("workspaces/custom-thing");
+        fs::create_dir_all(&custom).await.unwrap();
+        let leaked = std::env::temp_dir().join("rantaiclaw-leaked-workspace");
+
+        let marker = root.join(ACTIVE_WORKSPACE_STATE_FILE);
+        let shapes: Vec<(&str, Option<String>, bool)> = vec![
+            (
+                "a pointer to this root's profile",
+                Some(marker_contents(&root.join("profiles/work"))),
+                false,
+            ),
+            (
+                "another root's profile, set aside",
+                Some(marker_contents(&other_work)),
+                false,
+            ),
+            (
+                "another root's profile, honored",
+                Some(marker_contents(&other_lonely)),
+                true,
+            ),
+            (
+                "a directory under the OS temp dir",
+                Some(marker_contents(&leaked)),
+                false,
+            ),
+            ("a custom directory", Some(marker_contents(&custom)), true),
+            (
+                "an empty value",
+                Some("config_dir = \"\"\n".to_string()),
+                false,
+            ),
+            (
+                "unparsable TOML",
+                Some("config_dir = \n".to_string()),
+                false,
+            ),
+            ("a missing file", None, false),
+        ];
+
+        for (name, contents, expect_override) in shapes {
+            match &contents {
+                Some(contents) => fs::write(&marker, contents).await.unwrap(),
+                None => {
+                    let _ = fs::remove_file(&marker).await;
+                }
+            }
+
+            let loaded = load_persisted_workspace_dirs(&root).await.unwrap();
+            let in_effect = crate::profile::config_override::override_in_effect();
+
+            assert_eq!(
+                loaded.is_some(),
+                in_effect.is_some(),
+                "the loader and the override check must agree on {name:?}"
+            );
+            assert_eq!(
+                loaded.is_some(),
+                expect_override,
+                "{name:?} must {} be an override",
+                if expect_override { "" } else { "not" }
+            );
+            if let (Some((config_dir, _)), Some(over)) = (&loaded, &in_effect) {
+                assert_eq!(
+                    config_dir, &over.path,
+                    "{name:?} must name the same directory on both sides"
+                );
+            }
+        }
+
+        let _ = fs::remove_dir_all(&home).await;
+    }
+
+    /// The contents of an `active_workspace.toml` marker naming `config_dir`.
+    fn marker_contents(config_dir: &Path) -> String {
+        format!("config_dir = {:?}\n", config_dir.to_string_lossy())
+    }
+
+    /// A home that is deliberately NOT under `std::env::temp_dir()`: a
+    /// throwaway spot in this crate's `target/`, standing in for a real
+    /// install. The temp-leak rule only fires for such a root.
+    fn home_outside_the_temp_dir() -> PathBuf {
+        let home = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("rantaiclaw_test_home_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("scratch home");
+        assert!(
+            !crate::profile::dev_guard::is_under_temp_dir(&home),
+            "test setup bug: a home under the OS temp dir would defeat this test"
+        );
+        home
+    }
+
+    /// Every file and directory under `root`, as sorted relative paths.
+    fn root_file_list(root: &Path) -> Vec<String> {
+        let mut entries = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            let Ok(read) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in read.flatten() {
+                let path = entry.path();
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
+                entries.push(relative);
+                if path.is_dir() {
+                    pending.push(path);
+                }
+            }
+        }
+        entries.sort();
+        entries
+    }
+
+    /// An active profile that names nothing is an error, not a reason to
+    /// read the flat layout: the flat layout would silently shadow the
+    /// profile the operator chose.
+    #[tokio::test]
+    async fn a_missing_active_profile_fails_the_config_load_without_touching_the_root() {
+        let _env_guard = env_override_lock().await;
+        let home = tempfile::TempDir::new().unwrap();
+        let _g_home = crate::test_env::EnvGuard::set("HOME", home.path());
+        let _g_allow = crate::test_env::EnvGuard::set("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR", "1");
+        let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
+        let _g_profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
+
+        let root = home.path().join(".rantaiclaw");
+        fs::create_dir_all(&root).await.unwrap();
+        fs::write(root.join("active_profile"), "ghost\n")
+            .await
+            .unwrap();
+
+        let before = root_file_list(&root);
+        let error = Config::load_or_init()
+            .await
+            .expect_err("a profile that names nothing must fail the load");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("ghost") && message.contains("profile create ghost"),
+            "the refusal must name the profile and the remedy: {message}"
+        );
+        assert_eq!(
+            root_file_list(&root),
+            before,
+            "a failed load must not create anything under the root"
+        );
     }
 
     /// Recursive copy helper for the cross-root tests. The snapshot-restore
@@ -13297,7 +13289,6 @@ default_model = "legacy-model"
         );
     }
 
-    /// The gate skips the backup when a complete one exists, and says so when
     /// The v25 migration drops the old-shape `[cost.prices]` table, and
     /// those rows were operator-entered. The load says which models lost
     /// their prices and where the original file still is.
@@ -13384,6 +13375,7 @@ default_model = "legacy-model"
         );
     }
 
+    /// The gate skips the backup when a complete one exists, and says so when
     /// the live markdown files hold notes newer than that backup.
     #[tokio::test]
     async fn load_or_init_warns_when_it_skips_the_backup_but_markdown_notes_are_newer() {

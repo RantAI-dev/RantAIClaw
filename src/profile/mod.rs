@@ -358,8 +358,31 @@ impl ProfileManager {
             .unwrap_or_else(|| "default".to_string())
     }
 
-    /// Delete a profile. Refuses to delete the active profile unless
-    /// `force` is true (caller has acknowledged the consequences).
+    /// Whether the active-profile marker names `name`.
+    ///
+    /// `Ok(false)` when there is NO marker: the marker then names nothing,
+    /// so deleting a profile cannot leave it naming one that does not exist.
+    ///
+    /// A marker that EXISTS but cannot be read is an error, not an absence:
+    /// treating it as "names nothing" would let a delete remove the profile
+    /// and leave the marker naming a profile that no longer exists.
+    fn marker_names(name: &str) -> Result<bool> {
+        let marker = paths::active_profile_file();
+        match fs::read_to_string(&marker) {
+            Ok(contents) => Ok(contents.trim() == name),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error)
+                .with_context(|| format!("read the active-profile marker {}", marker.display())),
+        }
+    }
+
+    /// Delete a profile. Refuses to delete the active profile — the one the
+    /// environment names, or the one the active-profile marker names —
+    /// unless `force` is true (caller has acknowledged the consequences).
+    ///
+    /// A marker that cannot be read fails the delete: it may name this
+    /// profile, and a delete that cannot see it would leave the marker
+    /// naming a profile that no longer exists.
     pub fn delete(name: &str, force: bool) -> Result<()> {
         validate_profile_name(name)?;
         let dir = paths::profile_dir(name);
@@ -367,18 +390,48 @@ impl ProfileManager {
             bail!("profile {name:?} does not exist at {}", dir.display());
         }
         let active = Self::resolve_active_name();
-        if active == name && !force {
-            bail!(
-                "refusing to delete active profile {name:?}; pass --force or `rantaiclaw profile use <other>` first"
-            );
+        let marker_names = Self::marker_names(name)?;
+        if !force {
+            if active == name {
+                bail!(
+                    "refusing to delete active profile {name:?}; pass --force or `rantaiclaw profile use <other>` first"
+                );
+            }
+            if marker_names {
+                bail!(
+                    "refusing to delete the profile the active-profile marker names ({name:?}); \
+                     pass --force or `rantaiclaw profile use <other>` first"
+                );
+            }
         }
         fs::remove_dir_all(&dir)
             .with_context(|| format!("remove profile dir {}", dir.display()))?;
-        // If we just deleted the active profile, clear the marker so the
-        // next launch falls back to "default" (and re-creates it).
-        if active == name {
+        // Clear the marker when it named the deleted profile, so no command
+        // leaves the marker naming a profile that does not exist. A removal
+        // that fails is reported, not swallowed: the profile is already gone,
+        // and the marker still names it.
+        if active == name || marker_names {
             let marker = paths::active_profile_file();
-            let _ = fs::remove_file(&marker);
+            match fs::remove_file(&marker) {
+                Ok(()) => {}
+                // The marker is already gone: it names nothing, so nothing
+                // is left naming a profile that does not exist.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    let consequence = if marker_names {
+                        format!("the marker still names the deleted profile {name:?}")
+                    } else {
+                        "the marker was left in place".to_string()
+                    };
+                    return Err(error).with_context(|| {
+                        format!(
+                            "the profile {name:?} was deleted, but the active-profile marker {} \
+                             could not be removed: {consequence}",
+                            marker.display()
+                        )
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -388,32 +441,8 @@ impl ProfileManager {
 /// the previous profile. One line per outcome; a restart line names the
 /// unit, a pinned/hand-started line says what will NOT move and why.
 fn report_handoff_outcome(active: &str, outcome: &crate::daemon::handoff::HandoffOutcome) {
-    use crate::daemon::handoff::HandoffOutcome as H;
-    match outcome {
-        H::Restarted { unit } => {
-            println!("Restarted {unit} — the daemon now follows profile {active:?}");
-        }
-        H::Pinned { profile, unit } => {
-            println!(
-                "The daemon for profile {profile:?} stays on {profile:?}: its service pins \
-                 that profile ({unit}). Run `rantaiclaw service install` from the new profile \
-                 to change that."
-            );
-        }
-        H::HandStarted { profile } => {
-            println!(
-                "The daemon for profile {profile:?} was started by hand; restart it yourself \
-                 to pick up profile {active:?}."
-            );
-        }
-        H::NotRunning => {}
-        H::NoInit { profile, pid } => {
-            println!(
-                "The daemon for profile {profile:?} (pid {pid}) is running, but no supported \
-                 init system was detected (systemd / launchd); restart it yourself to pick up \
-                 profile {active:?}."
-            );
-        }
+    if let Some(line) = crate::daemon::handoff::outcome_line(active, outcome) {
+        println!("{line}");
     }
 }
 
@@ -729,7 +758,7 @@ mod profile_root_tests {
         }
     }
 
-    /// D2: while `RANTAICLAW_CONFIG_DIR` pins the config directory, a
+    /// While `RANTAICLAW_CONFIG_DIR` pins the config directory, a
     /// switch to another profile is refused — the switch would move the
     /// per-profile stores and leave the config, memory and cron behind.
     /// This is the split the audit saw.
@@ -899,7 +928,7 @@ mod profile_root_tests {
         assert_eq!(ProfileManager::marker_profile(), "old name");
     }
 
-    /// D2, selection door: a profile selected for this invocation — by the
+    /// The selection door: a profile selected for this invocation — by the
     /// `--profile` flag or by `RANTAICLAW_PROFILE` — is refused while an
     /// override keeps another profile in effect. It is the same one
     /// sentence the switch door gives.
@@ -1005,6 +1034,163 @@ mod profile_root_tests {
 
         ProfileManager::use_profile("default").expect("the switch back heals a stale marker");
         ProfileManager::active().expect("default exists again");
+    }
+
+    /// A delete must never leave the active-profile marker naming a profile
+    /// that does not exist: the marker refuses the delete while it names the
+    /// profile, and a forced delete clears the marker.
+    #[test]
+    fn deleting_the_profile_the_marker_names_is_refused_and_a_forced_delete_clears_the_marker() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _g_home = crate::test_env::EnvGuard::set("HOME", tmp.path());
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
+        let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+        // The environment names another profile, so the resolved name is not
+        // the one the marker names: only the marker rule can refuse here.
+        let _g_profile = crate::test_env::EnvGuard::set("RANTAICLAW_PROFILE", "work");
+
+        ProfileManager::ensure("work").unwrap();
+        ProfileManager::ensure("lonely").unwrap();
+        std::fs::write(paths::active_profile_file(), "lonely\n").unwrap();
+
+        let error = ProfileManager::delete("lonely", false)
+            .expect_err("the marker names this profile, so the delete must be refused");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("lonely"),
+            "the refusal must name the profile the marker names: {message}"
+        );
+        assert!(
+            paths::profile_dir("lonely").exists(),
+            "a refused delete must keep the profile"
+        );
+        assert!(
+            paths::active_profile_file().exists(),
+            "a refused delete must leave the marker alone"
+        );
+
+        ProfileManager::delete("lonely", true).expect("a forced delete goes through");
+        assert!(
+            !paths::profile_dir("lonely").exists(),
+            "a forced delete removes the profile"
+        );
+        assert!(
+            !paths::active_profile_file().exists(),
+            "a forced delete must not leave the marker naming a profile that does not exist"
+        );
+    }
+
+    /// A marker that EXISTS but cannot be read is not a marker that names
+    /// nothing: the delete fails loudly and the profile stays. The marker
+    /// path is turned into a DIRECTORY — reading a directory as a file
+    /// fails (EISDIR on Linux) for every user, root included.
+    #[test]
+    fn a_marker_that_cannot_be_read_refuses_the_delete_and_keeps_the_profile() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _g_home = crate::test_env::EnvGuard::set("HOME", tmp.path());
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
+        let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+        // The environment names another profile, so the resolved name is not
+        // the one under test: only the marker can refuse here.
+        let _g_profile = crate::test_env::EnvGuard::set("RANTAICLAW_PROFILE", "work");
+
+        ProfileManager::ensure("work").unwrap();
+        ProfileManager::ensure("lonely").unwrap();
+
+        let marker = paths::active_profile_file();
+        let marker_path = marker.display().to_string();
+        std::fs::create_dir_all(&marker).expect("the marker path becomes a directory");
+        assert!(
+            std::fs::read_to_string(&marker).is_err(),
+            "premise: a directory is not readable as a marker file"
+        );
+
+        let error = ProfileManager::delete("lonely", true)
+            .expect_err("an unreadable marker must fail the delete");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&marker_path),
+            "the refusal must name the marker path: {message}"
+        );
+        assert!(
+            message.contains("os error"),
+            "the refusal must give the reason: {message}"
+        );
+        assert!(
+            paths::profile_dir("lonely").exists(),
+            "a refused delete must keep the profile"
+        );
+    }
+
+    /// A forced delete that cannot clear the marker says so: the profile is
+    /// already gone and the marker still names it. The removal fails because
+    /// the marker's own directory is read-only — which needs a non-root
+    /// user, since root ignores the directory mode.
+    #[cfg(unix)]
+    #[test]
+    fn a_marker_that_cannot_be_removed_is_reported_after_the_profile_is_deleted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // SAFETY: getuid has no preconditions and cannot fail.
+        if unsafe { libc::getuid() == 0 } {
+            eprintln!(
+                "skipping: root ignores the read-only directory mode, so the marker removal \
+                 would succeed and the failure could not be provoked"
+            );
+            return;
+        }
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _g_home = crate::test_env::EnvGuard::set("HOME", tmp.path());
+        let _g_config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
+        let _g_workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+        let _g_profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
+
+        ProfileManager::ensure("lonely").unwrap();
+        let marker = paths::active_profile_file();
+        let marker_path = marker.display().to_string();
+        std::fs::write(&marker, "lonely\n").expect("the marker names the profile");
+
+        // The marker's own directory becomes read-only: unlinking the marker
+        // fails, while the profile dir one level deeper still goes.
+        let root = paths::rantaiclaw_root();
+        std::fs::set_permissions(&root, PermissionsExt::from_mode(0o555))
+            .expect("the root becomes read-only");
+
+        let outcome = ProfileManager::delete("lonely", true);
+
+        // Restore write access before the assertions, so the temp dir is
+        // still cleaned up when one of them fails.
+        std::fs::set_permissions(&root, PermissionsExt::from_mode(0o755))
+            .expect("restore the root mode");
+
+        let error = outcome.expect_err("a marker that cannot be removed must be reported");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&marker_path),
+            "the report must name the marker path: {message}"
+        );
+        assert!(
+            message.contains("os error"),
+            "the report must give the reason: {message}"
+        );
+        assert!(
+            !paths::profile_dir("lonely").exists(),
+            "the profile delete itself went through"
+        );
+        assert!(
+            marker.exists(),
+            "the marker is still there, naming a profile that no longer exists"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker)
+                .expect("the marker is readable")
+                .trim(),
+            "lonely",
+            "the marker still names the deleted profile"
+        );
     }
 
     /// A name from the marker or the environment that could escape the

@@ -9,10 +9,13 @@
 //!
 //! The unit tests in `src/profile/mod.rs` cover the rules themselves; this
 //! file drives the built binary, so the exit code and the message the
-//! operator sees are covered too.
+//! operator sees are covered too. A daemon refused at a door exits 78
+//! (`EX_CONFIG`), the code the installed unit's `RestartPreventExitStatus=78`
+//! stops on; every other command exits 1.
 
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
@@ -74,6 +77,54 @@ impl Sandbox {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             ),
+        )
+    }
+
+    /// Run the binary in the sandbox and wait for it with a deadline.
+    ///
+    /// A daemon that starts instead of being refused keeps running, so the
+    /// wait has a deadline and the child is killed when it passes. The
+    /// output goes to a file, not a pipe: a daemon that logs more than a
+    /// pipe buffer holds would block on a full pipe instead of exiting.
+    fn run_with_deadline(&self, args: &[&str], profile: &str) -> (i32, String) {
+        let log = self.home.path().join("run.log");
+        let stdout = std::fs::File::create(&log).expect("the log file");
+        let stderr = stdout.try_clone().expect("the log file clone");
+        let mut command = Command::new(binary_path());
+        command
+            .args(args)
+            .env("HOME", self.home.path())
+            .env("XDG_CONFIG_HOME", self.home.path().join("xdg"))
+            .env_remove("RANTAICLAW_CONFIG_DIR")
+            .env_remove("RANTAICLAW_WORKSPACE")
+            .env_remove("RANTAICLAW_PROFILE")
+            .env("RUST_LOG", "warn")
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr));
+        if !profile.is_empty() {
+            command.env("RANTAICLAW_PROFILE", profile);
+        }
+        let mut child = command.spawn().expect("the binary starts");
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            match child.try_wait().expect("the child is waited for") {
+                Some(status) => break status,
+                None if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "the daemon did not exit within 60 seconds: {}",
+                        std::fs::read_to_string(&log).unwrap_or_default()
+                    );
+                }
+                None => std::thread::sleep(Duration::from_millis(50)),
+            }
+        };
+
+        (
+            status.code().unwrap_or(-1),
+            std::fs::read_to_string(&log).unwrap_or_default(),
         )
     }
 }
@@ -224,4 +275,49 @@ fn a_name_that_names_nothing_is_refused_at_the_door() {
         !sandbox.profile_dir("ghost").exists(),
         "a refused name must not create the directory"
     );
+}
+
+/// A daemon refused at a profile door exits EX_CONFIG (78): the installed
+/// unit carries `RestartPreventExitStatus=78`, so it stops instead of
+/// being restarted every few seconds, and the journal keeps the sentence
+/// that says why.
+#[test]
+fn the_daemon_path_exits_ex_config_when_the_profile_door_refuses() {
+    let sandbox = Sandbox::new();
+    let (code, said) = sandbox.run(&["profile", "create", "work"], "", false);
+    assert_eq!(code, 0, "the profile is created: {said}");
+
+    let config_dir = sandbox
+        .config_dir
+        .path()
+        .to_str()
+        .expect("the config dir path");
+    let (code, said) = sandbox.run_with_deadline(&["--config-dir", config_dir, "daemon"], "work");
+
+    assert_eq!(
+        code, 78,
+        "the daemon path must exit EX_CONFIG, so the unit stops: {said}"
+    );
+    assert!(
+        said.contains("RANTAICLAW_CONFIG_DIR"),
+        "the refusal must name the override: {said}"
+    );
+    assert!(
+        said.contains("work"),
+        "the refusal must name the profile: {said}"
+    );
+}
+
+/// Every other command keeps exit 1 at the profile door: only the daemon
+/// is supervised by a unit that restarts it.
+#[test]
+fn a_non_daemon_command_does_not_exit_ex_config_at_the_profile_door() {
+    let sandbox = Sandbox::new();
+    let (code, said) = sandbox.run(&["profile", "create", "work"], "", false);
+    assert_eq!(code, 0, "the profile is created: {said}");
+
+    let (code, said) = sandbox.run(&["session", "list"], "work", true);
+
+    assert_ne!(code, 0, "the selection must be refused: {said}");
+    assert_ne!(code, 78, "only the daemon path exits EX_CONFIG: {said}");
 }

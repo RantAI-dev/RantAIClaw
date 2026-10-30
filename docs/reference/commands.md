@@ -158,11 +158,18 @@ A server is registered, and reported as authed, only after its credential was ac
 - `rantaiclaw service uninstall`
 
 `service install` records the profile in the unit: when the installer ran with a
-profile chosen explicitly (the global `--profile <name>` flag or `RANTAICLAW_PROFILE`), the
-unit is pinned to that profile via `RANTAICLAW_PROFILE` and `profile use` will not move
-it — reinstall from the other profile to move the service. Without an explicit profile
-the unit carries no `RANTAICLAW_PROFILE`, so the daemon follows the active-profile
-marker and `profile use` restarts it onto the profile it switches to.
+profile chosen explicitly (the global `--profile <name>` flag or
+`RANTAICLAW_PROFILE`), the systemd and launchd units are pinned to that profile
+via `RANTAICLAW_PROFILE` and `profile use` will not move it — reinstall from the
+other profile to move the service. Without an explicit profile the unit carries no
+`RANTAICLAW_PROFILE`, so the daemon follows the active-profile marker and
+`profile use` restarts it onto the profile it switches to.
+
+`service install` refuses an explicit profile on OpenRC: the unit reads its config
+from `/etc/rantaiclaw`, so a profile cannot apply to it. The unit it writes follows
+the active-profile marker. The profile door refuses the split an older pinned OpenRC
+unit caused, and only when the pinned profile is not the one the config-directory
+override keeps in effect.
 
 ### `ui`
 
@@ -813,6 +820,12 @@ to the active profile, not an override — onboarding writes that shape, so swit
 profiles keeps working. The refusal sits at those three doors, not in the profile
 resolution: `profile list`, `profile current`, `profile create` and `profile delete`
 stay available under an override, so a selection that cannot be used is still fixable.
+
+A daemon refused at one of those doors exits 78 (`EX_CONFIG`), the code a systemd
+unit's `RestartPreventExitStatus=78` stops on: on systemd the unit stays stopped
+instead of being restarted every few seconds and the journal keeps the sentence that
+says why, while launchd restarts the job anyway because it cannot exclude a single
+exit code. Every other command exits 1.
 
 ### `session`
 

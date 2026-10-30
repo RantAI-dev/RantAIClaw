@@ -848,6 +848,48 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// The daemon serves the profile the config loader resolves: the
+    /// environment first, then the active-profile marker. A daemon that read
+    /// the environment alone wrote its sentinel under a profile it was not
+    /// serving, so `profile use` moved the wrong daemon.
+    #[test]
+    fn the_daemon_serves_the_profile_the_active_marker_names() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let home = TempDir::new().expect("temp home");
+        let _home = crate::test_env::HomeGuard::set(home.path());
+        let _config_dir = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
+        let _workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+        let _profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
+
+        // The marker names "work", so the daemon follows it. `use_profile`
+        // writes the marker the way the production code does.
+        crate::profile::ProfileManager::ensure("work").expect("create the profile");
+        crate::profile::ProfileManager::use_profile("work")
+            .expect("write the active-profile marker");
+
+        let resolved = resolve_daemon_profile();
+        assert_eq!(
+            resolved.name, "work",
+            "the daemon must follow the active-profile marker"
+        );
+        assert!(
+            !resolved.pinned,
+            "a daemon that follows the marker is not pinned"
+        );
+
+        // The environment names another profile: it wins, and it pins.
+        let _pinned = crate::test_env::EnvGuard::set("RANTAICLAW_PROFILE", "other");
+        let resolved = resolve_daemon_profile();
+        assert_eq!(
+            resolved.name, "other",
+            "the environment must win over the marker"
+        );
+        assert!(
+            resolved.pinned,
+            "a daemon named by the environment is pinned"
+        );
+    }
+
     /// The heartbeat runs on the host and its reply goes to the journal and the
     /// observer, never to a chat, so it is a place private to the operator: it
     /// reads all of memory. The worker is the real door. Its first tick is
@@ -1193,6 +1235,41 @@ mod tests {
         assert!(
             !branch.contains(r#"mark_component_ok("scheduler")"#),
             "mark_component_ok on the disabled path is the defect:\n{branch}"
+        );
+    }
+
+    /// The daemon resolves the profile it serves through the shared resolver,
+    /// never by reading the environment alone.
+    ///
+    /// The sentinel is written inside `run`, which no unit test drives — it
+    /// starts the whole runtime — so the call site is scanned the way the
+    /// scheduler branch above scans its own. The scan is scoped to the body
+    /// of `run`: the resolver reads `RANTAICLAW_PROFILE` itself, and only the
+    /// call site may not.
+    #[test]
+    fn the_daemon_resolves_its_profile_through_the_shared_resolver() {
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("\npub async fn run(")
+            .expect("the daemon must keep a `pub async fn run(`");
+        // The body ends at the first `}` in column 0. Every brace inside the
+        // body is indented, so a format string such as `{host}` cannot end
+        // the scan early.
+        let end = source[start..]
+            .find("\n}")
+            .map(|at| start + at)
+            .expect("the body of `run` must have a closing brace");
+        let body = &source[start..end];
+
+        assert!(
+            body.contains("resolve_daemon_profile()"),
+            "the daemon must resolve its profile through the shared resolver, \
+             so the sentinel lands under the profile it actually serves"
+        );
+        assert!(
+            !body.contains("RANTAICLAW_PROFILE"),
+            "the daemon must not read RANTAICLAW_PROFILE itself; the resolver \
+             reads it, and only the resolver may"
         );
     }
 

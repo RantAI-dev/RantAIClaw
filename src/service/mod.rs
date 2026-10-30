@@ -617,12 +617,15 @@ fn install_macos(config: &Config) -> Result<()> {
     let stderr = logs_dir.join("daemon.stderr.log");
 
     let install_profile = explicit_install_profile();
+    // The profile is escaped by `macos_plist` itself, so it is escaped once:
+    // escaping it here as well made the daemon look for a profile named
+    // `a&amp;b` — a name that does not exist.
     let plist = macos_plist(
         SERVICE_LABEL,
         &xml_escape(&exe.display().to_string()),
         &xml_escape(&stdout.display().to_string()),
         &xml_escape(&stderr.display().to_string()),
-        install_profile.as_deref().map(xml_escape).as_deref(),
+        install_profile.as_deref(),
     );
 
     fs::write(&file, plist)?;
@@ -1217,20 +1220,21 @@ fn warn_if_binary_in_home(exe_path: &Path) {
 }
 
 /// Generate OpenRC init script content (pure function for testability)
-fn generate_openrc_script(exe_path: &Path, config_dir: &Path, profile: Option<&str>) -> String {
-    // The profile export is written only when the operator chose a profile at
-    // install time; without it the daemon follows the active-profile marker,
-    // which is what lets `profile use` move the service.
-    let profile_export = profile
-        .map(|profile| format!("export RANTAICLAW_PROFILE=\"{profile}\"\n"))
-        .unwrap_or_default();
+///
+/// The unit reads its config from the directory it is installed with
+/// (`/etc/rantaiclaw`), so it never names a profile: a pinned profile
+/// would split the config (from that directory) from the per-profile
+/// stores (from the profile), and the profile door refuses that split at
+/// every start. Without the export the per-profile stores follow the
+/// active-profile marker, while the config stays in that directory.
+fn generate_openrc_script(exe_path: &Path, config_dir: &Path) -> String {
     format!(
         r#"#!/sbin/openrc-run
 
 name="rantaiclaw"
 description="RantaiClaw daemon"
 
-{profile_export}export RANTAICLAW_UNIT="rantaiclaw"
+export RANTAICLAW_UNIT="rantaiclaw"
 
 command="{}"
 command_args="--config-dir {} daemon"
@@ -1251,6 +1255,25 @@ depend() {{
     )
 }
 
+/// Refuse an OpenRC install that pins a profile.
+///
+/// The OpenRC unit reads its config from `/etc/rantaiclaw`, so a profile
+/// cannot apply to it: the config would come from that directory while the
+/// per-profile stores followed the profile, and the profile door refuses
+/// that split at every start. The refusal names the directory and the
+/// way out: install again without a profile, and the unit then follows
+/// the active-profile marker.
+fn refuse_openrc_profile_pin(profile: Option<&str>) -> Result<()> {
+    let Some(profile) = profile else {
+        return Ok(());
+    };
+    bail!(
+        "refusing to install an OpenRC service pinned to profile {profile:?}: the unit reads its \
+         config from /etc/rantaiclaw, so a profile cannot apply to it; install it again without a \
+         profile, and the unit follows the active-profile marker"
+    );
+}
+
 fn resolve_openrc_executable() -> Result<PathBuf> {
     let preferred = Path::new("/usr/local/bin/rantaiclaw");
     if preferred.exists() {
@@ -1262,6 +1285,10 @@ fn resolve_openrc_executable() -> Result<PathBuf> {
 }
 
 fn install_linux_openrc(config: &Config) -> Result<()> {
+    // Refused before anything is written: a unit pinned to a profile cannot
+    // start, and the operator must see why before the install touches the
+    // disk.
+    refuse_openrc_profile_pin(explicit_install_profile().as_deref())?;
     if is_dev_build() {
         println!("{DEV_BUILD_SKIP_MESSAGE} (install)");
         return Ok(());
@@ -1378,8 +1405,7 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
         );
     }
 
-    let install_profile = explicit_install_profile();
-    let init_script = generate_openrc_script(&exe, config_dir, install_profile.as_deref());
+    let init_script = generate_openrc_script(&exe, config_dir);
     let init_path = Path::new("/etc/init.d/rantaiclaw");
     fs::write(init_path, init_script)
         .with_context(|| format!("Failed to write {}", init_path.display()))?;
@@ -1393,7 +1419,7 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
 
     run_checked(Command::new("rc-update").args(["add", "rantaiclaw", "default"]))?;
     println!("✅ Installed OpenRC service: /etc/init.d/rantaiclaw");
-    print_profile_binding(install_profile.as_deref());
+    print_profile_binding(None);
     println!("   Config path: /etc/rantaiclaw/config.toml");
     println!("   Start with: sudo rantaiclaw service start");
     let _ = config;
@@ -1574,6 +1600,37 @@ mod tests {
         assert!(
             p.contains("<key>RANTAICLAW_UNIT</key>\n    <string>com.rantaiclaw.daemon</string>"),
             "the unit identity is stamped either way: {p}"
+        );
+    }
+
+    /// A profile name is written into the plist escaped exactly once: an
+    /// ampersand must reach the daemon as `&`. Escaping twice made the
+    /// daemon look for a profile named `a&amp;b`, which does not exist.
+    /// A profile created before the strict name rule existed can hold an
+    /// ampersand, so this is a live name, not a hypothetical one.
+    #[test]
+    fn a_launchd_plist_escapes_the_profile_name_once() {
+        let _lock = crate::test_env::ENV_LOCK.blocking_lock();
+        let home = tempfile::TempDir::new().expect("temp home");
+        let _home = crate::test_env::HomeGuard::set(home.path());
+        let _profile = crate::test_env::EnvGuard::set("RANTAICLAW_PROFILE", "a&b");
+
+        install_macos(&Config::default()).expect("install the launchd job");
+
+        let plist = std::fs::read_to_string(
+            home.path()
+                .join("Library")
+                .join("LaunchAgents")
+                .join(format!("{SERVICE_LABEL}.plist")),
+        )
+        .expect("the launchd job must be written");
+        assert!(
+            plist.contains("<string>a&amp;b</string>"),
+            "the profile must be escaped once: {plist}"
+        );
+        assert!(
+            !plist.contains("&amp;amp;"),
+            "the profile must not be escaped twice: {plist}"
         );
     }
 
@@ -1769,12 +1826,11 @@ mod tests {
         use std::path::PathBuf;
 
         let exe_path = PathBuf::from("/usr/local/bin/rantaiclaw");
-        let script = generate_openrc_script(&exe_path, Path::new("/etc/rantaiclaw"), Some("work"));
+        let script = generate_openrc_script(&exe_path, Path::new("/etc/rantaiclaw"));
 
         assert!(script.starts_with("#!/sbin/openrc-run"));
         assert!(script.contains("name=\"rantaiclaw\""));
         assert!(script.contains("description=\"RantaiClaw daemon\""));
-        assert!(script.contains("export RANTAICLAW_PROFILE=\"work\""));
         assert!(script.contains("export RANTAICLAW_UNIT=\"rantaiclaw\""));
         assert!(script.contains("command=\"/usr/local/bin/rantaiclaw\""));
         assert!(script.contains("command_args=\"--config-dir /etc/rantaiclaw daemon\""));
@@ -1791,23 +1847,131 @@ mod tests {
         assert!(script.contains("after firewall"));
     }
 
-    /// No explicit profile at install time ⇒ no `export RANTAICLAW_PROFILE`
-    /// line: the daemon follows the active-profile marker.
+    /// The OpenRC unit reads its config from `/etc/rantaiclaw`, so a pinned
+    /// profile cannot apply to it: the config would come from that directory
+    /// while the per-profile stores followed the profile. The script
+    /// therefore never names a profile, and the daemon follows the
+    /// active-profile marker.
     #[test]
-    fn generate_openrc_script_without_an_explicit_profile_exports_no_profile() {
+    fn generate_openrc_script_never_exports_a_profile() {
         use std::path::PathBuf;
 
         let exe_path = PathBuf::from("/usr/local/bin/rantaiclaw");
-        let script = generate_openrc_script(&exe_path, Path::new("/etc/rantaiclaw"), None);
+        let script = generate_openrc_script(&exe_path, Path::new("/etc/rantaiclaw"));
 
         assert!(
             !script.contains("RANTAICLAW_PROFILE"),
-            "an unpinned OpenRC script must not name a profile: {script}"
+            "an OpenRC script must not name a profile: {script}"
         );
         assert!(
             script.contains("export RANTAICLAW_UNIT=\"rantaiclaw\""),
             "the unit identity is exported either way: {script}"
         );
+    }
+
+    /// The unit reads the config from `/etc/rantaiclaw` and runs the daemon
+    /// in the background, so the daemon follows the active-profile marker.
+    #[test]
+    fn generate_openrc_script_runs_the_daemon_against_the_config_directory() {
+        use std::path::PathBuf;
+
+        let exe_path = PathBuf::from("/usr/local/bin/rantaiclaw");
+        let script = generate_openrc_script(&exe_path, Path::new("/etc/rantaiclaw"));
+
+        assert!(
+            script.contains("command_args=\"--config-dir /etc/rantaiclaw daemon\""),
+            "the unit reads its config from /etc/rantaiclaw: {script}"
+        );
+        assert!(
+            script.contains("command_background=\"yes\""),
+            "the unit runs the daemon in the background: {script}"
+        );
+    }
+
+    /// An OpenRC install with an explicit profile is refused: the unit
+    /// reads `/etc/rantaiclaw`, so the profile cannot apply to it.
+    #[test]
+    fn openrc_install_refuses_an_explicit_profile() {
+        let error =
+            refuse_openrc_profile_pin(Some("work")).expect_err("a pinned profile must be refused");
+
+        let said = error.to_string();
+        assert!(
+            said.contains("/etc/rantaiclaw"),
+            "the refusal must name the directory the unit reads: {said}"
+        );
+        assert!(
+            said.contains("work"),
+            "the refusal must name the profile: {said}"
+        );
+    }
+
+    /// The refusal names the one way out that works: install again without
+    /// a profile, and the unit follows the active-profile marker. Making the
+    /// profile active does not help — the refusal reads the pinned profile
+    /// from the installer's environment, not from the marker — so the
+    /// message must not offer that second way out.
+    #[test]
+    fn openrc_install_refusal_names_the_only_way_out() {
+        let error =
+            refuse_openrc_profile_pin(Some("work")).expect_err("a pinned profile must be refused");
+
+        let said = error.to_string();
+        assert!(
+            said.contains("/etc/rantaiclaw"),
+            "the refusal must name the directory the unit reads: {said}"
+        );
+        assert!(
+            said.contains("work"),
+            "the refusal must name the profile: {said}"
+        );
+        assert!(
+            said.contains("install it again without a profile"),
+            "the refusal must name the way out that works: {said}"
+        );
+        assert!(
+            !said.contains("or make"),
+            "the refusal must not offer a second way out that does not unblock the install: {said}"
+        );
+    }
+
+    /// An OpenRC install without a profile is accepted: the unit follows
+    /// the active-profile marker.
+    #[test]
+    fn openrc_install_without_an_explicit_profile_is_accepted() {
+        assert!(
+            refuse_openrc_profile_pin(None).is_ok(),
+            "an unpinned OpenRC install must be accepted"
+        );
+    }
+
+    /// The refusal must stay on the install path, before the first write.
+    /// No behavioural test can see it: `install_linux_openrc` writes
+    /// `/etc/init.d/rantaiclaw` and runs `rc-update`, and `install()` stops
+    /// a dev build before it gets there, so the call site is pinned by
+    /// scanning the function the way the daemon module pins its own
+    /// wiring. A refusal that is dropped from the install path lets the
+    /// install write a unit and continue, and the operator's chosen
+    /// profile is ignored without a word.
+    #[test]
+    fn the_openrc_install_refuses_a_pinned_profile_before_it_writes() {
+        let source = include_str!("mod.rs");
+        let body = source
+            .split_once("fn install_linux_openrc")
+            .expect("install_linux_openrc exists")
+            .1;
+        let refusal = body
+            .find("refuse_openrc_profile_pin(explicit_install_profile()")
+            .expect("the OpenRC install must call the refusal with the chosen profile");
+        for side_effect in ["ensure_rantaiclaw_user", "fs::create_dir_all", "fs::write"] {
+            let at = body
+                .find(side_effect)
+                .unwrap_or_else(|| panic!("the OpenRC install does {side_effect}"));
+            assert!(
+                refusal < at,
+                "the refusal must come before the OpenRC install does {side_effect}"
+            );
+        }
     }
 
     #[test]
