@@ -871,6 +871,15 @@ fn sanitize_file_name(name: Option<&str>) -> String {
 
 /// Replace every document block in `content` with a one-line stub.
 ///
+/// A block whose closing sentinel is gone — the history compaction cut the
+/// message and took the sentinel with it — is stubbed up to the next
+/// opening sentinel, or to the end of the message when there is none: what
+/// is left of it is still the sender's document.
+///
+/// The closing sentinel of a block is looked for inside that block only. A
+/// closing sentinel that belongs to a later block does not close this one,
+/// so each block keeps its own name.
+///
 /// Returns `None` when there was no block, so the caller leaves the message
 /// alone.
 fn redact_document_blocks(content: &str) -> Option<String> {
@@ -879,10 +888,19 @@ fn redact_document_blocks(content: &str) -> Option<String> {
     let mut redacted = false;
     while let Some(rel) = content[cursor..].find(DOCUMENT_BLOCK_OPEN) {
         let start = cursor + rel;
-        let Some(close_rel) = content[start..].find(DOCUMENT_BLOCK_CLOSE) else {
-            break;
-        };
-        let end = start + close_rel + DOCUMENT_BLOCK_CLOSE.len();
+        // The next opening sentinel: a block the compaction cut runs into the
+        // next one, and that is where this block ends.
+        let next_open = content[start + DOCUMENT_BLOCK_OPEN.len()..]
+            .find(DOCUMENT_BLOCK_OPEN)
+            .map(|rel| start + DOCUMENT_BLOCK_OPEN.len() + rel);
+        let block_end = next_open.unwrap_or(content.len());
+
+        // The closing sentinel is looked for inside this block only: the
+        // close of a later block does not close this one.
+        let close = content[start..block_end].find(DOCUMENT_BLOCK_CLOSE);
+        let end = close.map_or(block_end, |close_rel| {
+            start + close_rel + DOCUMENT_BLOCK_CLOSE.len()
+        });
         out.push_str(&content[cursor..start]);
         out.push_str(&document_stub(&content[start..end]));
         redacted = true;
@@ -1861,6 +1879,23 @@ mod document_tests {
         )
     }
 
+    /// A document block whose closing sentinel is gone, the way the history
+    /// compaction leaves it: the cut keeps the beginning of the message and
+    /// drops the tail, sentinel included.
+    fn a_cut_document_block(name: &str) -> String {
+        let block = document_block(
+            DocumentKind::Pdf,
+            Some(name),
+            Some(1),
+            false,
+            "the quarterly numbers are 42",
+        );
+        let cut = block
+            .find(DOCUMENT_BLOCK_CLOSE)
+            .expect("the block has a closing sentinel");
+        block[..cut].to_string()
+    }
+
     #[test]
     fn an_old_document_block_becomes_a_one_line_stub() {
         let block = a_document_block();
@@ -1907,6 +1942,64 @@ mod document_tests {
         let redacted = redact_historic_document_blocks(&history, 1);
         assert_eq!(content_of(&redacted[0]), "just words");
         assert_eq!(content_of(&redacted[1]), "more words");
+    }
+
+    /// A block that lost its closing sentinel is stubbed too.
+    ///
+    /// The compaction cut drops the sentinel, and the text behind it is the
+    /// sender's document: a block the redaction cannot close must still be
+    /// stubbed, or the text rides along in every later turn.
+    #[test]
+    fn a_message_with_two_blocks_where_the_second_lost_its_close_stubs_both() {
+        let first = a_document_block();
+        let second = a_cut_document_block("cut.pdf");
+        let history = vec![chat("user", &format!("{first}\n{second}"))];
+
+        // The current turn starts after the message.
+        let redacted = redact_historic_document_blocks(&history, 1);
+        let content = content_of(&redacted[0]);
+        assert!(
+            content.contains("[inbound document omitted: report.pdf]"),
+            "the closed block is stubbed: {content}"
+        );
+        assert!(
+            content.contains("[inbound document omitted: cut.pdf]"),
+            "the block that lost its close is stubbed: {content}"
+        );
+        assert!(
+            !content.contains("the quarterly numbers are 42"),
+            "the document's text must not stay in the history: {content}"
+        );
+    }
+
+    /// A message with two blocks where the **first** lost its close: both are
+    /// stubbed, and each keeps its own name.
+    ///
+    /// The first block's closing sentinel is gone, so the redaction must not
+    /// close it with the *second* block's closing sentinel: that stub eats
+    /// the second block, loses its name and leaves one stub for two
+    /// documents.
+    #[test]
+    fn a_message_with_two_blocks_where_the_first_lost_its_close_stubs_both() {
+        let first = a_cut_document_block("first.pdf");
+        let second = a_document_block();
+        let history = vec![chat("user", &format!("{first}\n{second}"))];
+
+        // The current turn starts after the message.
+        let redacted = redact_historic_document_blocks(&history, 1);
+        let content = content_of(&redacted[0]);
+        assert!(
+            content.contains("[inbound document omitted: first.pdf]"),
+            "the block that lost its close is stubbed: {content}"
+        );
+        assert!(
+            content.contains("[inbound document omitted: report.pdf]"),
+            "the closed block behind it is stubbed as well: {content}"
+        );
+        assert!(
+            !content.contains("the quarterly numbers are 42"),
+            "the document's text must not stay in the history: {content}"
+        );
     }
 
     /// A document's text stays readable for the whole turn it arrived in.
