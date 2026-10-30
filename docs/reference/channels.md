@@ -402,6 +402,15 @@ How it lands in the store:
   and the image does not sit on disk for thirty days. The pass does not check
   that the body is base64. A marker with no closing `]` before the end of the
   line, and a marker whose body is a path, stay as they are.
+- **A document's text is recorded whole.** An inbound document (PDF, DOCX or
+  TXT) on Telegram or WhatsApp Web adds its extracted text to the sender's
+  message, and the text is recorded with the turn like any other words. The
+  three passes above redact secret-shaped values and base64 media payloads;
+  they do not redact a document's text away, only the secret-shaped values
+  inside it as in any other message, so the text is kept, and the owner-only
+  `session_search` tool — which searches recorded transcripts without filtering
+  them by source — can still find it. The one-line stub the model sees from the
+  next turn on is about the request to the provider, not about what is stored.
 - Retention: each recorded message is deleted 30 days after it was written,
   and a session is deleted when it has no message left. A session that keeps
   receiving turns therefore loses its older messages first. The prune runs
@@ -779,15 +788,24 @@ summary.
   nothing recognizable (`application/octet-stream`, no extension) imposes no
   constraint. A claim that is right does not make the bytes safe — the sniff
   always runs.
-- **Nothing is written to disk.** The bytes are read into memory and parsed
-  somewhere else: the parsing happens in a **child process** whose environment
-  holds four fixed request variables and one allocator setting
+- **The document's bytes are never written to disk.** The bytes are read into
+  memory and parsed somewhere else: the parsing happens in a **child process**
+  whose environment holds four fixed request variables and one allocator setting
   (`MALLOC_ARENA_MAX=1`, so the child's address-space ceiling is spent on the
   document and not on the parser's thread-pool reservations) and nothing else —
   no HOME, no PATH, no provider key, no configuration directory — and the
   document travels to it over a pipe. There is no temp file, not even a
   short-lived one. The child keeps the agent's own filesystem and network
   reach, so the boundary contains a crash, not a privilege.
+- **The extracted text is kept, in the history and in the transcript.** The
+  text — up to 50,000 characters — is stored with the turn, like any other
+  message, so the sender's words are in the channel history (`channel_history`
+  in `brain.db` when the memory backend is `sqlite`; the `markdown` and `none`
+  backends keep the history in memory only) and in the channel session
+  transcript — see [Channel Session Recording](#channel-session-recording). On
+  the default `sqlite` backend the text is therefore on disk twice. The
+  stubbing below is about the request sent to the provider, not about what is
+  stored.
 - **The limits are constants, not config keys.** 10 MiB per document (checked on
   the announced size before any download and again on the bounded read; over the
   cap is refused, never truncated), 50 PDF pages counted from the bytes before
@@ -806,17 +824,24 @@ summary.
   document that announced no size is refused before the download.
 - **Documents are budgeted separately from images**: 5 documents per sender per 10
   minutes, counted per channel-qualified sender. The budget is consulted
-  **before** the download, so an exhausted sender costs no bandwidth and — on
-  Telegram — no `getFile` call.
+  before the download and the slot is charged immediately before the download
+  starts, before a single byte of the document is read, so an exhausted sender
+  costs no bandwidth. Telegram peeks the budget before its `getFile` call as
+  well, so an exhausted sender costs no `getFile` call either. The
+  announced-size refusal comes before the charge on both channels: a document
+  over the 10 MiB cap, or a WhatsApp Web document that announced no size at
+  all, is refused without spending a budget slot. A download the size cap stops
+  does cost a slot: the cap is only found while the bytes arrive, and the
+  charge has already been taken.
 - **The text arrives as a delimited block** that names the file, the page count
   and whether the text was cut, and that says outright that the content came from
   the sender and is untrusted data, not instructions. Square brackets in the
   extracted text are defused, so a document cannot plant an `[IMAGE:…]` marker of
   its own and cannot forge the block's end. The text stays readable for the
   whole turn it arrived in, so every tool call of that turn still sees the
-  document; from the next user message on the block is a one-line stub, the way
-  an old image marker is, so a stale injection surface does not live forever in
-  the conversation.
+  document; from the next user message on the request to the provider carries
+  only a one-line stub where the block was, the way an old image marker is, so a
+  stale injection surface does not live forever in the conversation.
 - **Every rejection is visible**: the forwarded content carries an
   `[Attachment rejected: …]` note naming the reason — wrong type, too large, too
   many pages, too slow, budget spent, or a build that cannot read documents.

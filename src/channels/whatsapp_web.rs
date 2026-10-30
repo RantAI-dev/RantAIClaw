@@ -453,10 +453,12 @@ impl WhatsAppWebChannel {
     /// HTTP fetch, so this takes the bytes in hand — the same rules apply to
     /// those bytes as to a fetched document.
     ///
-    /// The order is the policy's: what this build can read, then the announced
-    /// size, then the budget — consulted **before** the download, so an
-    /// exhausted sender costs no bandwidth — then the download, the sniff and
-    /// the extraction.
+    /// The order is the policy's: what this build can read, then the budget
+    /// **peeked** — free, so an exhausted sender costs no bandwidth and the
+    /// refusal says the budget is spent — then the announced size, which is
+    /// free too, then the budget **charged** immediately before the
+    /// download, so a download the size cap stops still costs a slot, then
+    /// the download, the sniff and the extraction.
     #[cfg(feature = "whatsapp-web")]
     async fn resolve_document_block(
         client: &wa_rs::Client,
@@ -502,7 +504,8 @@ impl WhatsAppWebChannel {
     }
 
     /// The document path, with the download behind a future so the **order**
-    /// — budget, then the announced size, then download, then the policy — is
+    /// — what this build can read, then the budget peeked, then the announced
+    /// size, then the budget charged, then the download, then the policy — is
     /// reachable from a test without a linked session or a live socket.
     #[cfg(feature = "whatsapp-web")]
     async fn resolve_document_with(
@@ -526,9 +529,9 @@ impl WhatsAppWebChannel {
             return DocumentOutcome::Rejected(reason.into());
         }
 
-        // The budget is consulted **before** the download: an exhausted sender
-        // costs no bandwidth. The charge happens with the bytes, because the
-        // bytes arrive from a library call rather than a URL.
+        // The budget is peeked, not charged: the check is free, so an
+        // exhausted sender costs no bandwidth, and the refusal it gets names
+        // the budget rather than the size.
         if let Err(reason) = crate::channels::media::peek_document(&sender_key) {
             return DocumentOutcome::Rejected(reason);
         }
@@ -547,6 +550,16 @@ impl WhatsAppWebChannel {
             return DocumentOutcome::Rejected(reason);
         }
 
+        // The budget is charged **immediately before** the download: every
+        // download a sender's document causes is charged to that sender's
+        // budget before a byte is read, so a sender who announces a small
+        // size and sends more cannot make the agent download again and
+        // again. The size gates above cost no slot, because they stop the
+        // document before it is downloaded.
+        if let Err(reason) = crate::channels::media::charge_document(&sender_key) {
+            return DocumentOutcome::Rejected(reason);
+        }
+
         let bytes = match download.await {
             Ok(bytes) => bytes,
             // The reason is the one the download chose: a refusal that says
@@ -554,25 +567,25 @@ impl WhatsAppWebChannel {
             Err(reason) => return DocumentOutcome::Rejected(reason),
         };
 
-        Self::document_outcome_from_bytes(bytes, claimed, file_name, sender).await
+        Self::document_outcome_from_bytes(bytes, claimed, file_name).await
     }
 
     /// Turn downloaded document bytes into the block the agent sees.
     ///
     /// Separated from the download so the part that carries the risk — the
-    /// budget, the size cap and the byte sniffing — is reachable from a test
-    /// without the `whatsapp-web` feature, a linked session or a live socket.
-    /// The library call around it is a single `client.download(..)`.
+    /// size cap and the byte sniffing — is reachable from a test without a
+    /// linked session or a live socket. The budget is not here: it is charged
+    /// before the download, where the slot is taken before a byte is read.
+    /// The library call around it is a single
+    /// `client.download_to_writer(document, writer)`.
     #[cfg(feature = "whatsapp-web")]
     pub(crate) async fn document_outcome_from_bytes(
         bytes: Vec<u8>,
         claimed: Option<&str>,
         file_name: Option<&str>,
-        sender: &str,
     ) -> crate::channels::media::DocumentOutcome {
         use crate::channels::media::{DocumentClaim, DocumentOutcome};
 
-        let sender_key = format!("whatsapp:{sender}");
         let claim = DocumentClaim {
             mime_type: claimed.map(str::to_string),
             file_name: file_name.map(str::to_string),
@@ -581,12 +594,6 @@ impl WhatsAppWebChannel {
         // A build that cannot read documents says so.
         if let Some(reason) = crate::channels::media::unreadable_build_reason(&claim) {
             return DocumentOutcome::Rejected(reason.into());
-        }
-
-        // The budget is charged here, because the bytes arrive from a library
-        // call rather than a URL.
-        if let Err(reason) = crate::channels::media::charge_document(&sender_key) {
-            return DocumentOutcome::Rejected(reason);
         }
 
         crate::channels::media::document_outcome(bytes, &claim, file_name).await
@@ -2541,7 +2548,6 @@ mod media_tests {
             b"hello from a document".to_vec(),
             Some("text/plain"),
             Some("notes.txt"),
-            "6280000008888",
         )
         .await;
 
@@ -2561,12 +2567,176 @@ mod media_tests {
             vec![0xff, 0xfe, 0xfd, 0xfc],
             Some("text/plain"),
             None,
-            "6280000007777",
         )
         .await;
 
         let note = outcome.to_text();
         assert!(note.contains("[Attachment rejected:"), "{note}");
+    }
+
+    /// A download the size cap stops still costs the sender a budget slot.
+    ///
+    /// The charge happens before the bytes are read, so a sender who
+    /// announces a small size and sends more cannot make the agent download
+    /// again and again: the budget sees every download.
+    #[tokio::test]
+    async fn a_download_the_cap_stops_still_costs_the_budget() {
+        let sender = "6280000002222";
+        // Four documents already sent: one slot left.
+        for _ in 0..4 {
+            crate::channels::media::charge_document(&format!("whatsapp:{sender}"))
+                .expect("the sender has budget left");
+        }
+
+        let mut downloads = 0;
+        let outcome = WhatsAppWebChannel::resolve_document_with(
+            async {
+                downloads += 1;
+                Err("the document is too large (limit 10 MiB)".to_string())
+            },
+            Some("text/plain"),
+            Some("notes.txt"),
+            Some(4096),
+            sender,
+        )
+        .await;
+
+        assert_eq!(downloads, 1, "the document was downloaded once");
+        let note = outcome.to_text();
+        assert!(note.contains("too large"), "{note}");
+
+        // The next document from the same sender is refused by the budget.
+        let mut downloads = 0;
+        let outcome = WhatsAppWebChannel::resolve_document_with(
+            async {
+                downloads += 1;
+                Ok(b"hello".to_vec())
+            },
+            Some("text/plain"),
+            Some("notes.txt"),
+            Some(4096),
+            sender,
+        )
+        .await;
+
+        assert_eq!(downloads, 0, "an exhausted sender must cost no download");
+        let note = outcome.to_text();
+        assert!(note.contains("budget is spent"), "{note}");
+    }
+
+    /// A document refused for its announced size costs the sender no budget
+    /// slot.
+    ///
+    /// The budget counts the downloads a sender causes, not the attempts: a
+    /// document refused by the free size gate never reaches the wire, so it
+    /// must not cost a slot. Telegram refuses the same way.
+    #[tokio::test]
+    async fn a_document_refused_for_its_announced_size_costs_no_budget_slot() {
+        let sender = "6280000001111";
+        // Four documents already sent: one slot left.
+        for _ in 0..4 {
+            crate::channels::media::charge_document(&format!("whatsapp:{sender}"))
+                .expect("the sender has budget left");
+        }
+
+        // The announced size is over the cap: refused before the download.
+        let mut downloads = 0;
+        let outcome = WhatsAppWebChannel::resolve_document_with(
+            async {
+                downloads += 1;
+                Ok(b"hello".to_vec())
+            },
+            Some("application/pdf"),
+            Some("besar.pdf"),
+            Some(crate::channels::media::DOC_MAX_BYTES + 1),
+            sender,
+        )
+        .await;
+
+        assert_eq!(downloads, 0, "an oversized document must cost no download");
+        let note = outcome.to_text();
+        assert!(note.contains("too large"), "{note}");
+
+        // The refused document cost no slot, so the next one still has its
+        // slot and is downloaded.
+        let mut downloads = 0;
+        let outcome = WhatsAppWebChannel::resolve_document_with(
+            async {
+                downloads += 1;
+                Ok(b"hello from a document".to_vec())
+            },
+            Some("text/plain"),
+            Some("notes.txt"),
+            Some(4096),
+            sender,
+        )
+        .await;
+
+        assert_eq!(downloads, 1, "the sender still had a slot left");
+        let note = outcome.to_text();
+        assert!(
+            !note.contains("budget is spent"),
+            "the refused document cost no slot: {note}"
+        );
+    }
+
+    /// A document that announced no size costs the sender no budget slot
+    /// either.
+    ///
+    /// The refusal happens before the download, so nothing was read and
+    /// nothing may be charged: the budget meters the downloads, not the
+    /// attempts.
+    #[tokio::test]
+    async fn a_document_with_no_announced_size_costs_no_budget_slot() {
+        let sender = "6280000001212";
+        // Four documents already sent: one slot left.
+        for _ in 0..4 {
+            crate::channels::media::charge_document(&format!("whatsapp:{sender}"))
+                .expect("the sender has budget left");
+        }
+
+        // No announced size: refused before the download.
+        let mut downloads = 0;
+        let outcome = WhatsAppWebChannel::resolve_document_with(
+            async {
+                downloads += 1;
+                Ok(b"hello".to_vec())
+            },
+            Some("text/plain"),
+            Some("notes.txt"),
+            None,
+            sender,
+        )
+        .await;
+
+        assert_eq!(
+            downloads, 0,
+            "a document with no announced size must cost no download"
+        );
+        let note = outcome.to_text();
+        assert!(note.contains("did not announce its size"), "{note}");
+
+        // The refused document cost no slot, so the next one still has its
+        // slot and is downloaded.
+        let mut downloads = 0;
+        let outcome = WhatsAppWebChannel::resolve_document_with(
+            async {
+                downloads += 1;
+                Ok(b"hello from a document".to_vec())
+            },
+            Some("text/plain"),
+            Some("notes.txt"),
+            Some(4096),
+            sender,
+        )
+        .await;
+
+        assert_eq!(downloads, 1, "the sender still had a slot left");
+        let note = outcome.to_text();
+        assert!(
+            !note.contains("budget is spent"),
+            "the refused document cost no slot: {note}"
+        );
     }
 
     /// A document announced over the cap is refused before the download: the

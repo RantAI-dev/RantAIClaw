@@ -268,3 +268,57 @@ pub(crate) fn append_sender_turns(
     drop(histories);
     persist_sender_turns(ctx, sender_key, &snapshot);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::channels::media::DocumentKind;
+    use crate::providers::ConversationMessage;
+
+    /// The text of the document a sender sent, long enough to be cut.
+    const DOCUMENT_BODY: &str = "the quarterly numbers are 42 and the rest is filler text ";
+
+    /// A user message holding a document block whose body is longer than the
+    /// compaction cap, so the compaction cuts it.
+    fn a_document_message() -> ChatMessage {
+        let body = DOCUMENT_BODY.repeat(20);
+        let block = crate::channels::media::document_block(
+            DocumentKind::Pdf,
+            Some("report.pdf"),
+            Some(2),
+            false,
+            &body,
+        );
+        ChatMessage::user(block)
+    }
+
+    /// A document the compaction cut reaches the next turn as its one-line
+    /// stub.
+    ///
+    /// The cut drops the block's closing sentinel, and the redaction must
+    /// still hold: what is left of the document is the sender's text and may
+    /// not ride along in every later turn.
+    #[test]
+    fn a_document_cut_by_compaction_becomes_a_stub_in_the_next_turn() {
+        let cut = drop_overlong_rows(vec![a_document_message()]);
+        assert_eq!(cut.len(), 1, "the row is kept, cut short");
+        assert!(
+            cut[0].content.chars().count() <= CHANNEL_HISTORY_COMPACT_CONTENT_CHARS,
+            "the row was cut to the cap"
+        );
+
+        let history = vec![ConversationMessage::Chat(cut[0].clone())];
+        // The current turn starts after the cut message.
+        let redacted = crate::channels::media::redact_historic_document_blocks(&history, 1);
+
+        let ConversationMessage::Chat(chat) = &redacted[0] else {
+            panic!("the history row is a chat message");
+        };
+        assert_eq!(chat.content, "[inbound document omitted: report.pdf]");
+        assert!(
+            !chat.content.contains(DOCUMENT_BODY.trim()),
+            "the document's text must not stay in the history: {}",
+            chat.content
+        );
+    }
+}

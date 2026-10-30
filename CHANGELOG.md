@@ -166,15 +166,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounded by a writer that refuses the write past the cap, so the bytes held are at most the cap
   whatever the sender announced, and a document that announced no size is refused before the
   download. Documents are budgeted separately from images — 5
-  documents per sender per 10 minutes, consulted **before** any download, so an exhausted sender
-  costs no bandwidth and no `getFile` call. The text stays readable for the whole turn it arrived
-  in and becomes a one-line stub from the next user message on. A Telegram document with no
-  caption is a document like any other: it is policy-checked and answered, not taken for an
-  intruder. A DOCX needs the `kb-office` feature, which is not a default: a default build refuses
-  a DOCX with a note that says why. Every other channel keeps ignoring documents, and no document
-  is ever written to disk. The full rules are in `docs/security/inbound-media-policy.md`. The
-  reason a document is refused is always a sentence of ours, so no part of the sender's own word
-  reaches the model through the error.
+  documents per sender per 10 minutes. The budget is consulted before the download and the slot
+  is charged immediately before it starts, so an exhausted sender costs no bandwidth. On Telegram
+  the budget is also peeked before the `getFile` call, so an exhausted sender costs no `getFile`
+  call either. The announced-size refusal comes before the charge on both channels: a document
+  over the cap, or a WhatsApp Web document that announced no size at all, is refused without
+  spending a budget slot. A download the size cap stops does cost a slot: the cap is only found
+  while the bytes arrive, and the charge has already been taken. The document's bytes are never
+  written to disk. Its extracted text is kept with the turn, like any other message, so the
+  sender's text is in the channel history (`brain.db` when the memory backend is `sqlite`) and in
+  the channel session transcript (`sessions.db`). On the default backend that is the text on disk
+  twice, and the transcript copy stays readable to the owner-only `session_search` tool. The model
+  reads that text for the whole turn it arrived in; from the next user message on, the request to
+  the provider carries only a one-line stub in its place. A Telegram document with no caption is a
+  document like any other: it is policy-checked and answered, not taken for an intruder. A DOCX
+  needs the `kb-office` feature, which is not a default: a default build refuses a DOCX with a
+  note that says why. Every other channel keeps ignoring documents. The full rules are in
+  `docs/security/inbound-media-policy.md`. The reason a document is refused is always a sentence
+  of ours, so no part of the sender's own word reaches the model through the error.
 
 - `rantaiclaw personality set` takes `--name` and `--timezone` next to the
   positional preset, so the persona's owner name and its timezone can be set

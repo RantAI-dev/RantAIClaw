@@ -3,7 +3,9 @@
 **Date**: 2026-08-14
 **Plan**: `plans/148-attachments-spike.md`
 **Amended**: 2026-10-26 — inbound documents (PDF, DOCX, TXT) under rules
-7–16. Rules 1–6 are unchanged.
+7–16. 2026-10-29: rules 3, 9, 11 and 12 clarified for documents — where the
+extracted text is kept, and when the budget slot is charged. Rules 1–6 are
+otherwise unchanged.
 **Applies to**: every channel that accepts an attachment from a chat platform.
 
 Accepting an inbound image means **downloading attacker-supplied bytes onto the
@@ -58,7 +60,7 @@ download.
 ### 3. Where the bytes land — memory only
 
 Inbound media is converted to a `data:` URI **in memory** and embedded in the
-message content. **Nothing is written to disk.**
+message content. **The bytes are never written to disk.**
 
 This is the deliberate answer to "if disk, under what path, with what
 permissions, and who cleans up?" — the question has no good answer yet, so the
@@ -71,6 +73,16 @@ If disk persistence is ever wanted (large files, audio, video, retention),
 that is an operator-facing decision about where agent-received files live —
 **escalate it, do not settle it inside a channel.** The 2026-10-26 amendment
 keeps documents in memory too (rule 9); it does not take the disk option.
+
+**Amendment 2026-10-29:** what the rule covers is the **attachment**. The text
+a document yields is a different thing, and it does reach disk: the extracted
+text is kept in the conversation history with the turn, like any other message
+(rule 12), so a `sqlite` memory backend writes it into `brain.db` with
+everything else the sender said. The same turn is recorded in the channel
+session transcript as well, so with the `sqlite` backend the text is on disk
+twice: once as conversation history, once as a recorded transcript (rule 12). A
+document is therefore never stored as a file, but its text is stored as
+conversation and as transcript.
 
 ### 4. Interaction with `[multimodal].allow_remote_fetch`
 
@@ -203,6 +215,9 @@ unchanged, and this amendment does not touch the config schema.
 Rule 3 applies to documents with more force: the bytes are **parsed in a child
 process over a pipe**, and **no temp file** is ever written. A document parser
 is exactly the kind of code that must not be handed a writable path it can fill.
+The text that comes back is kept like any other message (rule 12): in the
+conversation history and in the channel session transcript. The document
+itself is not kept.
 
 The agent process never parses a document. The parent
 (`src/kb/extract/child_process.rs`) starts the same binary with a hidden
@@ -268,13 +283,25 @@ Whatever the parser does — panic, abort, loop, runaway allocation — it is th
 **child** that dies, not the agent. The sender gets a visible rejection, and the
 next document can still be read.
 
-### 11. Budget — documents are metered separately, before any download
+### 11. Budget — documents are metered separately, charged before the bytes are read
 
 **One document per message. Budget: 5 documents per sender per 10 minutes**
 (`DOC_BUDGET_DOCUMENTS`, over the same fixed window as rule 6), constants in
-`src/channels/media.rs`, not config keys. The budget is consulted **before any
-download**, so an exhausted sender costs no bandwidth and no `getFile` call —
-the rule 6 peek-then-charge order, applied to the document path.
+`src/channels/media.rs`, not config keys.
+
+The budget is consulted before the download and the slot is charged immediately
+before the download starts, before a single byte of the document is read, so an
+exhausted sender costs no bandwidth. On Telegram the budget is also **peeked**
+before the `getFile` call, so an exhausted sender costs no `getFile` call
+either — the rule 6 peek-then-charge order, applied to the document path.
+
+The announced-size refusal comes **before** the charge on both channels: a
+document over the 10 MiB cap, or a WhatsApp Web document that announced no size
+at all, is refused without spending a budget slot. A download the size cap
+stops **does** cost a slot: the cap is only discovered while the bytes are
+arriving, and the charge has already been taken. So a sender cannot make the
+agent download again and again, and an oversized announcement cannot spend the
+budget either.
 
 ### 12. How the text reaches the model — a delimited, defused, untrusted block
 
@@ -294,6 +321,24 @@ The text stays readable for the **whole turn it arrived in**, so every tool
 call of that turn still sees the document and the model can answer the turn the
 document came with. Otherwise every later turn re-carries the full text:
 prompt bloat, plus a stale injection surface that lives forever.
+
+The stub is about the **request sent to the provider**, not about what is
+stored. The stored history keeps the text with the turn, like any other
+message — the block, the sender's words and all — so a `sqlite` memory backend
+writes it into `brain.db`. The one-line stub is what the model is shown in a
+later turn; the stored text is kept and trimmed the way every other message in
+the history is.
+
+The turn is recorded twice over, so with the `sqlite` backend the text is on
+disk twice: in the channel history, as above, and in the channel session
+transcript, where the sender's message is written as a `user` row of the
+session store (`<profile root>/sessions/sessions.db`). The three scrub passes
+that run before that row is written — secret patterns, credentials, media
+payloads — redact secret-shaped values and base64 media payloads; they do not
+redact a document's text away, only the secret-shaped values inside it as in
+any other message, so the text is kept, and the owner-only `session_search`
+tool, which searches recorded transcripts without filtering them by source,
+can still find it. The operator's transcript is meant to hold what was said.
 
 The rule lives in `redact_historic_document_blocks` (`src/channels/media.rs`).
 It works on the **structured** history (`ConversationMessage`) and is given the
