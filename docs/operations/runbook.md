@@ -24,10 +24,13 @@ For first-time installation, start from [one-click-bootstrap.md](../start/one-cl
 | User service | `rantaiclaw service install && rantaiclaw service start` | persistent operator-managed runtime |
 
 Profiles and the installed service: a service installed without an explicit profile
-(`-p` / `RANTAICLAW_PROFILE`) follows the active-profile marker, so `rantaiclaw profile use <name>`
-restarts the unit onto the new profile. A service installed with an explicit profile is
-pinned to it — `profile use` leaves it running and says so; reinstall from the other
-profile to move it.
+(`--profile <name>` / `RANTAICLAW_PROFILE`) follows the active-profile marker, so
+`rantaiclaw profile use <name>` restarts the unit onto the new profile. On systemd and
+launchd, a service installed with an explicit profile is pinned to it: `profile use` leaves it
+running and says so; reinstall from the other profile to move it. On OpenRC, `service install`
+refuses an explicit profile, because the unit reads its config from `/etc/rantaiclaw` and a
+profile cannot apply to it; install it again without a profile, and the unit follows the
+active-profile marker.
 
 ## Baseline Operator Checklist
 
@@ -159,8 +162,8 @@ journalctl --user -u rantaiclaw.service -f
 
 ## Daemon Stops With Exit Code 78
 
-A daemon that exits with code 78 (`EX_CONFIG`) stopped for a configuration that can never work; the
-stop message names the setting. The fatal set is:
+A daemon that exits with code 78 (`EX_CONFIG`) stopped for something that can never work; the
+stop message names what to fix. The fatal set is:
 
 - an unknown tunnel `provider` name, or a missing `[tunnel.<provider>]` section
 - a refused public bind (`[gateway] allow_public_bind` is false)
@@ -170,10 +173,15 @@ stop message names the setting. The fatal set is:
 - a custom provider URL that is missing, unparseable, or not http(s)
 - an unknown `[memory] backend`
 - an unknown `[runtime] kind`
+- a profile selection the door refuses (`--profile <name>` or `RANTAICLAW_PROFILE` naming a
+  profile that cannot be selected)
 
 A missing API key, a missing auth profile and a DNS lookup failure are NOT in that set: they are
 retried, because `rantaiclaw auth login`, an environment variable, a key stored in the config later
 or a resolver that comes back can supply them without the config file changing.
+
+The profile-door refusal is NOT retried either: it names the profile it could not select, and the
+daemon exits before it starts, so the operator has to fix the selection.
 
 systemd units rendered by current versions carry `RestartPreventExitStatus=78`, so systemd does not
 restart the daemon — fix the config and start the service again. On launchd (macOS) the job is

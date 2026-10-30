@@ -229,12 +229,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   key, the `/debug` command and the `/status` Debug row. `/model <provider:model>` changes the model.
 - `[browser] allowed_domains` now defaults to `["*"]` (config schema 38 → 39), so `browser` and `browser_open` take a public host on a fresh install. An existing config is left as written.
 - `rantaiclaw service install` pins a profile only when one was chosen
-  explicitly. A unit installed with `-p <name>` or `RANTAICLAW_PROFILE` set
-  carries `RANTAICLAW_PROFILE` as before; a unit installed without either now
-  carries no profile and the daemon follows the active-profile marker, so
-  `rantaiclaw profile use <name>` restarts it onto the profile it switches
-  to. The install output names the binding either way. An already installed
-  unit keeps its current binding until the next `service install`.
+  explicitly, and only on systemd and launchd. A unit installed with
+  `--profile <name>` or `RANTAICLAW_PROFILE` set carries `RANTAICLAW_PROFILE`
+  as before; a unit installed without either now carries no profile and the
+  daemon follows the active-profile marker, so `rantaiclaw profile use <name>`
+  restarts it onto the profile it switches to. The install output names the
+  binding either way. An already installed unit keeps its current binding
+  until the next `service install`. On OpenRC an explicit profile is refused
+  outright, before anything is written, and a unit installed without one
+  follows the active-profile marker.
 - The operator's `[[model_routes]]` table now applies to every door that runs
   an agent turn — the gateway's webhook, the chat channels and the delegate
   tool — not only to the CLI/TUI agent and cron. A chat runtime picks the
@@ -255,6 +258,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The OpenRC units written before the profile doors always pinned a profile with
+  `RANTAICLAW_PROFILE` and ran `--config-dir /etc/rantaiclaw daemon`, so the config came from
+  `/etc/rantaiclaw` while the per-profile stores followed the pinned profile — the split the profile
+  door refuses. The door refuses that split whenever the pinned profile is not the one the
+  config-directory override keeps in effect, so such a unit could not start at all: the
+  daemon exited 1 on every start. A unit installed with an
+  explicit profile was refused the same way: `service install` refuses an explicit profile on
+  OpenRC, and at runtime the profile door refuses the split such a unit caused. The OpenRC unit no
+  longer names a profile: its per-profile stores follow the active-profile marker, while its config
+  stays in `/etc/rantaiclaw`. `rantaiclaw service install` refuses an explicit profile on OpenRC
+  with one sentence naming `/etc/rantaiclaw` and the way out (install it again without a profile,
+  and the unit follows the active-profile marker), and it refuses before it writes anything. A
+  daemon refused at a profile door now exits 78 (`EX_CONFIG`) instead of 1 — the code a systemd
+  unit's `RestartPreventExitStatus=78` stops on — so a systemd unit that cannot start stays stopped
+  and the journal keeps the sentence that says why, while launchd restarts the job anyway because it
+  cannot exclude a single exit code; every other command keeps exit 1. An OpenRC unit written before
+  this fix whose pinned profile is not the active one now exits 78 at start, so re-run
+  `rantaiclaw service install` without a profile in the environment to write the unit without one.
+  The systemd and launchd units still pin a profile when one was
+  chosen.
+- The profile door and the config loader disagreed about the `active_workspace.toml` marker, and
+  the door was the stricter one. The marker had two independent readers: the config loader set a
+  marker aside in two cases — one naming another root's profile directory, one pointing into the OS
+  temp dir while the root is not under the temp dir — while the profile door treated every marker
+  that was not a profile pointer of this root as an override in effect. For those two marker shapes
+  the loader ignored the marker and the door believed it pinned a profile, so `rantaiclaw profile
+  use` and the `--profile` / `RANTAICLAW_PROFILE` doors refused a switch that could not have split
+  anything. The decision now lives in one place and both sides use it: a marker the loader sets
+  aside is no override, so nothing is refused, and a marker the loader honors is still an
+  override, so the split is still refused. Nothing for the operator to do — the marker shapes an
+  install already had keep working, and the ones that were locked out can switch again. No config
+  key, no default and no schema change.
+- A missing active profile was a silent fallback to the flat layout, not an error. When the active
+  profile named a directory that did not exist, the config resolution swallowed the error and fell
+  back to `~/.rantaiclaw/config.toml` and `~/.rantaiclaw/workspace`, so the flat files silently
+  shadowed the profile the operator had chosen. The load now fails and names the profile and how
+  to create it (`rantaiclaw profile create <name>`). The flat-layout fallback is gone: the config
+  lives in the active profile's directory, with no other path. An install whose profile exists is
+  unaffected — what is stored and where it is stored did not change for it.
+- `profile delete` could leave the active-profile marker naming a profile that does not exist. The
+  delete compared the name only against the profile the environment named (`RANTAICLAW_PROFILE`), so
+  with the environment on one profile and the marker on another, deleting the marker-named profile
+  succeeded and left the marker naming a profile that does not exist. The delete now refuses the
+  profile the marker names too, exactly like it refuses the environment-named one, and `--force`
+  clears the marker instead. The message names the fix: pass `--force`, or
+  `rantaiclaw profile use <other>` first. A marker that exists but cannot be read now fails the
+  delete instead of passing for one that names nothing, and `--force` does not help here: the marker
+  is read for every delete, and the code cannot tell whether an unreadable marker names that
+  profile, so the delete fails, removes nothing and says why. A marker that cannot be cleared is
+  reported: the profile is already gone and the marker still names
+  it.
+- The launchd unit escaped the profile name twice. The profile was escaped when the plist was
+  written and escaped again inside the plist writer, so a profile whose name holds `&` was written
+  as `&amp;amp;` and the daemon looked for a profile that does not exist. New profile names are
+  restricted to letters, digits, `-` and `_`, so only a profile created before that rule could hit
+  it. It is escaped once now: a launchd unit installed for such a profile finds the profile again.
+- A daemon started by hand with `RANTAICLAW_PROFILE` set was told a restart would move it.
+  `rantaiclaw profile use` reported such a daemon as "restart it yourself to pick up profile
+  <new>", but a restart brings it back on the pinned profile, so the restart cannot move it. The
+  pinned case is now checked first and the line says the daemon stays on its profile and how to
+  change it: start it again with `RANTAICLAW_PROFILE` unset.
 - The id `cron list` printed could not be used. An operator copied the 8-character id out of the list and every command that takes a job id refused it, because the id was matched whole. The id every surface prints is now accepted everywhere — `cron run`, `cron pause`, `cron resume`, `cron update`, `cron remove`, `cron runs`, the `/cron` TUI commands, the `/api/v1/cron/{id}` HTTP endpoints and the `cron_*` agent tools — as the full id or as a prefix of one. A full id always wins, even when it is also the prefix of another job's id; a prefix must be at least 8 characters, and a shorter one is refused, because a mistyped delete is worse than a refusal; a prefix that names exactly one job resolves to it, and a prefix that names several is refused with the candidates named so one can be picked. An id that names no job is still `not found`. The prefix is compared literally, so `%` and `_` in a typed id match nothing rather than everything. The TUI now shows the id in its listings, so a named job is no longer listed without one.
 - The TUI's `/cron` commands and the cron detail panel ignored `cron.enabled`: with the switch off, a job could still be created, edited, removed, paused, resumed and run from the TUI while every other surface refused. Every door that writes a cron job now refuses with the same message — `cron is disabled by config (cron.enabled=false)` — the CLI, the HTTP API, the agent tools, the TUI commands and the TUI detail panel alike, and the store refuses a write that reaches it without the check. Reads stay open: `cron list`, `cron runs`, `GET /api/v1/cron` and `GET /api/v1/cron/{id}/runs` still work while the switch is off, so an operator can inspect dormant jobs (the `cron_list` and `cron_runs` agent tools refuse reads while disabled, as they always did). The scheduler's own bookkeeping is exempt, so a runtime flip of the switch cannot make a one-shot that already fired fire again.
 - Every surface that names the approval preset now reads the same source: the profile's marker, `<profile>/policy/autonomy.toml`. `rantaiclaw status` and `rantaiclaw autonomy` agree by construction, the channel prompt names the preset the profile has, and `GET /api/v1/status` reports the marker's preset id — or `null` when the profile has no preset, where it used to report one derived from `config.toml`. A profile that never chose a preset read as "Manual" (the shipped `always_ask` is non-empty) and the TUI's shell-block hint said "Smart"; both now read as unset. The enforced autonomy level still comes from `config.toml` and is unchanged: `status` shows it in its own `Enforced` row, right after the preset.
@@ -572,8 +636,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run. The check runs when the flag is applied, before the subcommand, so
   `--profile work profile create work` is refused — create the profile
   first, without the flag. A command whose config resolution misses the
-  profile (the flat `~/.rantaiclaw/config.toml` fallback) is unchanged: it
-  creates nothing under `profiles/`. The help no longer claims a `-p`
+  profile is an error now, not a fallback to the flat layout: it names the
+  profile and how to create it. The help no longer claims a `-p`
   short flag: no such flag exists (`agent -p` is `--provider`), and every
   help and doc mention of one is now `--profile`.
 - A migration dropped the operator's price table without a word. The v24 → v25

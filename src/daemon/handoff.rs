@@ -183,10 +183,14 @@ pub enum HandoffOutcome {
     /// profile.
     Restarted { unit: String },
     /// The daemon keeps serving the profile it is on: its launcher pinned
-    /// it (`RANTAICLAW_PROFILE`), so a restart would change nothing.
-    Pinned { profile: String, unit: String },
-    /// The daemon was started by hand — no unit is recorded, so there is
-    /// nothing any init system can restart.
+    /// it (`RANTAICLAW_PROFILE`), so a restart would change nothing. The
+    /// unit is absent when the daemon was started by hand.
+    Pinned {
+        profile: String,
+        unit: Option<String>,
+    },
+    /// The daemon was started by hand and follows the active-profile marker —
+    /// no unit is recorded, so there is nothing any init system can restart.
     HandStarted { profile: String },
     /// No live daemon was registered for that profile (no sentinel, a stale
     /// one, or a unit the manager does not report as active).
@@ -212,9 +216,10 @@ pub fn restart_daemon_for_profile(profile: &str) -> Result<HandoffOutcome> {
 /// 1. no (or unparseable) sentinel for this profile → `NotRunning`;
 /// 2. sentinel whose pid is not a live daemon → stale: clear it,
 ///    `NotRunning`;
-/// 3. sentinel with no unit → `HandStarted` (no init system is contacted);
-/// 4. sentinel that says `profile_pinned` → `Pinned` (no restart — the
-///    daemon's launcher named its profile and a restart cannot move it);
+/// 3. sentinel that says `profile_pinned` → `Pinned` (the daemon's launcher
+///    named its profile, so a restart cannot move it; a hand-started daemon
+///    can be pinned too, and then there is no unit);
+/// 4. sentinel with no unit → `HandStarted` (no init system is contacted);
 /// 5. no usable init system → `NoInit`;
 /// 6. unit not active → `NotRunning`;
 /// 7. otherwise restart the recorded unit → `Restarted`.
@@ -244,6 +249,17 @@ pub fn restart_daemon_for_profile_with(
         return Ok(HandoffOutcome::NotRunning);
     }
 
+    // A pinned daemon serves the profile its launcher named, whatever the
+    // marker says. Restarting it would not move it, so the caller says so
+    // instead. The check comes before the unit check: a daemon that was
+    // started by hand can be pinned too, and it comes back on that profile.
+    if sentinel.profile_pinned {
+        return Ok(HandoffOutcome::Pinned {
+            profile: profile.to_string(),
+            unit: sentinel.unit.clone(),
+        });
+    }
+
     // A daemon whose sentinel names no unit was started by hand. There is no
     // unit to restart, and the `rantaiclaw@<profile>.service` template the
     // installer never creates is not a substitute.
@@ -252,16 +268,6 @@ pub fn restart_daemon_for_profile_with(
             profile: profile.to_string(),
         });
     };
-
-    // A pinned daemon serves the profile its launcher named, whatever the
-    // marker says. Restarting it would not move it, so the caller says so
-    // instead.
-    if sentinel.profile_pinned {
-        return Ok(HandoffOutcome::Pinned {
-            profile: profile.to_string(),
-            unit,
-        });
-    }
 
     if control.name() == "none" {
         return Ok(HandoffOutcome::NoInit {
@@ -286,6 +292,47 @@ pub fn restart_daemon_for_profile_with(
         .with_context(|| format!("restart {unit} via {}", control.name()))?;
 
     Ok(HandoffOutcome::Restarted { unit })
+}
+
+/// The line the operator reads about a handoff outcome, or `None` when there
+/// is nothing to say (nothing was running).
+///
+/// A line must tell the truth about what a restart would do: a daemon that
+/// follows the marker moves when it is restarted, a daemon whose launcher
+/// named its profile comes back on that profile.
+pub fn outcome_line(active: &str, outcome: &HandoffOutcome) -> Option<String> {
+    let line = match outcome {
+        HandoffOutcome::Restarted { unit } => {
+            format!("Restarted {unit} — the daemon now follows profile {active:?}")
+        }
+        HandoffOutcome::Pinned {
+            profile,
+            unit: Some(unit),
+        } => format!(
+            "The daemon for profile {profile:?} stays on {profile:?}: its service pins \
+             that profile ({unit}). Run `rantaiclaw service install` from the new profile \
+             to change that."
+        ),
+        HandoffOutcome::Pinned {
+            profile,
+            unit: None,
+        } => format!(
+            "The daemon for profile {profile:?} stays on {profile:?}: it was started with \
+             RANTAICLAW_PROFILE set, so it comes back on that profile. Start it again with \
+             RANTAICLAW_PROFILE unset to serve {active:?}."
+        ),
+        HandoffOutcome::HandStarted { profile } => format!(
+            "The daemon for profile {profile:?} was started by hand; restart it yourself \
+             to pick up profile {active:?}."
+        ),
+        HandoffOutcome::NotRunning => return None,
+        HandoffOutcome::NoInit { profile, pid } => format!(
+            "The daemon for profile {profile:?} (pid {pid}) is running, but no supported \
+             init system was detected (systemd / launchd); restart it yourself to pick up \
+             profile {active:?}."
+        ),
+    };
+    Some(line)
 }
 
 /// Best-effort current uid for launchd `gui/<uid>/<label>` targeting. We
@@ -479,10 +526,45 @@ mod tests {
                 outcome,
                 HandoffOutcome::Pinned {
                     profile: "alpha".to_string(),
-                    unit: "rantaiclaw.service".to_string()
+                    unit: Some("rantaiclaw.service".to_string())
                 }
             );
             assert_eq!(stub.restarts.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    /// A daemon started by hand whose launcher named its profile stays on
+    /// that profile: a restart comes back on it, so the operator must not be
+    /// told that restarting will pick up the new one.
+    #[test]
+    fn a_pinned_hand_started_daemon_is_not_told_a_restart_will_move_it() {
+        with_home(|| {
+            write_sentinel_for("alpha", std::process::id(), None, true);
+            let stub = RecordingControl::new("systemd");
+            let outcome = restart_daemon_for_profile_with("alpha", stub.as_ref()).unwrap();
+            assert_eq!(
+                outcome,
+                HandoffOutcome::Pinned {
+                    profile: "alpha".to_string(),
+                    unit: None,
+                }
+            );
+            assert_eq!(stub.restarts.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                stub.is_active_calls.load(Ordering::SeqCst),
+                0,
+                "a pinned daemon must not reach the init system at all"
+            );
+
+            let line = outcome_line("work", &outcome).expect("the operator is told something");
+            assert!(
+                !line.contains("restart it yourself"),
+                "a pinned daemon is not moved by a restart: {line}"
+            );
+            assert!(
+                !line.contains("pick up profile"),
+                "a pinned daemon is not moved by a restart: {line}"
+            );
         });
     }
 

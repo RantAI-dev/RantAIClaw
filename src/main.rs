@@ -1369,6 +1369,20 @@ fn is_profile_command(command: Option<&Commands>) -> bool {
     matches!(command, Some(Commands::Profile { .. }))
 }
 
+/// The exit a refusal at a profile door deserves.
+///
+/// The daemon path exits EX_CONFIG (78): the installed unit carries
+/// `RestartPreventExitStatus=78`, so a daemon that cannot start stays
+/// stopped instead of being restarted every few seconds, and the journal
+/// keeps the sentence that says why. Every other command keeps exit 1.
+fn profile_door_refusal(command: Option<&Commands>, error: anyhow::Error) -> anyhow::Error {
+    if matches!(command, Some(Commands::Daemon { .. })) {
+        eprintln!("Error: {error:#}");
+        std::process::exit(gateway::EX_CONFIG_EXIT_CODE);
+    }
+    error
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
@@ -1423,7 +1437,9 @@ async fn main() -> Result<()> {
         // that does not exist refused before it reaches any command (it used
         // to become a new, empty profile directory). `default` stays
         // bootstrappable for the first run.
-        rantaiclaw::profile::ProfileManager::require_selectable(profile_name)?;
+        if let Err(e) = rantaiclaw::profile::ProfileManager::require_selectable(profile_name) {
+            return Err(profile_door_refusal(cli.command.as_ref(), e));
+        }
         std::env::set_var("RANTAICLAW_PROFILE", profile_name);
     } else if !is_profile_command(cli.command.as_ref()) {
         // The environment door: `RANTAICLAW_PROFILE` names the profile for
@@ -1435,7 +1451,10 @@ async fn main() -> Result<()> {
         if let Ok(env_profile) = std::env::var("RANTAICLAW_PROFILE") {
             let env_profile = env_profile.trim();
             if !env_profile.is_empty() {
-                rantaiclaw::profile::ProfileManager::require_selectable(env_profile)?;
+                if let Err(e) = rantaiclaw::profile::ProfileManager::require_selectable(env_profile)
+                {
+                    return Err(profile_door_refusal(cli.command.as_ref(), e));
+                }
             }
         }
     }
@@ -3192,6 +3211,45 @@ mod tests {
     #[test]
     fn cli_definition_has_no_flag_conflicts() {
         Cli::command().debug_assert();
+    }
+
+    /// The profile is named with `--profile`. A `-p` short form would shadow
+    /// `--provider` on `agent` and `--port` on `daemon`, `gateway` and `ui
+    /// start`, so the flag stays long-only.
+    #[test]
+    fn the_profile_flag_has_no_short_form() {
+        let mut command = Cli::command();
+        // The global `--profile` reaches the subcommands' help only after
+        // the command tree is built.
+        command.build();
+        let profile = command
+            .find_subcommand_mut("profile")
+            .expect("the profile subcommand must exist");
+        let help = profile.render_long_help().to_string();
+
+        assert!(
+            help.contains("--profile"),
+            "the profile flag must be named --profile: {help}"
+        );
+
+        // Clap writes the short flags in the flag column, before the long
+        // one, so a short form shows up in the part of the option line that
+        // precedes `--profile` and nowhere else. The column must stay empty:
+        // `-p` is `--provider` on `agent` and `--port` on `daemon`,
+        // `gateway` and `ui start`.
+        let option = help
+            .lines()
+            .map(str::trim_start)
+            .find(|line| line.starts_with('-') && line.contains("--profile"))
+            .expect("the rendered options must list the profile flag");
+        let flag_column = option
+            .split("--profile")
+            .next()
+            .expect("the option line must hold --profile");
+        assert!(
+            flag_column.trim().is_empty(),
+            "the profile flag must have no short form: {option}"
+        );
     }
 
     #[test]
