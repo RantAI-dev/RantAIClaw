@@ -139,7 +139,7 @@ fn handoff_leaves_a_pinned_daemon_alone() {
             outcome,
             HandoffOutcome::Pinned {
                 profile: "work".to_string(),
-                unit: "rantaiclaw.service".to_string()
+                unit: Some("rantaiclaw.service".to_string())
             }
         );
         assert_eq!(

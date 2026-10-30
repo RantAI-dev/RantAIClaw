@@ -9,7 +9,7 @@ Config path resolution at startup:
 1. `RANTAICLAW_CONFIG_DIR` override (if set) — the whole config directory; the workspace becomes `<dir>/workspace`
 2. `RANTAICLAW_WORKSPACE` override (if set)
 3. persisted `~/.rantaiclaw/active_workspace.toml` marker (if present) — with two exceptions: a marker that names the `profiles/<name>` directory of a different root while the local root has its own `config.toml` for that profile (a tree that was copied, moved or restored to another path) is set aside and the local profile wins, with a single warning naming the marker, the directory it pointed at, and the directory used instead; and a marker that names a profile directory **of this root** (`~/.rantaiclaw/profiles/<name>`) is a *profile pointer* — it means "the active profile", so it pins nothing and resolution continues with step 4
-4. default: the **active profile's directory** — `~/.rantaiclaw/profiles/<name>/config.toml` (profile `default` unless `RANTAICLAW_PROFILE` or the `~/.rantaiclaw/active_profile` marker selects another). A flat `~/.rantaiclaw/config.toml` is used only as a fallback if profile resolution fails.
+4. default: the **active profile's directory** — `~/.rantaiclaw/profiles/<name>/config.toml` (profile `default` unless `RANTAICLAW_PROFILE` or the `~/.rantaiclaw/active_profile` marker selects another). There is no flat fallback: an active profile that names nothing on disk is an error that names the profile and the fix (`rantaiclaw profile create <name>`) — only `default` bootstraps itself.
 
 `RANTAICLAW_CONFIG_DIR` moves **config and workspace only**. The profile root —
 `~/.rantaiclaw/profiles/<name>/`, which holds `policy/`, session and KB
