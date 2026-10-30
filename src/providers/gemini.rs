@@ -10,14 +10,25 @@
 //! renewed by running `gemini` is used on the next request, and an expired
 //! one fails that request with the fix named, before anything is sent.
 
+use crate::providers::gemini_error::GeminiAuthError;
 use crate::providers::traits::{ChatMessage, Provider};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+/// What to say when the only Gemini credential is missing.
+///
+/// Names every way in, and answers the question an operator asks next: no
+/// restart is needed, because the login is read when a request is sent.
+pub(crate) const MISSING_CREDENTIAL_REFUSAL: &str = "Gemini API key not found. Options:\n\
+     1. Set GEMINI_API_KEY env var\n\
+     2. Run `gemini` CLI to authenticate (tokens will be reused, no restart needed)\n\
+     3. Get an API key from https://aistudio.google.com/app/apikey\n\
+     4. Run `rantaiclaw onboard` to configure";
+
 /// Gemini provider supporting multiple authentication methods.
 pub struct GeminiProvider {
-    auth: Option<GeminiAuth>,
+    auth: GeminiAuth,
 }
 
 /// Resolved credential — the variant determines both the HTTP auth method
@@ -172,24 +183,16 @@ impl GeminiProvider {
     ///
     /// The CLI login is not read here: the login file is read when a request
     /// is sent, so a login renewed by running `gemini` is used on the next
-    /// request, without a restart.
+    /// request, without a restart. The fallback to the CLI login is
+    /// unconditional for the same reason — the build must not depend on the
+    /// login file's state.
     pub fn new(api_key: Option<&str>) -> Self {
         let resolved_auth = api_key
             .and_then(Self::normalize_non_empty)
             .map(GeminiAuth::ExplicitKey)
             .or_else(|| Self::load_non_empty_env("GEMINI_API_KEY").map(GeminiAuth::EnvGeminiKey))
             .or_else(|| Self::load_non_empty_env("GOOGLE_API_KEY").map(GeminiAuth::EnvGoogleKey))
-            .or_else(|| {
-                // The login file holds a token — valid or expired. An expired
-                // login still counts: the request that uses it is refused
-                // with the fix named, which beats a key-less path that cannot
-                // work either.
-                (!matches!(
-                    crate::providers::gemini_cli::read_gemini_cli_login(),
-                    crate::providers::gemini_cli::Login::Missing
-                ))
-                .then_some(GeminiAuth::CliLogin)
-            });
+            .unwrap_or(GeminiAuth::CliLogin);
 
         Self {
             auth: resolved_auth,
@@ -226,12 +229,11 @@ impl GeminiProvider {
     /// Get authentication source description for diagnostics.
     /// Uses the stored enum variant — no env var re-reading at call time.
     pub fn auth_source(&self) -> &'static str {
-        match self.auth.as_ref() {
-            Some(GeminiAuth::ExplicitKey(_)) => "config",
-            Some(GeminiAuth::EnvGeminiKey(_)) => "GEMINI_API_KEY env var",
-            Some(GeminiAuth::EnvGoogleKey(_)) => "GOOGLE_API_KEY env var",
-            Some(GeminiAuth::CliLogin) => "Gemini CLI OAuth",
-            None => "none",
+        match &self.auth {
+            GeminiAuth::ExplicitKey(_) => "config",
+            GeminiAuth::EnvGeminiKey(_) => "GEMINI_API_KEY env var",
+            GeminiAuth::EnvGoogleKey(_) => "GOOGLE_API_KEY env var",
+            GeminiAuth::CliLogin => "Gemini CLI OAuth",
         }
     }
 
@@ -277,7 +279,7 @@ impl GeminiProvider {
         crate::config::build_runtime_proxy_client_with_timeouts("provider.gemini", 120, 10)
     }
 
-    /// Build the request for `auth`.
+    /// Build the request for the provider's credential.
     ///
     /// The Gemini CLI login is read here, when the request is built: a login
     /// renewed by running `gemini` is used on the next request, and an
@@ -285,12 +287,11 @@ impl GeminiProvider {
     /// request leaves the machine.
     fn build_generate_content_request(
         &self,
-        auth: &GeminiAuth,
         url: &str,
         request: &GenerateContentRequest,
         model: &str,
     ) -> anyhow::Result<reqwest::RequestBuilder> {
-        match auth {
+        match &self.auth {
             GeminiAuth::CliLogin => {
                 let token = Self::cli_login_token()?;
                 // Internal Code Assist API uses a wrapped payload shape:
@@ -317,16 +318,43 @@ impl GeminiProvider {
         }
     }
 
+    /// Build the request a single user turn would produce, without sending it.
+    ///
+    /// The seam for "what would go on the wire": the login is read here, so a
+    /// missing or expired login fails here and builds nothing, and a valid one
+    /// puts its token in the `Authorization` header. Building a request does
+    /// not send it, so a test that uses this seam cannot reach Google.
+    #[cfg(test)]
+    pub(crate) fn build_request_for_test(&self, model: &str) -> anyhow::Result<reqwest::Request> {
+        let request = GenerateContentRequest {
+            contents: vec![Content {
+                role: Some("user".to_string()),
+                parts: vec![Part {
+                    text: "hello".to_string(),
+                }],
+            }],
+            system_instruction: None,
+            generation_config: GenerationConfig {
+                temperature: 0.7,
+                max_output_tokens: 8192,
+            },
+        };
+        let url = Self::build_generate_content_url(model, &self.auth);
+        self.build_generate_content_request(&url, &request, model)?
+            .build()
+            .map_err(anyhow::Error::from)
+    }
+
     /// The Gemini CLI login token, read now.
     ///
     /// An expired login fails the request with the refusal that names the
     /// fix, a missing one with the "no credential" message. Neither is sent
-    /// to Google.
+    /// to Google, and neither is worth retrying: both are typed refusals.
     fn cli_login_token() -> anyhow::Result<String> {
         match crate::providers::gemini_cli::read_gemini_cli_login() {
             crate::providers::gemini_cli::Login::Valid(token) => Ok(token),
             crate::providers::gemini_cli::Login::Expired => {
-                anyhow::bail!(crate::providers::gemini_cli::EXPIRED_LOGIN_REFUSAL)
+                Err(GeminiAuthError::ExpiredCliLogin.into())
             }
             crate::providers::gemini_cli::Login::Missing => Err(Self::missing_credential_error()),
         }
@@ -334,13 +362,7 @@ impl GeminiProvider {
 
     /// The error a Gemini provider without a usable credential fails with.
     fn missing_credential_error() -> anyhow::Error {
-        anyhow::anyhow!(
-            "Gemini API key not found. Options:\n\
-             1. Set GEMINI_API_KEY env var\n\
-             2. Run `gemini` CLI to authenticate (tokens will be reused)\n\
-             3. Get an API key from https://aistudio.google.com/app/apikey\n\
-             4. Run `rantaiclaw onboard` to configure"
-        )
+        GeminiAuthError::MissingCredential.into()
     }
 
     fn resolve_oauth_project_id() -> Option<String> {
@@ -368,11 +390,6 @@ impl GeminiProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let auth = self
-            .auth
-            .as_ref()
-            .ok_or_else(Self::missing_credential_error)?;
-
         let request = GenerateContentRequest {
             contents,
             system_instruction,
@@ -382,10 +399,10 @@ impl GeminiProvider {
             },
         };
 
-        let url = Self::build_generate_content_url(model, auth);
+        let url = Self::build_generate_content_url(model, &self.auth);
 
         let response = self
-            .build_generate_content_request(auth, &url, &request, model)?
+            .build_generate_content_request(&url, &request, model)?
             .send()
             .await?;
 
@@ -415,6 +432,13 @@ impl GeminiProvider {
 
 #[async_trait]
 impl Provider for GeminiProvider {
+    /// The provider itself: the factory builds this type, so a test that
+    /// reaches it through the wrappers has reached the factory's build.
+    #[cfg(test)]
+    fn test_as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -491,26 +515,24 @@ impl Provider for GeminiProvider {
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
-        if let Some(auth) = self.auth.as_ref() {
-            // cloudcode-pa does not expose a lightweight model-list probe like the public API.
-            // Avoid false negatives for valid Gemini CLI OAuth credentials.
-            if auth.is_oauth() {
-                return Ok(());
-            }
-
-            let url = match auth.api_key() {
-                Some(key) => {
-                    format!("https://generativelanguage.googleapis.com/v1beta/models?key={key}")
-                }
-                None => "https://generativelanguage.googleapis.com/v1beta/models".to_string(),
-            };
-
-            self.http_client()
-                .get(&url)
-                .send()
-                .await?
-                .error_for_status()?;
+        // cloudcode-pa does not expose a lightweight model-list probe like the public API.
+        // Avoid false negatives for valid Gemini CLI OAuth credentials.
+        if self.auth.is_oauth() {
+            return Ok(());
         }
+
+        // The CLI login is the only credential without a key, and it returned
+        // above: what is left always carries one.
+        let Some(key) = self.auth.api_key() else {
+            return Ok(());
+        };
+        let url = format!("https://generativelanguage.googleapis.com/v1beta/models?key={key}");
+
+        self.http_client()
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?;
         Ok(())
     }
 }
@@ -542,10 +564,7 @@ mod tests {
 
     /// The credential the provider resolved when it was built.
     fn cli_login_auth(provider: &GeminiProvider) -> &GeminiAuth {
-        provider
-            .auth
-            .as_ref()
-            .expect("the provider uses the Gemini CLI login")
+        &provider.auth
     }
 
     #[test]
@@ -570,34 +589,40 @@ mod tests {
         let provider = GeminiProvider::new(Some("test-api-key"));
         assert!(matches!(
             provider.auth,
-            Some(GeminiAuth::ExplicitKey(ref key)) if key == "test-api-key"
+            GeminiAuth::ExplicitKey(ref key) if key == "test-api-key"
         ));
     }
 
     #[test]
     fn provider_rejects_empty_key() {
         let provider = GeminiProvider::new(Some(""));
-        assert!(!matches!(provider.auth, Some(GeminiAuth::ExplicitKey(_))));
+        assert!(!matches!(provider.auth, GeminiAuth::ExplicitKey(_)));
     }
 
     #[test]
     fn auth_source_explicit_key() {
         let provider = GeminiProvider {
-            auth: Some(GeminiAuth::ExplicitKey("key".into())),
+            auth: GeminiAuth::ExplicitKey("key".into()),
         };
         assert_eq!(provider.auth_source(), "config");
     }
 
-    #[test]
-    fn auth_source_none_without_credentials() {
-        let provider = GeminiProvider { auth: None };
-        assert_eq!(provider.auth_source(), "none");
+    /// Without a key the provider still has a way in: the Gemini CLI login,
+    /// read when a request is sent. There is no "no credential" state to be
+    /// in — a login made later is used without a restart.
+    #[tokio::test]
+    async fn auth_source_is_the_cli_login_without_a_key() {
+        let _guard = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+
+        let provider = GeminiProvider::new(None);
+        assert_eq!(provider.auth_source(), "Gemini CLI OAuth");
     }
 
     #[test]
     fn auth_source_oauth() {
         let provider = GeminiProvider {
-            auth: Some(GeminiAuth::CliLogin),
+            auth: GeminiAuth::CliLogin,
         };
         assert_eq!(provider.auth_source(), "Gemini CLI OAuth");
     }
@@ -684,7 +709,7 @@ mod tests {
         let auth = cli_login_auth(&provider);
         let url = GeminiProvider::build_generate_content_url("gemini-2.0-flash", auth);
         let request = provider
-            .build_generate_content_request(auth, &url, &user_request(), "gemini-2.0-flash")
+            .build_generate_content_request(&url, &user_request(), "gemini-2.0-flash")
             .expect("a valid login builds a request")
             .build()
             .expect("the request builds");
@@ -715,7 +740,7 @@ mod tests {
         let auth = cli_login_auth(&provider);
         let url = GeminiProvider::build_generate_content_url("gemini-2.0-flash", auth);
         let request = provider
-            .build_generate_content_request(auth, &url, &user_request(), "gemini-2.0-flash")
+            .build_generate_content_request(&url, &user_request(), "gemini-2.0-flash")
             .expect("a renewed login builds a request")
             .build()
             .expect("the request builds");
@@ -731,6 +756,9 @@ mod tests {
 
     /// A login that died after the provider was built fails the next
     /// request with the fix named, and no request is built.
+    ///
+    /// The assertion is on the request that WOULD be built: a test must never
+    /// send anything to Google, not even a request the provider refuses.
     #[tokio::test]
     async fn an_expired_cli_login_refuses_the_next_request() {
         let _guard = crate::test_env::ENV_LOCK.lock().await;
@@ -745,25 +773,13 @@ mod tests {
         write_gemini_creds_with_expiry(&home, "ya29.mock-token", -3_600_000);
 
         let error = provider
-            .chat_with_system(None, "hello", "gemini-2.0-flash", 0.7)
-            .await
+            .build_request_for_test("gemini-2.0-flash")
             .expect_err("an expired login must fail the request");
         assert!(error.to_string().contains(EXPIRED_LOGIN_REFUSAL), "{error}");
-
-        // No request is built at all: the login is refused before the
-        // request exists.
-        let auth = cli_login_auth(&provider);
-        let url = GeminiProvider::build_generate_content_url("gemini-2.0-flash", auth);
-        assert!(
-            provider
-                .build_generate_content_request(auth, &url, &user_request(), "gemini-2.0-flash")
-                .is_err(),
-            "an expired login must not build a request"
-        );
     }
 
     /// The login file is gone when the request is sent: the request is
-    /// refused with the "no credential" message.
+    /// refused with the "no credential" message, and nothing is built.
     #[tokio::test]
     async fn a_deleted_cli_login_file_refuses_the_next_request() {
         let _guard = crate::test_env::ENV_LOCK.lock().await;
@@ -776,13 +792,58 @@ mod tests {
         std::fs::remove_file(gemini_creds_path(&home)).expect("remove creds");
 
         let error = provider
-            .chat_with_system(None, "hello", "gemini-2.0-flash", 0.7)
-            .await
+            .build_request_for_test("gemini-2.0-flash")
             .expect_err("a missing login must fail the request");
         assert!(
             error.to_string().contains("Gemini API key not found"),
             "{error}"
         );
+    }
+
+    /// A login made after the provider was built is used on the next
+    /// request: no restart, and the token is the one the login file holds.
+    #[tokio::test]
+    async fn a_login_made_after_the_provider_was_built_is_used_on_the_next_request() {
+        let _guard = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let (home, _home_guard) = gemini_home();
+
+        // No login file yet: the provider is built anyway.
+        let provider = GeminiProvider::new(None);
+
+        // The operator logs in.
+        write_gemini_creds_with_expiry(&home, "ya29.mock-token", 3_600_000);
+
+        let request = provider
+            .build_request_for_test("gemini-2.0-flash")
+            .expect("a login made after the build is used on the next request");
+
+        assert_eq!(
+            request
+                .headers()
+                .get(AUTHORIZATION)
+                .and_then(|h| h.to_str().ok()),
+            Some("Bearer ya29.mock-token")
+        );
+    }
+
+    /// With no login file and no key, the request is refused with the fix
+    /// named — and the fix says no restart is needed.
+    #[tokio::test]
+    async fn a_missing_login_refuses_the_request_with_the_fix_named() {
+        let _guard = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let (_home, _home_guard) = gemini_home();
+
+        let provider = GeminiProvider::new(None);
+
+        let error = provider
+            .build_request_for_test("gemini-2.0-flash")
+            .expect_err("a missing login must fail the request");
+        let message = error.to_string();
+        assert!(message.contains("Gemini API key not found"), "{message}");
+        assert!(message.contains("GEMINI_API_KEY"), "{message}");
+        assert!(message.contains("no restart needed"), "{message}");
     }
 
     #[tokio::test]
@@ -799,7 +860,7 @@ mod tests {
         let body = user_request();
 
         let request = provider
-            .build_generate_content_request(auth, &url, &body, "models/gemini-2.0-flash")
+            .build_generate_content_request(&url, &body, "models/gemini-2.0-flash")
             .expect("a valid login builds a request")
             .build()
             .expect("the request builds");
@@ -819,14 +880,14 @@ mod tests {
     #[test]
     fn api_key_request_does_not_set_bearer_header() {
         let provider = GeminiProvider {
-            auth: Some(GeminiAuth::ExplicitKey("api-key-123".into())),
+            auth: GeminiAuth::ExplicitKey("api-key-123".into()),
         };
         let auth = GeminiAuth::ExplicitKey("api-key-123".into());
         let url = GeminiProvider::build_generate_content_url("gemini-2.0-flash", &auth);
         let body = user_request();
 
         let request = provider
-            .build_generate_content_request(&auth, &url, &body, "gemini-2.0-flash")
+            .build_generate_content_request(&url, &body, "gemini-2.0-flash")
             .expect("an API key builds a request")
             .build()
             .unwrap();
@@ -965,16 +1026,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn warmup_without_key_is_noop() {
-        let provider = GeminiProvider { auth: None };
-        let result = provider.warmup().await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
     async fn warmup_oauth_is_noop() {
         let provider = GeminiProvider {
-            auth: Some(GeminiAuth::CliLogin),
+            auth: GeminiAuth::CliLogin,
         };
         let result = provider.warmup().await;
         assert!(result.is_ok());

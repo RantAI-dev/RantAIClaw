@@ -517,6 +517,24 @@ pub trait Provider: Send + Sync {
         stream::empty().boxed()
     }
 
+    /// The concrete provider behind this one, for a test that needs to reach
+    /// the implementation a factory built.
+    ///
+    /// The factory hands back a `Box<dyn Provider>`, and the gateway wraps
+    /// that box in a retry wrapper, a router and a hint guard. A test that
+    /// wants to prove what the FACTORY built has to get past those wrappers,
+    /// and it cannot: `downcast` needs the concrete type, and the box hides
+    /// it. This accessor is the way through.
+    ///
+    /// It is test-only on purpose. The wrappers exist to be opaque to the
+    /// doors that use them, and opening them up for production code would be
+    /// an interface nobody asked for. The default is `None`: a provider with
+    /// nothing behind it to show.
+    #[cfg(test)]
+    fn test_as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+
     /// Streaming chat with history.
     /// Default implementation falls back to stream_chat_with_system with last user message.
     fn stream_chat_with_history(
