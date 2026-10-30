@@ -175,13 +175,22 @@ stop message names what to fix. The fatal set is:
 - an unknown `[runtime] kind`
 - a profile selection the door refuses (`--profile <name>` or `RANTAICLAW_PROFILE` naming a
   profile that cannot be selected)
+- the active-profile marker names a profile that does not exist
+- a `config.toml` that does not parse as TOML or does not fit the schema
+- a `config.toml` value the schema refuses
+- a `config.toml` secret the `.secret_key` on disk cannot decrypt
+- a `schema_version` that is negative, malformed or newer than the binary supports
 
 A missing API key, a missing auth profile and a DNS lookup failure are NOT in that set: they are
 retried, because `rantaiclaw auth login`, an environment variable, a key stored in the config later
-or a resolver that comes back can supply them without the config file changing.
+or a resolver that comes back can supply them without the config file changing. A secret that is
+present but that the key on disk cannot decrypt is a different case — the files on disk have to
+change before the daemon can start.
 
 The profile-door refusal is NOT retried either: it names the profile it could not select, and the
-daemon exits before it starts, so the operator has to fix the selection.
+daemon exits before it starts, so the operator has to fix the selection. The config-load refusals
+are not retried either: the same files fail the same way on every start, so a restart cannot fix
+them.
 
 systemd units rendered by current versions carry `RestartPreventExitStatus=78`, so systemd does not
 restart the daemon — fix the config and start the service again. On launchd (macOS) the job is

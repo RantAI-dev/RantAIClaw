@@ -1,8 +1,12 @@
 pub mod api_url;
 pub mod fingerprint;
 pub mod migrations;
+pub mod persistent;
 pub mod schema;
 pub mod watcher;
+
+#[allow(unused_imports)]
+pub use persistent::PersistentConfigError;
 
 #[allow(unused_imports)]
 pub use schema::{

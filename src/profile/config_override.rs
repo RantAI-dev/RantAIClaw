@@ -356,7 +356,14 @@ pub fn refuse_switch(name: &str) -> anyhow::Result<()> {
 }
 
 /// A non-empty environment variable, trimmed.
-fn non_empty_env(key: &str) -> Option<String> {
+///
+/// This is THE rule for "is this override variable set?". The config loader
+/// ([`crate::config::schema::resolve_runtime_config_dirs`]) and
+/// [`apply_env_overrides`] use it too, so a value of spaces is unset for the
+/// loader and for the door alike. A loader that read the variable untrimmed
+/// would resolve a config directory nobody named, while the door — which
+/// trims — would let a profile switch through that the loader then ignores.
+pub fn non_empty_env(key: &str) -> Option<String> {
     std::env::var(key)
         .ok()
         .map(|value| value.trim().to_string())

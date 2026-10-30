@@ -47,6 +47,28 @@ impl Sandbox {
             .join(name)
     }
 
+    /// Remove the environment a run must not inherit.
+    ///
+    /// The door variables would move the config away from the sandbox, and
+    /// the credentials and the provider/model variables are folded onto the
+    /// config at load: an inherited `API_KEY` or a `PROVIDER` would change
+    /// what the run reads, so every run starts from a clean slate.
+    fn clear_inherited_env(command: &mut Command) {
+        for name in [
+            "RANTAICLAW_CONFIG_DIR",
+            "RANTAICLAW_WORKSPACE",
+            "RANTAICLAW_PROFILE",
+            "RANTAICLAW_API_KEY",
+            "API_KEY",
+            "RANTAICLAW_PROVIDER",
+            "PROVIDER",
+            "RANTAICLAW_MODEL",
+            "MODEL",
+        ] {
+            command.env_remove(name);
+        }
+    }
+
     /// Run the binary in the sandbox and return its exit code and output.
     ///
     /// `profile` is the `RANTAICLAW_PROFILE` value (empty: unset).
@@ -57,12 +79,8 @@ impl Sandbox {
             .args(args)
             .env("HOME", self.home.path())
             .env("XDG_CONFIG_HOME", self.home.path().join("xdg"))
-            // An override inherited from the parent shell would change what
-            // these runs exercise.
-            .env_remove("RANTAICLAW_CONFIG_DIR")
-            .env_remove("RANTAICLAW_WORKSPACE")
-            .env_remove("RANTAICLAW_PROFILE")
             .env("RUST_LOG", "warn");
+        Self::clear_inherited_env(&mut command);
         if under_override {
             command.env("RANTAICLAW_CONFIG_DIR", self.config_dir.path());
         }
@@ -87,6 +105,20 @@ impl Sandbox {
     /// output goes to a file, not a pipe: a daemon that logs more than a
     /// pipe buffer holds would block on a full pipe instead of exiting.
     fn run_with_deadline(&self, args: &[&str], profile: &str) -> (i32, String) {
+        self.run_with_deadline_and_env(args, profile, &[])
+    }
+
+    /// Run the binary in the sandbox with extra environment variables and
+    /// wait for it with a deadline.
+    ///
+    /// The extra variables are set AFTER the inherited ones are removed, so
+    /// a run can name exactly the environment it exercises.
+    fn run_with_deadline_and_env(
+        &self,
+        args: &[&str],
+        profile: &str,
+        env: &[(&str, &str)],
+    ) -> (i32, String) {
         let log = self.home.path().join("run.log");
         let stdout = std::fs::File::create(&log).expect("the log file");
         let stderr = stdout.try_clone().expect("the log file clone");
@@ -95,12 +127,13 @@ impl Sandbox {
             .args(args)
             .env("HOME", self.home.path())
             .env("XDG_CONFIG_HOME", self.home.path().join("xdg"))
-            .env_remove("RANTAICLAW_CONFIG_DIR")
-            .env_remove("RANTAICLAW_WORKSPACE")
-            .env_remove("RANTAICLAW_PROFILE")
             .env("RUST_LOG", "warn")
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
+        Self::clear_inherited_env(&mut command);
+        for (name, value) in env {
+            command.env(name, value);
+        }
         if !profile.is_empty() {
             command.env("RANTAICLAW_PROFILE", profile);
         }
@@ -320,4 +353,242 @@ fn a_non_daemon_command_does_not_exit_ex_config_at_the_profile_door() {
 
     assert_ne!(code, 0, "the selection must be refused: {said}");
     assert_ne!(code, 78, "only the daemon path exits EX_CONFIG: {said}");
+}
+
+/// The flag door refuses a profile that names nothing, and the daemon path
+/// exits EX_CONFIG (78) there too: the same refusal, the same exit code.
+#[test]
+fn the_daemon_path_exits_ex_config_when_the_profile_flag_refuses() {
+    let sandbox = Sandbox::new();
+
+    let (code, said) = sandbox.run_with_deadline(&["--profile", "ghost", "daemon"], "");
+
+    assert_eq!(
+        code, 78,
+        "the daemon path must exit EX_CONFIG, so the unit stops: {said}"
+    );
+    assert!(
+        said.contains("ghost"),
+        "the refusal must name the profile: {said}"
+    );
+}
+
+/// A daemon whose active-profile marker names a profile directory that is
+/// gone cannot load its config. The marker is a fact on disk, so the same
+/// load fails the same way on every restart: the daemon exits EX_CONFIG
+/// (78) and the unit stays stopped instead of being restarted every few
+/// seconds.
+#[test]
+fn the_daemon_path_exits_ex_config_when_the_config_cannot_be_loaded() {
+    let sandbox = Sandbox::new();
+    // The marker names a profile that does not exist. No flag and no
+    // environment name a profile, so the doors do not run and the failure
+    // surfaces at the config load.
+    std::fs::create_dir_all(sandbox.home.path().join(".rantaiclaw")).expect("the config root");
+    std::fs::write(
+        sandbox.home.path().join(".rantaiclaw/active_profile"),
+        "ghost\n",
+    )
+    .expect("the marker names a profile that does not exist");
+    assert!(
+        !sandbox.profile_dir("ghost").exists(),
+        "premise: the profile the marker names does not exist"
+    );
+
+    let (code, said) = sandbox.run_with_deadline(&["daemon"], "");
+
+    assert_eq!(
+        code, 78,
+        "the daemon path must exit EX_CONFIG, so the unit stops: {said}"
+    );
+    assert!(
+        said.contains("ghost"),
+        "the refusal must name the profile: {said}"
+    );
+}
+
+/// Every other command keeps exit 1 for the same broken config: only the
+/// daemon is supervised by a unit that restarts it.
+#[test]
+fn a_non_daemon_command_keeps_exit_one_when_the_config_cannot_be_loaded() {
+    let sandbox = Sandbox::new();
+    std::fs::create_dir_all(sandbox.home.path().join(".rantaiclaw")).expect("the config root");
+    std::fs::write(
+        sandbox.home.path().join(".rantaiclaw/active_profile"),
+        "ghost\n",
+    )
+    .expect("the marker names a profile that does not exist");
+
+    let (code, said) = sandbox.run(&["status"], "", false);
+
+    assert_eq!(code, 1, "every other command keeps exit 1: {said}");
+    assert!(
+        said.contains("ghost"),
+        "the refusal must name the profile: {said}"
+    );
+}
+
+/// A config that is valid TOML but does not fit the schema is a fact on
+/// disk too: the same file fails the same way on every start, so the daemon
+/// exits EX_CONFIG (78) and the unit stays stopped instead of being
+/// restarted every few seconds.
+#[test]
+fn the_daemon_path_exits_ex_config_when_the_config_does_not_fit_the_schema() {
+    let sandbox = Sandbox::new();
+    let profile_dir = sandbox.profile_dir("default");
+    std::fs::create_dir_all(&profile_dir).expect("the profile dir");
+    std::fs::write(
+        profile_dir.join("config.toml"),
+        // The current schema version, so the failure is the shape of the
+        // file and not a migration: `default_temperature` is a number, and
+        // a string does not fit it.
+        "schema_version = 40\ndefault_temperature = \"hot\"\n",
+    )
+    .expect("the config does not fit the schema");
+
+    let (code, said) = sandbox.run_with_deadline(&["daemon"], "");
+
+    assert_eq!(
+        code, 78,
+        "the daemon path must exit EX_CONFIG, so the unit stops: {said}"
+    );
+    assert!(
+        said.contains("default_temperature"),
+        "the refusal must name the field that does not fit: {said}"
+    );
+}
+
+/// A config that parses and deserialises but holds a value the schema
+/// refuses is a fact on disk too: the same file fails the same way on every
+/// start, so the daemon exits EX_CONFIG (78) and the unit stays stopped
+/// instead of being restarted every few seconds.
+#[test]
+fn the_daemon_path_exits_ex_config_when_the_config_holds_an_invalid_value() {
+    let sandbox = Sandbox::new();
+    let profile_dir = sandbox.profile_dir("default");
+    std::fs::create_dir_all(&profile_dir).expect("the profile dir");
+    std::fs::write(
+        profile_dir.join("config.toml"),
+        // The current schema version, so the failure is the value and not a
+        // migration: `default_temperature` must be between 0.0 and 2.0, and
+        // 9.0 is a number the schema refuses.
+        "schema_version = 40\ndefault_temperature = 9.0\n",
+    )
+    .expect("the config holds a value that does not fit");
+
+    let (code, said) = sandbox.run_with_deadline(&["daemon"], "");
+
+    assert_eq!(
+        code, 78,
+        "the daemon path must exit EX_CONFIG, so the unit stops: {said}"
+    );
+    assert!(
+        said.contains("default_temperature"),
+        "the refusal must name the field that does not fit: {said}"
+    );
+}
+
+/// A ciphertext the key on disk cannot decrypt is a fact on disk too: the
+/// same value and the same key fail the same way on every start, so the
+/// daemon exits EX_CONFIG (78) and the unit stays stopped instead of being
+/// restarted every few seconds.
+#[test]
+fn the_daemon_path_exits_ex_config_when_the_config_holds_an_undecryptable_secret() {
+    let sandbox = Sandbox::new();
+    let profile_dir = sandbox.profile_dir("default");
+    std::fs::create_dir_all(&profile_dir).expect("the profile dir");
+    std::fs::write(
+        profile_dir.join("config.toml"),
+        // The current schema version, so the failure is the secret and not a
+        // migration. `enc2:` is the encrypted prefix, and the blob behind it
+        // is too short to hold a nonce, so the decrypt fails before any key
+        // is read.
+        "schema_version = 40\napi_key = \"enc2:00\"\n",
+    )
+    .expect("the config holds a secret that cannot be decrypted");
+
+    let (code, said) = sandbox.run_with_deadline(&["daemon"], "");
+
+    assert_eq!(
+        code, 78,
+        "the daemon path must exit EX_CONFIG, so the unit stops: {said}"
+    );
+    assert!(
+        said.contains("api_key"),
+        "the refusal must name the field that cannot be decrypted: {said}"
+    );
+}
+
+/// Every other command keeps exit 1 for a config that holds a value the
+/// schema refuses: only the daemon is supervised by a unit that restarts it.
+#[test]
+fn a_non_daemon_command_keeps_exit_one_when_the_config_holds_an_invalid_value() {
+    let sandbox = Sandbox::new();
+    let profile_dir = sandbox.profile_dir("default");
+    std::fs::create_dir_all(&profile_dir).expect("the profile dir");
+    std::fs::write(
+        profile_dir.join("config.toml"),
+        "schema_version = 40\ndefault_temperature = 9.0\n",
+    )
+    .expect("the config holds a value that does not fit");
+
+    let (code, said) = sandbox.run(&["status"], "", false);
+
+    assert_eq!(code, 1, "every other command keeps exit 1: {said}");
+    assert!(
+        said.contains("default_temperature"),
+        "the refusal must name the field that does not fit: {said}"
+    );
+}
+
+/// Every other command keeps exit 1 for a config that holds a secret the key
+/// cannot decrypt: only the daemon is supervised by a unit that restarts it.
+#[test]
+fn a_non_daemon_command_keeps_exit_one_when_the_config_holds_an_undecryptable_secret() {
+    let sandbox = Sandbox::new();
+    let profile_dir = sandbox.profile_dir("default");
+    std::fs::create_dir_all(&profile_dir).expect("the profile dir");
+    std::fs::write(
+        profile_dir.join("config.toml"),
+        "schema_version = 40\napi_key = \"enc2:00\"\n",
+    )
+    .expect("the config holds a secret that cannot be decrypted");
+
+    let (code, said) = sandbox.run(&["status"], "", false);
+
+    assert_eq!(code, 1, "every other command keeps exit 1: {said}");
+    assert!(
+        said.contains("api_key"),
+        "the refusal must name the field that cannot be decrypted: {said}"
+    );
+}
+
+/// A config that does not exist yet is written from the defaults, and the
+/// environment can fold a value onto it that the schema refuses. The
+/// environment belongs to the unit, so the same failure repeats on every
+/// restart: the daemon exits EX_CONFIG (78) and the unit stays stopped
+/// instead of being restarted every few seconds.
+#[test]
+fn the_daemon_path_exits_ex_config_when_the_environment_holds_an_invalid_value() {
+    let sandbox = Sandbox::new();
+    // No config file exists, so the daemon writes one from the defaults and
+    // then folds the environment onto it: a ':cloud' model needs a remote
+    // endpoint, and the default `api_url` is unset.
+    let (code, said) = sandbox.run_with_deadline_and_env(
+        &["daemon"],
+        "",
+        &[
+            ("RANTAICLAW_PROVIDER", "ollama"),
+            ("RANTAICLAW_MODEL", "llama3:cloud"),
+        ],
+    );
+
+    assert_eq!(
+        code, 78,
+        "the daemon path must exit EX_CONFIG, so the unit stops: {said}"
+    );
+    assert!(
+        said.contains("default_model"),
+        "the refusal must name the field that does not fit: {said}"
+    );
 }

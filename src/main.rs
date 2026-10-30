@@ -1369,16 +1369,35 @@ fn is_profile_command(command: Option<&Commands>) -> bool {
     matches!(command, Some(Commands::Profile { .. }))
 }
 
-/// The exit a refusal at a profile door deserves.
+/// The exit a daemon refusal deserves.
 ///
 /// The daemon path exits EX_CONFIG (78): the installed unit carries
 /// `RestartPreventExitStatus=78`, so a daemon that cannot start stays
 /// stopped instead of being restarted every few seconds, and the journal
 /// keeps the sentence that says why. Every other command keeps exit 1.
-fn profile_door_refusal(command: Option<&Commands>, error: anyhow::Error) -> anyhow::Error {
+fn daemon_refusal(command: Option<&Commands>, error: anyhow::Error) -> anyhow::Error {
     if matches!(command, Some(Commands::Daemon { .. })) {
         eprintln!("Error: {error:#}");
         std::process::exit(gateway::EX_CONFIG_EXIT_CODE);
+    }
+    error
+}
+
+/// The exit a config the daemon cannot load deserves.
+///
+/// Only a failure that follows from the files on disk alone — a profile
+/// that names nothing, a config that does not parse, a config written by a
+/// newer schema — gets EX_CONFIG (78): the same files fail the same way on
+/// every restart, so the unit must stay stopped. A failure that can pass on
+/// a retry (a write that failed for disk space during the first-run init)
+/// keeps exit 1, so systemd keeps retrying it.
+fn config_load_refusal(command: Option<&Commands>, error: anyhow::Error) -> anyhow::Error {
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<config::PersistentConfigError>()
+            .is_some()
+    }) {
+        return daemon_refusal(command, error);
     }
     error
 }
@@ -1438,7 +1457,7 @@ async fn main() -> Result<()> {
         // to become a new, empty profile directory). `default` stays
         // bootstrappable for the first run.
         if let Err(e) = rantaiclaw::profile::ProfileManager::require_selectable(profile_name) {
-            return Err(profile_door_refusal(cli.command.as_ref(), e));
+            return Err(daemon_refusal(cli.command.as_ref(), e));
         }
         std::env::set_var("RANTAICLAW_PROFILE", profile_name);
     } else if !is_profile_command(cli.command.as_ref()) {
@@ -1453,7 +1472,7 @@ async fn main() -> Result<()> {
             if !env_profile.is_empty() {
                 if let Err(e) = rantaiclaw::profile::ProfileManager::require_selectable(env_profile)
                 {
-                    return Err(profile_door_refusal(cli.command.as_ref(), e));
+                    return Err(daemon_refusal(cli.command.as_ref(), e));
                 }
             }
         }
@@ -1905,7 +1924,16 @@ async fn main() -> Result<()> {
     }
 
     // All other commands need config loaded first
-    let mut config = Config::load_or_init().await?;
+    //
+    // A daemon whose config cannot be loaded must exit EX_CONFIG (78) when
+    // the failure follows from the files on disk alone: the same files fail
+    // the same way on every restart, so the unit must stay stopped instead
+    // of being restarted every few seconds. A failure that can pass on a
+    // retry keeps exit 1, so systemd keeps retrying it.
+    let mut config = match Config::load_or_init().await {
+        Ok(config) => config,
+        Err(error) => return Err(config_load_refusal(cli.command.as_ref(), error)),
+    };
     config.apply_env_overrides();
 
     match cli.command {
