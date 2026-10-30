@@ -1,3 +1,4 @@
+use super::gemini_error::GeminiAuthError;
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamOptions, StreamResult,
 };
@@ -18,6 +19,18 @@ use std::time::Duration;
 /// Check if an error is non-retryable (client errors that won't resolve with retries).
 fn is_non_retryable(err: &anyhow::Error) -> bool {
     if is_context_window_exceeded(err) {
+        return true;
+    }
+
+    // A Gemini credential refusal is decided locally, before anything is
+    // sent: the credential is missing, or the CLI login has expired. A retry
+    // cannot change the outcome — it can only spend the operator's time
+    // waiting out a backoff that ends in the same sentence. The refusal is a
+    // type, so it is recognised here and not by its wording.
+    if err
+        .chain()
+        .any(|cause| cause.downcast_ref::<GeminiAuthError>().is_some())
+    {
         return true;
     }
 
@@ -303,6 +316,17 @@ impl ReliableProvider {
 
 #[async_trait]
 impl Provider for ReliableProvider {
+    /// The first provider in the chain that has a concrete type to show.
+    ///
+    /// The chain holds the providers the factory built; a test that wants
+    /// one of them reaches it through here.
+    #[cfg(test)]
+    fn test_as_any(&self) -> Option<&dyn std::any::Any> {
+        self.providers
+            .iter()
+            .find_map(|(_, provider)| provider.test_as_any())
+    }
+
     async fn warmup(&self) -> anyhow::Result<()> {
         for (name, provider) in &self.providers {
             tracing::info!(provider = name, "Warming up provider connection pool");
@@ -934,6 +958,56 @@ mod tests {
         }
     }
 
+    /// A provider that counts the calls it receives and answers with the
+    /// refusal the real Gemini provider produced.
+    ///
+    /// The refusal is the one the FACTORY-built provider produced, taken at
+    /// the provider's own decision point, so the error the wrapper sees is
+    /// the real one and not a sentence this test wrote. A double that
+    /// FABRICATED the refusal would prove only that the wrapper recognises a
+    /// type it was handed.
+    ///
+    /// It never sends: the request is built by the provider's seam and the
+    /// refusal is handed back, so no test in this file can reach Google — not
+    /// even if the refusal logic were removed.
+    struct CallCounter {
+        calls: Arc<AtomicUsize>,
+        refusal: GeminiAuthError,
+    }
+
+    #[async_trait]
+    impl Provider for CallCounter {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(self.refusal.clone().into())
+        }
+    }
+
+    /// The refusal the FACTORY-built Gemini provider produces, as a type.
+    ///
+    /// The provider is the one the factory builds — the same one the gateway
+    /// uses — and the error is the one it produces for a request it refuses.
+    /// The refusal comes back as the typed error it is, so a test can prove
+    /// that the type survives the provider boundary and reaches the retry
+    /// wrapper, instead of reading the message for a hint.
+    fn factory_built_gemini_refusal(
+        gemini: &crate::providers::gemini::GeminiProvider,
+    ) -> anyhow::Result<GeminiAuthError> {
+        let error = gemini
+            .build_request_for_test("gemini-2.0-flash")
+            .expect_err("the request must be refused");
+        error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<GeminiAuthError>().cloned())
+            .ok_or_else(|| anyhow::anyhow!("the refusal must be a typed error: {error:?}"))
+    }
+
     /// Mock with a configurable vision capability.
     struct VisionMock(bool);
 
@@ -1278,6 +1352,108 @@ mod tests {
         // Primary should have been called only once (no retries)
         assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A refused Gemini CLI login fails the turn at once. The credential is
+    /// decided locally, before anything is sent, so a retry can only end in
+    /// the same sentence — it can only spend the operator's time waiting out
+    /// a backoff.
+    ///
+    /// The provider is the one the FACTORY builds and the refusal is the one
+    /// it produces: the type has to survive the provider boundary, or the
+    /// retry wrapper cannot recognise it.
+    #[tokio::test]
+    async fn a_refused_expired_gemini_cli_login_is_not_retried() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let (home, _home_guard) = crate::providers::gemini_cli::gemini_home();
+
+        crate::providers::gemini_cli::write_gemini_creds_with_expiry(
+            &home,
+            "ya29.mock-token",
+            -3_600_000,
+        );
+
+        let built = crate::providers::create_provider("gemini", None)
+            .expect("a keyless Gemini provider must be built");
+        let gemini = crate::providers::tests::gemini_provider_inside(built.as_ref())
+            .expect("the factory builds the Gemini CLI-login provider when there is no key");
+
+        let refusal = factory_built_gemini_refusal(gemini)
+            .expect("an expired Gemini CLI login must be refused with a typed error");
+        assert!(matches!(refusal, GeminiAuthError::ExpiredCliLogin));
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![(
+                "gemini".into(),
+                Box::new(CallCounter {
+                    calls: Arc::clone(&calls),
+                    refusal,
+                }) as Box<dyn Provider>,
+            )],
+            3,
+            1,
+        );
+
+        let error = provider
+            .simple_chat("hello", "gemini-2.0-flash", 0.0)
+            .await
+            .expect_err("a refused login must fail the turn");
+        assert!(error.to_string().contains("has expired"), "{error}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a refused Gemini CLI login must not be retried"
+        );
+    }
+
+    /// The same for the "no credential" refusal.
+    ///
+    /// The sentence names no hint the retry wrapper looks for, so the TYPE is
+    /// the only thing that can stop the retries — which is why the refusal
+    /// has to be a type and not a wording.
+    #[tokio::test]
+    async fn a_refused_missing_gemini_credential_is_not_retried() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let (_home, _home_guard) = crate::providers::gemini_cli::gemini_home();
+
+        let built = crate::providers::create_provider("gemini", None)
+            .expect("a keyless Gemini provider must be built");
+        let gemini = crate::providers::tests::gemini_provider_inside(built.as_ref())
+            .expect("the factory builds the Gemini CLI-login provider when there is no key");
+
+        let refusal = factory_built_gemini_refusal(gemini)
+            .expect("a missing Gemini credential must be refused with a typed error");
+        assert!(matches!(refusal, GeminiAuthError::MissingCredential));
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![(
+                "gemini".into(),
+                Box::new(CallCounter {
+                    calls: Arc::clone(&calls),
+                    refusal,
+                }) as Box<dyn Provider>,
+            )],
+            3,
+            1,
+        );
+
+        let error = provider
+            .simple_chat("hello", "gemini-2.0-flash", 0.0)
+            .await
+            .expect_err("a missing credential must fail the turn");
+        assert!(
+            error.to_string().contains("Gemini API key not found"),
+            "{error}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a missing Gemini credential must not be retried"
+        );
     }
 
     #[tokio::test]

@@ -159,6 +159,17 @@ impl RouterProvider {
 
 #[async_trait]
 impl Provider for RouterProvider {
+    /// The first routed provider that has a concrete type to show.
+    ///
+    /// The router holds a chain per route; a test that wants the provider
+    /// the factory built reaches it through here.
+    #[cfg(test)]
+    fn test_as_any(&self) -> Option<&dyn std::any::Any> {
+        self.providers
+            .iter()
+            .find_map(|(_, provider)| provider.test_as_any())
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -380,6 +391,13 @@ impl HintGuard {
 
 #[async_trait]
 impl Provider for HintGuard {
+    /// The wrapped provider's own answer: the guard adds a refusal, not a
+    /// provider, so what is behind it is what the factory built.
+    #[cfg(test)]
+    fn test_as_any(&self) -> Option<&dyn std::any::Any> {
+        self.inner.test_as_any()
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,

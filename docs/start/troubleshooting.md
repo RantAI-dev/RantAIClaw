@@ -203,6 +203,9 @@ refused before anything is sent, with the fix in the message:
 the Gemini CLI login has expired — run `gemini` to renew it, or set `GEMINI_API_KEY`
 ```
 
+The turn fails at once: the credential is decided locally, before anything is sent, so the refusal
+is not retried and no backoff wait sits in front of the message.
+
 Fix it with either one:
 
 ```bash
@@ -213,7 +216,9 @@ gemini          # renew the login, then retry
 export GEMINI_API_KEY=...   # use a key instead
 ```
 
-No restart is needed after `gemini`: the renewed login is used on the next request.
+No restart is needed after `gemini`: the renewed login is used on the next request. The same holds
+for a first login — the login file is read when a request is about to be sent, so logging in after
+the agent started is enough.
 
 With Gemini CLI's encrypted credential storage the login lives in the OS keychain and the file is
 deleted after the migration, so there is nothing to reuse and a key is the only way in.

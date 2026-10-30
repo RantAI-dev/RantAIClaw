@@ -27,6 +27,7 @@ pub mod config_error;
 pub mod copilot;
 pub mod gemini;
 pub mod gemini_cli;
+pub(crate) mod gemini_error;
 pub mod ollama;
 #[cfg(feature = "legacy-providers")]
 pub mod openai;
@@ -1316,18 +1317,13 @@ fn create_provider_with_url_and_options(
         #[cfg(not(feature = "legacy-providers"))]
         "gemini" | "google" | "google-gemini" => {
             // rig's gemini client only speaks the public endpoint; Gemini CLI
-            // OAuth tokens are scoped for cloudcode-pa. With no API key but a
-            // CLI login file that holds a token — valid or expired — route to
-            // the legacy provider (handles cloudcode-pa); otherwise the rig
-            // path (streaming + native tools). An expired login still routes
-            // here: the request that uses it is refused with the fix named,
-            // which beats a key-less rig path that cannot work either.
-            if key.is_none()
-                && !matches!(
-                    gemini_cli::read_gemini_cli_login(),
-                    gemini_cli::Login::Missing
-                )
-            {
+            // OAuth tokens are scoped for cloudcode-pa. With an API key the
+            // rig path stays the default (streaming + native tools). Without
+            // one, the CLI-login provider is used: the login file is read
+            // when a request is sent, so a login made later is used without a
+            // restart, and a missing one fails that turn with the fix named.
+            // The build never fails because of the login's state.
+            if key.is_none() {
                 Ok(Box::new(gemini::GeminiProvider::new(key)))
             } else {
                 Ok(Box::new(rig_native::RigProvider::for_provider("gemini", key)?))
@@ -2056,6 +2052,21 @@ pub(crate) mod tests {
         pub(crate) credential: Option<String>,
     }
 
+    /// The Gemini provider a factory-built provider holds, if any.
+    ///
+    /// The factory hands back a `Box<dyn Provider>`, and the routed factory
+    /// wraps it in a retry wrapper and a hint guard. A test that wants to
+    /// prove what the FACTORY built has to reach through those wrappers: a
+    /// provider the test builds next to the factory's one proves something
+    /// else, and the two can drift apart.
+    pub(crate) fn gemini_provider_inside(
+        provider: &dyn Provider,
+    ) -> Option<&gemini::GeminiProvider> {
+        provider
+            .test_as_any()
+            .and_then(|inner| inner.downcast_ref::<gemini::GeminiProvider>())
+    }
+
     /// The calls the recording provider has seen, oldest first.
     static RECORDED_CALLS: Mutex<Vec<RecordedCall>> = Mutex::new(Vec::new());
 
@@ -2592,6 +2603,11 @@ pub(crate) mod tests {
     /// Building a Gemini provider never fails because of the login's state:
     /// an expired login is refused when the request is sent, with the fix
     /// named. The gateway and the channels start with an expired login.
+    ///
+    /// The refusal is asserted on the provider the FACTORY built — not on one
+    /// the test builds next to it — and on the request that WOULD be built:
+    /// a test must never send anything to Google, not even a request the
+    /// provider refuses.
     #[tokio::test]
     async fn an_expired_gemini_cli_login_does_not_fail_the_provider_build() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
@@ -2603,9 +2619,11 @@ pub(crate) mod tests {
         let provider = create_provider("gemini", None)
             .expect("an expired Gemini CLI login must not fail the provider build");
 
-        let error = provider
-            .chat_with_system(None, "hello", "gemini-2.0-flash", 0.7)
-            .await
+        let gemini = gemini_provider_inside(provider.as_ref())
+            .expect("the factory builds the Gemini CLI-login provider when there is no key");
+
+        let error = gemini
+            .build_request_for_test("gemini-2.0-flash")
             .expect_err("an expired Gemini CLI login must fail the request");
         assert!(
             error
@@ -2613,10 +2631,20 @@ pub(crate) mod tests {
                 .contains(gemini_cli::EXPIRED_LOGIN_REFUSAL),
             "{error}"
         );
+        // The refusal is a TYPE, so the retry wrapper recognises it without
+        // reading the message. The type has to survive the provider
+        // boundary for that to hold.
+        assert!(
+            error.chain().any(|cause| cause
+                .downcast_ref::<gemini_error::GeminiAuthError>()
+                .is_some()),
+            "the refusal must reach the retry wrapper as a typed error: {error:?}"
+        );
     }
 
     /// The same through the routed factory the gateway builds its provider
-    /// with: the door stays open, and the turn carries the refusal.
+    /// with: the door stays open, and the refusal the wrapped provider
+    /// produces is a typed one.
     #[tokio::test]
     async fn the_routed_factory_builds_a_provider_with_an_expired_gemini_cli_login() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
@@ -2643,9 +2671,13 @@ pub(crate) mod tests {
         )
         .expect("an expired Gemini CLI login must not fail the provider build");
 
-        let error = provider
-            .chat_with_system(None, "hello", "gemini-2.0-flash", 0.7)
-            .await
+        // The provider the ROUTED factory built, reached through the retry
+        // wrapper and the hint guard it wraps the build in.
+        let gemini = gemini_provider_inside(provider.as_ref())
+            .expect("the routed factory builds the Gemini CLI-login provider when there is no key");
+
+        let error = gemini
+            .build_request_for_test("gemini-2.0-flash")
             .expect_err("an expired Gemini CLI login must fail the request");
         assert!(
             error
@@ -2653,6 +2685,71 @@ pub(crate) mod tests {
                 .contains(gemini_cli::EXPIRED_LOGIN_REFUSAL),
             "{error}"
         );
+        assert!(
+            error.chain().any(|cause| cause
+                .downcast_ref::<gemini_error::GeminiAuthError>()
+                .is_some()),
+            "the refusal must reach the retry wrapper as a typed error: {error:?}"
+        );
+    }
+
+    /// With no key and no login file at all, the Gemini provider is still
+    /// built: the login file is read when a request is sent, so a login made
+    /// later is used without a restart — and the build never fails because of
+    /// the login's state.
+    #[tokio::test]
+    async fn a_keyless_gemini_provider_is_built_without_a_login_file() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let (_home, _home_guard) = gemini_cli::gemini_home();
+
+        let provider = create_provider("gemini", None).expect(
+            "a keyless Gemini provider must be built: the login is read when a request is sent",
+        );
+
+        let gemini = gemini_provider_inside(provider.as_ref())
+            .expect("the factory builds the Gemini CLI-login provider when there is no key");
+
+        // No login file yet: the request is refused with the fix named, and
+        // the refusal is a type, so the retry wrapper recognises it.
+        let error = gemini
+            .build_request_for_test("gemini-2.0-flash")
+            .expect_err("a missing login must fail the request");
+        assert!(
+            error.to_string().contains("Gemini API key not found"),
+            "{error}"
+        );
+        assert!(
+            error.chain().any(|cause| cause
+                .downcast_ref::<gemini_error::GeminiAuthError>()
+                .is_some()),
+            "the refusal must reach the retry wrapper as a typed error: {error:?}"
+        );
+    }
+
+    /// The same through the routed factory the gateway builds its provider
+    /// with.
+    #[tokio::test]
+    async fn the_routed_factory_builds_a_keyless_gemini_provider() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let (_home, _home_guard) = gemini_cli::gemini_home();
+
+        let reliability = crate::config::ReliabilityConfig {
+            provider_retries: 0,
+            ..Default::default()
+        };
+        create_routed_provider_with_options(
+            "gemini",
+            None,
+            None,
+            &reliability,
+            &[],
+            "gemini-2.0-flash",
+            &|_: &str| -> Option<String> { None },
+            &ProviderRuntimeOptions::default(),
+        )
+        .expect("a keyless Gemini provider must be built");
     }
 
     #[test]

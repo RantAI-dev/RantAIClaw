@@ -729,7 +729,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it, or set `GEMINI_API_KEY`. Nothing is sent to Google. A login renewed by
   running `gemini` is used on the next request, with no restart. The gateway
   and the channels start with an expired login, and the refusal lands on the
-  turn that needs the credential.
+  turn that needs the credential. A refused login now fails that turn at once:
+  the credential is decided locally, before anything is sent, so a retry could
+  only end in the same sentence — it spent about three and a half seconds of
+  backoff first. The refusal is a type, not a wording, so the retry wrapper
+  recognises it without reading the message. A first login needs no restart
+  either: the login file is read when a request is about to be sent, so a login
+  made after the start is used on the next request. And building a provider
+  never fails because of the login's state: with Gemini as the provider and no
+  credentials at all, the gateway and the channels now start, and every turn
+  fails with the fix named, instead of the gateway build failing with
+  `gemini: GEMINI_API_KEY required`.
 - `rantaiclaw uninstall` could say it had preserved a file it had deleted,
   and `--purge` could delete a binary this account did not own. The report
   named `~/.rantaiclaw/.secret_key`, a path the profile layout no longer

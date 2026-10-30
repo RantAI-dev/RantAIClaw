@@ -119,6 +119,12 @@ a provider that does not report them adds nothing to the day's total.
   fails that turn with the fix named: run `gemini` again or set `GEMINI_API_KEY`. Nothing is sent to
   Google, so the expired login no longer comes back as a 401. No restart is needed after `gemini`:
   the renewed login is used on the next request.
+- A refused login fails the turn at once — no retry, no backoff wait. The credential is decided
+  locally, before anything is sent, so a retry could only end in the same sentence.
+- A first login needs no restart: the login file is read when a request is about to be sent, so a
+  login made after the agent started is used on the next request. Building the provider never fails
+  because of the login's state — with no key and no login file the gateway and the channels still
+  start, and every turn fails with the fix named.
 - With Gemini CLI's encrypted credential storage there is no `oauth_creds.json` to reuse — the login
   lives in the OS keychain and the file is deleted after the migration — so nothing is found and a key
   is needed.

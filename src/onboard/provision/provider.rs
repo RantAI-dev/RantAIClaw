@@ -355,9 +355,11 @@ impl TuiProvisioner for ProviderProvisioner {
                     // oracle boot uses — including the per-provider env-var
                     // fallback (OPENAI_API_KEY etc.) — so what passes here is
                     // exactly what will start later. Keyless-capable flows
-                    // (ollama, gemini CLI auth, exported env key) sail
-                    // through; a provider that cannot build without a key
-                    // (openai/anthropic/gemini route through rig and fail at
+                    // (ollama, exported env key) sail through, and so does
+                    // Gemini: its CLI login is read when a request is sent,
+                    // so the build succeeds with no key and no login file
+                    // yet. A provider that cannot build without a key
+                    // (openai/anthropic route through rig and fail at
                     // construction) must not be saved silently: that config
                     // used to abort every later launch — including
                     // `rantaiclaw setup`, the repair path — before the TUI

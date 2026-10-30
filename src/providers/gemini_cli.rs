@@ -54,6 +54,7 @@ pub enum GeminiCliLogin {
 }
 
 /// What the reader found in the login file.
+#[derive(PartialEq, Eq)]
 pub(crate) enum Login {
     /// No file, or no access token in it.
     Missing,
@@ -61,6 +62,21 @@ pub(crate) enum Login {
     Valid(String),
     /// A token that has expired.
     Expired,
+}
+
+/// The reader's answer, with the token left out.
+///
+/// `Debug` is what a failing assertion prints, and the token is a bearer
+/// credential: the derived `Debug` would put it in the test output, in a CI
+/// log and in a bug report. The variant is printed; the token is not.
+impl std::fmt::Debug for Login {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Login::Missing => f.write_str("Missing"),
+            Login::Valid(_) => f.write_str("Valid(<redacted>)"),
+            Login::Expired => f.write_str("Expired"),
+        }
+    }
 }
 
 /// Get the Gemini CLI config directory (`~/.gemini`).
@@ -113,18 +129,6 @@ pub fn gemini_cli_login() -> GeminiCliLogin {
         Login::Missing => GeminiCliLogin::Missing,
         Login::Valid(_) => GeminiCliLogin::Valid,
         Login::Expired => GeminiCliLogin::Expired,
-    }
-}
-
-/// Try to load the OAuth access token from Gemini CLI's cached credentials.
-/// Location: `~/.gemini/oauth_creds.json`.
-///
-/// An expired token yields `None`: it is not sent to Google, where it would
-/// come back as a 401.
-pub fn try_load_gemini_cli_token() -> Option<String> {
-    match read_gemini_cli_login() {
-        Login::Valid(token) => Some(token),
-        Login::Missing | Login::Expired => None,
     }
 }
 
@@ -287,7 +291,7 @@ mod tests {
         )
         .expect("write expired creds");
         assert!(!gemini_cli_has_credentials());
-        assert_eq!(try_load_gemini_cli_token(), None);
+        assert_eq!(read_gemini_cli_login(), Login::Expired);
 
         // Valid (far-future) token -> credentials detected.
         std::fs::write(
@@ -296,7 +300,10 @@ mod tests {
         )
         .expect("write valid creds");
         assert!(gemini_cli_has_credentials());
-        assert_eq!(try_load_gemini_cli_token(), Some("valid-token".to_string()));
+        assert_eq!(
+            read_gemini_cli_login(),
+            Login::Valid("valid-token".to_string())
+        );
 
         match original_home {
             Some(value) => std::env::set_var("HOME", value),
@@ -319,7 +326,7 @@ mod tests {
 
         assert_eq!(gemini_cli_login(), GeminiCliLogin::Expired);
         assert!(!gemini_cli_has_credentials());
-        assert_eq!(try_load_gemini_cli_token(), None);
+        assert_eq!(read_gemini_cli_login(), Login::Expired);
     }
 
     /// The same shape, one hour ahead: the token is used.
@@ -336,7 +343,7 @@ mod tests {
 
         assert_eq!(gemini_cli_login(), GeminiCliLogin::Valid);
         assert!(gemini_cli_has_credentials());
-        assert_eq!(try_load_gemini_cli_token(), Some("t".to_string()));
+        assert_eq!(read_gemini_cli_login(), Login::Valid("t".to_string()));
     }
 
     /// A token that dies in ten seconds is not sent: the margin covers the
@@ -353,7 +360,7 @@ mod tests {
         );
 
         assert_eq!(gemini_cli_login(), GeminiCliLogin::Expired);
-        assert_eq!(try_load_gemini_cli_token(), None);
+        assert_eq!(read_gemini_cli_login(), Login::Expired);
     }
 
     /// The older shape still works, both ways.
@@ -367,14 +374,17 @@ mod tests {
             r#"{"access_token":"expired-token","expiry":"2000-01-01T00:00:00Z"}"#,
         );
         assert_eq!(gemini_cli_login(), GeminiCliLogin::Expired);
-        assert_eq!(try_load_gemini_cli_token(), None);
+        assert_eq!(read_gemini_cli_login(), Login::Expired);
 
         write_gemini_creds(
             &home,
             r#"{"access_token":"valid-token","expiry":"2999-01-01T00:00:00Z"}"#,
         );
         assert_eq!(gemini_cli_login(), GeminiCliLogin::Valid);
-        assert_eq!(try_load_gemini_cli_token(), Some("valid-token".to_string()));
+        assert_eq!(
+            read_gemini_cli_login(),
+            Login::Valid("valid-token".to_string())
+        );
     }
 
     /// Both fields present: `expiry_date` decides.
@@ -418,7 +428,7 @@ mod tests {
         );
         assert_eq!(gemini_cli_login(), GeminiCliLogin::Expired);
         assert!(!gemini_cli_has_credentials());
-        assert_eq!(try_load_gemini_cli_token(), None);
+        assert_eq!(read_gemini_cli_login(), Login::Expired);
 
         // The string decides in the other direction too: a login the `expiry`
         // string says is alive is alive.
@@ -427,7 +437,7 @@ mod tests {
             r#"{"access_token":"t","expiry":"2999-01-01T00:00:00Z","expiry_date":1e30}"#,
         );
         assert_eq!(gemini_cli_login(), GeminiCliLogin::Valid);
-        assert_eq!(try_load_gemini_cli_token(), Some("t".to_string()));
+        assert_eq!(read_gemini_cli_login(), Login::Valid("t".to_string()));
     }
 
     /// A float within the range still decides, both ways.
@@ -442,7 +452,7 @@ mod tests {
             &format!(r#"{{"access_token":"t","expiry_date":{an_hour_ahead}.5}}"#),
         );
         assert_eq!(gemini_cli_login(), GeminiCliLogin::Valid);
-        assert_eq!(try_load_gemini_cli_token(), Some("t".to_string()));
+        assert_eq!(read_gemini_cli_login(), Login::Valid("t".to_string()));
 
         let an_hour_ago = now_millis() - 3_600_000;
         write_gemini_creds(
@@ -450,7 +460,7 @@ mod tests {
             &format!(r#"{{"access_token":"t","expiry_date":{an_hour_ago}.5}}"#),
         );
         assert_eq!(gemini_cli_login(), GeminiCliLogin::Expired);
-        assert_eq!(try_load_gemini_cli_token(), None);
+        assert_eq!(read_gemini_cli_login(), Login::Expired);
     }
 
     /// A float with a fractional part is truncated to whole milliseconds, so a
@@ -475,7 +485,7 @@ mod tests {
             &format!(r#"{{"access_token":"t","expiry_date":{at_the_margin}.5}}"#),
         );
         assert_eq!(gemini_cli_login(), GeminiCliLogin::Expired);
-        assert_eq!(try_load_gemini_cli_token(), None);
+        assert_eq!(read_gemini_cli_login(), Login::Expired);
     }
 
     /// A negative float is a deadline before the epoch, and it is honoured:
@@ -488,7 +498,7 @@ mod tests {
         // An hour before the epoch, with a fractional part.
         write_gemini_creds(&home, r#"{"access_token":"t","expiry_date":-3600000.5}"#);
         assert_eq!(gemini_cli_login(), GeminiCliLogin::Expired);
-        assert_eq!(try_load_gemini_cli_token(), None);
+        assert_eq!(read_gemini_cli_login(), Login::Expired);
     }
 
     /// A file with no expiry at all keeps working: Gemini CLI can write a
@@ -500,13 +510,13 @@ mod tests {
 
         write_gemini_creds(&home, r#"{"access_token":"t"}"#);
         assert_eq!(gemini_cli_login(), GeminiCliLogin::Valid);
-        assert_eq!(try_load_gemini_cli_token(), Some("t".to_string()));
+        assert_eq!(read_gemini_cli_login(), Login::Valid("t".to_string()));
 
         // `expiry_date: null` is the shape Gemini CLI writes when the token
         // has no known expiry.
         write_gemini_creds(&home, r#"{"access_token":"t","expiry_date":null}"#);
         assert_eq!(gemini_cli_login(), GeminiCliLogin::Valid);
-        assert_eq!(try_load_gemini_cli_token(), Some("t".to_string()));
+        assert_eq!(read_gemini_cli_login(), Login::Valid("t".to_string()));
     }
 
     /// A file that is not JSON, or that holds no token, yields no token — and
@@ -518,21 +528,21 @@ mod tests {
 
         write_gemini_creds(&home, "not json at all");
         assert_eq!(gemini_cli_login(), GeminiCliLogin::Missing);
-        assert_eq!(try_load_gemini_cli_token(), None);
+        assert_eq!(read_gemini_cli_login(), Login::Missing);
 
         write_gemini_creds(&home, r#"{"refresh_token":"r"}"#);
         assert_eq!(gemini_cli_login(), GeminiCliLogin::Missing);
-        assert_eq!(try_load_gemini_cli_token(), None);
+        assert_eq!(read_gemini_cli_login(), Login::Missing);
 
         // An empty access token is no token.
         write_gemini_creds(&home, r#"{"access_token":"   "}"#);
         assert_eq!(gemini_cli_login(), GeminiCliLogin::Missing);
-        assert_eq!(try_load_gemini_cli_token(), None);
+        assert_eq!(read_gemini_cli_login(), Login::Missing);
     }
 
-    /// The provider follows the shared reader: a login file that holds a
-    /// token — valid or expired — makes the provider use the Gemini CLI
-    /// login, and no login file at all leaves it without a credential.
+    /// The provider follows the shared reader: a keyless provider uses the
+    /// Gemini CLI login whether or not the login file exists. The file's
+    /// state is read when a request is sent, not when the provider is built.
     #[tokio::test]
     async fn the_provider_uses_the_shared_reader() {
         let _guard = crate::test_env::ENV_LOCK.lock().await;
@@ -550,15 +560,19 @@ mod tests {
         let provider = crate::providers::gemini::GeminiProvider::new(None);
         assert_eq!(provider.auth_source(), "Gemini CLI OAuth");
 
-        // No login file at all: no credential.
+        // No login file at all: still the CLI login. The login may be made
+        // after this point, and it is used on the next request.
         std::fs::remove_file(gemini_creds_path(&home)).expect("remove creds");
         let provider = crate::providers::gemini::GeminiProvider::new(None);
-        assert_eq!(provider.auth_source(), "none");
+        assert_eq!(provider.auth_source(), "Gemini CLI OAuth");
     }
 
     /// The refusal names the command to run and the key to set. It happens
     /// when the request is sent, not when the provider is built: the build
     /// succeeds, so the gateway and the channels start with an expired login.
+    ///
+    /// The assertion is on the request that WOULD be built: a test must never
+    /// send anything to Google, not even a request the provider refuses.
     #[tokio::test]
     async fn an_expired_login_is_refused_with_the_fix_named() {
         let _guard = crate::test_env::ENV_LOCK.lock().await;
@@ -567,15 +581,28 @@ mod tests {
 
         write_gemini_creds_with_expiry(&home, "ya29.mock-token", -3_600_000);
 
-        let provider = crate::providers::create_provider("gemini", None)
+        let built = crate::providers::create_provider("gemini", None)
             .expect("an expired login must not fail the provider build");
 
+        // The provider the FACTORY built — not one built next to it, which
+        // would prove something about the test rather than about the
+        // factory.
+        let provider = crate::providers::tests::gemini_provider_inside(built.as_ref())
+            .expect("the factory builds the Gemini CLI-login provider when there is no key");
+
         let error = provider
-            .chat_with_system(None, "hello", "gemini-2.0-flash", 0.7)
-            .await
+            .build_request_for_test("gemini-2.0-flash")
             .expect_err("an expired Gemini CLI login must be refused");
         let message = error.to_string();
         assert!(message.contains("gemini"), "{message}");
         assert!(message.contains("GEMINI_API_KEY"), "{message}");
+        // The refusal is a TYPE, so the retry wrapper recognises it without
+        // reading the message.
+        assert!(
+            error.chain().any(|cause| cause
+                .downcast_ref::<crate::providers::gemini_error::GeminiAuthError>()
+                .is_some()),
+            "the refusal must reach the retry wrapper as a typed error: {error:?}"
+        );
     }
 }
