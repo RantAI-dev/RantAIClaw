@@ -940,6 +940,18 @@ async fn agent_chat_stream(
                                     );
                                 }
                             }
+                            // Carry this conversation's medium-risk grants into the
+                            // shell policy too. They answer the risk gate only, so
+                            // they go into the policy's medium-risk set and never
+                            // into the basename allowlist — re-seeding them there
+                            // would also lift the unallowed-command prompt.
+                            for name in
+                                crate::approval::session_grants::session_granted_medium_commands(
+                                    sid,
+                                )
+                            {
+                                sec.add_medium_risk_approval(&name);
+                            }
                         }
                     }
                     let mut shell_rx = web_approvals.subscribe();
@@ -950,11 +962,13 @@ async fn agent_chat_stream(
                     let fwd_session_id = history_session_id.clone();
                     shell_approval_forwarder = Some(tokio::spawn(async move {
                         use tokio::sync::broadcast::error::RecvError;
-                        // This turn's forwarded shell requests, by id: the basename
-                        // and whether Always could hold for it. Read at resolve time
-                        // to decide whether an Always answer becomes a command grant.
-                        let mut forwarded: std::collections::HashMap<uuid::Uuid, (String, bool)> =
-                            std::collections::HashMap::new();
+                        // This turn's forwarded shell requests, by id: what the browser was
+                        // told and what an answer to it may hold for. Read at
+                        // resolve time to decide what a "Session" answer grants.
+                        let mut forwarded: std::collections::HashMap<
+                            uuid::Uuid,
+                            ForwardedShellRequest,
+                        > = std::collections::HashMap::new();
                         loop {
                             tokio::select! {
                                 r = shell_rx.recv() => match r {
@@ -970,11 +984,19 @@ async fn agent_chat_stream(
                                         // request.
                                         && req.basename != req.id.to_string() =>
                                     {
-                                        let always_available = req.always_available
+                                        let always_available = req.session_scope.holds_for_session()
                                             && fwd_manager.always_available_for("shell");
                                         forwarded.insert(
                                             req.id,
-                                            (req.basename.clone(), always_available),
+                                            ForwardedShellRequest {
+                                                basename: req.basename.clone(),
+                                                scope: req.session_scope,
+                                                always_available,
+                                                grant_basenames:
+                                                    crate::security::command_segment_basenames(
+                                                        &req.full_command,
+                                                    ),
+                                            },
                                         );
                                         let _ = fwd_tx
                                             .send(crate::agent::AgentEvent::ApprovalRequest {
@@ -1007,14 +1029,33 @@ async fn agent_chat_stream(
                                         // Only an explicit, live Always on a request that
                                         // could hold for the conversation becomes a grant.
                                         // Once, Deny and timeouts record nothing.
-                                        if let Some((basename, true)) = forwarded.remove(&info.id) {
+                                        if let Some(request) = forwarded.remove(&info.id) {
                                             if info.decision == crate::security::Decision::Session
                                                 && !info.timed_out
+                                                && request.always_available
                                             {
                                                 if let Some(sid) = fwd_session_id.as_deref() {
-                                                    crate::approval::session_grants::record_session_command(
-                                                        sid, &basename,
-                                                    );
+                                                    match request.scope {
+                                                        crate::security::SessionScope::Command => {
+                                                            crate::approval::session_grants::record_session_command(
+                                                                sid, &request.basename,
+                                                            );
+                                                        }
+                                                        // A medium-risk grant covers the
+                                                        // basenames the command runs, and
+                                                        // answers the risk gate only.
+                                                        crate::security::SessionScope::MediumRisk => {
+                                                            for name in &request.grant_basenames {
+                                                                crate::approval::session_grants::record_session_medium_command(
+                                                                    sid, name,
+                                                                );
+                                                            }
+                                                        }
+                                                        // `None` and `HighRisk` hold
+                                                        // nothing: high risk always asks
+                                                        // again.
+                                                        _ => {}
+                                                    }
                                                 }
                                             }
                                         }
@@ -1320,6 +1361,25 @@ impl Drop for CancelOnDrop {
 /// Extracted so the scoping can be unit-tested without a live stream.
 fn forward_to_this_stream(req: &crate::security::PendingRequest, turn_scope: &str) -> bool {
     !turn_scope.is_empty() && req.channel == "console" && req.reply_target == turn_scope
+}
+
+/// A shell request this turn forwarded to the browser, kept until it is
+/// resolved.
+///
+/// The scope decides what an answer may hold for: a "Session" answer to a
+/// medium-risk request grants the basenames the command runs for the rest of
+/// the conversation, a high-risk one grants nothing, and a command-scope
+/// request grants its basename.
+struct ForwardedShellRequest {
+    /// The basename the browser was told about.
+    basename: String,
+    /// What an answer to this request may hold for.
+    scope: crate::security::SessionScope,
+    /// Whether the browser was told that an "Always" answer would hold. Only
+    /// then may an answer become a grant.
+    always_available: bool,
+    /// The basenames a session grant covers: every basename the command runs.
+    grant_basenames: Vec<String>,
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -4404,9 +4464,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn console_medium_risk_prompt_offers_no_always_and_asks_every_time() {
-        // `git commit` is allowed but medium risk: its prompt must say Always does
-        // not hold, and the next message must prompt again.
+    async fn console_medium_risk_prompt_offers_always_and_a_session_answer_holds() {
+        // `git commit` is allowed but medium risk. Its prompt must offer Always,
+        // because a "Session" answer holds for that basename at medium risk for
+        // the rest of the conversation: the next message must not prompt.
         let _env = crate::test_env::ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().expect("temp home");
         let _restore = HomeGuard::set(tmp.path());
@@ -4425,15 +4486,48 @@ mod tests {
         .await;
         let prompt = prompt.expect("message 1 must prompt for a medium-risk command");
         assert_eq!(
-            prompt["always_available"], false,
-            "a medium-risk prompt must say Always does not hold: {first:?}"
+            prompt["always_available"], true,
+            "a medium-risk prompt must offer Always: {first:?}"
+        );
+
+        let (second, second_prompt) =
+            drive_console_turn(&state, &script.provider(), Some(sid), "commit again", None).await;
+        assert!(
+            second_prompt.is_none(),
+            "a session answer must hold for the next message: {second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn console_medium_risk_approve_without_always_asks_again() {
+        // "Approve" without "Always" covers one run only: the next message must
+        // prompt again.
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+        let state = scripted_state();
+        let script = ShellToolScript::start().await;
+        let sid = fresh_session_id();
+
+        script.ask_for("git commit -m probe");
+        let (first, prompt) = drive_console_turn(
+            &state,
+            &script.provider(),
+            Some(sid.clone()),
+            "commit",
+            Some((true, false)),
+        )
+        .await;
+        assert!(
+            prompt.is_some(),
+            "message 1 must prompt for a medium-risk command: {first:?}"
         );
 
         let (second, second_prompt) =
             drive_console_turn(&state, &script.provider(), Some(sid), "commit again", None).await;
         assert!(
             second_prompt.is_some(),
-            "a medium-risk prompt must ask again on the next message: {second:?}"
+            "an approve without always must not hold for the next message: {second:?}"
         );
     }
 
@@ -4771,7 +4865,7 @@ mod tests {
             channel: channel.into(),
             reply_target: reply_target.into(),
             created_at: 0,
-            always_available: false,
+            session_scope: crate::security::SessionScope::None,
         };
         assert!(forward_to_this_stream(&mk("t1", "console"), "t1"));
         assert!(!forward_to_this_stream(&mk("t2", "console"), "t1"));

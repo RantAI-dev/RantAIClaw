@@ -841,6 +841,14 @@ impl TuiApp {
     /// `self.pending_approval` regardless of outcome so the prompt
     /// overlay disappears.
     ///
+    /// What an answer actually holds for depends on the gate that raised the
+    /// request, and the message says so:
+    /// - the unallowed-command gate holds the basename for the session;
+    /// - the risk gate holds the basename **at medium risk** for the session —
+    ///   a high-risk command asks again, and nothing is written to disk, so
+    ///   `Persist` there means the same as `Session`;
+    /// - a high-risk command holds nothing beyond this run.
+    ///
     /// The "deny cancels everything" semantics (vs CC's "deny returns
     /// to LLM") came from tester feedback: under the per-call-deny
     /// model the LLM kept trying alternative invocations (`curl -s` →
@@ -852,6 +860,7 @@ impl TuiApp {
             None => return,
         };
         let basename = req.basename.clone();
+        let scope = req.session_scope;
         let Some(security) = self.context.security.as_ref() else {
             let _ = self
                 .context
@@ -867,6 +876,13 @@ impl TuiApp {
         // Persist / Session decisions also add the basename to the
         // runtime allowlist so the same command doesn't prompt twice
         // in this session. Mirrors what /allow does.
+        //
+        // The risk gate is the exception: its answer never touches the
+        // allowlist. A medium-risk session grant is recorded by the shell tool
+        // itself, in the policy's medium-risk set, and a high-risk command
+        // holds nothing at all — writing the basename to the allowlist (or to
+        // disk) would grant far more than the answer says.
+        //
         // Resolve by ID, and grant only after it resolves.
         //
         // This used to widen the allowlist FIRST and then resolve by basename —
@@ -877,7 +893,12 @@ impl TuiApp {
         let resolved = pending.resolve(req.id, decision);
 
         let persist_flag = matches!(decision, crate::security::Decision::Persist);
+        let writes_allowlist = matches!(
+            scope,
+            crate::security::SessionScope::Command | crate::security::SessionScope::None
+        );
         if resolved
+            && writes_allowlist
             && matches!(
                 decision,
                 crate::security::Decision::Session | crate::security::Decision::Persist
@@ -915,12 +936,34 @@ impl TuiApp {
         }
 
         let msg = match decision {
-            crate::security::Decision::Session if resolved => {
-                format!("✓ Approved `{basename}` for this session.")
-            }
-            crate::security::Decision::Persist if resolved => {
-                format!("✓ Approved `{basename}` and persisted to allowlist.")
-            }
+            crate::security::Decision::Session if resolved => match scope {
+                // The risk gate: the answer holds for this basename at medium
+                // risk, and a high-risk command asks again.
+                crate::security::SessionScope::MediumRisk => {
+                    format!("✓ Approved `{basename}` for this session (medium risk only).")
+                }
+                // High risk holds nothing beyond this run.
+                crate::security::SessionScope::HighRisk => {
+                    format!("✓ Approved `{basename}` for this run only.")
+                }
+                crate::security::SessionScope::Command | crate::security::SessionScope::None => {
+                    format!("✓ Approved `{basename}` for this session.")
+                }
+            },
+            crate::security::Decision::Persist if resolved => match scope {
+                // The risk gate writes nothing to disk: a persist there would
+                // claim more than the answer gives. It means the same as
+                // Session.
+                crate::security::SessionScope::MediumRisk => {
+                    format!("✓ Approved `{basename}` for this session (medium risk only).")
+                }
+                crate::security::SessionScope::HighRisk => {
+                    format!("✓ Approved `{basename}` for this run only.")
+                }
+                crate::security::SessionScope::Command | crate::security::SessionScope::None => {
+                    format!("✓ Approved `{basename}` and persisted to allowlist.")
+                }
+            },
             crate::security::Decision::Deny => {
                 format!("✗ Denied `{basename}` — turn cancelled.")
             }
@@ -14446,7 +14489,7 @@ mod autonomy_keybinding_tests {
             channel: "tui".to_string(),
             reply_target: String::new(),
             created_at: 0,
-            always_available: false,
+            session_scope: crate::security::SessionScope::None,
         });
 
         press_shift_tab(&mut app).await;
@@ -14455,6 +14498,78 @@ mod autonomy_keybinding_tests {
             preset_on_disk(dir.path()),
             None,
             "autonomy changed while an approval was on screen"
+        );
+    }
+
+    /// A risk-gate answer states what it holds for. A medium-risk session
+    /// grant is not an allowlist entry, so none is written and the message
+    /// says "medium risk only" — a claim of a persisted allowlist would be
+    /// false.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_medium_risk_answer_states_its_scope_and_writes_no_allowlist_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut ctx, _req_rx, _events_tx) = crate::tui::context::TuiContext::test_context();
+        let security = std::sync::Arc::new(crate::security::SecurityPolicy::default());
+        let approvals = std::sync::Arc::new(crate::security::PendingApprovals::new(None));
+        security.set_pending(approvals.clone());
+        ctx.security = Some(security.clone());
+        let mut app = app_with_profile_root(ctx, dir.path().to_path_buf());
+
+        // The shell tool's risk gate asks, and the prompt answers it.
+        let id = uuid::Uuid::new_v4();
+        let request = tokio::spawn({
+            let approvals = approvals.clone();
+            async move {
+                approvals
+                    .request_decision_in_scope(
+                        id,
+                        "git",
+                        "git commit -m probe",
+                        "tui",
+                        String::new(),
+                        crate::security::SessionScope::MediumRisk,
+                    )
+                    .await
+            }
+        });
+        for _ in 0..500 {
+            if !approvals.list().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        app.pending_approval = Some(crate::security::PendingRequest {
+            id,
+            basename: "git".to_string(),
+            full_command: "git commit -m probe".to_string(),
+            channel: "tui".to_string(),
+            reply_target: String::new(),
+            created_at: 0,
+            session_scope: crate::security::SessionScope::MediumRisk,
+        });
+
+        app.resolve_pending_approval(crate::security::Decision::Persist);
+
+        assert_eq!(
+            request.await.expect("the request resolves"),
+            crate::security::Decision::Persist
+        );
+        assert!(
+            security.runtime_allowlist_snapshot().is_empty(),
+            "a risk-gate answer must not widen the allowlist"
+        );
+        let message = app
+            .scrollback_queue
+            .last()
+            .map(|(_, text)| text.clone())
+            .unwrap_or_default();
+        assert!(
+            message.contains("medium risk only"),
+            "the message must state the scope the answer has: {message}"
+        );
+        assert!(
+            !message.contains("persisted"),
+            "a risk-gate answer persists nothing: {message}"
         );
     }
 

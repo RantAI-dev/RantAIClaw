@@ -726,6 +726,9 @@ async fn set_autonomy(
     // made under a looser preset is re-seeded into the next turn's manager and
     // keeps skipping the prompt.
     crate::gateway::web_approval::clear_all_session_grants();
+    // The medium-risk session grants go with them: a grant made under a looser
+    // level must not survive a tighter one.
+    state.security.clear_medium_risk_approvals();
     Ok(Json(resp))
 }
 

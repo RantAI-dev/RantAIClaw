@@ -40,6 +40,34 @@ pub enum Decision {
     Deny,
 }
 
+/// What an answer to a request may hold for.
+///
+/// The scope an answer has must equal the scope its surface states: a request
+/// carries the scope of the gate that raised it, so every surface can say what
+/// the answer really does instead of guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionScope {
+    /// The answer covers this run only. Nothing holds.
+    None,
+    /// The answer holds for this command basename for the rest of the session —
+    /// the shell unallowed-command gate.
+    Command,
+    /// The answer holds for this command basename **at medium risk** for the rest
+    /// of the session — the shell risk gate. A high-risk command never holds.
+    MediumRisk,
+    /// The answer covers this run only: a high-risk command always asks again.
+    HighRisk,
+}
+
+impl SessionScope {
+    /// True when an answer to a request with this scope can hold for the rest of
+    /// the session. High risk is excluded on purpose: it always asks again.
+    #[must_use]
+    pub fn holds_for_session(self) -> bool {
+        matches!(self, Self::Command | Self::MediumRisk)
+    }
+}
+
 /// A decision together with whether the registry deadline produced it.
 ///
 /// `decision` is exactly what the matching `request_decision*` call returns.
@@ -77,11 +105,13 @@ pub struct PendingRequest {
     pub reply_target: String,
     /// Unix epoch seconds when the request was created.
     pub created_at: u64,
-    /// True when an "Always" answer to this request may hold for the rest of the
-    /// conversation. Only the shell unallowed-command gate sets it (via
-    /// [`PendingApprovals::request_decision_in_always`]). Defaults to false, so
-    /// every other prompt, and every medium-risk one, offers no Always effect.
-    pub always_available: bool,
+    /// What an answer to this request may hold for. The shell unallowed-command
+    /// gate offers [`SessionScope::Command`], the shell risk gate
+    /// [`SessionScope::MediumRisk`] or [`SessionScope::HighRisk`] depending on
+    /// the risk it classified, and every other prompt
+    /// [`SessionScope::None`] — so a surface never has to claim a scope the
+    /// code does not give.
+    pub session_scope: SessionScope,
 }
 
 /// A resolution event, broadcast to `subscribe_resolved` listeners when a pending
@@ -240,7 +270,7 @@ impl PendingRequest {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
-            always_available: false,
+            session_scope: SessionScope::None,
         }
     }
 }
@@ -388,14 +418,21 @@ impl PendingApprovals {
         channel: impl Into<String>,
         reply_target: impl Into<String>,
     ) -> PendingOutcome {
-        self.request_decision_with(id, basename, full_command, channel, reply_target, false)
-            .await
+        self.request_decision_with(
+            id,
+            basename,
+            full_command,
+            channel,
+            reply_target,
+            SessionScope::None,
+        )
+        .await
     }
 
     /// As [`request_decision_in`](Self::request_decision_in), for the shell
     /// unallowed-command gate only: its "Always" answer is recorded as a command
-    /// grant and holds for the rest of the conversation, so the request is
-    /// flagged `always_available`. Every other caller keeps the deny default.
+    /// grant and holds for the rest of the conversation, so the request carries
+    /// [`SessionScope::Command`]. Every other caller keeps the deny default.
     pub async fn request_decision_in_always(
         &self,
         id: Uuid,
@@ -404,7 +441,33 @@ impl PendingApprovals {
         channel: impl Into<String>,
         reply_target: impl Into<String>,
     ) -> Decision {
-        self.request_decision_with(id, basename, full_command, channel, reply_target, true)
+        self.request_decision_with(
+            id,
+            basename,
+            full_command,
+            channel,
+            reply_target,
+            SessionScope::Command,
+        )
+        .await
+        .decision
+    }
+
+    /// As [`request_decision_in`](Self::request_decision_in), but the request
+    /// states what an answer to it may hold for. The shell risk gate uses this:
+    /// a medium-risk command may hold for the session, a high-risk one never
+    /// does, so the scope is decided by the gate that raises the request and
+    /// every surface can report it truthfully.
+    pub async fn request_decision_in_scope(
+        &self,
+        id: Uuid,
+        basename: impl Into<String>,
+        full_command: impl Into<String>,
+        channel: impl Into<String>,
+        reply_target: impl Into<String>,
+        scope: SessionScope,
+    ) -> Decision {
+        self.request_decision_with(id, basename, full_command, channel, reply_target, scope)
             .await
             .decision
     }
@@ -416,7 +479,7 @@ impl PendingApprovals {
         full_command: impl Into<String>,
         channel: impl Into<String>,
         reply_target: impl Into<String>,
-        always_available: bool,
+        scope: SessionScope,
     ) -> PendingOutcome {
         let mut request = PendingRequest::new_with_id(
             id,
@@ -425,7 +488,7 @@ impl PendingApprovals {
             channel.into(),
             reply_target.into(),
         );
-        request.always_available = always_available;
+        request.session_scope = scope;
         let id = request.id;
         // Kept for the resolution broadcast on the auto-deny path (the snapshot
         // entry is gone by the time the deadline fires and cleanup runs).
@@ -540,6 +603,27 @@ impl PendingApprovals {
         } else {
             None
         }
+    }
+
+    /// The scope of the pending request matched by basename, when exactly one
+    /// request carries that basename.
+    ///
+    /// A surface that answers by basename has to know what the answer will hold
+    /// for *before* it resolves — the scope is gone once the request is
+    /// resolved. More than one match is `None`, the same refusal
+    /// [`resolve_by_basename`](Self::resolve_by_basename) makes: a surface must
+    /// never claim a scope for a request it cannot name.
+    pub fn scope_by_basename(&self, basename: &str) -> Option<SessionScope> {
+        let snap = self.inner.snapshot.lock();
+        let mut scopes = snap
+            .values()
+            .filter(|r| r.basename == basename)
+            .map(|r| r.session_scope);
+        let first = scopes.next()?;
+        if scopes.next().is_some() {
+            return None;
+        }
+        Some(first)
     }
 
     /// Resolve a pending request matched by basename **within one chat**.

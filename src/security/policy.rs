@@ -136,6 +136,16 @@ pub struct SecurityPolicy {
     /// the same set. Optionally backed by a persisted overlay file
     /// (`<policy_dir>/runtime_allowlist.toml`).
     pub runtime_allowlist: Arc<RwLock<HashSet<String>>>,
+    /// Command basenames approved at **medium** risk for the rest of the
+    /// session.
+    ///
+    /// The shell risk gate's "Session" answer lands here: the basename may run
+    /// at medium risk without asking again for the rest of the session. A
+    /// high-risk command never consults this set — it always asks again.
+    ///
+    /// Shared by handle, like `runtime_allowlist`, so every clone of a policy
+    /// sees the same grants. In-memory only: nothing here reaches disk.
+    pub medium_risk_approved: Arc<RwLock<HashSet<String>>>,
     /// Where to persist additions when `add_runtime_command(_, true)` is
     /// called. `None` means runtime additions stay in-memory only
     /// (default for ad-hoc/test policies).
@@ -208,6 +218,7 @@ impl Default for SecurityPolicy {
             workspace_dir: PathBuf::from("."),
             tracker: Arc::new(ActionTracker::new()),
             runtime_allowlist: Arc::new(RwLock::new(HashSet::new())),
+            medium_risk_approved: Arc::new(RwLock::new(HashSet::new())),
             policy_dir: None,
             pending: Arc::new(RwLock::new(None)),
         }
@@ -399,6 +410,32 @@ enum QuoteState {
     None,
     Single,
     Double,
+}
+
+/// The basename of every segment of a command string.
+///
+/// Segments are split on unquoted shell operators, leading environment
+/// assignments are skipped, and the leading path is dropped — the same
+/// derivation [`SecurityPolicy::command_risk_level`] uses, so a basename read
+/// here is the basename that command's risk was judged by.
+pub fn command_segment_basenames(command: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for segment in split_unquoted_segments(command) {
+        let cmd_part = skip_env_assignments(&segment);
+        let Some(base_raw) = cmd_part.split_whitespace().next() else {
+            continue;
+        };
+        let base = base_raw
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if base.is_empty() {
+            continue;
+        }
+        names.push(base);
+    }
+    names
 }
 
 /// Split a shell command into sub-commands by unquoted separators.
@@ -855,6 +892,11 @@ impl SecurityPolicy {
     /// The credential-directory refusal runs first and is a hard block: it does
     /// not depend on the allowlist or the autonomy level, so `full` is covered
     /// and an approval cannot lift it.
+    ///
+    /// A medium-risk command whose every segment's basename carries a session
+    /// grant is treated as approved: that is what a "Session" answer to the
+    /// risk gate means. The grant is never consulted for high risk — a
+    /// high-risk command always asks again.
     pub fn validate_command_execution(
         &self,
         command: &str,
@@ -886,6 +928,7 @@ impl SecurityPolicy {
             && self.effective_autonomy() == AutonomyLevel::Supervised
             && self.fields().require_approval_for_medium_risk
             && !approved
+            && !self.medium_risk_is_approved(command)
         {
             return Err(
                 "Command requires explicit approval (approved=true): medium-risk operation".into(),
@@ -994,8 +1037,16 @@ impl SecurityPolicy {
     /// via the inner `Arc`, so tools already built observe it. Process state —
     /// the rate-limit window, operator grants, the approval registry — is
     /// untouched by design.
+    ///
+    /// The one exception is the medium-risk session grants: a rung change
+    /// revokes them, so a grant made under a looser level never survives a
+    /// tighter one. A change that keeps the level keeps the grants.
     pub fn apply_config(&self, config: &crate::config::AutonomyConfig) {
+        let level_changed = self.fields().autonomy != config.level;
         *self.fields.write() = Arc::new(PolicyFields::from_config(config));
+        if level_changed {
+            self.clear_medium_risk_approvals();
+        }
     }
 
     /// Builder helper. Installs a **new** slot rather than writing through the
@@ -1418,6 +1469,7 @@ impl SecurityPolicy {
             workspace_dir: workspace_dir.to_path_buf(),
             tracker: Arc::new(ActionTracker::new()),
             runtime_allowlist: Arc::new(RwLock::new(runtime_set)),
+            medium_risk_approved: Arc::new(RwLock::new(HashSet::new())),
             policy_dir,
             pending: Arc::new(RwLock::new(None)),
         }
@@ -1469,6 +1521,53 @@ impl SecurityPolicy {
         let mut v: Vec<String> = set.iter().cloned().collect();
         v.sort();
         v
+    }
+
+    /// Record that `basename` may run at **medium** risk for the rest of the
+    /// session — the shell risk gate's "Session" answer.
+    ///
+    /// The name is normalised the way the risk gate reads it: trimmed, reduced
+    /// to its basename (the last path segment) and lowercased. An empty name is
+    /// ignored. In-memory only: nothing is written to disk, and a high-risk
+    /// command never consults this set.
+    pub fn add_medium_risk_approval(&self, basename: &str) {
+        let name = basename.trim();
+        let name = name
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if name.is_empty() {
+            return;
+        }
+        self.medium_risk_approved.write().insert(name);
+    }
+
+    /// Forget every medium-risk session grant. Called when the autonomy level
+    /// changes: a grant made under a looser level must not survive a tighter
+    /// one.
+    pub fn clear_medium_risk_approvals(&self) {
+        self.medium_risk_approved.write().clear();
+    }
+
+    /// The basenames currently approved at medium risk for this session.
+    pub fn medium_risk_approved_snapshot(&self) -> Vec<String> {
+        let set = self.medium_risk_approved.read();
+        let mut v: Vec<String> = set.iter().cloned().collect();
+        v.sort();
+        v
+    }
+
+    /// True when every segment of `command` runs a basename this session
+    /// approved at medium risk.
+    ///
+    /// A grant covers one basename, so a chained command is covered only when
+    /// every segment's basename is granted. An empty command is never covered.
+    fn medium_risk_is_approved(&self, command: &str) -> bool {
+        let set = self.medium_risk_approved.read();
+        let names = command_segment_basenames(command);
+        !names.is_empty() && names.iter().all(|name| set.contains(name))
     }
 
     /// Walk the command exactly like `is_command_allowed` and return
@@ -1978,6 +2077,106 @@ mod tests {
 
         let allowed = p.validate_command_execution("touch test.txt", true);
         assert_eq!(allowed.unwrap(), CommandRiskLevel::Medium);
+    }
+
+    /// A "Session" answer to the risk gate holds for that basename at medium
+    /// risk: the next call runs without asking again.
+    #[test]
+    fn a_medium_risk_session_approval_holds_for_the_basename() {
+        let p = SecurityPolicy::default()
+            .with_autonomy(AutonomyLevel::Supervised)
+            .with_require_approval_for_medium_risk(true)
+            .with_allowed_commands(vec!["touch".into()]);
+
+        assert!(
+            p.validate_command_execution("touch test.txt", false)
+                .is_err(),
+            "an ungranted medium-risk command must ask"
+        );
+        p.add_medium_risk_approval("touch");
+        assert_eq!(
+            p.validate_command_execution("touch test.txt", false)
+                .unwrap(),
+            CommandRiskLevel::Medium,
+            "a session grant must hold for the rest of the session"
+        );
+    }
+
+    /// High risk always asks again: a medium-risk grant never covers it.
+    #[test]
+    fn a_high_risk_command_asks_again_after_a_medium_risk_approval() {
+        let p = SecurityPolicy::default()
+            .with_autonomy(AutonomyLevel::Supervised)
+            .with_require_approval_for_medium_risk(true)
+            .with_allowed_commands(vec!["chmod".into()]);
+
+        p.add_medium_risk_approval("chmod");
+        let denied = p.validate_command_execution("chmod 600 test.txt", false);
+        assert!(
+            denied.is_err(),
+            "a high-risk command must ask again after a medium-risk grant"
+        );
+        assert!(denied.unwrap_err().contains("high-risk"));
+    }
+
+    /// One grant covers one basename: a chained command is only covered when
+    /// every segment's basename is granted.
+    #[test]
+    fn a_medium_risk_approval_covers_only_the_granted_basenames() {
+        let p = SecurityPolicy::default()
+            .with_autonomy(AutonomyLevel::Supervised)
+            .with_require_approval_for_medium_risk(true)
+            .with_allowed_commands(vec!["touch".into(), "mkdir".into()]);
+
+        p.add_medium_risk_approval("touch");
+        assert!(
+            p.validate_command_execution("touch a && mkdir b", false)
+                .is_err(),
+            "a chain with an ungranted segment must still ask"
+        );
+        p.add_medium_risk_approval("mkdir");
+        assert!(
+            p.validate_command_execution("touch a && mkdir b", false)
+                .is_ok(),
+            "a chain whose every segment is granted must hold"
+        );
+    }
+
+    /// A rung change revokes the grant: a tightening must not keep a grant made
+    /// under a looser level. A change that keeps the level keeps the grant.
+    #[test]
+    fn a_rung_change_clears_the_medium_risk_approvals() {
+        let p = SecurityPolicy::default()
+            .with_autonomy(AutonomyLevel::Supervised)
+            .with_require_approval_for_medium_risk(true)
+            .with_allowed_commands(vec!["touch".into()]);
+        p.add_medium_risk_approval("touch");
+        assert_eq!(
+            p.medium_risk_approved_snapshot(),
+            vec!["touch".to_string()],
+            "the grant is recorded under the basename, not the path"
+        );
+
+        let same_level = crate::config::AutonomyConfig {
+            level: AutonomyLevel::Supervised,
+            ..crate::config::AutonomyConfig::default()
+        };
+        p.apply_config(&same_level);
+        assert_eq!(
+            p.medium_risk_approved_snapshot(),
+            vec!["touch".to_string()],
+            "a reload that keeps the level must keep the grant"
+        );
+
+        let tighter = crate::config::AutonomyConfig {
+            level: AutonomyLevel::ReadOnly,
+            ..crate::config::AutonomyConfig::default()
+        };
+        p.apply_config(&tighter);
+        assert!(
+            p.medium_risk_approved_snapshot().is_empty(),
+            "a rung change must revoke the session grant"
+        );
     }
 
     #[test]

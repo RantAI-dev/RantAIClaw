@@ -37,10 +37,10 @@ pub use pairing::PairingGuard;
 #[allow(unused_imports)]
 pub use pending::{
     current_turn_scope, merge_tool_approval_outcome, record_tool_approval, tool_approval_cell,
-    tool_approval_outcome, Decision, PendingApprovals, PendingRequest, ToolApprovalCell,
-    TOOL_APPROVAL, TURN_SCOPE,
+    tool_approval_outcome, Decision, PendingApprovals, PendingRequest, SessionScope,
+    ToolApprovalCell, TOOL_APPROVAL, TURN_SCOPE,
 };
-pub use policy::{AutonomyLevel, SecurityPolicy};
+pub use policy::{command_segment_basenames, AutonomyLevel, SecurityPolicy};
 #[allow(unused_imports)]
 pub use secrets::SecretStore;
 
