@@ -167,6 +167,20 @@ fn blocked_reason_with_remediation(reason: &str) -> String {
     format!("{reason}{BLOCKED_COMMAND_REMEDIATION}")
 }
 
+/// What a human's answer to a shell prompt means for the audit trail.
+///
+/// `Once`, `Session` and `Persist` are all "a person said yes"; `Deny` is "a
+/// person said no". The deadline auto-deny is a `Deny` too — nobody answered,
+/// but the call did not run either, and the trail must not read as approved.
+fn decision_outcome(decision: Decision) -> crate::security::ApprovalOutcome {
+    match decision {
+        Decision::Once | Decision::Session | Decision::Persist => {
+            crate::security::ApprovalOutcome::Granted
+        }
+        Decision::Deny => crate::security::ApprovalOutcome::Denied,
+    }
+}
+
 /// Read an async pipe to EOF, appending into `buf` (kept at most `cap` bytes).
 /// Bytes past the cap are still drained (so the child never blocks on a full
 /// pipe) but discarded — a runaway command can't OOM the agent, unlike
@@ -478,6 +492,9 @@ impl Tool for ShellTool {
                                 reply_target,
                             )
                             .await;
+                        // A human answered inside the tool: the audit trail has
+                        // to say so, or the record claims nobody was asked.
+                        crate::security::record_tool_approval(decision_outcome(decision));
                         match decision {
                             // Once/Session/Persist fall through to re-validate on
                             // the next loop iteration (an explicit `continue` here
@@ -533,6 +550,9 @@ impl Tool for ShellTool {
                                 reply_target,
                             )
                             .await;
+                        // A human answered inside the tool: the audit trail has
+                        // to say so, or the record claims nobody was asked.
+                        crate::security::record_tool_approval(decision_outcome(decision));
                         match decision {
                             // Approved for this run — fall through to re-validate
                             // with `human_approved = true` on the next iteration.
