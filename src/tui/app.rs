@@ -14886,6 +14886,56 @@ mod autonomy_live_level_tests {
         );
     }
 
+    /// Smart and Manual share the `supervised` level and differ only in
+    /// `always_ask`, so the preset path has to read the rung as the pair it
+    /// is: a grant made under Smart must not answer the risk gate under
+    /// Manual.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_tui_preset_path_clears_the_medium_risk_grants_on_a_rung_change() {
+        use crate::approval::policy_writer::PolicyPreset;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut ctx, _req_rx, _events_tx) = crate::tui::context::TuiContext::test_context();
+        let policy = Arc::new(crate::security::SecurityPolicy::from_config(
+            &crate::config::AutonomyConfig::default(),
+            dir.path(),
+        ));
+        ctx.security = Some(policy.clone());
+        let mut app = app_with_profile_root(ctx, dir.path().to_path_buf());
+        app.config.workspace_dir = dir.path().to_path_buf();
+
+        // A grant made under the rung the operator starts on.
+        policy.add_medium_risk_approval("touch");
+        assert_eq!(
+            policy.medium_risk_approved_snapshot(),
+            vec!["touch".to_string()],
+            "the grant is recorded under the basename, not the path"
+        );
+
+        // The profile on disk names the preset under test, as a provisioned
+        // profile does before the operator picks the next one.
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[autonomy]\nlevel = \"supervised\"\n",
+        )
+        .expect("write the config the preset run starts from");
+
+        app.apply_preset_to_config_and_reload(PolicyPreset::Smart)
+            .expect("the Smart preset applies, saves and reloads");
+        assert_eq!(
+            policy.medium_risk_approved_snapshot(),
+            vec!["touch".to_string()],
+            "a preset that does not change the rung must keep the grant"
+        );
+
+        app.apply_preset_to_config_and_reload(PolicyPreset::Manual)
+            .expect("the Manual preset applies, saves and reloads");
+        assert!(
+            policy.medium_risk_approved_snapshot().is_empty(),
+            "a rung change must revoke the session grant on the running policy"
+        );
+    }
+
     /// The reload must read the config file the watcher watches — the one
     /// `Config::load` resolves — not a path derived from the profile
     /// directory.

@@ -3191,6 +3191,38 @@ mod tests {
         );
     }
 
+    /// The fan-out carries a rung change all the way to the grant set: a
+    /// medium-risk grant made before the change must not answer the risk gate
+    /// after it. The change here moves only `always_ask` — Manual against
+    /// Smart — because that is the rung change a level comparison misses.
+    #[test]
+    fn the_live_registry_clears_the_medium_risk_grants_on_a_rung_change() {
+        use crate::security::AutonomyLevel;
+        let registry = super::LiveAutonomyRegistry::default();
+        let policy = std::sync::Arc::new(crate::security::SecurityPolicy::default());
+        policy.add_medium_risk_approval("touch");
+        super::register_live_autonomy(
+            &registry,
+            Some(&policy),
+            None,
+            super::web_approval::AutonomyOverlay::Global,
+        );
+
+        super::apply_live_autonomy(
+            &registry,
+            &crate::config::AutonomyConfig {
+                level: AutonomyLevel::Supervised,
+                always_ask: vec!["*".to_string()],
+                ..crate::config::AutonomyConfig::default()
+            },
+        );
+
+        assert!(
+            policy.medium_risk_approved_snapshot().is_empty(),
+            "a rung change must revoke the medium-risk grants of a running turn"
+        );
+    }
+
     /// A turn that ended leaves a dead `Weak` behind, and the next fan-out
     /// drops it: the dead entry IS the turn-end cleanup.
     #[test]

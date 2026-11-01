@@ -1039,12 +1039,17 @@ impl SecurityPolicy {
     /// untouched by design.
     ///
     /// The one exception is the medium-risk session grants: a rung change
-    /// revokes them, so a grant made under a looser level never survives a
-    /// tighter one. A change that keeps the level keeps the grants.
+    /// revokes them, so a grant made under a looser rung never survives a
+    /// tighter one. A change that keeps the rung keeps the grants.
     pub fn apply_config(&self, config: &crate::config::AutonomyConfig) {
-        let level_changed = self.fields().autonomy != config.level;
+        // A rung change is a change to `level` **or** to `always_ask`: the two
+        // presets that share a level (Manual and Smart) differ only by
+        // `always_ask`, so comparing the level alone keeps a grant made under
+        // the looser rung.
+        let old = self.fields();
+        let rung_changed = old.autonomy != config.level || old.always_ask != config.always_ask;
         *self.fields.write() = Arc::new(PolicyFields::from_config(config));
-        if level_changed {
+        if rung_changed {
             self.clear_medium_risk_approvals();
         }
     }
@@ -1544,9 +1549,9 @@ impl SecurityPolicy {
         self.medium_risk_approved.write().insert(name);
     }
 
-    /// Forget every medium-risk session grant. Called when the autonomy level
-    /// changes: a grant made under a looser level must not survive a tighter
-    /// one.
+    /// Forget every medium-risk session grant. Called when the rung changes —
+    /// the level or `always_ask`: a grant made under a looser rung must not
+    /// survive a tighter one.
     pub fn clear_medium_risk_approvals(&self) {
         self.medium_risk_approved.write().clear();
     }
@@ -2176,6 +2181,39 @@ mod tests {
         assert!(
             p.medium_risk_approved_snapshot().is_empty(),
             "a rung change must revoke the session grant"
+        );
+    }
+
+    /// Manual and Smart share the `supervised` level and differ only in
+    /// `always_ask`, so a change to `always_ask` is a rung change too: a grant
+    /// made under the looser rung must not answer the risk gate under the
+    /// tighter one.
+    #[test]
+    fn a_change_to_always_ask_clears_the_medium_risk_approvals() {
+        let p = SecurityPolicy::default()
+            .with_autonomy(AutonomyLevel::Supervised)
+            .with_require_approval_for_medium_risk(true)
+            .with_allowed_commands(vec!["touch".into()]);
+        p.add_medium_risk_approval("touch");
+
+        let manual = crate::config::AutonomyConfig {
+            level: AutonomyLevel::Supervised,
+            always_ask: vec!["*".to_string()],
+            ..crate::config::AutonomyConfig::default()
+        };
+        p.apply_config(&manual);
+        assert!(
+            p.medium_risk_approved_snapshot().is_empty(),
+            "a rung change that only moves always_ask must revoke the session grant"
+        );
+
+        // The negative control: the same rung again keeps what is granted now.
+        p.add_medium_risk_approval("touch");
+        p.apply_config(&manual);
+        assert_eq!(
+            p.medium_risk_approved_snapshot(),
+            vec!["touch".to_string()],
+            "a reload that changes nothing must keep the grant"
         );
     }
 
