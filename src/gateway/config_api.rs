@@ -484,7 +484,13 @@ async fn persist_and_swap(
     *state.config_fingerprint.lock() =
         crate::config::fingerprint::fingerprint_file(&cfg.config_path);
     audit_config_change(&cfg, change_summary);
+    // The autonomy in force may have changed. Push it onto the process policy
+    // and onto every live turn, so the next tool-call decision on a turn that
+    // is already running reads the new level — in both directions. A prompt
+    // that is already open is not touched by this: the human still answers it.
+    let autonomy = cfg.autonomy.clone();
     *state.config.lock() = cfg;
+    state.apply_autonomy(&autonomy);
     Ok(())
 }
 
@@ -595,7 +601,7 @@ async fn set_model(
 // ── PUT /config/autonomy ─────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
-struct AutonomyBody {
+pub(crate) struct AutonomyBody {
     #[serde(default)]
     level: Option<String>,
     #[serde(default)]
@@ -646,7 +652,7 @@ fn sets_readonly_or_full(level: Option<&str>) -> bool {
     )
 }
 
-async fn set_autonomy(
+pub(crate) async fn set_autonomy(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<AutonomyBody>,
@@ -4158,6 +4164,7 @@ mod tests {
 
             tools_factory: Arc::new(|_: &Config| Vec::new()),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            live_autonomy: Arc::default(),
             webhook_secret_hash: None,
             pairing: Arc::new(crate::security::pairing::PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,

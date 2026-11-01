@@ -168,6 +168,44 @@ pub fn exempt_shell_from_tool_gate(autonomy: &mut crate::config::AutonomyConfig)
     }
 }
 
+/// The narrowing a turn carries on top of the global autonomy config.
+///
+/// A turn's approval manager is built from an autonomy that is not always the
+/// global one: the console exempts `shell` from the Layer-A gate, a webhook
+/// carries the sender's already-approved tools. Pushing the global config
+/// straight onto such a manager would WIDEN it (the console would gate `shell`
+/// twice, the webhook would lose the carried-over approvals), so the
+/// narrowing travels with the turn and is re-applied on every config change.
+#[derive(Debug, Clone, Default)]
+pub enum AutonomyOverlay {
+    /// The turn runs the global config as it is.
+    #[default]
+    Global,
+    /// The turn's `shell` tool is exempt from the Layer-A tool-gate.
+    ShellExempt,
+    /// The turn carries these tools as already approved.
+    ExtraAutoApprove(Vec<String>),
+}
+
+impl AutonomyOverlay {
+    /// The autonomy this turn's manager sees, given the global config.
+    pub fn resolve(&self, global: &crate::config::AutonomyConfig) -> crate::config::AutonomyConfig {
+        let mut autonomy = global.clone();
+        match self {
+            Self::Global => {}
+            Self::ShellExempt => exempt_shell_from_tool_gate(&mut autonomy),
+            Self::ExtraAutoApprove(extra) => {
+                for name in extra {
+                    if !autonomy.auto_approve.iter().any(|t| t == name) {
+                        autonomy.auto_approve.push(name.clone());
+                    }
+                }
+            }
+        }
+        autonomy
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,5 +459,73 @@ mod tests {
             mgr.needs_approval("http_request"),
             "other tools stay gated at Layer-A"
         );
+    }
+
+    // ── AutonomyOverlay ───────────────────────────────────────
+
+    fn supervised_with_shell_asked() -> crate::config::AutonomyConfig {
+        crate::config::AutonomyConfig {
+            level: crate::security::AutonomyLevel::Supervised,
+            always_ask: vec!["shell".to_string(), "ssh".to_string()],
+            ..crate::config::AutonomyConfig::default()
+        }
+    }
+
+    /// The plain overlay hands the global config over unchanged.
+    #[test]
+    fn the_global_overlay_resolves_to_the_global_config() {
+        let global = supervised_with_shell_asked();
+        let resolved = AutonomyOverlay::Global.resolve(&global);
+        assert_eq!(resolved.level, global.level);
+        assert_eq!(resolved.always_ask, global.always_ask);
+        assert_eq!(resolved.auto_approve, global.auto_approve);
+    }
+
+    /// The console's narrowing must survive a config change: the Layer-A gate
+    /// must not come back for `shell`, or one command shows two modals.
+    #[test]
+    fn the_shell_exempt_overlay_keeps_the_exemption() {
+        let global = supervised_with_shell_asked();
+        let resolved = AutonomyOverlay::ShellExempt.resolve(&global);
+        assert!(
+            !resolved.always_ask.iter().any(|t| t == "shell"),
+            "shell must stay off always_ask"
+        );
+        assert!(
+            resolved.auto_approve.iter().any(|t| t == "shell"),
+            "shell must stay auto-approved"
+        );
+        assert!(
+            resolved.always_ask.iter().any(|t| t == "ssh"),
+            "the other entries stay"
+        );
+        let mgr = crate::approval::ApprovalManager::from_config(&resolved);
+        assert!(
+            !mgr.needs_approval("shell"),
+            "the exemption must reach the gate"
+        );
+    }
+
+    /// The webhook's carried-over approvals must survive a config change, and
+    /// must not be added twice.
+    #[test]
+    fn the_extra_auto_approve_overlay_keeps_the_carried_over_tools() {
+        let global = crate::config::AutonomyConfig {
+            level: crate::security::AutonomyLevel::Supervised,
+            auto_approve: vec!["file_read".to_string()],
+            ..crate::config::AutonomyConfig::default()
+        };
+        let resolved = AutonomyOverlay::ExtraAutoApprove(vec![
+            "http_request".to_string(),
+            "file_read".to_string(),
+        ])
+        .resolve(&global);
+        assert_eq!(
+            resolved.auto_approve,
+            vec!["file_read".to_string(), "http_request".to_string()],
+            "the carried-over tool is added once, after the global list"
+        );
+        let mgr = crate::approval::ApprovalManager::from_config(&resolved);
+        assert!(!mgr.needs_approval("http_request"));
     }
 }

@@ -464,6 +464,103 @@ fn load_webhook_routes(config_dir: &std::path::Path) -> Vec<WebhookRoute> {
     }
 }
 
+/// The live autonomy registry: the turns whose autonomy a config change has
+/// to reach while they run.
+///
+/// A turn registers here when it starts, so an autonomy change written to the
+/// config governs the next tool-call decision on a turn that is already
+/// running — not only on the next turn. The entries are weak: a turn that has
+/// ended leaves a dead `Weak` behind, and the next fan-out prunes it.
+pub type LiveAutonomyRegistry = Arc<Mutex<Vec<LiveAutonomyEntry>>>;
+
+/// One live turn's autonomy sources.
+///
+/// The policy and the manager are independent: a turn may have both (the
+/// console chat), only one of them (the webhook turn has a manager, the
+/// webhook tools share the process policy), or neither.
+pub struct LiveAutonomyEntry {
+    /// The turn's own policy, when it built one.
+    pub policy: Option<std::sync::Weak<SecurityPolicy>>,
+    /// The turn's approval manager, when it built one.
+    pub manager: Option<std::sync::Weak<ApprovalManager>>,
+    /// The narrowing this turn carries on top of the global config.
+    pub overlay: crate::gateway::web_approval::AutonomyOverlay,
+}
+
+/// The live sources of one entry: its policy and its manager, with a dead
+/// `Weak` resolved away.
+///
+/// A turn that ended drops both of its `Arc`s, so its `Weak`s stop
+/// upgrading — that pair of dead `Weak`s IS the turn-end cleanup, and an
+/// entry in that state carries no live autonomy any more.
+fn resolve_live_autonomy_sources(
+    entry: &LiveAutonomyEntry,
+) -> (Option<Arc<SecurityPolicy>>, Option<Arc<ApprovalManager>>) {
+    (
+        entry.policy.as_ref().and_then(std::sync::Weak::upgrade),
+        entry.manager.as_ref().and_then(std::sync::Weak::upgrade),
+    )
+}
+
+/// Register a live turn's autonomy sources.
+///
+/// Called when the turn starts, with whatever the turn built: its own policy,
+/// its own approval manager, and the narrowing it carries (the console's
+/// shell exemption, a webhook's carried-over approvals).
+///
+/// A turn that ended before this one left a dead entry behind, so the
+/// register step drops those here — the same condition
+/// [`apply_live_autonomy`] applies — instead of waiting for the next
+/// fan-out to clean them up. The registry then stays bounded by the number
+/// of turns that are actually running.
+pub fn register_live_autonomy(
+    registry: &LiveAutonomyRegistry,
+    policy: Option<&Arc<SecurityPolicy>>,
+    manager: Option<&Arc<ApprovalManager>>,
+    overlay: crate::gateway::web_approval::AutonomyOverlay,
+) {
+    let mut entries = registry.lock();
+    entries.retain(|entry| {
+        let (policy, manager) = resolve_live_autonomy_sources(entry);
+        policy.is_some() || manager.is_some()
+    });
+    entries.push(LiveAutonomyEntry {
+        policy: policy.map(Arc::downgrade),
+        manager: manager.map(Arc::downgrade),
+        overlay,
+    });
+}
+
+/// Push a new autonomy onto every live turn.
+///
+/// Each entry carries its own narrowing, so a turn that runs a narrowed
+/// autonomy keeps that narrowing — the console's `shell` exemption and the
+/// webhook's carried-over approvals both survive the change.
+///
+/// An entry whose policy AND manager are both gone is dropped in the same
+/// pass: the dead `Weak` IS the turn-end cleanup, so there is nothing to
+/// unregister.
+pub fn apply_live_autonomy(
+    registry: &LiveAutonomyRegistry,
+    autonomy: &crate::config::AutonomyConfig,
+) {
+    let mut entries = registry.lock();
+    entries.retain(|entry| {
+        let (policy, manager) = resolve_live_autonomy_sources(entry);
+        if policy.is_none() && manager.is_none() {
+            return false;
+        }
+        let resolved = entry.overlay.resolve(autonomy);
+        if let Some(policy) = policy {
+            policy.apply_config(&resolved);
+        }
+        if let Some(manager) = manager {
+            manager.apply_config(&resolved);
+        }
+        true
+    });
+}
+
 /// Shared state for all axum handlers
 /// Builds one turn's tool registry from the `Config` in force at that moment.
 pub type ToolsFactory = Arc<dyn Fn(&Config) -> Vec<Box<dyn Tool>> + Send + Sync>;
@@ -499,6 +596,9 @@ pub struct AppState {
     /// The process-wide policy: the webhook gate reads its live autonomy level
     /// and the tools share the same object. Built once in `start`.
     pub security: Arc<SecurityPolicy>,
+    /// The turns that are running right now, and whose autonomy a config
+    /// change has to reach. See [`register_live_autonomy`].
+    pub live_autonomy: LiveAutonomyRegistry,
     /// SHA-256 hash of `X-Webhook-Secret` (hex-encoded), never plaintext.
     pub webhook_secret_hash: Option<Arc<str>>,
     pub pairing: Arc<PairingGuard>,
@@ -556,6 +656,19 @@ pub struct AppState {
     /// moves that lifetime here; it rebuilds itself when a hot-reloaded config
     /// changes `mcp_servers`. See [`crate::mcp::discover::McpPoolHandle`].
     pub mcp: Arc<crate::mcp::discover::McpPoolHandle>,
+}
+
+impl AppState {
+    /// Push a new autonomy onto the process policy and onto every live turn.
+    ///
+    /// The process policy is the one the webhook tools share; the live turns
+    /// are the ones that built their own policy or their own approval manager
+    /// when they started. A turn that is running right now reads the new level
+    /// on its next tool call, in both directions.
+    pub fn apply_autonomy(&self, autonomy: &crate::config::AutonomyConfig) {
+        self.security.apply_config(autonomy);
+        apply_live_autonomy(&self.live_autonomy, autonomy);
+    }
 }
 
 /// Build the closure stored in [`AppState::tools_factory`].
@@ -874,6 +987,7 @@ pub fn build_gateway_router(
         memory_search_mode,
         tools_factory,
         security,
+        live_autonomy: LiveAutonomyRegistry::default(),
         webhook_secret_hash,
         pairing,
         trust_forwarded_headers: config.gateway.trust_forwarded_headers,
@@ -1408,6 +1522,8 @@ pub async fn run_gateway(
         state.config_fingerprint.clone(),
         config.config_path.clone(),
         state.pairing.clone(),
+        state.security.clone(),
+        state.live_autonomy.clone(),
         reloader_shutdown.clone(),
     );
 
@@ -1783,6 +1899,11 @@ fn spawn_config_reloader(
     config_fingerprint: Arc<Mutex<String>>,
     config_path: std::path::PathBuf,
     pairing: Arc<PairingGuard>,
+    // The process policy and the live-turn registry, so a reload that changed
+    // the autonomy governs the next tool call on a turn that is already
+    // running — not only on the next one.
+    security: Arc<SecurityPolicy>,
+    live_autonomy: LiveAutonomyRegistry,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
     tokio::spawn(async move {
@@ -1838,8 +1959,13 @@ fn spawn_config_reloader(
                         &fresh.gateway.paired_tokens,
                         fresh.gateway.require_pairing,
                     );
+                    let autonomy = fresh.autonomy.clone();
                     *config.lock() = fresh;
                     *config_fingerprint.lock() = fresh_fp;
+                    // An autonomy change in the file governs the next tool call
+                    // on every live turn, in both directions.
+                    security.apply_config(&autonomy);
+                    apply_live_autonomy(&live_autonomy, &autonomy);
                     tracing::info!(target: "gateway", "config.toml changed — reloaded running config");
                 }
                 Err(e) => {
@@ -2110,9 +2236,23 @@ async fn run_gateway_chat_with_multimodal(
             autonomy
                 .auto_approve
                 .extend(extra_auto_approve.iter().cloned());
-            Some(ApprovalManager::from_config(&autonomy))
+            Some(Arc::new(ApprovalManager::from_config(&autonomy)))
         }
     };
+    // Register the turn's manager as live: an autonomy change written to the
+    // config has to govern this turn's next tool call too, and the sender's
+    // carried-over approvals have to survive that change — so the manager
+    // carries the narrowing it was built with.
+    if let Some(mgr) = approval_manager.as_ref() {
+        register_live_autonomy(
+            &state.live_autonomy,
+            None,
+            Some(mgr),
+            crate::gateway::web_approval::AutonomyOverlay::ExtraAutoApprove(
+                extra_auto_approve.to_vec(),
+            ),
+        );
+    }
 
     // Run the full agentic loop: LLM → tool calls → execute → feed results → repeat.
     let response = run_tool_call_loop(
@@ -2124,7 +2264,7 @@ async fn run_gateway_chat_with_multimodal(
         &state.model,
         state.temperature,
         true, // silent — no terminal output in gateway mode
-        approval_manager.as_ref(),
+        approval_manager.as_deref(),
         "webhook",
         None, // no origin chat — gateway/web has no cron_add push channel
         // The console SSE chat resolves approvals in-browser through
@@ -2153,7 +2293,7 @@ async fn run_gateway_chat_with_multimodal(
     // the auto-deny path records each as an `ApprovalResponse::No` audit
     // entry. The caller uses this to drive the in-chat Y/A/N prompt.
     let denied_tools = approval_manager
-        .as_ref()
+        .as_deref()
         .map(|mgr| {
             let mut seen = std::collections::HashSet::new();
             mgr.audit_log()
@@ -3019,6 +3159,162 @@ mod tests {
     // child as alive.
     #[cfg(unix)]
     use crate::tunnel::{process_is_alive, wait_for_pid_file};
+
+    // ── the live autonomy registry ───────────────────────────────
+
+    /// A config change reaches a turn that is running right now: the turn's
+    /// own policy reads the new level on its next tool call.
+    #[test]
+    fn the_live_registry_pushes_a_new_level_onto_a_running_turn() {
+        use crate::security::AutonomyLevel;
+        let registry = super::LiveAutonomyRegistry::default();
+        let policy = std::sync::Arc::new(crate::security::SecurityPolicy::default());
+        super::register_live_autonomy(
+            &registry,
+            Some(&policy),
+            None,
+            super::web_approval::AutonomyOverlay::Global,
+        );
+
+        super::apply_live_autonomy(
+            &registry,
+            &crate::config::AutonomyConfig {
+                level: AutonomyLevel::Full,
+                ..crate::config::AutonomyConfig::default()
+            },
+        );
+
+        assert_eq!(
+            policy.effective_autonomy(),
+            AutonomyLevel::Full,
+            "the running turn must read the new level"
+        );
+    }
+
+    /// A turn that ended leaves a dead `Weak` behind, and the next fan-out
+    /// drops it: the dead entry IS the turn-end cleanup.
+    #[test]
+    fn the_live_registry_drops_a_turn_that_ended() {
+        let registry = super::LiveAutonomyRegistry::default();
+        {
+            let policy = std::sync::Arc::new(crate::security::SecurityPolicy::default());
+            super::register_live_autonomy(
+                &registry,
+                Some(&policy),
+                None,
+                super::web_approval::AutonomyOverlay::Global,
+            );
+            assert_eq!(registry.lock().len(), 1, "the turn registered itself");
+        }
+
+        super::apply_live_autonomy(&registry, &crate::config::AutonomyConfig::default());
+
+        assert!(
+            registry.lock().is_empty(),
+            "a turn that ended must leave no entry behind"
+        );
+    }
+
+    /// The register step prunes a turn that already ended, in the same step
+    /// that adds the new one: the registry stays bounded by the number of
+    /// turns that are actually running, without waiting for the next
+    /// fan-out to clean up.
+    #[test]
+    fn the_live_registry_prunes_an_ended_turn_when_a_new_turn_registers() {
+        let registry = super::LiveAutonomyRegistry::default();
+        {
+            let ended = std::sync::Arc::new(crate::security::SecurityPolicy::default());
+            super::register_live_autonomy(
+                &registry,
+                Some(&ended),
+                None,
+                super::web_approval::AutonomyOverlay::Global,
+            );
+            assert_eq!(registry.lock().len(), 1, "the turn registered itself");
+        }
+
+        let running = std::sync::Arc::new(crate::security::SecurityPolicy::default());
+        super::register_live_autonomy(
+            &registry,
+            Some(&running),
+            None,
+            super::web_approval::AutonomyOverlay::Global,
+        );
+
+        assert_eq!(
+            registry.lock().len(),
+            1,
+            "the ended turn must be pruned by the register step, not only by the next fan-out"
+        );
+    }
+
+    /// The console's narrowing survives the change: the Layer-A gate must not
+    /// come back for `shell`, or one command shows two modals.
+    #[test]
+    fn the_live_registry_keeps_a_turns_narrowing_across_a_change() {
+        let registry = super::LiveAutonomyRegistry::default();
+        let manager = std::sync::Arc::new(crate::approval::ApprovalManager::from_config(
+            &crate::config::AutonomyConfig::default(),
+        ));
+        super::register_live_autonomy(
+            &registry,
+            None,
+            Some(&manager),
+            super::web_approval::AutonomyOverlay::ShellExempt,
+        );
+
+        // A change that names `shell` in always_ask: without the narrowing the
+        // console would gate `shell` a second time (two modals for one
+        // command).
+        super::apply_live_autonomy(
+            &registry,
+            &crate::config::AutonomyConfig {
+                level: crate::security::AutonomyLevel::Supervised,
+                always_ask: vec!["shell".to_string(), "web_search".to_string()],
+                ..crate::config::AutonomyConfig::default()
+            },
+        );
+
+        assert!(
+            !manager.needs_approval("shell"),
+            "the shell exemption must survive the change"
+        );
+        assert!(
+            manager.needs_approval("web_search"),
+            "the rest of the gate must still be in force"
+        );
+    }
+
+    /// The webhook's carried-over approvals survive the change too: a sender
+    /// who already approved a tool keeps it approved.
+    #[test]
+    fn the_live_registry_keeps_a_webhooks_carried_over_tools_across_a_change() {
+        let registry = super::LiveAutonomyRegistry::default();
+        let manager = std::sync::Arc::new(crate::approval::ApprovalManager::from_config(
+            &crate::config::AutonomyConfig::default(),
+        ));
+        super::register_live_autonomy(
+            &registry,
+            None,
+            Some(&manager),
+            super::web_approval::AutonomyOverlay::ExtraAutoApprove(
+                vec!["http_request".to_string()],
+            ),
+        );
+
+        super::apply_live_autonomy(
+            &registry,
+            &crate::config::AutonomyConfig {
+                level: crate::security::AutonomyLevel::Supervised,
+                ..crate::config::AutonomyConfig::default()
+            },
+        );
+
+        assert!(
+            !manager.needs_approval("http_request"),
+            "the carried-over tool must survive the change"
+        );
+    }
 
     #[test]
     fn every_loopback_spelling_resolves() {
@@ -4340,6 +4636,7 @@ mod tests {
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            live_autonomy: Arc::default(),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -4395,6 +4692,7 @@ mod tests {
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            live_autonomy: Arc::default(),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -4767,6 +5065,7 @@ mod tests {
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            live_autonomy: Arc::default(),
         }
     }
 
@@ -5186,6 +5485,7 @@ mod tests {
                 ]
             }),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            live_autonomy: Arc::default(),
         };
 
         let run = async {
@@ -5459,6 +5759,7 @@ mod tests {
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            live_autonomy: Arc::default(),
         };
 
         let mut headers = HeaderMap::new();
@@ -5528,6 +5829,7 @@ mod tests {
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            live_autonomy: Arc::default(),
         };
 
         let headers = HeaderMap::new();
@@ -5619,6 +5921,7 @@ mod tests {
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            live_autonomy: Arc::default(),
         };
 
         let headers = HeaderMap::new();
@@ -5851,6 +6154,7 @@ mod tests {
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            live_autonomy: Arc::default(),
         };
 
         let response = handle_webhook(
@@ -5905,6 +6209,7 @@ mod tests {
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            live_autonomy: Arc::default(),
         };
 
         let mut headers = HeaderMap::new();
@@ -5964,6 +6269,7 @@ mod tests {
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            live_autonomy: Arc::default(),
         };
 
         let mut headers = HeaderMap::new();
@@ -6058,6 +6364,7 @@ mod tests {
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            live_autonomy: Arc::default(),
         }
     }
 
@@ -6833,6 +7140,7 @@ mod tests {
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            live_autonomy: Arc::default(),
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -6894,6 +7202,7 @@ mod tests {
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            live_autonomy: Arc::default(),
         };
 
         let mut headers = HeaderMap::new();
@@ -6958,6 +7267,7 @@ mod tests {
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            live_autonomy: Arc::default(),
         };
 
         let body = r#"{"type":"message","object":{"token":"room-token"},"message":{"actorType":"users","actorId":"user_a","message":"hello"}}"#;
@@ -7058,6 +7368,7 @@ mod tests {
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            live_autonomy: Arc::default(),
         }
     }
 
@@ -7855,6 +8166,7 @@ mod tests {
             mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
             tools_factory: Arc::new(webhook_prompt_tools),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            live_autonomy: Arc::default(),
         };
         let response = handle_webhook(
             State(state),

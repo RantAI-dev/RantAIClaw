@@ -694,11 +694,22 @@ async fn agent_chat_sync(
     // an SSE `approval_request` event and `POST /approvals/{id}`, and this
     // request has no stream for anyone to answer on. Denying inline is the
     // honest answer, and it is now the same answer in both environments.
+    let manager = std::sync::Arc::new(crate::approval::ApprovalManager::from_config(
+        &config.autonomy,
+    ));
     agent.set_approval(
-        Some(std::sync::Arc::new(
-            crate::approval::ApprovalManager::from_config(&config.autonomy),
-        )),
+        Some(manager.clone()),
         Some(std::sync::Arc::new(crate::approval::AutoDenyBackend)),
+    );
+    // Register the turn's policy and manager as live: an autonomy change
+    // written to the config governs this turn's next tool call too, not only
+    // the next turn's. This turn's manager runs the global config un-narrowed,
+    // so the plain overlay is the right one here.
+    crate::gateway::register_live_autonomy(
+        &state.live_autonomy,
+        agent.security().as_ref(),
+        Some(&manager),
+        crate::gateway::web_approval::AutonomyOverlay::Global,
     );
     // Scope this request's turn memory to its conversation. The gateway serves
     // many callers, so an unscoped agent would write every session's messages
@@ -868,6 +879,9 @@ async fn agent_chat_stream(
     // approval requests against it — the forwarder then only sees and the
     // browser only resolves this turn's own requests.
     let turn_scope = uuid::Uuid::new_v4().to_string();
+    // The registry the turn registers its live autonomy sources in, taken
+    // before the spawn so the turn can reach it.
+    let live_autonomy = state.live_autonomy.clone();
 
     tokio::spawn(async move {
         match crate::agent::Agent::from_config_with_mcp_pool(&config, observer, &mcp).await {
@@ -893,6 +907,24 @@ async fn agent_chat_stream(
                     crate::gateway::web_approval::exempt_shell_from_tool_gate(&mut autonomy);
                     let manager = std::sync::Arc::new(
                         crate::approval::ApprovalManager::from_config(&autonomy),
+                    );
+                    // Register the turn's live autonomy sources. The policy runs
+                    // the global config (it is the Layer-B command gate), the
+                    // manager keeps the console's shell exemption — its Layer-A
+                    // gate must not come back and show two modals for one
+                    // command. Two entries, one per target: the narrowing
+                    // belongs to the manager alone.
+                    crate::gateway::register_live_autonomy(
+                        &live_autonomy,
+                        agent.security().as_ref(),
+                        None,
+                        crate::gateway::web_approval::AutonomyOverlay::Global,
+                    );
+                    crate::gateway::register_live_autonomy(
+                        &live_autonomy,
+                        None,
+                        Some(&manager),
+                        crate::gateway::web_approval::AutonomyOverlay::ShellExempt,
                     );
                     // Shared with the shell forwarder below, which reads the live
                     // policy when it decides whether an Always answer can hold.
@@ -3063,6 +3095,7 @@ mod tests {
 
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            live_autonomy: Arc::default(),
             webhook_secret_hash: None,
             pairing: Arc::new(crate::security::pairing::PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
@@ -3102,12 +3135,13 @@ mod tests {
     }
 
     /// A local OpenAI-compatible server for the console tests. Each request
-    /// whose history has no tool result yet gets one `shell` tool call for the
-    /// configured command; once a result is back it answers in text. The
-    /// command is set per test, so the same server drives the allowlist, the
-    /// medium-risk and the forbidden-argument cases.
+    /// whose history carries N tool results gets one `shell` tool call for the
+    /// Nth configured command; once the commands run out it answers in text.
+    /// The commands are set per test, so the same server drives the allowlist,
+    /// the medium-risk and the forbidden-argument cases, and a turn that runs
+    /// several commands in a row.
     struct ShellToolScript {
-        command: Arc<parking_lot::Mutex<String>>,
+        commands: Arc<parking_lot::Mutex<Vec<String>>>,
         requests: Arc<parking_lot::Mutex<usize>>,
         addr: std::net::SocketAddr,
         _task: tokio::task::JoinHandle<()>,
@@ -3115,7 +3149,7 @@ mod tests {
 
     #[derive(Clone)]
     struct ShellToolScriptState {
-        command: Arc<parking_lot::Mutex<String>>,
+        commands: Arc<parking_lot::Mutex<Vec<String>>>,
         requests: Arc<parking_lot::Mutex<usize>>,
     }
 
@@ -3127,30 +3161,30 @@ mod tests {
         use std::fmt::Write;
         let request: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
         *state.requests.lock() += 1;
-        let has_tool_result = request["messages"]
+        // How many tool results the history already carries: that is the index
+        // of the command this request asks for.
+        let done = request["messages"]
             .as_array()
-            .is_some_and(|msgs| msgs.iter().any(|m| m["role"] == "tool"));
-        let frames = if has_tool_result {
-            vec![serde_json::json!({
-                "choices": [{ "index": 0, "delta": { "content": "done" }, "finish_reason": null }]
-            })]
-        } else {
-            let command = state.command.lock().clone();
+            .map(|msgs| msgs.iter().filter(|m| m["role"] == "tool").count())
+            .unwrap_or(0);
+        let next = state.commands.lock().get(done).cloned();
+        let has_next = next.is_some();
+        let frames = if let Some(command) = next {
             let arguments = serde_json::json!({ "command": command }).to_string();
             vec![serde_json::json!({
                 "choices": [{ "index": 0, "delta": { "tool_calls": [{
                     "index": 0,
-                    "id": "call_shell_1",
+                    "id": format!("call_shell_{}", done + 1),
                     "type": "function",
                     "function": { "name": "shell", "arguments": arguments }
                 }] }, "finish_reason": null }]
             })]
-        };
-        let finish_reason = if has_tool_result {
-            "stop"
         } else {
-            "tool_calls"
+            vec![serde_json::json!({
+                "choices": [{ "index": 0, "delta": { "content": "done" }, "finish_reason": null }]
+            })]
         };
+        let finish_reason = if has_next { "tool_calls" } else { "stop" };
         let mut body = String::new();
         for frame in frames {
             let _ = write!(body, "data: {frame}\n\n");
@@ -3170,12 +3204,12 @@ mod tests {
 
     impl ShellToolScript {
         async fn start() -> Self {
-            let command = Arc::new(parking_lot::Mutex::new(String::new()));
+            let commands = Arc::new(parking_lot::Mutex::new(Vec::new()));
             let requests = Arc::new(parking_lot::Mutex::new(0usize));
             let app = axum::Router::new()
                 .fallback(shell_tool_script_answer)
                 .with_state(ShellToolScriptState {
-                    command: Arc::clone(&command),
+                    commands: Arc::clone(&commands),
                     requests: Arc::clone(&requests),
                 });
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -3186,7 +3220,7 @@ mod tests {
                 let _ = axum::serve(listener, app).await;
             });
             Self {
-                command,
+                commands,
                 requests,
                 addr,
                 _task: task,
@@ -3198,8 +3232,45 @@ mod tests {
         }
 
         fn ask_for(&self, command: &str) {
-            *self.command.lock() = command.to_string();
+            *self.commands.lock() = vec![command.to_string()];
         }
+
+        /// Queue several commands for one turn: the request whose history
+        /// carries N tool results asks for the Nth command. The names must be
+        /// distinct — a grant for one basename answers the next call too.
+        fn ask_for_sequence(&self, commands: &[&str]) {
+            *self.commands.lock() = commands.iter().map(|c| (*c).to_string()).collect();
+        }
+    }
+
+    /// A hook that runs after every SSE event of a turn, so a test can change
+    /// the config at a chosen moment of the turn: while a prompt is open, or
+    /// after the first tool call.
+    type HookFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+    type TurnHook<'a> = &'a mut (dyn FnMut(&[serde_json::Value], AppState) -> HookFuture + Send);
+
+    type TurnHookFn = Box<dyn FnMut(&[serde_json::Value], AppState) -> HookFuture + Send>;
+
+    /// A hook that runs `body` exactly once, the first time `trigger` matches
+    /// the turn's events so far.
+    fn once_hook<F>(trigger: fn(&[serde_json::Value]) -> bool, body: F) -> TurnHookFn
+    where
+        F: Fn(AppState) -> HookFuture + Send + Sync + 'static,
+    {
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body = Arc::new(body);
+        Box::new(move |events, state| {
+            let fired = Arc::clone(&fired);
+            let body = Arc::clone(&body);
+            let ready = !fired.load(std::sync::atomic::Ordering::SeqCst) && trigger(events);
+            Box::pin(async move {
+                if ready {
+                    fired.store(true, std::sync::atomic::Ordering::SeqCst);
+                    body(state).await;
+                }
+            }) as HookFuture
+        })
     }
 
     /// Send one console chat message through the streaming handler and read its
@@ -3214,6 +3285,20 @@ mod tests {
         session_id: Option<String>,
         message: &str,
         resolve: Option<(bool, bool)>,
+    ) -> (Vec<serde_json::Value>, Option<serde_json::Value>) {
+        drive_console_turn_with_hook(state, provider, session_id, message, resolve, None).await
+    }
+
+    /// [`drive_console_turn`] with a hook that runs after every event, BEFORE a
+    /// prompt is answered. A test uses it to change the autonomy while the turn
+    /// is running: while a prompt is open, or after a tool call.
+    async fn drive_console_turn_with_hook(
+        state: &AppState,
+        provider: &str,
+        session_id: Option<String>,
+        message: &str,
+        resolve: Option<(bool, bool)>,
+        mut hook: Option<TurnHook<'_>>,
     ) -> (Vec<serde_json::Value>, Option<serde_json::Value>) {
         use http_body_util::BodyExt;
         let mut headers = HeaderMap::new();
@@ -3257,6 +3342,13 @@ mod tests {
                     let Ok(ev) = serde_json::from_str::<serde_json::Value>(json) else {
                         continue;
                     };
+                    let is_done = ev["type"] == "done";
+                    events.push(ev.clone());
+                    // The hook runs before the prompt is answered, so a test can
+                    // change the autonomy while a prompt is open.
+                    if let Some(hook) = hook.as_mut() {
+                        hook(&events, state.clone()).await;
+                    }
                     if ev["type"] == "approval_request" {
                         if prompt.is_none() {
                             prompt = Some(ev.clone());
@@ -3275,8 +3367,6 @@ mod tests {
                         )
                         .await;
                     }
-                    let is_done = ev["type"] == "done";
-                    events.push(ev);
                     if is_done {
                         return (events, prompt);
                     }
@@ -4551,6 +4641,151 @@ mod tests {
             approval_request_count(&events),
             1,
             "Smart's one shell request must be one event: {events:?}"
+        );
+    }
+
+    /// A console state whose autonomy allows no shell command, so every shell
+    /// call has to pass the Layer-B gate and a level change is visible. The
+    /// config points into `root`, so the console's own write lands in the temp
+    /// dir instead of the operator's real config.
+    fn empty_allowlist_state(root: &std::path::Path) -> AppState {
+        let mut config = crate::config::Config::default();
+        config.default_provider = Some("test-sse".to_string());
+        config.default_model = Some("test-model".to_string());
+        config.gateway.require_pairing = false;
+        config.api_key = Some("mock-key".to_string());
+        config.autonomy.allowed_commands = Vec::new();
+        config.config_path = root.join("config.toml");
+        config.workspace_dir = root.join("workspace");
+        let mut state = test_state();
+        state.config = Arc::new(Mutex::new(config));
+        state
+    }
+
+    /// The console's autonomy write, driven the way the console drives it.
+    async fn put_autonomy(state: &AppState, level: &str) {
+        let body: crate::gateway::config_api::AutonomyBody =
+            serde_json::from_value(serde_json::json!({ "level": level })).expect("autonomy body");
+        let response = Box::pin(crate::gateway::config_api::set_autonomy(
+            axum::extract::State(state.clone()),
+            HeaderMap::new(),
+            axum::Json(body),
+        ))
+        .await
+        .expect("the autonomy write must succeed");
+        assert_eq!(
+            response.0["level"], level,
+            "the console must report the level it wrote"
+        );
+    }
+
+    /// A level change governs the turn that is already running: the console
+    /// moves to Full while the first shell prompt is open, and the two calls
+    /// that follow run with no prompt at all.
+    #[tokio::test]
+    async fn console_a_level_change_to_full_governs_the_running_turn() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+        let state = empty_allowlist_state(tmp.path());
+        let script = ShellToolScript::start().await;
+        let sid = fresh_session_id();
+
+        // Three distinct basenames: a grant for one of them would answer the
+        // next call too, and the test would pass without the level change.
+        script.ask_for_sequence(&["hostname", "id -u", "whoami"]);
+        let mut hook = once_hook(
+            |events| events.iter().any(|e| e["type"] == "approval_request"),
+            |state: AppState| {
+                Box::pin(async move {
+                    put_autonomy(&state, "full").await;
+                })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            },
+        );
+        let (events, prompt) = drive_console_turn_with_hook(
+            &state,
+            &script.provider(),
+            Some(sid),
+            "run them",
+            Some((true, false)),
+            Some(&mut *hook),
+        )
+        .await;
+
+        assert!(prompt.is_some(), "the first call must prompt: {events:?}");
+        assert_eq!(
+            approval_request_count(&events),
+            1,
+            "the level change must end the prompting: {events:?}"
+        );
+        let ran = events
+            .iter()
+            .filter(|e| e["type"] == "tool_call_end" && e["ok"] == true)
+            .count();
+        assert_eq!(ran, 3, "every call must run: {events:?}");
+    }
+
+    /// The other direction: a turn that is running when the level drops to
+    /// ReadOnly has its NEXT call refused — the answer the human gave is still
+    /// the answer, but the level decides what happens next.
+    ///
+    /// The change lands while the second call's prompt is open, so it is
+    /// guaranteed to arrive between the two calls: the agent is parked on that
+    /// prompt until the human answers it.
+    #[tokio::test]
+    async fn console_a_level_change_to_readonly_refuses_the_next_call() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+        let state = empty_allowlist_state(tmp.path());
+        let script = ShellToolScript::start().await;
+        let sid = fresh_session_id();
+
+        script.ask_for_sequence(&["hostname", "id -u"]);
+        let mut hook = once_hook(
+            |events| {
+                events
+                    .iter()
+                    .filter(|e| e["type"] == "approval_request")
+                    .count()
+                    >= 2
+            },
+            |state: AppState| {
+                Box::pin(async move {
+                    put_autonomy(&state, "readonly").await;
+                })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            },
+        );
+        let (events, prompt) = drive_console_turn_with_hook(
+            &state,
+            &script.provider(),
+            Some(sid),
+            "run them",
+            Some((true, false)),
+            Some(&mut *hook),
+        )
+        .await;
+
+        assert!(prompt.is_some(), "the first call must prompt: {events:?}");
+        assert_eq!(
+            approval_request_count(&events),
+            2,
+            "each call prompts once: {events:?}"
+        );
+        let ends: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|e| e["type"] == "tool_call_end")
+            .collect();
+        assert_eq!(ends.len(), 2, "both calls must end: {events:?}");
+        assert_eq!(
+            ends[0]["ok"], true,
+            "the first call ran before the change: {events:?}"
+        );
+        assert_eq!(
+            ends[1]["ok"], false,
+            "the second call must be refused under ReadOnly: {events:?}"
         );
     }
 

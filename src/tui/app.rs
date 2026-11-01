@@ -811,6 +811,13 @@ impl TuiApp {
             tokio::runtime::Handle::current().block_on(config_for_save.save())
         });
         saved?;
+        // The running agent's policy must read the new level now: the turn in
+        // flight decides its next tool call against that policy, and the
+        // rebuild below is deferred until the turn ends. A prompt that is
+        // already open stays open — the human still answers it.
+        if let Some(sec) = self.context.security.as_ref() {
+            sec.apply_config(&self.config.autonomy);
+        }
         // Hand the new config to the agent actor — mirrors what
         // `reload_config` does after a wizard run, but without the
         // wholesale re-read since we already have the live struct.
@@ -2808,6 +2815,13 @@ impl TuiApp {
         let store = crate::security::SecretStore::new(&rantaiclaw_dir, config.secrets.encrypt);
         crate::config::schema::decrypt_config_secrets(&store, &mut config)?;
         config.apply_env_overrides();
+        // A config change governs the next tool call on this surface too: the
+        // running agent's policy reads the new level at once, so a turn in
+        // flight does not wait for the deferred rebuild below. A prompt that is
+        // already open stays open — the human still answers it.
+        if let Some(sec) = self.context.security.as_ref() {
+            sec.apply_config(&config.autonomy);
+        }
         // A `/model` switch in flight outranks what the file says: its model is
         // on neither `self.config` nor the file until its own rebuild lands, so
         // rebuilding the agent from the bytes just read would take the agent
@@ -14686,6 +14700,164 @@ mod autonomy_keybinding_tests {
             preset_on_disk(dir.path()),
             Some(PolicyPreset::Manual),
             "the keybinding cycle must skip Off — it disables the approval gate"
+        );
+    }
+}
+
+#[cfg(test)]
+mod autonomy_live_level_tests {
+    use super::test_support::app_with_profile_root;
+    use crate::security::AutonomyLevel;
+    use std::sync::Arc;
+
+    /// A config change on disk governs the running agent's policy at once: the
+    /// TUI's watcher path (`reload_config`) pushes the new level onto the
+    /// policy the running turn decides against, without waiting for the
+    /// deferred rebuild.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_tui_watcher_path_applies_the_new_level_to_the_running_policy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut ctx, _req_rx, _events_tx) = crate::tui::context::TuiContext::test_context();
+        let policy = Arc::new(crate::security::SecurityPolicy::from_config(
+            &crate::config::AutonomyConfig::default(),
+            dir.path(),
+        ));
+        ctx.security = Some(policy.clone());
+        let mut app = app_with_profile_root(ctx, dir.path().to_path_buf());
+        app.config.workspace_dir = dir.path().to_path_buf();
+
+        assert_eq!(
+            policy.effective_autonomy(),
+            AutonomyLevel::Supervised,
+            "the policy starts at the level the agent booted with"
+        );
+
+        // The file the watcher saw change.
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[autonomy]\nlevel = \"full\"\n",
+        )
+        .expect("write the config the watcher saw");
+
+        app.reload_config().expect("the reload succeeds");
+
+        assert_eq!(
+            policy.effective_autonomy(),
+            AutonomyLevel::Full,
+            "the running policy must read the new level at once"
+        );
+    }
+
+    /// The other direction: a level that drops to ReadOnly reaches the running
+    /// policy too, and a prompt that is already open stays open — the human
+    /// still answers it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_tui_watcher_path_applies_a_tightening_and_leaves_an_open_prompt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut ctx, _req_rx, _events_tx) = crate::tui::context::TuiContext::test_context();
+        let policy = Arc::new(crate::security::SecurityPolicy::from_config(
+            &crate::config::AutonomyConfig {
+                level: AutonomyLevel::Full,
+                ..crate::config::AutonomyConfig::default()
+            },
+            dir.path(),
+        ));
+        ctx.security = Some(policy.clone());
+        let mut app = app_with_profile_root(ctx, dir.path().to_path_buf());
+        app.config.workspace_dir = dir.path().to_path_buf();
+
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[autonomy]\nlevel = \"readonly\"\n",
+        )
+        .expect("write the config the watcher saw");
+
+        // A prompt that is already open when the change lands.
+        let open = crate::security::PendingRequest {
+            id: uuid::Uuid::new_v4(),
+            basename: "git".to_string(),
+            full_command: "git commit -m probe".to_string(),
+            channel: "tui".to_string(),
+            reply_target: String::new(),
+            created_at: 0,
+            session_scope: crate::security::SessionScope::None,
+        };
+        app.pending_approval = Some(open.clone());
+
+        app.reload_config().expect("the reload succeeds");
+
+        assert_eq!(
+            policy.effective_autonomy(),
+            AutonomyLevel::ReadOnly,
+            "a tightening must reach the running policy too"
+        );
+        assert_eq!(
+            app.pending_approval.as_ref().map(|p| p.id),
+            Some(open.id),
+            "a prompt that is already open stays open"
+        );
+    }
+
+    /// The other TUI path: the `/autonomy` picker and Shift+Tab do not go
+    /// through the watcher, they call `apply_preset_to_config_and_reload`
+    /// directly. That call must push the new level onto the running policy
+    /// itself (`sec.apply_config`) — saving config.toml and handing the
+    /// config to the actor is not enough, because the turn in flight decides
+    /// its next tool call against the policy that is in force right now, and
+    /// the actor's rebuild is deferred until the turn ends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_tui_preset_path_applies_the_new_level_to_the_running_policy() {
+        use crate::approval::policy_writer::PolicyPreset;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut ctx, _req_rx, _events_tx) = crate::tui::context::TuiContext::test_context();
+        let policy = Arc::new(crate::security::SecurityPolicy::from_config(
+            &crate::config::AutonomyConfig::default(),
+            dir.path(),
+        ));
+        ctx.security = Some(policy.clone());
+        let mut app = app_with_profile_root(ctx, dir.path().to_path_buf());
+        app.config.workspace_dir = dir.path().to_path_buf();
+
+        assert_eq!(
+            policy.effective_autonomy(),
+            AutonomyLevel::Supervised,
+            "the policy starts at the level the agent booted with"
+        );
+
+        // The profile on disk names the preset under test, as a provisioned
+        // profile does before the operator picks the next one.
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[autonomy]\nlevel = \"full\"\n",
+        )
+        .expect("write the config the preset run starts from");
+
+        // Widening: `/autonomy off`. The real callers call it exactly like
+        // this, right after they wrote the policy files.
+        app.apply_preset_to_config_and_reload(PolicyPreset::Off)
+            .expect("the Off preset applies, saves and reloads");
+
+        assert_eq!(
+            policy.effective_autonomy(),
+            AutonomyLevel::Full,
+            "the preset must reach the running policy at once, not after a rebuild"
+        );
+
+        // The opposite direction, in the same run: a tightening preset must
+        // land on the running policy just as fast.
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[autonomy]\nlevel = \"readonly\"\n",
+        )
+        .expect("write the config the tightening run starts from");
+        app.apply_preset_to_config_and_reload(PolicyPreset::Strict)
+            .expect("the Strict preset applies, saves and reloads");
+
+        assert_eq!(
+            policy.effective_autonomy(),
+            AutonomyLevel::ReadOnly,
+            "a tightening via the preset path must reach the running policy too"
         );
     }
 }
