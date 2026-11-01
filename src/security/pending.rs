@@ -24,6 +24,8 @@ use std::time::Duration;
 use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
 
+use super::audit::ApprovalOutcome;
+
 /// User's response to a pending approval request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -36,6 +38,34 @@ pub enum Decision {
     Persist,
     /// Reject; the tool call fails with the original allowlist error.
     Deny,
+}
+
+/// What an answer to a request may hold for.
+///
+/// The scope an answer has must equal the scope its surface states: a request
+/// carries the scope of the gate that raised it, so every surface can say what
+/// the answer really does instead of guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionScope {
+    /// The answer covers this run only. Nothing holds.
+    None,
+    /// The answer holds for this command basename for the rest of the session —
+    /// the shell unallowed-command gate.
+    Command,
+    /// The answer holds for this command basename **at medium risk** for the rest
+    /// of the session — the shell risk gate. A high-risk command never holds.
+    MediumRisk,
+    /// The answer covers this run only: a high-risk command always asks again.
+    HighRisk,
+}
+
+impl SessionScope {
+    /// True when an answer to a request with this scope can hold for the rest of
+    /// the session. High risk is excluded on purpose: it always asks again.
+    #[must_use]
+    pub fn holds_for_session(self) -> bool {
+        matches!(self, Self::Command | Self::MediumRisk)
+    }
 }
 
 /// A decision together with whether the registry deadline produced it.
@@ -75,11 +105,13 @@ pub struct PendingRequest {
     pub reply_target: String,
     /// Unix epoch seconds when the request was created.
     pub created_at: u64,
-    /// True when an "Always" answer to this request may hold for the rest of the
-    /// conversation. Only the shell unallowed-command gate sets it (via
-    /// [`PendingApprovals::request_decision_in_always`]). Defaults to false, so
-    /// every other prompt, and every medium-risk one, offers no Always effect.
-    pub always_available: bool,
+    /// What an answer to this request may hold for. The shell unallowed-command
+    /// gate offers [`SessionScope::Command`], the shell risk gate
+    /// [`SessionScope::MediumRisk`] or [`SessionScope::HighRisk`] depending on
+    /// the risk it classified, and every other prompt
+    /// [`SessionScope::None`] — so a surface never has to claim a scope the
+    /// code does not give.
+    pub session_scope: SessionScope,
 }
 
 /// A resolution event, broadcast to `subscribe_resolved` listeners when a pending
@@ -118,6 +150,110 @@ tokio::task_local! {
     /// Absent on the TUI and CLI paths, where there is no chat — those keep
     /// today's unscoped behaviour.
     pub static TURN_SCOPE: (String, String);
+
+    /// The human answer a tool received while it ran, if any.
+    ///
+    /// The agent loop installs one of these around every tool's `execute`, so
+    /// a tool that asks a human itself (shell's two gates, `pty`, `ssh`) can
+    /// report the answer; the loop reads it back and writes the honest verdict
+    /// into the audit trail. Without it the trail could only report what the
+    /// OUTER `ApprovalManager` gate saw, and a call a human approved from
+    /// inside the tool read as `not_required` — nobody had approved anything,
+    /// as far as the record could tell.
+    ///
+    /// The value is a shared handle rather than the answer itself: a task-local
+    /// is only visible while the task is being polled (`tokio`'s `scope` swaps
+    /// the value in around each poll of the inner future and swaps it back
+    /// afterwards), so the tool and the loop must reach the same cell through
+    /// one interior-mutable handle. See [`ToolApprovalCell`].
+    pub static TOOL_APPROVAL: ToolApprovalCell;
+
+    /// Whether the current turn belongs to a guest — a sender who is not an
+    /// owner.
+    ///
+    /// The security layer owns this marker instead of reading the approval
+    /// module's `GUEST_TURN`: the dependency runs approval → security, so a
+    /// security-side reader of an approval-side marker would invert it. The
+    /// channel dispatch sets both from the same owner decision, so they cannot
+    /// disagree.
+    ///
+    /// `false` outside a turn is the safe answer: the TUI, the CLI and the
+    /// gateway's own operator paths are the operator's own turns.
+    pub static TURN_IS_GUEST: bool;
+}
+
+/// Shared handle to the human answer one tool call received.
+///
+/// `None` means no tool-internal prompt was answered. The loop keeps its own
+/// clone and reads the cell after the tool's future completes; the tool writes
+/// into it through [`record_tool_approval`].
+pub type ToolApprovalCell = Arc<Mutex<Option<ApprovalOutcome>>>;
+
+/// A fresh cell for one tool call: no human answer yet.
+#[must_use]
+pub fn tool_approval_cell() -> ToolApprovalCell {
+    Arc::new(Mutex::new(None))
+}
+
+/// Record the human answer a tool received while the running call was in
+/// flight.
+///
+/// A no-op when no cell is installed: a tool can run outside the agent loop
+/// (a unit test, a cron path), and there is no trail to write there.
+///
+/// The merge is sticky. A call may prompt more than once — a chained shell
+/// command asks about each blocked basename, and the risk gate asks again
+/// after that — and a refusal outranks a grant: the call records `denied`
+/// when any of its prompts was refused, `granted` when they were all
+/// answered yes.
+pub fn record_tool_approval(outcome: ApprovalOutcome) {
+    let _ = TOOL_APPROVAL.try_with(|cell| {
+        let mut slot = cell.lock();
+        match outcome {
+            ApprovalOutcome::Denied => *slot = Some(ApprovalOutcome::Denied),
+            ApprovalOutcome::Granted => {
+                if *slot != Some(ApprovalOutcome::Denied) {
+                    *slot = Some(ApprovalOutcome::Granted);
+                }
+            }
+            // Nobody was asked. That is not a human answer, so it is not
+            // recorded — the cell keeps saying "no prompt was answered".
+            ApprovalOutcome::NotRequired => {}
+        }
+    });
+}
+
+/// The human answer recorded in `cell`, if any.
+#[must_use]
+pub fn tool_approval_outcome(cell: &ToolApprovalCell) -> Option<ApprovalOutcome> {
+    *cell.lock()
+}
+
+/// What the audit trail says about who let this call through.
+///
+/// Two gates can ask a human: the OUTER `ApprovalManager` (the caller knows
+/// its verdict and passes it in) and the tool itself (shell's basename and
+/// risk gates, `pty`, `ssh` — the tool writes its answer into the cell). A
+/// refusal inside the tool outranks everything: the call did not run, so no
+/// outer grant can make it read as approved. A grant inside the tool means a
+/// person really answered, so the line says `granted` even when the outer
+/// gate never asked. A call nobody was asked about keeps the outer outcome.
+///
+/// The rule lives beside the cell rather than in the agent loop, so the loop
+/// keeps exactly one place that may write `Granted`: the branch that asked a
+/// human (`only_the_branch_that_asked_a_human_may_record_a_granted_approval`
+/// in `src/agent/loop_.rs`). This function names `Granted` only when the cell
+/// holds it, and only a tool that asked a human can put it there.
+#[must_use]
+pub fn merge_tool_approval_outcome(
+    outer: ApprovalOutcome,
+    cell: &ToolApprovalCell,
+) -> ApprovalOutcome {
+    match tool_approval_outcome(cell) {
+        Some(ApprovalOutcome::Denied) => ApprovalOutcome::Denied,
+        Some(ApprovalOutcome::Granted) => ApprovalOutcome::Granted,
+        _ => outer,
+    }
 }
 
 /// The current turn's `(channel, reply_target)`, or empty strings when there is
@@ -127,6 +263,14 @@ pub fn current_turn_scope() -> (String, String) {
     TURN_SCOPE
         .try_with(|(channel, reply_target)| (channel.clone(), reply_target.clone()))
         .unwrap_or_default()
+}
+
+/// True when the current task runs a guest's turn. See [`TURN_IS_GUEST`].
+#[must_use]
+pub fn current_turn_is_guest() -> bool {
+    TURN_IS_GUEST
+        .try_with(|is_guest| *is_guest)
+        .unwrap_or(false)
 }
 
 impl PendingRequest {
@@ -147,7 +291,7 @@ impl PendingRequest {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
-            always_available: false,
+            session_scope: SessionScope::None,
         }
     }
 }
@@ -295,14 +439,21 @@ impl PendingApprovals {
         channel: impl Into<String>,
         reply_target: impl Into<String>,
     ) -> PendingOutcome {
-        self.request_decision_with(id, basename, full_command, channel, reply_target, false)
-            .await
+        self.request_decision_with(
+            id,
+            basename,
+            full_command,
+            channel,
+            reply_target,
+            SessionScope::None,
+        )
+        .await
     }
 
     /// As [`request_decision_in`](Self::request_decision_in), for the shell
     /// unallowed-command gate only: its "Always" answer is recorded as a command
-    /// grant and holds for the rest of the conversation, so the request is
-    /// flagged `always_available`. Every other caller keeps the deny default.
+    /// grant and holds for the rest of the conversation, so the request carries
+    /// [`SessionScope::Command`]. Every other caller keeps the deny default.
     pub async fn request_decision_in_always(
         &self,
         id: Uuid,
@@ -311,7 +462,33 @@ impl PendingApprovals {
         channel: impl Into<String>,
         reply_target: impl Into<String>,
     ) -> Decision {
-        self.request_decision_with(id, basename, full_command, channel, reply_target, true)
+        self.request_decision_with(
+            id,
+            basename,
+            full_command,
+            channel,
+            reply_target,
+            SessionScope::Command,
+        )
+        .await
+        .decision
+    }
+
+    /// As [`request_decision_in`](Self::request_decision_in), but the request
+    /// states what an answer to it may hold for. The shell risk gate uses this:
+    /// a medium-risk command may hold for the session, a high-risk one never
+    /// does, so the scope is decided by the gate that raises the request and
+    /// every surface can report it truthfully.
+    pub async fn request_decision_in_scope(
+        &self,
+        id: Uuid,
+        basename: impl Into<String>,
+        full_command: impl Into<String>,
+        channel: impl Into<String>,
+        reply_target: impl Into<String>,
+        scope: SessionScope,
+    ) -> Decision {
+        self.request_decision_with(id, basename, full_command, channel, reply_target, scope)
             .await
             .decision
     }
@@ -323,7 +500,7 @@ impl PendingApprovals {
         full_command: impl Into<String>,
         channel: impl Into<String>,
         reply_target: impl Into<String>,
-        always_available: bool,
+        scope: SessionScope,
     ) -> PendingOutcome {
         let mut request = PendingRequest::new_with_id(
             id,
@@ -332,7 +509,7 @@ impl PendingApprovals {
             channel.into(),
             reply_target.into(),
         );
-        request.always_available = always_available;
+        request.session_scope = scope;
         let id = request.id;
         // Kept for the resolution broadcast on the auto-deny path (the snapshot
         // entry is gone by the time the deadline fires and cleanup runs).
@@ -447,6 +624,27 @@ impl PendingApprovals {
         } else {
             None
         }
+    }
+
+    /// The scope of the pending request matched by basename, when exactly one
+    /// request carries that basename.
+    ///
+    /// A surface that answers by basename has to know what the answer will hold
+    /// for *before* it resolves — the scope is gone once the request is
+    /// resolved. More than one match is `None`, the same refusal
+    /// [`resolve_by_basename`](Self::resolve_by_basename) makes: a surface must
+    /// never claim a scope for a request it cannot name.
+    pub fn scope_by_basename(&self, basename: &str) -> Option<SessionScope> {
+        let snap = self.inner.snapshot.lock();
+        let mut scopes = snap
+            .values()
+            .filter(|r| r.basename == basename)
+            .map(|r| r.session_scope);
+        let first = scopes.next()?;
+        if scopes.next().is_some() {
+            return None;
+        }
+        Some(first)
     }
 
     /// Resolve a pending request matched by basename **within one chat**.
@@ -795,5 +993,51 @@ mod tests {
         assert_eq!(info.decision, Decision::Deny);
         assert_eq!(info.reply_target, "turn-2");
         assert!(info.timed_out);
+    }
+
+    /// The merge rule the audit trail depends on: a refusal inside the tool
+    /// outranks an outer grant, a grant inside the tool stands on its own, and
+    /// a call nobody was asked about keeps the outer outcome.
+    #[test]
+    fn the_merged_outcome_follows_the_cell_and_the_outer_gate() {
+        let cell = tool_approval_cell();
+        assert_eq!(
+            merge_tool_approval_outcome(ApprovalOutcome::NotRequired, &cell),
+            ApprovalOutcome::NotRequired
+        );
+        assert_eq!(
+            merge_tool_approval_outcome(ApprovalOutcome::Granted, &cell),
+            ApprovalOutcome::Granted
+        );
+
+        *cell.lock() = Some(ApprovalOutcome::Granted);
+        assert_eq!(
+            merge_tool_approval_outcome(ApprovalOutcome::NotRequired, &cell),
+            ApprovalOutcome::Granted
+        );
+
+        *cell.lock() = Some(ApprovalOutcome::Denied);
+        assert_eq!(
+            merge_tool_approval_outcome(ApprovalOutcome::Granted, &cell),
+            ApprovalOutcome::Denied
+        );
+    }
+
+    /// A call may prompt more than once (a chained shell command asks about
+    /// each blocked basename, then the risk gate asks again). The recorded
+    /// answer is sticky: a refusal outranks a grant, and "nobody was asked" is
+    /// never recorded as an answer.
+    #[tokio::test]
+    async fn the_recorded_answer_is_sticky_across_several_prompts() {
+        let cell = tool_approval_cell();
+        TOOL_APPROVAL
+            .scope(Arc::clone(&cell), async {
+                record_tool_approval(ApprovalOutcome::Granted);
+                record_tool_approval(ApprovalOutcome::NotRequired);
+                record_tool_approval(ApprovalOutcome::Denied);
+                record_tool_approval(ApprovalOutcome::Granted);
+            })
+            .await;
+        assert_eq!(tool_approval_outcome(&cell), Some(ApprovalOutcome::Denied));
     }
 }

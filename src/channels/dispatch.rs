@@ -19,6 +19,7 @@ use crate::memory::{Memory, MemoryView, MEMORY_VIEW};
 use crate::providers::{self, ChatMessage, ProviderCapabilityError};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -970,6 +971,24 @@ pub(crate) enum TurnEnd {
     NotStarted,
 }
 
+/// The task-local scope a channel turn runs under: the chat it came from, and
+/// whether its sender is a guest.
+///
+/// The guest marker is security-owned: the risk gate must never answer a
+/// guest's turn with a grant, and `src/security` cannot depend on
+/// `src/approval` — that dependency runs the other way. The dispatch states the
+/// owner's decision once, here, so the chat scope and the role cannot disagree.
+fn scope_channel_turn<'a, T: 'a>(
+    scope: (String, String),
+    sender_is_owner: bool,
+    turn: impl Future<Output = T> + 'a,
+) -> impl Future<Output = T> + 'a {
+    crate::security::TURN_SCOPE.scope(
+        scope,
+        crate::security::TURN_IS_GUEST.scope(!sender_is_owner, turn),
+    )
+}
+
 pub(crate) async fn process_channel_message(
     ctx: Arc<ChannelRuntimeContext>,
     msg: traits::ChannelMessage,
@@ -1398,8 +1417,9 @@ pub(crate) async fn process_channel_message(
             // `TURN_SCOPE`, set the same way per turn.
             MEMORY_VIEW.scope(
                 memory_view.clone(),
-                crate::security::TURN_SCOPE.scope(
+                scope_channel_turn(
                     (msg.channel.clone(), msg.reply_target.clone()),
+                    sender_is_owner,
                     crate::memory::SAVED_NOTES.scope(saved_notes.clone(), async {
                         if sender_is_owner {
                             run_tool_call_loop(
@@ -2256,6 +2276,51 @@ fn default_channel_session_title(conversation_key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The chat a turn came from, and whether its sender is a guest.
+    ///
+    /// The risk gate reads both: a grant answers the gate only in the
+    /// conversation that made it, and never for a guest. So the dispatch has to
+    /// state them together, once per turn.
+    #[tokio::test]
+    async fn a_channel_turn_marks_a_guest_sender_and_leaves_an_owner_unmarked() {
+        let guest = scope_channel_turn(
+            ("telegram".to_string(), "chat-1".to_string()),
+            false,
+            async {
+                (
+                    crate::security::current_turn_scope(),
+                    crate::security::current_turn_is_guest(),
+                )
+            },
+        )
+        .await;
+        assert_eq!(
+            guest.0,
+            ("telegram".to_string(), "chat-1".to_string()),
+            "the turn must know the chat it came from"
+        );
+        assert!(
+            guest.1,
+            "a sender who is not an owner must be marked as a guest"
+        );
+
+        let owner = scope_channel_turn(
+            ("telegram".to_string(), "chat-1".to_string()),
+            true,
+            async {
+                (
+                    crate::security::current_turn_scope(),
+                    crate::security::current_turn_is_guest(),
+                )
+            },
+        )
+        .await;
+        assert!(
+            !owner.1,
+            "an owner must not be marked as a guest: an owner's grant answers the gate"
+        );
+    }
 
     #[test]
     fn find_provider_capability_error_matches_wrapped_typed_error() {

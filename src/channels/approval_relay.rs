@@ -72,7 +72,7 @@ use crate::channels::traits::Channel;
 #[cfg(test)]
 use crate::channels::traits::SendMessage;
 use crate::security::pending::REQUEST_HANDLE_LEN;
-use crate::security::{Decision, PendingApprovals, PendingRequest, SecurityPolicy};
+use crate::security::{Decision, PendingApprovals, PendingRequest, SecurityPolicy, SessionScope};
 
 /// Try to interpret `text` as an approval reply. On success returns a
 /// human-readable acknowledgement *and* resolves the pending request
@@ -256,6 +256,11 @@ fn handle_parsed(
             } else {
                 Decision::Session
             };
+            // What the answer will hold for, read BEFORE the resolve: the scope
+            // is gone once the request is resolved. The risk gate answers
+            // differently from the unallowed-command gate, so the reply has to
+            // say which one it was.
+            let request_scope = pending.scope_by_basename(&parsed.basename);
             // Resolve FIRST, and only widen the allowlist if something was
             // actually pending.
             //
@@ -270,18 +275,38 @@ fn handle_parsed(
                     parsed.basename
                 ));
             };
-            if let Err(e) = security.add_runtime_command(&parsed.basename, parsed.persist) {
-                return Some(format!("Failed to allow `{}`: {e}", parsed.basename));
+            match request_scope {
+                // The risk gate: the answer holds for this basename at medium
+                // risk for the rest of the session — the shell tool records that
+                // grant — and it never touches the allowlist.
+                Some(SessionScope::MediumRisk) => Some(format!(
+                    "✅ Approved `{}` for this session (medium risk only) — pending approval resolved; \
+                     the agent will retry.",
+                    parsed.basename
+                )),
+                // High risk holds nothing beyond this run.
+                Some(SessionScope::HighRisk) => Some(format!(
+                    "✅ Approved `{}` for this run only — pending approval resolved; the agent will retry.",
+                    parsed.basename
+                )),
+                // The unallowed-command gate (and every prompt that is not the
+                // risk gate) widens the allowlist, as it always did.
+                _ => {
+                    if let Err(e) = security.add_runtime_command(&parsed.basename, parsed.persist) {
+                        return Some(format!("Failed to allow `{}`: {e}", parsed.basename));
+                    }
+                    let allowlist_scope = if parsed.persist {
+                        "persistent"
+                    } else {
+                        "session"
+                    };
+                    Some(format!(
+                        "✅ Added `{}` to the {allowlist_scope} allowlist — pending approval resolved; \
+                         the agent will retry.",
+                        parsed.basename
+                    ))
+                }
             }
-            let scope = if parsed.persist {
-                "persistent"
-            } else {
-                "session"
-            };
-            Some(format!(
-                "✅ Added `{}` to the {scope} allowlist — pending approval resolved; the agent will retry.",
-                parsed.basename
-            ))
         }
         ReplyVerb::Deny => match pending.resolve_by_basename(&parsed.basename, Decision::Deny) {
             Some(_) => Some(format!(
@@ -1015,6 +1040,57 @@ mod tests {
         assert!(security
             .runtime_allowlist_snapshot()
             .contains(&"brew".to_string()));
+    }
+
+    /// A risk-gate answer holds for the session at medium risk. It must not
+    /// claim an allowlist entry, because none is written.
+    #[tokio::test]
+    async fn a_medium_risk_reply_says_session_and_writes_no_allowlist_entry() {
+        let security = supervised_only_echo();
+        let pending = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        security.set_pending(pending.clone());
+
+        // Producer side: the shell tool's risk gate.
+        let pending2 = pending.clone();
+        let task = tokio::spawn(async move {
+            pending2
+                .request_decision_in_scope(
+                    uuid::Uuid::new_v4(),
+                    "git",
+                    "git commit -m probe",
+                    "telegram",
+                    String::new(),
+                    crate::security::SessionScope::MediumRisk,
+                )
+                .await
+        });
+        await_pending(&pending, 1).await;
+
+        let owners = vec!["owner1".to_string()];
+        let ack = try_handle_reply(
+            "/allow git",
+            &security,
+            "owner1",
+            &owners,
+            "telegram",
+            "chat-1",
+        )
+        .expect("recognised");
+        assert!(
+            ack.contains("medium risk only"),
+            "the reply must say what the answer holds for: {ack}"
+        );
+        assert!(
+            !ack.contains("allowlist"),
+            "the reply must not claim an allowlist entry: {ack}"
+        );
+        assert_eq!(task.await.unwrap(), Decision::Session);
+        assert!(
+            !security
+                .runtime_allowlist_snapshot()
+                .contains(&"git".to_string()),
+            "a risk-gate answer must not widen the allowlist"
+        );
     }
 
     #[tokio::test]

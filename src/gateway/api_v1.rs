@@ -694,11 +694,22 @@ async fn agent_chat_sync(
     // an SSE `approval_request` event and `POST /approvals/{id}`, and this
     // request has no stream for anyone to answer on. Denying inline is the
     // honest answer, and it is now the same answer in both environments.
+    let manager = std::sync::Arc::new(crate::approval::ApprovalManager::from_config(
+        &config.autonomy,
+    ));
     agent.set_approval(
-        Some(std::sync::Arc::new(
-            crate::approval::ApprovalManager::from_config(&config.autonomy),
-        )),
+        Some(manager.clone()),
         Some(std::sync::Arc::new(crate::approval::AutoDenyBackend)),
+    );
+    // Register the turn's policy and manager as live: an autonomy change
+    // written to the config governs this turn's next tool call too, not only
+    // the next turn's. This turn's manager runs the global config un-narrowed,
+    // so the plain overlay is the right one here.
+    crate::gateway::register_live_autonomy(
+        &state.live_autonomy,
+        agent.security().as_ref(),
+        Some(&manager),
+        crate::gateway::web_approval::AutonomyOverlay::Global,
     );
     // Scope this request's turn memory to its conversation. The gateway serves
     // many callers, so an unscoped agent would write every session's messages
@@ -868,6 +879,9 @@ async fn agent_chat_stream(
     // approval requests against it — the forwarder then only sees and the
     // browser only resolves this turn's own requests.
     let turn_scope = uuid::Uuid::new_v4().to_string();
+    // The registry the turn registers its live autonomy sources in, taken
+    // before the spawn so the turn can reach it.
+    let live_autonomy = state.live_autonomy.clone();
 
     tokio::spawn(async move {
         match crate::agent::Agent::from_config_with_mcp_pool(&config, observer, &mcp).await {
@@ -884,6 +898,18 @@ async fn agent_chat_stream(
                     std::sync::Arc<crate::approval::ApprovalManager>,
                 > = None;
                 let mut shell_approval_forwarder: Option<tokio::task::JoinHandle<()>> = None;
+                // Register the turn's policy as live, whether or not the turn
+                // gates tools: an autonomy change written to the config governs
+                // this turn's next tool call too, not only the next turn's.
+                // The policy runs the global config — it is the Layer-B command
+                // gate and the ReadOnly gate of the tool loop — so it carries no
+                // narrowing of its own.
+                crate::gateway::register_live_autonomy(
+                    &live_autonomy,
+                    agent.security().as_ref(),
+                    None,
+                    crate::gateway::web_approval::AutonomyOverlay::Global,
+                );
                 if gate_tools {
                     // Exempt `shell` from the Layer-A tool-gate: the shell tool has
                     // its own command-level gate (Layer-B, handled below), so gating
@@ -893,6 +919,17 @@ async fn agent_chat_stream(
                     crate::gateway::web_approval::exempt_shell_from_tool_gate(&mut autonomy);
                     let manager = std::sync::Arc::new(
                         crate::approval::ApprovalManager::from_config(&autonomy),
+                    );
+                    // Register the turn's approval manager as live too. It keeps
+                    // the console's shell exemption — its Layer-A gate must not
+                    // come back and show two modals for one command. The
+                    // narrowing belongs to the manager alone: the policy above
+                    // is registered with the plain overlay.
+                    crate::gateway::register_live_autonomy(
+                        &live_autonomy,
+                        None,
+                        Some(&manager),
+                        crate::gateway::web_approval::AutonomyOverlay::ShellExempt,
                     );
                     // Shared with the shell forwarder below, which reads the live
                     // policy when it decides whether an Always answer can hold.
@@ -940,6 +977,30 @@ async fn agent_chat_stream(
                                     );
                                 }
                             }
+                            // Carry this conversation's medium-risk grants into the
+                            // shell policy too. They answer the risk gate only, so
+                            // they go into the policy's medium-risk set and never
+                            // into the basename allowlist — re-seeding them there
+                            // would also lift the unallowed-command prompt.
+                            //
+                            // The grant belongs to this turn's conversation, so it
+                            // is filed under this turn's scope — the same scope
+                            // the turn runs under below. That is what the risk
+                            // gate reads it back from.
+                            let () = crate::security::TURN_SCOPE
+                                .scope(
+                                    ("console".to_string(), turn_scope.clone()),
+                                    async {
+                                        for name in
+                                            crate::approval::session_grants::session_granted_medium_commands(
+                                                sid,
+                                            )
+                                        {
+                                            sec.add_medium_risk_approval(&name);
+                                        }
+                                    },
+                                )
+                                .await;
                         }
                     }
                     let mut shell_rx = web_approvals.subscribe();
@@ -950,11 +1011,13 @@ async fn agent_chat_stream(
                     let fwd_session_id = history_session_id.clone();
                     shell_approval_forwarder = Some(tokio::spawn(async move {
                         use tokio::sync::broadcast::error::RecvError;
-                        // This turn's forwarded shell requests, by id: the basename
-                        // and whether Always could hold for it. Read at resolve time
-                        // to decide whether an Always answer becomes a command grant.
-                        let mut forwarded: std::collections::HashMap<uuid::Uuid, (String, bool)> =
-                            std::collections::HashMap::new();
+                        // This turn's forwarded shell requests, by id: what the browser was
+                        // told and what an answer to it may hold for. Read at
+                        // resolve time to decide what a "Session" answer grants.
+                        let mut forwarded: std::collections::HashMap<
+                            uuid::Uuid,
+                            ForwardedShellRequest,
+                        > = std::collections::HashMap::new();
                         loop {
                             tokio::select! {
                                 r = shell_rx.recv() => match r {
@@ -970,11 +1033,19 @@ async fn agent_chat_stream(
                                         // request.
                                         && req.basename != req.id.to_string() =>
                                     {
-                                        let always_available = req.always_available
+                                        let always_available = req.session_scope.holds_for_session()
                                             && fwd_manager.always_available_for("shell");
                                         forwarded.insert(
                                             req.id,
-                                            (req.basename.clone(), always_available),
+                                            ForwardedShellRequest {
+                                                basename: req.basename.clone(),
+                                                scope: req.session_scope,
+                                                always_available,
+                                                grant_basenames:
+                                                    crate::security::command_medium_risk_basenames(
+                                                        &req.full_command,
+                                                    ),
+                                            },
                                         );
                                         let _ = fwd_tx
                                             .send(crate::agent::AgentEvent::ApprovalRequest {
@@ -1007,14 +1078,34 @@ async fn agent_chat_stream(
                                         // Only an explicit, live Always on a request that
                                         // could hold for the conversation becomes a grant.
                                         // Once, Deny and timeouts record nothing.
-                                        if let Some((basename, true)) = forwarded.remove(&info.id) {
+                                        if let Some(request) = forwarded.remove(&info.id) {
                                             if info.decision == crate::security::Decision::Session
                                                 && !info.timed_out
+                                                && request.always_available
                                             {
                                                 if let Some(sid) = fwd_session_id.as_deref() {
-                                                    crate::approval::session_grants::record_session_command(
-                                                        sid, &basename,
-                                                    );
+                                                    match request.scope {
+                                                        crate::security::SessionScope::Command => {
+                                                            crate::approval::session_grants::record_session_command(
+                                                                sid, &request.basename,
+                                                            );
+                                                        }
+                                                        // A medium-risk grant covers the
+                                                        // basenames of the segments that
+                                                        // were medium risk, and answers
+                                                        // the risk gate only.
+                                                        crate::security::SessionScope::MediumRisk => {
+                                                            for name in &request.grant_basenames {
+                                                                crate::approval::session_grants::record_session_medium_command(
+                                                                    sid, name,
+                                                                );
+                                                            }
+                                                        }
+                                                        // `None` and `HighRisk` hold
+                                                        // nothing: high risk always asks
+                                                        // again.
+                                                        _ => {}
+                                                    }
                                                 }
                                             }
                                         }
@@ -1320,6 +1411,26 @@ impl Drop for CancelOnDrop {
 /// Extracted so the scoping can be unit-tested without a live stream.
 fn forward_to_this_stream(req: &crate::security::PendingRequest, turn_scope: &str) -> bool {
     !turn_scope.is_empty() && req.channel == "console" && req.reply_target == turn_scope
+}
+
+/// A shell request this turn forwarded to the browser, kept until it is
+/// resolved.
+///
+/// The scope decides what an answer may hold for: a "Session" answer to a
+/// medium-risk request grants the basenames the command runs for the rest of
+/// the conversation, a high-risk one grants nothing, and a command-scope
+/// request grants its basename.
+struct ForwardedShellRequest {
+    /// The basename the browser was told about.
+    basename: String,
+    /// What an answer to this request may hold for.
+    scope: crate::security::SessionScope,
+    /// Whether the browser was told that an "Always" answer would hold. Only
+    /// then may an answer become a grant.
+    always_available: bool,
+    /// The basenames a session grant covers: the basenames of the segments
+    /// that were medium risk themselves.
+    grant_basenames: Vec<String>,
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -3003,6 +3114,7 @@ mod tests {
 
             tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            live_autonomy: Arc::default(),
             webhook_secret_hash: None,
             pairing: Arc::new(crate::security::pairing::PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
@@ -3041,22 +3153,31 @@ mod tests {
             .collect()
     }
 
+    /// Answers held back until the test releases them, keyed by the number of
+    /// tool results the request's history carries. A held answer parks the
+    /// agent between two calls, so a test can change the autonomy at that point
+    /// with no timing race.
+    type HeldAnswers = Arc<parking_lot::Mutex<Vec<(usize, Arc<tokio::sync::Notify>)>>>;
+
     /// A local OpenAI-compatible server for the console tests. Each request
-    /// whose history has no tool result yet gets one `shell` tool call for the
-    /// configured command; once a result is back it answers in text. The
-    /// command is set per test, so the same server drives the allowlist, the
-    /// medium-risk and the forbidden-argument cases.
+    /// whose history carries N tool results gets one `shell` tool call for the
+    /// Nth configured command; once the commands run out it answers in text.
+    /// The commands are set per test, so the same server drives the allowlist,
+    /// the medium-risk and the forbidden-argument cases, and a turn that runs
+    /// several commands in a row.
     struct ShellToolScript {
-        command: Arc<parking_lot::Mutex<String>>,
+        commands: Arc<parking_lot::Mutex<Vec<String>>>,
         requests: Arc<parking_lot::Mutex<usize>>,
+        holds: HeldAnswers,
         addr: std::net::SocketAddr,
         _task: tokio::task::JoinHandle<()>,
     }
 
     #[derive(Clone)]
     struct ShellToolScriptState {
-        command: Arc<parking_lot::Mutex<String>>,
+        commands: Arc<parking_lot::Mutex<Vec<String>>>,
         requests: Arc<parking_lot::Mutex<usize>>,
+        holds: HeldAnswers,
     }
 
     async fn shell_tool_script_answer(
@@ -3067,30 +3188,42 @@ mod tests {
         use std::fmt::Write;
         let request: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
         *state.requests.lock() += 1;
-        let has_tool_result = request["messages"]
+        // How many tool results the history already carries: that is the index
+        // of the command this request asks for.
+        let done = request["messages"]
             .as_array()
-            .is_some_and(|msgs| msgs.iter().any(|m| m["role"] == "tool"));
-        let frames = if has_tool_result {
-            vec![serde_json::json!({
-                "choices": [{ "index": 0, "delta": { "content": "done" }, "finish_reason": null }]
-            })]
-        } else {
-            let command = state.command.lock().clone();
+            .map(|msgs| msgs.iter().filter(|m| m["role"] == "tool").count())
+            .unwrap_or(0);
+        let next = state.commands.lock().get(done).cloned();
+        let has_next = next.is_some();
+        // A held answer waits for the test to release it. The agent parks
+        // there, so a test can change the autonomy between two calls without
+        // racing the turn.
+        let held = state
+            .holds
+            .lock()
+            .iter()
+            .find(|(results, _)| *results == done)
+            .map(|(_, notify)| Arc::clone(notify));
+        if let Some(notify) = held {
+            notify.notified().await;
+        }
+        let frames = if let Some(command) = next {
             let arguments = serde_json::json!({ "command": command }).to_string();
             vec![serde_json::json!({
                 "choices": [{ "index": 0, "delta": { "tool_calls": [{
                     "index": 0,
-                    "id": "call_shell_1",
+                    "id": format!("call_shell_{}", done + 1),
                     "type": "function",
                     "function": { "name": "shell", "arguments": arguments }
                 }] }, "finish_reason": null }]
             })]
-        };
-        let finish_reason = if has_tool_result {
-            "stop"
         } else {
-            "tool_calls"
+            vec![serde_json::json!({
+                "choices": [{ "index": 0, "delta": { "content": "done" }, "finish_reason": null }]
+            })]
         };
+        let finish_reason = if has_next { "tool_calls" } else { "stop" };
         let mut body = String::new();
         for frame in frames {
             let _ = write!(body, "data: {frame}\n\n");
@@ -3110,13 +3243,15 @@ mod tests {
 
     impl ShellToolScript {
         async fn start() -> Self {
-            let command = Arc::new(parking_lot::Mutex::new(String::new()));
+            let commands = Arc::new(parking_lot::Mutex::new(Vec::new()));
             let requests = Arc::new(parking_lot::Mutex::new(0usize));
+            let holds = Arc::new(parking_lot::Mutex::new(Vec::new()));
             let app = axum::Router::new()
                 .fallback(shell_tool_script_answer)
                 .with_state(ShellToolScriptState {
-                    command: Arc::clone(&command),
+                    commands: Arc::clone(&commands),
                     requests: Arc::clone(&requests),
+                    holds: Arc::clone(&holds),
                 });
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
@@ -3126,8 +3261,9 @@ mod tests {
                 let _ = axum::serve(listener, app).await;
             });
             Self {
-                command,
+                commands,
                 requests,
+                holds,
                 addr,
                 _task: task,
             }
@@ -3138,8 +3274,55 @@ mod tests {
         }
 
         fn ask_for(&self, command: &str) {
-            *self.command.lock() = command.to_string();
+            *self.commands.lock() = vec![command.to_string()];
         }
+
+        /// Queue several commands for one turn: the request whose history
+        /// carries N tool results asks for the Nth command. The names must be
+        /// distinct — a grant for one basename answers the next call too.
+        fn ask_for_sequence(&self, commands: &[&str]) {
+            *self.commands.lock() = commands.iter().map(|c| (*c).to_string()).collect();
+        }
+
+        /// Hold the answer for the request whose history carries `results` tool
+        /// results, and hand back the release. The agent parks there until the
+        /// test releases it, so a change made in between lands before the next
+        /// call — no timing race.
+        fn hold_answer(&self, results: usize) -> Arc<tokio::sync::Notify> {
+            let notify = Arc::new(tokio::sync::Notify::new());
+            self.holds.lock().push((results, Arc::clone(&notify)));
+            notify
+        }
+    }
+
+    /// A hook that runs after every SSE event of a turn, so a test can change
+    /// the config at a chosen moment of the turn: while a prompt is open, or
+    /// after the first tool call.
+    type HookFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+    type TurnHook<'a> = &'a mut (dyn FnMut(&[serde_json::Value], AppState) -> HookFuture + Send);
+
+    type TurnHookFn = Box<dyn FnMut(&[serde_json::Value], AppState) -> HookFuture + Send>;
+
+    /// A hook that runs `body` exactly once, the first time `trigger` matches
+    /// the turn's events so far.
+    fn once_hook<F>(trigger: fn(&[serde_json::Value]) -> bool, body: F) -> TurnHookFn
+    where
+        F: Fn(AppState) -> HookFuture + Send + Sync + 'static,
+    {
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body = Arc::new(body);
+        Box::new(move |events, state| {
+            let fired = Arc::clone(&fired);
+            let body = Arc::clone(&body);
+            let ready = !fired.load(std::sync::atomic::Ordering::SeqCst) && trigger(events);
+            Box::pin(async move {
+                if ready {
+                    fired.store(true, std::sync::atomic::Ordering::SeqCst);
+                    body(state).await;
+                }
+            }) as HookFuture
+        })
     }
 
     /// Send one console chat message through the streaming handler and read its
@@ -3154,6 +3337,20 @@ mod tests {
         session_id: Option<String>,
         message: &str,
         resolve: Option<(bool, bool)>,
+    ) -> (Vec<serde_json::Value>, Option<serde_json::Value>) {
+        drive_console_turn_with_hook(state, provider, session_id, message, resolve, None).await
+    }
+
+    /// [`drive_console_turn`] with a hook that runs after every event, BEFORE a
+    /// prompt is answered. A test uses it to change the autonomy while the turn
+    /// is running: while a prompt is open, or after a tool call.
+    async fn drive_console_turn_with_hook(
+        state: &AppState,
+        provider: &str,
+        session_id: Option<String>,
+        message: &str,
+        resolve: Option<(bool, bool)>,
+        mut hook: Option<TurnHook<'_>>,
     ) -> (Vec<serde_json::Value>, Option<serde_json::Value>) {
         use http_body_util::BodyExt;
         let mut headers = HeaderMap::new();
@@ -3197,6 +3394,13 @@ mod tests {
                     let Ok(ev) = serde_json::from_str::<serde_json::Value>(json) else {
                         continue;
                     };
+                    let is_done = ev["type"] == "done";
+                    events.push(ev.clone());
+                    // The hook runs before the prompt is answered, so a test can
+                    // change the autonomy while a prompt is open.
+                    if let Some(hook) = hook.as_mut() {
+                        hook(&events, state.clone()).await;
+                    }
                     if ev["type"] == "approval_request" {
                         if prompt.is_none() {
                             prompt = Some(ev.clone());
@@ -3215,8 +3419,6 @@ mod tests {
                         )
                         .await;
                     }
-                    let is_done = ev["type"] == "done";
-                    events.push(ev);
                     if is_done {
                         return (events, prompt);
                     }
@@ -4404,9 +4606,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn console_medium_risk_prompt_offers_no_always_and_asks_every_time() {
-        // `git commit` is allowed but medium risk: its prompt must say Always does
-        // not hold, and the next message must prompt again.
+    async fn console_medium_risk_prompt_offers_always_and_a_session_answer_holds() {
+        // `git commit` is allowed but medium risk. Its prompt must offer Always,
+        // because a "Session" answer holds for that basename at medium risk for
+        // the rest of the conversation: the next message must not prompt.
         let _env = crate::test_env::ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().expect("temp home");
         let _restore = HomeGuard::set(tmp.path());
@@ -4425,15 +4628,144 @@ mod tests {
         .await;
         let prompt = prompt.expect("message 1 must prompt for a medium-risk command");
         assert_eq!(
-            prompt["always_available"], false,
-            "a medium-risk prompt must say Always does not hold: {first:?}"
+            prompt["always_available"], true,
+            "a medium-risk prompt must offer Always: {first:?}"
+        );
+
+        let (second, second_prompt) =
+            drive_console_turn(&state, &script.provider(), Some(sid), "commit again", None).await;
+        assert!(
+            second_prompt.is_none(),
+            "a session answer must hold for the next message: {second:?}"
+        );
+    }
+
+    /// A console grant belongs to its own conversation: another session's
+    /// medium-risk command asks again.
+    #[tokio::test]
+    async fn console_medium_risk_grant_does_not_answer_another_session() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+        let state = scripted_state();
+        let script = ShellToolScript::start().await;
+        let first_session = fresh_session_id();
+        let second_session = fresh_session_id();
+
+        script.ask_for("git commit -m probe");
+        let (first, prompt) = drive_console_turn(
+            &state,
+            &script.provider(),
+            Some(first_session.clone()),
+            "commit",
+            Some((true, true)),
+        )
+        .await;
+        assert!(
+            prompt.is_some(),
+            "the first session must prompt for a medium-risk command: {first:?}"
+        );
+
+        // The same conversation: the session answer holds.
+        let (same, same_prompt) = drive_console_turn(
+            &state,
+            &script.provider(),
+            Some(first_session),
+            "commit again",
+            None,
+        )
+        .await;
+        assert!(
+            same_prompt.is_none(),
+            "a session answer must hold for the next message of its own conversation: {same:?}"
+        );
+
+        // Another conversation: it asks again.
+        let (other, other_prompt) = drive_console_turn(
+            &state,
+            &script.provider(),
+            Some(second_session),
+            "commit again",
+            None,
+        )
+        .await;
+        assert!(
+            other_prompt.is_some(),
+            "another console session must ask again: {other:?}"
+        );
+    }
+
+    /// A "Session" answer grants only the segments that were medium risk
+    /// themselves. The low-risk `git status` in the chain is not granted, so
+    /// the conversation holds `mv` and nothing else — `git push` asks again.
+    #[tokio::test]
+    async fn console_medium_risk_session_grant_covers_only_the_medium_segments() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+        let state = scripted_state();
+        // `mv` is the medium-risk segment of the chain below; it is not on the
+        // default allowlist.
+        state
+            .config
+            .lock()
+            .autonomy
+            .allowed_commands
+            .push("mv".to_string());
+        let script = ShellToolScript::start().await;
+        let sid = fresh_session_id();
+
+        script.ask_for("git status && mv missing-source probe-target");
+        let (first, prompt) = drive_console_turn(
+            &state,
+            &script.provider(),
+            Some(sid.clone()),
+            "commit",
+            Some((true, true)),
+        )
+        .await;
+        assert!(
+            prompt.is_some(),
+            "the medium-risk chain must prompt: {first:?}"
+        );
+
+        assert_eq!(
+            crate::approval::session_grants::session_granted_medium_commands(&sid),
+            vec!["mv".to_string()],
+            "a session answer grants only the medium-risk segments of the chain"
+        );
+    }
+
+    #[tokio::test]
+    async fn console_medium_risk_approve_without_always_asks_again() {
+        // "Approve" without "Always" covers one run only: the next message must
+        // prompt again.
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+        let state = scripted_state();
+        let script = ShellToolScript::start().await;
+        let sid = fresh_session_id();
+
+        script.ask_for("git commit -m probe");
+        let (first, prompt) = drive_console_turn(
+            &state,
+            &script.provider(),
+            Some(sid.clone()),
+            "commit",
+            Some((true, false)),
+        )
+        .await;
+        assert!(
+            prompt.is_some(),
+            "message 1 must prompt for a medium-risk command: {first:?}"
         );
 
         let (second, second_prompt) =
             drive_console_turn(&state, &script.provider(), Some(sid), "commit again", None).await;
         assert!(
             second_prompt.is_some(),
-            "a medium-risk prompt must ask again on the next message: {second:?}"
+            "an approve without always must not hold for the next message: {second:?}"
         );
     }
 
@@ -4457,6 +4789,220 @@ mod tests {
             approval_request_count(&events),
             1,
             "Smart's one shell request must be one event: {events:?}"
+        );
+    }
+
+    /// A console state whose autonomy allows no shell command, so every shell
+    /// call has to pass the Layer-B gate and a level change is visible. The
+    /// config points into `root`, so the console's own write lands in the temp
+    /// dir instead of the operator's real config.
+    fn empty_allowlist_state(root: &std::path::Path) -> AppState {
+        let mut config = crate::config::Config::default();
+        config.default_provider = Some("test-sse".to_string());
+        config.default_model = Some("test-model".to_string());
+        config.gateway.require_pairing = false;
+        config.api_key = Some("mock-key".to_string());
+        config.autonomy.allowed_commands = Vec::new();
+        config.config_path = root.join("config.toml");
+        config.workspace_dir = root.join("workspace");
+        let mut state = test_state();
+        state.config = Arc::new(Mutex::new(config));
+        state
+    }
+
+    /// The console's autonomy write, driven the way the console drives it.
+    async fn put_autonomy(state: &AppState, level: &str) {
+        let body: crate::gateway::config_api::AutonomyBody =
+            serde_json::from_value(serde_json::json!({ "level": level })).expect("autonomy body");
+        let response = Box::pin(crate::gateway::config_api::set_autonomy(
+            axum::extract::State(state.clone()),
+            HeaderMap::new(),
+            axum::Json(body),
+        ))
+        .await
+        .expect("the autonomy write must succeed");
+        assert_eq!(
+            response.0["level"], level,
+            "the console must report the level it wrote"
+        );
+    }
+
+    /// A level change governs the turn that is already running: the console
+    /// moves to Full while the first shell prompt is open, and the two calls
+    /// that follow run with no prompt at all.
+    #[tokio::test]
+    async fn console_a_level_change_to_full_governs_the_running_turn() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+        let state = empty_allowlist_state(tmp.path());
+        let script = ShellToolScript::start().await;
+        let sid = fresh_session_id();
+
+        // Three distinct basenames: a grant for one of them would answer the
+        // next call too, and the test would pass without the level change.
+        script.ask_for_sequence(&["hostname", "id -u", "whoami"]);
+        let mut hook = once_hook(
+            |events| events.iter().any(|e| e["type"] == "approval_request"),
+            |state: AppState| {
+                Box::pin(async move {
+                    put_autonomy(&state, "full").await;
+                })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            },
+        );
+        let (events, prompt) = drive_console_turn_with_hook(
+            &state,
+            &script.provider(),
+            Some(sid),
+            "run them",
+            Some((true, false)),
+            Some(&mut *hook),
+        )
+        .await;
+
+        assert!(prompt.is_some(), "the first call must prompt: {events:?}");
+        assert_eq!(
+            approval_request_count(&events),
+            1,
+            "the level change must end the prompting: {events:?}"
+        );
+        let ran = events
+            .iter()
+            .filter(|e| e["type"] == "tool_call_end" && e["ok"] == true)
+            .count();
+        assert_eq!(ran, 3, "every call must run: {events:?}");
+    }
+
+    /// The other direction: a turn that is running when the level drops to
+    /// ReadOnly has its NEXT call refused — the answer the human gave is still
+    /// the answer, but the level decides what happens next.
+    ///
+    /// The change lands while the second call's prompt is open, so it is
+    /// guaranteed to arrive between the two calls: the agent is parked on that
+    /// prompt until the human answers it.
+    #[tokio::test]
+    async fn console_a_level_change_to_readonly_refuses_the_next_call() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+        let state = empty_allowlist_state(tmp.path());
+        let script = ShellToolScript::start().await;
+        let sid = fresh_session_id();
+
+        script.ask_for_sequence(&["hostname", "id -u"]);
+        let mut hook = once_hook(
+            |events| {
+                events
+                    .iter()
+                    .filter(|e| e["type"] == "approval_request")
+                    .count()
+                    >= 2
+            },
+            |state: AppState| {
+                Box::pin(async move {
+                    put_autonomy(&state, "readonly").await;
+                })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            },
+        );
+        let (events, prompt) = drive_console_turn_with_hook(
+            &state,
+            &script.provider(),
+            Some(sid),
+            "run them",
+            Some((true, false)),
+            Some(&mut *hook),
+        )
+        .await;
+
+        assert!(prompt.is_some(), "the first call must prompt: {events:?}");
+        assert_eq!(
+            approval_request_count(&events),
+            2,
+            "each call prompts once: {events:?}"
+        );
+        let ends: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|e| e["type"] == "tool_call_end")
+            .collect();
+        assert_eq!(ends.len(), 2, "both calls must end: {events:?}");
+        assert_eq!(
+            ends[0]["ok"], true,
+            "the first call ran before the change: {events:?}"
+        );
+        assert_eq!(
+            ends[1]["ok"], false,
+            "the second call must be refused under ReadOnly: {events:?}"
+        );
+    }
+
+    /// The same invariant on a turn that does NOT gate tools: with
+    /// `autonomous_tools = true` the console has no approval modal and no
+    /// approval backend, but the level a change writes still governs the NEXT
+    /// tool call of the turn that is running.
+    ///
+    /// The agent is parked between the two calls (the script holds its second
+    /// answer), so the change lands before the second call is even requested —
+    /// the test does not depend on how fast the turn runs.
+    #[tokio::test]
+    async fn console_a_level_change_to_readonly_refuses_the_next_call_without_the_tool_gate() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+        let state = empty_allowlist_state(tmp.path());
+        {
+            let mut config = state.config.lock();
+            // The tool gate is off: no modal, no approval backend.
+            config.channels_config.autonomous_tools = true;
+            // One allowed basename, so the first call runs instead of asking.
+            // Under `autonomous_tools` there is nobody to ask.
+            config.autonomy.allowed_commands = vec!["echo".to_string()];
+        }
+        let script = ShellToolScript::start().await;
+        let sid = fresh_session_id();
+
+        script.ask_for_sequence(&["echo one", "echo two"]);
+        // Hold the answer for the request that carries one tool result: the
+        // agent parks there, between the two calls.
+        let release = script.hold_answer(1);
+        let mut hook = once_hook(
+            |events| events.iter().any(|e| e["type"] == "tool_call_end"),
+            move |state: AppState| {
+                let release = Arc::clone(&release);
+                Box::pin(async move {
+                    put_autonomy(&state, "readonly").await;
+                    release.notify_one();
+                })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            },
+        );
+        let (events, prompt) = drive_console_turn_with_hook(
+            &state,
+            &script.provider(),
+            Some(sid),
+            "run them",
+            None,
+            Some(&mut *hook),
+        )
+        .await;
+
+        assert!(
+            prompt.is_none(),
+            "the tool gate is off, so nothing may be asked: {events:?}"
+        );
+        let ends: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|e| e["type"] == "tool_call_end")
+            .collect();
+        assert_eq!(ends.len(), 2, "both calls must end: {events:?}");
+        assert_eq!(
+            ends[0]["ok"], true,
+            "the first call ran before the change: {events:?}"
+        );
+        assert_eq!(
+            ends[1]["ok"], false,
+            "the second call must be refused under ReadOnly: {events:?}"
         );
     }
 
@@ -4771,7 +5317,7 @@ mod tests {
             channel: channel.into(),
             reply_target: reply_target.into(),
             created_at: 0,
-            always_available: false,
+            session_scope: crate::security::SessionScope::None,
         };
         assert!(forward_to_this_stream(&mk("t1", "console"), "t1"));
         assert!(!forward_to_this_stream(&mk("t2", "console"), "t1"));
@@ -4857,8 +5403,10 @@ mod tests {
             json["autonomy_preset"]
         );
 
-        // The marker names it — and it wins over the config, which still says
-        // Manual (a non-empty `always_ask` under `Supervised`).
+        // The marker names it — and it wins over the config, which names no
+        // preset of its own (a `Supervised` level with one built-in tool named
+        // reads as Smart under the config-derived rule, and a profile that
+        // chose nothing must not be named at all).
         std::fs::write(
             profile.policy_dir().join("autonomy.toml"),
             "[autonomy]\npreset = \"strict\"\n",

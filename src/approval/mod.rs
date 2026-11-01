@@ -13,7 +13,7 @@ pub use guest::GuestGate;
 use crate::config::AutonomyConfig;
 use crate::security::AutonomyLevel;
 use chrono::Utc;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -98,18 +98,41 @@ pub struct ApprovalLogEntry {
 
 // ── ApprovalManager ──────────────────────────────────────────────
 
+/// The autonomy an [`ApprovalManager`] gates on while no live policy is
+/// attached.
+///
+/// Held behind a lock so [`ApprovalManager::apply_config`] can replace it on a
+/// manager that was built once: a config change must govern the next decision
+/// even on a surface that builds its manager per turn and never rebuilds it.
+#[derive(Debug, Clone)]
+struct AutonomySnapshot {
+    /// Tools that never need approval.
+    auto_approve: HashSet<String>,
+    /// Tools that always need approval, ignoring the session allowlist.
+    always_ask: HashSet<String>,
+    /// The autonomy level.
+    level: AutonomyLevel,
+}
+
+impl AutonomySnapshot {
+    fn from_config(config: &AutonomyConfig) -> Self {
+        Self {
+            auto_approve: config.auto_approve.iter().cloned().collect(),
+            always_ask: config.always_ask.iter().cloned().collect(),
+            level: config.level,
+        }
+    }
+}
+
 /// Manages the interactive approval workflow.
 ///
 /// - Checks config-level `auto_approve` / `always_ask` lists
 /// - Maintains a session-scoped "always" allowlist
 /// - Records an audit trail of all decisions
 pub struct ApprovalManager {
-    /// Tools that never need approval (from config).
-    auto_approve: HashSet<String>,
-    /// Tools that always need approval, ignoring session allowlist.
-    always_ask: HashSet<String>,
-    /// Autonomy level from config.
-    autonomy_level: AutonomyLevel,
+    /// The autonomy this manager gates on. Replaced by
+    /// [`Self::apply_config`] when the config changes.
+    autonomy: RwLock<AutonomySnapshot>,
     /// Session-scoped allowlist built from "Always" responses.
     session_allowlist: Mutex<HashSet<String>>,
     /// Audit trail of approval decisions.
@@ -125,9 +148,7 @@ impl ApprovalManager {
     /// Create from autonomy config.
     pub fn from_config(config: &AutonomyConfig) -> Self {
         Self {
-            auto_approve: config.auto_approve.iter().cloned().collect(),
-            always_ask: config.always_ask.iter().cloned().collect(),
-            autonomy_level: config.level,
+            autonomy: RwLock::new(AutonomySnapshot::from_config(config)),
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
             policy: None,
@@ -141,12 +162,27 @@ impl ApprovalManager {
         self
     }
 
+    /// Swap this manager's autonomy for the one a config change put in force.
+    ///
+    /// The mirror of [`crate::security::SecurityPolicy::apply_config`]: the
+    /// level, `always_ask` and `auto_approve` the gate reads are replaced, so
+    /// a config change governs the next decision on a manager that was built
+    /// once — in both directions.
+    ///
+    /// The session allowlist, the audit trail and the attached policy are left
+    /// alone: revoking an operator's grants is the caller's job (the policy's
+    /// own `apply_config` revokes the medium-risk grants on a level change),
+    /// and the attached policy stays the authority for a manager that has one.
+    pub fn apply_config(&self, config: &AutonomyConfig) {
+        *self.autonomy.write() = AutonomySnapshot::from_config(config);
+    }
+
     /// Autonomy level to gate on: the live policy when one is attached,
     /// otherwise the level captured at construction.
     fn effective_autonomy(&self) -> AutonomyLevel {
         match &self.policy {
             Some(p) => p.effective_autonomy(),
-            None => self.autonomy_level,
+            None => self.autonomy.read().level,
         }
     }
 
@@ -164,7 +200,10 @@ impl ApprovalManager {
                 .always_ask
                 .iter()
                 .any(|t| t == "*" || t == tool_name),
-            None => self.always_ask.contains(tool_name) || self.always_ask.contains("*"),
+            None => {
+                let snapshot = self.autonomy.read();
+                snapshot.always_ask.contains(tool_name) || snapshot.always_ask.contains("*")
+            }
         }
     }
 
@@ -182,7 +221,7 @@ impl ApprovalManager {
     fn pre_approved(&self, tool_name: &str) -> bool {
         match &self.policy {
             Some(p) => p.fields().auto_approve.iter().any(|t| t == tool_name),
-            None => self.auto_approve.contains(tool_name),
+            None => self.autonomy.read().auto_approve.contains(tool_name),
         }
     }
 
@@ -1003,6 +1042,92 @@ mod tests {
         let mgr = ApprovalManager::from_config(&config);
         assert!(!mgr.needs_approval("shell"));
         assert!(!mgr.needs_approval("ssh"));
+    }
+
+    // ── apply_config ──────────────────────────────────────────
+
+    /// A manager built once must read the autonomy that is in force NOW: the
+    /// gateway's per-turn managers live for a turn, and a level change written
+    /// to the config has to govern that turn's next decision.
+    #[test]
+    fn apply_config_swaps_the_level_and_the_lists() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        assert!(mgr.needs_approval("file_write"), "supervised prompts");
+
+        mgr.apply_config(&AutonomyConfig {
+            level: AutonomyLevel::Full,
+            always_ask: vec!["ssh".into()],
+            auto_approve: vec![],
+            ..AutonomyConfig::default()
+        });
+        assert!(
+            !mgr.needs_approval("file_write"),
+            "Full must stop the prompt for a tool nobody put on always_ask"
+        );
+        assert!(
+            mgr.needs_approval("ssh"),
+            "the new always_ask list must be honoured too"
+        );
+
+        // And the other direction: a tightening applies at once as well.
+        mgr.apply_config(&AutonomyConfig {
+            level: AutonomyLevel::Supervised,
+            always_ask: vec![],
+            auto_approve: vec![],
+            ..AutonomyConfig::default()
+        });
+        assert!(
+            mgr.needs_approval("file_write"),
+            "a tightening must prompt again"
+        );
+    }
+
+    /// The swap replaces the autonomy and nothing else: an operator's "Always"
+    /// grants and the audit trail are the caller's to revoke, not the swap's.
+    #[test]
+    fn apply_config_keeps_the_session_allowlist_and_the_audit_trail() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        mgr.record_decision(
+            "file_write",
+            &serde_json::json!({"path": "test.txt"}),
+            ApprovalResponse::Always,
+            "cli",
+        );
+        assert_eq!(mgr.audit_log().len(), 1);
+
+        mgr.apply_config(&AutonomyConfig {
+            level: AutonomyLevel::Full,
+            ..AutonomyConfig::default()
+        });
+
+        assert!(
+            mgr.session_allowlist().contains("file_write"),
+            "the session grant survives the swap"
+        );
+        assert_eq!(
+            mgr.audit_log().len(),
+            1,
+            "the audit trail survives the swap"
+        );
+    }
+
+    /// A manager with a live policy attached reads the POLICY, so the swap
+    /// must not make it read its own snapshot again.
+    #[test]
+    fn apply_config_does_not_override_an_attached_policy() {
+        let policy = Arc::new(crate::security::SecurityPolicy::default());
+        let mgr =
+            ApprovalManager::from_config(&supervised_config()).with_policy(Arc::clone(&policy));
+        mgr.apply_config(&AutonomyConfig {
+            level: AutonomyLevel::Full,
+            always_ask: vec![],
+            auto_approve: vec![],
+            ..AutonomyConfig::default()
+        });
+        assert!(
+            mgr.needs_approval("file_write"),
+            "the attached policy stays the authority"
+        );
     }
 
     // ── session allowlist ────────────────────────────────────

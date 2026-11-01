@@ -125,10 +125,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the provider's error. The bind stays `127.0.0.1:11500` and the authorization and token
   endpoints stay constants; no environment variable or config key can redirect the exchange,
   and the test-only seam that can is compiled out of production paths. No config key changed.
+- **A medium-risk grant made in one channel conversation answered the risk gate in every
+  conversation.** The shell risk gate's "Session" answer recorded the basename on the one
+  process-wide policy that every channel shares, so an owner's answer in chat A let the same
+  medium-risk command run unasked in chat B — and chat B is a chat a guest chose. The grants are
+  now filed per conversation: a grant answers the risk gate only in the channel and reply
+  target that made it, and never for a guest's turn, which asks again — the risk gate is the
+  owner's only check on a guest, and the guest's own `guest_allowed_commands` ceiling says
+  which commands a guest may run, not that a medium-risk one may run unasked. The TUI, the CLI
+  and the gateway's own operator paths have no chat, so their grants stay process-wide (one
+  operator). The console keeps its per-session grants: they are re-seeded under the console
+  turn's own scope, so a session answer still holds for the next message of that conversation
+  and for no other. No config key changed; rolling back means reverting this change.
 
 ### Added
 
-- The console's `approval_request` event carries `always_available`. It is `true` when an Always answer holds for the rest of the conversation, and `false` when the modal should not offer Always (a medium-risk prompt, or a tool forced to prompt by `always_ask` or Manual).
+- The console's `approval_request` event carries `always_available`. It is `true` when an Always answer holds for the rest of the conversation, and `false` when the modal should not offer Always (a high-risk command, or a tool forced to prompt by `always_ask` or Manual).
 - `rantaiclaw usage` prints today's token total for the active workspace, the daily ceiling from
   `[cost] max_tokens_per_day`, the percentage used, and per-model lines. A model with no configured
   price reports "not reported", not `0.00`. It reads through the same tracker the ceiling uses.
@@ -190,6 +202,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from the shell without a console. The preset stays the positional argument,
   and the two flags can also be used on their own. The timezone must be an
   IANA name the build knows (`Asia/Jakarta`, `UTC`); an empty value clears it.
+- `PUT /api/v1/config/autonomy` takes a `preset` field, so a client can switch
+  the approval preset in one request instead of writing the fields by hand. The
+  name is read case-insensitively and takes `manual`, `smart`, `strict` or
+  `off` (`full` is an alias for `off`, and the legacy `L1`–`L4` ids are still
+  accepted). An unknown name is refused with `400` rather than ignored — a typo
+  must not leave the old policy in force. The preset is applied **first** and
+  an explicit `level`, `always_ask`, `auto_approve` or `allowed_commands` in the
+  same body is written on top of it, so the operator's own words are the last
+  ones. The response stays the autonomy config itself: the preset is not
+  echoed back.
 
 ### Changed
 
@@ -243,6 +265,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tool — not only to the CLI/TUI agent and cron. A chat runtime picks the
   table up on a config reload like any other setting, so adding a route takes
   effect on the next message without restarting the channel runtime.
+- The Smart preset keeps the operator's own `always_ask` entries, on every
+  surface. The console already kept them; the CLI and the TUI wiped the list,
+  so `ssh` and `pty` stopped asking in one door and kept asking in another.
+  Smart now drops only the `"*"` wildcard and the built-in tool names and
+  leaves everything else the operator wrote alone — Smart is a looser Manual,
+  not a blank slate. `strict` and `off` drop a stray wildcard the same way.
+  One rule now says what Manual is, and every surface uses it: under
+  `supervised`, the config reads Manual when `always_ask` holds `"*"` or names
+  every built-in tool, and Smart otherwise. The shipped default
+  `["ssh", "pty"]` therefore reads as Smart everywhere.
 
 ### Removed
 
@@ -387,7 +419,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `proxy_config` saved and applied a proxy that could not be reached, which stopped every provider call without saying why; `set` and `apply_env` now probe each URL that would take effect with a 3 second TCP connect and refuse the first that fails, naming the redacted URL and changing nothing.
 - `doctor` passed an MCP server that was on PATH but could not start. It now starts each configured server, completes the initialize handshake and lists tools under a 10-second per-server deadline, and names the failing server and the step that failed; `--offline` keeps the PATH-only scan.
 - The shell security note claimed an automatic Landlock sandbox with a Firejail fallback that the code does not have. The note is rewritten in English and states the controls that exist: the command allowlist, the credential-directory refusal, the central read-only gate, the per-hour action budget, the 600 s timeout, the 1 MiB output cap, and `[runtime].kind`.
-- In the console's approval modal, Always did nothing beyond the current reply: the next message asked again. Always on a command outside the allowlist now holds until the conversation ends. It does not carry into another conversation, and it is cleared when the conversation is deleted or the autonomy preset changes. Medium-risk prompts and tools forced to prompt still ask every time.
+- In the console's approval modal, Always did nothing beyond the current reply: the next message asked again. Always on a command outside the allowlist now holds until the conversation ends. It does not carry into another conversation, and it is cleared when the conversation is deleted, the autonomy preset changes, or the config file is reloaded. A medium-risk prompt holds at medium risk for the rest of the conversation, and a config reload drops that grant too; a tool forced to prompt still asks every time.
 - `memory clear` and `/clear` stopped at 1000 entries and reported the rest as gone: with 1001 notes one stayed, and the summary still said everything was cleared. A lookup by key prefix (`memory get`, `memory clear --key`) or by text (`memory_store` `replaces`) missed notes older than the newest 1000.
 - While a reply streamed, the model's reasoning showed in front of the answer. The saved reply was already clean; the streamed text was not. This applied to every surface that streams: the gateway chunk events, the TUI live preview and channel streaming. Only the reply is streamed now, and reasoning is sent once, at the end, when it is the whole reply.
 - `anthropic-custom:<url>` inherits the `anthropic` env vars. `ANTHROPIC_API_KEY` was ignored for a custom
@@ -768,6 +800,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider is no longer reported as an unknown hint; and a door with no table
   at all refuses a `hint:` model with `no [[model_routes]] configured` instead
   of sending the literal string.
+- The audit trail recorded a tool call a human approved from inside the tool as
+  `not_required`. Only the outer approval gate was visible to the record, so a
+  `shell`, `pty` or `ssh` call the human answered at the tool's own prompt read
+  as if nobody had been asked. The tool now reports the answer it received: a
+  refusal inside the tool outranks an outer grant, a grant inside the tool
+  stands on its own, and a call nobody was asked about keeps the outer outcome.
+  A deadline that auto-denies reads as `denied`, because the call did not run.
+- A `Session` answer to the shell risk gate did not hold for the session, so a
+  medium-risk command asked again on every run. A pending request now states
+  what an answer to it may hold for — nothing, this command, this command at
+  medium risk, or this run only — and every surface answers exactly that. A
+  medium-risk `Session` answer grants only the segments the risk gate classified
+  Medium — a low-risk segment of a chain is granted nothing — and it holds for
+  the conversation that made it, never for a guest's turn; a high-risk command
+  always asks again. The grant answers the risk gate only: it never widens the
+  runtime allowlist, and it is dropped when the autonomy rung changes — the
+  level or the `always_ask` list.
+- An autonomy change reached the next turn, not the running one. The gateway's
+  chat and webhook turns built their policy and approval manager once at turn
+  start and nothing updated them, so a tightening the operator made mid-turn
+  was not in force until that turn ended. The new autonomy now goes onto the
+  process policy and onto every turn that is still running, on every surface —
+  cron agent jobs and the heartbeat are the exception, and pick a new level up
+  on their next run — and a turn keeps the narrowing it was built with, so a
+  change never widens a turn past what it was built to ask. A prompt that is
+  already open stays open and is answered by the human.
+- The TUI reloaded a config file it was not watching. The reload read the
+  profile's own `config.toml`, but in the flat layout (`RANTAICLAW_CONFIG_DIR`)
+  the watcher watches the flat directory's `config.toml`, so an edit made there
+  was answered with `config.toml changed but reload failed` and the running
+  policy never learned the new level. The reload and the watcher's fingerprint
+  gate now read the config path `Config::load` resolved — the file the process
+  runs from, which is the same file in the profile layout. The gate also
+  remembered the profile file's bytes, so a second edit to the watched file
+  could be dropped as bytes the app already had.
 
 ## [0.33.0-alpha] — 2026-10-08
 

@@ -42,7 +42,7 @@ impl SshTool {
             )));
         };
         let (channel, reply_target) = crate::security::current_turn_scope();
-        match approvals
+        let decision = approvals
             .request_decision_in(
                 uuid::Uuid::new_v4(),
                 label.to_string(),
@@ -50,8 +50,16 @@ impl SshTool {
                 channel,
                 reply_target,
             )
-            .await
-        {
+            .await;
+        // The prompt was answered inside the tool: the audit trail has to say
+        // so, or the record claims nobody was asked. A refusal — a person's or
+        // the deadline's — means the command did not run, so it reads as
+        // denied.
+        crate::security::record_tool_approval(match decision {
+            crate::security::Decision::Deny => crate::security::ApprovalOutcome::Denied,
+            _ => crate::security::ApprovalOutcome::Granted,
+        });
+        match decision {
             crate::security::Decision::Deny => {
                 Some(fail(format!("`{label}` denied by the operator")))
             }

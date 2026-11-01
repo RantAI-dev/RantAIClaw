@@ -31,6 +31,11 @@ struct SessionGrants {
     /// tool names: a command grant only answers the unallowed-command prompt
     /// in the shell tool, and must never be read back as a tool grant.
     commands: Mutex<HashMap<String, HashSet<String>>>,
+    /// Command basenames approved at **medium** risk for a session, kept apart
+    /// from both other maps: this grant only answers the shell risk gate, and
+    /// re-seeding it into the basename allowlist would be wrong — it would lift
+    /// the unallowed-command prompt too.
+    medium_commands: Mutex<HashMap<String, HashSet<String>>>,
 }
 
 impl SessionGrants {
@@ -38,6 +43,7 @@ impl SessionGrants {
         Self {
             map: Mutex::new(HashMap::new()),
             commands: Mutex::new(HashMap::new()),
+            medium_commands: Mutex::new(HashMap::new()),
         }
     }
 
@@ -86,6 +92,44 @@ impl SessionGrants {
             .unwrap_or_default()
     }
 
+    /// The basenames this session may run at medium risk without asking again.
+    fn granted_medium_commands(&self, session_id: &str) -> Vec<String> {
+        if session_id.trim().is_empty() {
+            return Vec::new();
+        }
+        let mut names: Vec<String> = self
+            .medium_commands
+            .lock()
+            .get(session_id)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// Record one basename as approved at medium risk for this session. Called
+    /// at the moment the operator answers "Session" to the shell risk gate, so
+    /// an "Approve (once)" answer cannot leave a grant behind.
+    fn record_medium_command(&self, session_id: &str, basename: &str) {
+        let basename = basename.trim();
+        if session_id.trim().is_empty() || basename.is_empty() {
+            return;
+        }
+        let mut commands = self.medium_commands.lock();
+        if !commands.contains_key(session_id) && commands.len() >= MAX_GRANT_SESSIONS {
+            tracing::warn!(
+                session_id = %session_id,
+                cap = MAX_GRANT_SESSIONS,
+                "web approval medium-risk grant not persisted: session cap reached"
+            );
+            return;
+        }
+        commands
+            .entry(session_id.to_string())
+            .or_default()
+            .insert(basename.to_string());
+    }
+
     fn record<S: std::hash::BuildHasher>(&self, session_id: &str, tools: &HashSet<String, S>) {
         if session_id.trim().is_empty() || tools.is_empty() {
             return;
@@ -107,11 +151,13 @@ impl SessionGrants {
     fn clear(&self, session_id: &str) {
         self.map.lock().remove(session_id);
         self.commands.lock().remove(session_id);
+        self.medium_commands.lock().remove(session_id);
     }
 
     fn clear_all(&self) {
         self.map.lock().clear();
         self.commands.lock().clear();
+        self.medium_commands.lock().clear();
     }
 }
 
@@ -134,6 +180,20 @@ pub fn session_granted_commands(session_id: &str) -> Vec<String> {
 /// answer cannot leave a grant behind.
 pub fn record_session_command(session_id: &str, basename: &str) {
     SESSION_GRANTS.record_command(session_id, basename);
+}
+
+/// Command basenames this session may run at **medium** risk without asking
+/// again. Used to seed each new turn's shell policy. An empty session id owns
+/// none.
+pub fn session_granted_medium_commands(session_id: &str) -> Vec<String> {
+    SESSION_GRANTS.granted_medium_commands(session_id)
+}
+
+/// Record one basename as approved at medium risk for a session. Called at the
+/// moment the operator answers "Session" to the shell risk gate, so an
+/// "Approve (once)" answer cannot leave a grant behind.
+pub fn record_session_medium_command(session_id: &str, basename: &str) {
+    SESSION_GRANTS.record_medium_command(session_id, basename);
 }
 
 /// Merge a turn's "Always" grants into the session's persistent set. No-op when
@@ -213,6 +273,60 @@ mod tests {
         grants.record_command("sess-cmd-all-a-02dd", "hostname");
         grants.clear_all();
         assert!(grants.granted_commands("sess-cmd-all-a-02dd").is_empty());
+    }
+
+    #[test]
+    fn medium_grant_round_trips_within_its_session() {
+        let grants = SessionGrants::new();
+        let sid = "sess-medium-round-trip-9a4c";
+        assert!(grants.granted_medium_commands(sid).is_empty());
+        grants.record_medium_command(sid, "git");
+        grants.record_medium_command(sid, "git");
+        assert_eq!(grants.granted_medium_commands(sid), vec!["git".to_string()]);
+    }
+
+    /// A medium-risk grant is its own thing: it neither lifts the
+    /// unallowed-command prompt nor answers a tool prompt.
+    #[test]
+    fn medium_grant_is_not_visible_as_a_command_grant_or_a_tool_grant() {
+        let grants = SessionGrants::new();
+        let sid = "sess-medium-vs-others-2b71";
+        grants.record(sid, &HashSet::from(["browser".to_string()]));
+        grants.record_command(sid, "hostname");
+        grants.record_medium_command(sid, "git");
+        assert_eq!(grants.granted_tools(sid), vec!["browser".to_string()]);
+        assert_eq!(grants.granted_commands(sid), vec!["hostname".to_string()]);
+        assert_eq!(grants.granted_medium_commands(sid), vec!["git".to_string()]);
+    }
+
+    #[test]
+    fn medium_grants_are_cleared_with_their_session_only() {
+        let grants = SessionGrants::new();
+        let a = "sess-medium-clear-a-4d2e";
+        let b = "sess-medium-clear-b-4d2e";
+        grants.record_medium_command(a, "git");
+        grants.record_medium_command(b, "npm");
+        grants.clear(a);
+        assert!(grants.granted_medium_commands(a).is_empty());
+        assert_eq!(grants.granted_medium_commands(b), vec!["npm".to_string()]);
+    }
+
+    #[test]
+    fn clear_all_empties_medium_grants_too() {
+        let grants = SessionGrants::new();
+        grants.record_medium_command("sess-medium-all-a-71f8", "git");
+        grants.clear_all();
+        assert!(grants
+            .granted_medium_commands("sess-medium-all-a-71f8")
+            .is_empty());
+    }
+
+    #[test]
+    fn empty_medium_command_or_session_is_never_keyed() {
+        let grants = SessionGrants::new();
+        grants.record_medium_command("", "git");
+        grants.record_medium_command("sess-medium-empty-name-3c5b", "   ");
+        assert!(grants.medium_commands.lock().is_empty());
     }
 
     #[test]

@@ -1,13 +1,19 @@
 use parking_lot::{Mutex, RwLock};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::security::pending::PendingApprovals;
+use crate::security::pending::{current_turn_is_guest, current_turn_scope, PendingApprovals};
 use crate::security::runtime_overlay;
+
+/// The conversation a medium-risk grant belongs to: `(channel, reply_target)`.
+///
+/// The empty pair is the one-operator surface — the TUI, the CLI and the
+/// gateway's own operator paths — where there is no chat to be narrower than.
+pub type MediumGrantScope = (String, String);
 
 /// How much autonomy the agent has
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -136,6 +142,18 @@ pub struct SecurityPolicy {
     /// the same set. Optionally backed by a persisted overlay file
     /// (`<policy_dir>/runtime_allowlist.toml`).
     pub runtime_allowlist: Arc<RwLock<HashSet<String>>>,
+    /// Command basenames approved at **medium** risk, per conversation.
+    ///
+    /// The shell risk gate's "Session" answer lands here: the basename may run
+    /// at medium risk without asking again — but only in the conversation that
+    /// made the grant. The key is that conversation's scope (channel and reply
+    /// target); the empty pair is the one-operator surface (TUI, CLI).
+    ///
+    /// A high-risk command never consults this set — it always asks again.
+    ///
+    /// Shared by handle, like `runtime_allowlist`, so every clone of a policy
+    /// sees the same grants. In-memory only: nothing here reaches disk.
+    pub medium_risk_approved: Arc<RwLock<HashMap<MediumGrantScope, HashSet<String>>>>,
     /// Where to persist additions when `add_runtime_command(_, true)` is
     /// called. `None` means runtime additions stay in-memory only
     /// (default for ad-hoc/test policies).
@@ -208,6 +226,7 @@ impl Default for SecurityPolicy {
             workspace_dir: PathBuf::from("."),
             tracker: Arc::new(ActionTracker::new()),
             runtime_allowlist: Arc::new(RwLock::new(HashSet::new())),
+            medium_risk_approved: Arc::new(RwLock::new(HashMap::new())),
             policy_dir: None,
             pending: Arc::new(RwLock::new(None)),
         }
@@ -399,6 +418,200 @@ enum QuoteState {
     None,
     Single,
     Double,
+}
+
+/// The basename of every segment of a command string.
+///
+/// Segments are split on unquoted shell operators, leading environment
+/// assignments are skipped, and the leading path is dropped — the same
+/// derivation [`SecurityPolicy::command_risk_level`] uses, so a basename read
+/// here is the basename that command's risk was judged by.
+pub fn command_segment_basenames(command: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for segment in split_unquoted_segments(command) {
+        let cmd_part = skip_env_assignments(&segment);
+        let Some(base_raw) = cmd_part.split_whitespace().next() else {
+            continue;
+        };
+        let base = base_raw
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if base.is_empty() {
+            continue;
+        }
+        names.push(base);
+    }
+    names
+}
+
+/// The basename of every segment of `command` that is classified Medium.
+///
+/// A "Session" answer to the risk gate grants exactly these: a segment the
+/// gate classifies Low is not granted, so a later medium-risk command that
+/// runs the same basename asks again. The names are normalised exactly as
+/// [`command_segment_basenames`] normalises them, so a granted name and a
+/// gated name are always the same string.
+pub fn command_medium_risk_basenames(command: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for segment in split_unquoted_segments(command) {
+        let cmd_part = skip_env_assignments(&segment);
+        if segment_risk_level(cmd_part) != CommandRiskLevel::Medium {
+            continue;
+        }
+        let Some(base_raw) = cmd_part.split_whitespace().next() else {
+            continue;
+        };
+        let base = base_raw
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if base.is_empty() {
+            continue;
+        }
+        names.push(base);
+    }
+    names
+}
+
+/// Classify one command segment on its own.
+///
+/// The basename and the arguments are read exactly as
+/// [`SecurityPolicy::command_risk_level`] reads them, so the classification
+/// of a segment here is the classification the risk gate judges it by.
+fn segment_risk_level(cmd_part: &str) -> CommandRiskLevel {
+    let Some(base_raw) = cmd_part.split_whitespace().next() else {
+        return CommandRiskLevel::Low;
+    };
+
+    let base = base_raw
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    // De-quote the arguments the shell will actually see so a quoted
+    // state-changing verb (e.g. `git "push"`) is still detected. A quoted
+    // *base* can't reach here allowlisted (it fails the basename match in
+    // `is_command_allowed`), so keeping the base split_whitespace is safe.
+    let args: Vec<String> = shell_argv(cmd_part)
+        .into_iter()
+        .skip(1)
+        .map(|w| w.to_ascii_lowercase())
+        .collect();
+    let joined_segment = cmd_part.to_ascii_lowercase();
+
+    // High-risk commands
+    if matches!(
+        base.as_str(),
+        "rm" | "mkfs"
+            | "dd"
+            | "shutdown"
+            | "reboot"
+            | "halt"
+            | "poweroff"
+            | "sudo"
+            | "su"
+            | "chown"
+            | "chmod"
+            | "useradd"
+            | "userdel"
+            | "usermod"
+            | "passwd"
+            | "mount"
+            | "umount"
+            | "iptables"
+            | "ufw"
+            | "firewall-cmd"
+            | "curl"
+            | "wget"
+            | "nc"
+            | "ncat"
+            | "netcat"
+            | "scp"
+            | "ssh"
+            | "ftp"
+            | "telnet"
+    ) {
+        return CommandRiskLevel::High;
+    }
+
+    // NOTE: no fork-bomb (`:(){:|:&};:`) check here — this runs on a
+    // single already-split segment (split on `;`/`|`/`&`), so the full
+    // fork-bomb string can never appear in one segment. It is already
+    // denied because `:` is not on the command allowlist.
+    if joined_segment.contains("rm -rf /") || joined_segment.contains("rm -fr /") {
+        return CommandRiskLevel::High;
+    }
+
+    // Medium-risk commands (state-changing, but not inherently destructive).
+    // Scan ALL args for the state-changing verb, not just the first: a
+    // leading global option (`git --no-pager push`, `npm --prefix . install`,
+    // `git -C /path reset`) would otherwise shift the verb out of position
+    // and misclassify the command as Low, skipping the Supervised approval
+    // gate. A rare false-positive (an arg literally equal to a verb keyword)
+    // only over-prompts, which is the safe direction for a security gate.
+    let medium = match base.as_str() {
+        "git" => args.iter().any(|verb| {
+            matches!(
+                verb.as_str(),
+                "commit"
+                    | "push"
+                    | "reset"
+                    | "clean"
+                    | "rebase"
+                    | "merge"
+                    | "cherry-pick"
+                    | "revert"
+                    | "branch"
+                    | "checkout"
+                    | "switch"
+                    | "tag"
+                    // Transport verbs: not destructive by themselves, but
+                    // they're the vector for the --upload-pack/-u RCE class
+                    // above. Risk-gating them means an unapproved
+                    // Supervised session still hits the approval prompt
+                    // even if is_args_safe's blocklist ever has a gap.
+                    | "clone"
+                    | "fetch"
+                    | "ls-remote"
+                    | "pull"
+                    // Subcommands that run an arbitrary program: bisect
+                    // run <prog>, submodule foreach '<cmd>', filter-branch.
+                    | "bisect"
+                    | "submodule"
+                    | "filter-branch"
+            )
+        }),
+        "npm" | "pnpm" | "yarn" => args.iter().any(|verb| {
+            matches!(
+                verb.as_str(),
+                "install" | "add" | "remove" | "uninstall" | "update" | "publish"
+                // run/test/exec/ci/dlx execute arbitrary package.json
+                // scripts or fetched packages.
+                    | "run" | "test" | "exec" | "ci" | "dlx"
+            )
+        }),
+        "cargo" => args.iter().any(|verb| {
+            matches!(
+                verb.as_str(),
+                "add" | "remove" | "install" | "clean" | "publish"
+                // run/build/test/bench execute a build.rs hook or
+                // project/test code.
+                    | "run" | "build" | "test" | "bench"
+            )
+        }),
+        "touch" | "mkdir" | "mv" | "cp" | "ln" => true,
+        _ => false,
+    };
+
+    if medium {
+        CommandRiskLevel::Medium
+    } else {
+        CommandRiskLevel::Low
+    }
 }
 
 /// Split a shell command into sub-commands by unquoted separators.
@@ -700,144 +913,18 @@ impl SecurityPolicy {
 
     /// Classify command risk. Any high-risk segment marks the whole command high.
     pub fn command_risk_level(&self, command: &str) -> CommandRiskLevel {
-        let mut saw_medium = false;
+        let mut risk = CommandRiskLevel::Low;
 
         for segment in split_unquoted_segments(command) {
             let cmd_part = skip_env_assignments(&segment);
-            let mut words = cmd_part.split_whitespace();
-            let Some(base_raw) = words.next() else {
-                continue;
-            };
-
-            let base = base_raw
-                .rsplit('/')
-                .next()
-                .unwrap_or("")
-                .to_ascii_lowercase();
-
-            // De-quote the arguments the shell will actually see so a quoted
-            // state-changing verb (e.g. `git "push"`) is still detected. A quoted
-            // *base* can't reach here allowlisted (it fails the basename match in
-            // `is_command_allowed`), so keeping the base split_whitespace is safe.
-            let args: Vec<String> = shell_argv(cmd_part)
-                .into_iter()
-                .skip(1)
-                .map(|w| w.to_ascii_lowercase())
-                .collect();
-            let joined_segment = cmd_part.to_ascii_lowercase();
-
-            // High-risk commands
-            if matches!(
-                base.as_str(),
-                "rm" | "mkfs"
-                    | "dd"
-                    | "shutdown"
-                    | "reboot"
-                    | "halt"
-                    | "poweroff"
-                    | "sudo"
-                    | "su"
-                    | "chown"
-                    | "chmod"
-                    | "useradd"
-                    | "userdel"
-                    | "usermod"
-                    | "passwd"
-                    | "mount"
-                    | "umount"
-                    | "iptables"
-                    | "ufw"
-                    | "firewall-cmd"
-                    | "curl"
-                    | "wget"
-                    | "nc"
-                    | "ncat"
-                    | "netcat"
-                    | "scp"
-                    | "ssh"
-                    | "ftp"
-                    | "telnet"
-            ) {
-                return CommandRiskLevel::High;
+            match segment_risk_level(cmd_part) {
+                CommandRiskLevel::High => return CommandRiskLevel::High,
+                CommandRiskLevel::Medium => risk = CommandRiskLevel::Medium,
+                CommandRiskLevel::Low => {}
             }
-
-            // NOTE: no fork-bomb (`:(){:|:&};:`) check here — this runs on a
-            // single already-split segment (split on `;`/`|`/`&`), so the full
-            // fork-bomb string can never appear in one segment. It is already
-            // denied because `:` is not on the command allowlist.
-            if joined_segment.contains("rm -rf /") || joined_segment.contains("rm -fr /") {
-                return CommandRiskLevel::High;
-            }
-
-            // Medium-risk commands (state-changing, but not inherently destructive).
-            // Scan ALL args for the state-changing verb, not just the first: a
-            // leading global option (`git --no-pager push`, `npm --prefix . install`,
-            // `git -C /path reset`) would otherwise shift the verb out of position
-            // and misclassify the command as Low, skipping the Supervised approval
-            // gate. A rare false-positive (an arg literally equal to a verb keyword)
-            // only over-prompts, which is the safe direction for a security gate.
-            let medium = match base.as_str() {
-                "git" => args.iter().any(|verb| {
-                    matches!(
-                        verb.as_str(),
-                        "commit"
-                            | "push"
-                            | "reset"
-                            | "clean"
-                            | "rebase"
-                            | "merge"
-                            | "cherry-pick"
-                            | "revert"
-                            | "branch"
-                            | "checkout"
-                            | "switch"
-                            | "tag"
-                            // Transport verbs: not destructive by themselves, but
-                            // they're the vector for the --upload-pack/-u RCE class
-                            // above. Risk-gating them means an unapproved
-                            // Supervised session still hits the approval prompt
-                            // even if is_args_safe's blocklist ever has a gap.
-                            | "clone"
-                            | "fetch"
-                            | "ls-remote"
-                            | "pull"
-                            // Subcommands that run an arbitrary program: bisect
-                            // run <prog>, submodule foreach '<cmd>', filter-branch.
-                            | "bisect"
-                            | "submodule"
-                            | "filter-branch"
-                    )
-                }),
-                "npm" | "pnpm" | "yarn" => args.iter().any(|verb| {
-                    matches!(
-                        verb.as_str(),
-                        "install" | "add" | "remove" | "uninstall" | "update" | "publish"
-                        // run/test/exec/ci/dlx execute arbitrary package.json
-                        // scripts or fetched packages.
-                            | "run" | "test" | "exec" | "ci" | "dlx"
-                    )
-                }),
-                "cargo" => args.iter().any(|verb| {
-                    matches!(
-                        verb.as_str(),
-                        "add" | "remove" | "install" | "clean" | "publish"
-                        // run/build/test/bench execute a build.rs hook or
-                        // project/test code.
-                            | "run" | "build" | "test" | "bench"
-                    )
-                }),
-                "touch" | "mkdir" | "mv" | "cp" | "ln" => true,
-                _ => false,
-            };
-
-            saw_medium |= medium;
         }
 
-        if saw_medium {
-            CommandRiskLevel::Medium
-        } else {
-            CommandRiskLevel::Low
-        }
+        risk
     }
 
     // ── Command Execution Policy Gate ──────────────────────────────────────
@@ -855,6 +942,11 @@ impl SecurityPolicy {
     /// The credential-directory refusal runs first and is a hard block: it does
     /// not depend on the allowlist or the autonomy level, so `full` is covered
     /// and an approval cannot lift it.
+    ///
+    /// A medium-risk command whose every segment's basename carries a session
+    /// grant is treated as approved: that is what a "Session" answer to the
+    /// risk gate means. The grant is never consulted for high risk — a
+    /// high-risk command always asks again.
     pub fn validate_command_execution(
         &self,
         command: &str,
@@ -886,6 +978,7 @@ impl SecurityPolicy {
             && self.effective_autonomy() == AutonomyLevel::Supervised
             && self.fields().require_approval_for_medium_risk
             && !approved
+            && !self.medium_risk_is_approved(command)
         {
             return Err(
                 "Command requires explicit approval (approved=true): medium-risk operation".into(),
@@ -994,8 +1087,21 @@ impl SecurityPolicy {
     /// via the inner `Arc`, so tools already built observe it. Process state —
     /// the rate-limit window, operator grants, the approval registry — is
     /// untouched by design.
+    ///
+    /// The one exception is the medium-risk session grants: a rung change
+    /// revokes them, so a grant made under a looser rung never survives a
+    /// tighter one. A change that keeps the rung keeps the grants.
     pub fn apply_config(&self, config: &crate::config::AutonomyConfig) {
+        // A rung change is a change to `level` **or** to `always_ask`: the two
+        // presets that share a level (Manual and Smart) differ only by
+        // `always_ask`, so comparing the level alone keeps a grant made under
+        // the looser rung.
+        let old = self.fields();
+        let rung_changed = old.autonomy != config.level || old.always_ask != config.always_ask;
         *self.fields.write() = Arc::new(PolicyFields::from_config(config));
+        if rung_changed {
+            self.clear_medium_risk_approvals();
+        }
     }
 
     /// Builder helper. Installs a **new** slot rather than writing through the
@@ -1418,6 +1524,7 @@ impl SecurityPolicy {
             workspace_dir: workspace_dir.to_path_buf(),
             tracker: Arc::new(ActionTracker::new()),
             runtime_allowlist: Arc::new(RwLock::new(runtime_set)),
+            medium_risk_approved: Arc::new(RwLock::new(HashMap::new())),
             policy_dir,
             pending: Arc::new(RwLock::new(None)),
         }
@@ -1469,6 +1576,78 @@ impl SecurityPolicy {
         let mut v: Vec<String> = set.iter().cloned().collect();
         v.sort();
         v
+    }
+
+    /// Record that `basename` may run at **medium** risk for the rest of this
+    /// conversation — the shell risk gate's "Session" answer.
+    ///
+    /// The name is normalised the way the risk gate reads it: trimmed, reduced
+    /// to its basename (the last path segment) and lowercased. An empty name is
+    /// ignored. In-memory only: nothing is written to disk, and a high-risk
+    /// command never consults this set.
+    ///
+    /// The grant is filed under the current turn's scope, so it answers the
+    /// risk gate in the conversation that made it and in no other one.
+    pub fn add_medium_risk_approval(&self, basename: &str) {
+        let name = basename.trim();
+        let name = name
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if name.is_empty() {
+            return;
+        }
+        let scope = current_turn_scope();
+        self.medium_risk_approved
+            .write()
+            .entry(scope)
+            .or_default()
+            .insert(name);
+    }
+
+    /// Forget every medium-risk session grant, in every conversation. Called
+    /// when the rung changes — the level or `always_ask`: a grant made under a
+    /// looser rung must not survive a tighter one.
+    pub fn clear_medium_risk_approvals(&self) {
+        self.medium_risk_approved.write().clear();
+    }
+
+    /// The basenames currently approved at medium risk in this conversation.
+    pub fn medium_risk_approved_snapshot(&self) -> Vec<String> {
+        let scope = current_turn_scope();
+        let map = self.medium_risk_approved.read();
+        let mut v: Vec<String> = map
+            .get(&scope)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    /// True when every segment of `command` runs a basename this conversation
+    /// approved at medium risk.
+    ///
+    /// A grant covers one basename, so a chained command is covered only when
+    /// every segment's basename is granted. An empty command is never covered.
+    ///
+    /// Only the current conversation's grants count: a grant made elsewhere
+    /// answers nothing here.
+    ///
+    /// A guest turn inherits nothing at all: the risk gate is the owner's only
+    /// check on a guest, so the owner's own answer must not answer for them.
+    fn medium_risk_is_approved(&self, command: &str) -> bool {
+        if current_turn_is_guest() {
+            return false;
+        }
+        let scope = current_turn_scope();
+        let map = self.medium_risk_approved.read();
+        let Some(set) = map.get(&scope) else {
+            return false;
+        };
+        let names = command_segment_basenames(command);
+        !names.is_empty() && names.iter().all(|name| set.contains(name))
     }
 
     /// Walk the command exactly like `is_command_allowed` and return
@@ -1862,6 +2041,31 @@ mod tests {
         );
     }
 
+    /// A "Session" answer to the risk gate grants only the segments that were
+    /// medium risk themselves. A low-risk segment in the same command is not
+    /// granted, so a later medium-risk command that runs it asks again.
+    #[test]
+    fn only_the_medium_risk_segments_are_named_for_a_grant() {
+        assert_eq!(
+            command_medium_risk_basenames("git status && touch x"),
+            vec!["touch".to_string()],
+            "a low-risk segment must not be granted"
+        );
+        assert_eq!(
+            command_medium_risk_basenames("touch a && mkdir b"),
+            vec!["touch".to_string(), "mkdir".to_string()],
+            "every medium-risk segment is granted"
+        );
+        assert!(
+            command_medium_risk_basenames("git status").is_empty(),
+            "a command with no medium-risk segment grants nothing"
+        );
+        assert!(
+            command_medium_risk_basenames("rm -rf /tmp/test").is_empty(),
+            "a high-risk segment is never granted at medium risk"
+        );
+    }
+
     #[test]
     fn find_command_execution_args_are_blocked() {
         // `find` is allowlisted by default; its command-running / file-writing
@@ -1978,6 +2182,232 @@ mod tests {
 
         let allowed = p.validate_command_execution("touch test.txt", true);
         assert_eq!(allowed.unwrap(), CommandRiskLevel::Medium);
+    }
+
+    /// A "Session" answer to the risk gate holds for that basename at medium
+    /// risk: the next call runs without asking again.
+    #[test]
+    fn a_medium_risk_session_approval_holds_for_the_basename() {
+        let p = SecurityPolicy::default()
+            .with_autonomy(AutonomyLevel::Supervised)
+            .with_require_approval_for_medium_risk(true)
+            .with_allowed_commands(vec!["touch".into()]);
+
+        assert!(
+            p.validate_command_execution("touch test.txt", false)
+                .is_err(),
+            "an ungranted medium-risk command must ask"
+        );
+        p.add_medium_risk_approval("touch");
+        assert_eq!(
+            p.validate_command_execution("touch test.txt", false)
+                .unwrap(),
+            CommandRiskLevel::Medium,
+            "a session grant must hold for the rest of the session"
+        );
+    }
+
+    /// High risk always asks again: a medium-risk grant never covers it.
+    #[test]
+    fn a_high_risk_command_asks_again_after_a_medium_risk_approval() {
+        let p = SecurityPolicy::default()
+            .with_autonomy(AutonomyLevel::Supervised)
+            .with_require_approval_for_medium_risk(true)
+            .with_allowed_commands(vec!["chmod".into()]);
+
+        p.add_medium_risk_approval("chmod");
+        let denied = p.validate_command_execution("chmod 600 test.txt", false);
+        assert!(
+            denied.is_err(),
+            "a high-risk command must ask again after a medium-risk grant"
+        );
+        assert!(denied.unwrap_err().contains("high-risk"));
+    }
+
+    /// One grant covers one basename: a chained command is only covered when
+    /// every segment's basename is granted.
+    #[test]
+    fn a_medium_risk_approval_covers_only_the_granted_basenames() {
+        let p = SecurityPolicy::default()
+            .with_autonomy(AutonomyLevel::Supervised)
+            .with_require_approval_for_medium_risk(true)
+            .with_allowed_commands(vec!["touch".into(), "mkdir".into()]);
+
+        p.add_medium_risk_approval("touch");
+        assert!(
+            p.validate_command_execution("touch a && mkdir b", false)
+                .is_err(),
+            "a chain with an ungranted segment must still ask"
+        );
+        p.add_medium_risk_approval("mkdir");
+        assert!(
+            p.validate_command_execution("touch a && mkdir b", false)
+                .is_ok(),
+            "a chain whose every segment is granted must hold"
+        );
+    }
+
+    /// A medium-risk grant answers the risk gate in the conversation that made
+    /// it, and in no other conversation.
+    ///
+    /// The grants used to live on one set for the whole process, so an owner's
+    /// "Session" answer in chat A let the same command run unasked in chat B —
+    /// and in a chat B a guest chose.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_medium_risk_grant_holds_only_in_the_conversation_that_made_it() {
+        let p = SecurityPolicy::default()
+            .with_autonomy(AutonomyLevel::Supervised)
+            .with_require_approval_for_medium_risk(true)
+            .with_allowed_commands(vec!["touch".into()]);
+
+        // The grant is made in one chat.
+        crate::security::TURN_SCOPE
+            .scope(("telegram".to_string(), "chat-a".to_string()), async {
+                p.add_medium_risk_approval("touch");
+            })
+            .await;
+
+        // It answers the risk gate in that chat.
+        crate::security::TURN_SCOPE
+            .scope(("telegram".to_string(), "chat-a".to_string()), async {
+                assert_eq!(
+                    p.validate_command_execution("touch test.txt", false)
+                        .unwrap(),
+                    CommandRiskLevel::Medium,
+                    "the grant must answer the gate in the conversation that made it"
+                );
+            })
+            .await;
+
+        // It does not answer it in another chat on the same channel.
+        crate::security::TURN_SCOPE
+            .scope(("telegram".to_string(), "chat-b".to_string()), async {
+                assert!(
+                    p.validate_command_execution("touch test.txt", false)
+                        .is_err(),
+                    "a grant must not answer the gate in another conversation"
+                );
+            })
+            .await;
+
+        // Nor in the same chat id on another channel.
+        crate::security::TURN_SCOPE
+            .scope(("slack".to_string(), "chat-a".to_string()), async {
+                assert!(
+                    p.validate_command_execution("touch test.txt", false)
+                        .is_err(),
+                    "a grant must not answer the gate on another channel"
+                );
+            })
+            .await;
+    }
+
+    /// The risk gate is the owner's only check on a guest, so a grant never
+    /// answers it: a guest turn asks again, even in the conversation that
+    /// holds the grant.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_guest_turn_never_uses_a_medium_risk_grant() {
+        let p = SecurityPolicy::default()
+            .with_autonomy(AutonomyLevel::Supervised)
+            .with_require_approval_for_medium_risk(true)
+            .with_allowed_commands(vec!["touch".into()]);
+
+        crate::security::TURN_SCOPE
+            .scope(("telegram".to_string(), "chat-a".to_string()), async {
+                p.add_medium_risk_approval("touch");
+            })
+            .await;
+
+        crate::security::TURN_SCOPE
+            .scope(("telegram".to_string(), "chat-a".to_string()), async {
+                // The owner in that chat: the grant answers the gate.
+                assert!(p
+                    .validate_command_execution("touch test.txt", false)
+                    .is_ok());
+
+                // A guest in the same chat: the grant answers nothing.
+                crate::security::TURN_IS_GUEST
+                    .scope(true, async {
+                        assert!(
+                            p.validate_command_execution("touch test.txt", false)
+                                .is_err(),
+                            "a guest turn must ask again: the risk gate is the owner's \
+                                 only check on a guest"
+                        );
+                    })
+                    .await;
+            })
+            .await;
+    }
+
+    /// A rung change revokes the grant: a tightening must not keep a grant made
+    /// under a looser level. A change that keeps the level keeps the grant.
+    #[test]
+    fn a_rung_change_clears_the_medium_risk_approvals() {
+        let p = SecurityPolicy::default()
+            .with_autonomy(AutonomyLevel::Supervised)
+            .with_require_approval_for_medium_risk(true)
+            .with_allowed_commands(vec!["touch".into()]);
+        p.add_medium_risk_approval("touch");
+        assert_eq!(
+            p.medium_risk_approved_snapshot(),
+            vec!["touch".to_string()],
+            "the grant is recorded under the basename, not the path"
+        );
+
+        let same_level = crate::config::AutonomyConfig {
+            level: AutonomyLevel::Supervised,
+            ..crate::config::AutonomyConfig::default()
+        };
+        p.apply_config(&same_level);
+        assert_eq!(
+            p.medium_risk_approved_snapshot(),
+            vec!["touch".to_string()],
+            "a reload that keeps the level must keep the grant"
+        );
+
+        let tighter = crate::config::AutonomyConfig {
+            level: AutonomyLevel::ReadOnly,
+            ..crate::config::AutonomyConfig::default()
+        };
+        p.apply_config(&tighter);
+        assert!(
+            p.medium_risk_approved_snapshot().is_empty(),
+            "a rung change must revoke the session grant"
+        );
+    }
+
+    /// Manual and Smart share the `supervised` level and differ only in
+    /// `always_ask`, so a change to `always_ask` is a rung change too: a grant
+    /// made under the looser rung must not answer the risk gate under the
+    /// tighter one.
+    #[test]
+    fn a_change_to_always_ask_clears_the_medium_risk_approvals() {
+        let p = SecurityPolicy::default()
+            .with_autonomy(AutonomyLevel::Supervised)
+            .with_require_approval_for_medium_risk(true)
+            .with_allowed_commands(vec!["touch".into()]);
+        p.add_medium_risk_approval("touch");
+
+        let manual = crate::config::AutonomyConfig {
+            level: AutonomyLevel::Supervised,
+            always_ask: vec!["*".to_string()],
+            ..crate::config::AutonomyConfig::default()
+        };
+        p.apply_config(&manual);
+        assert!(
+            p.medium_risk_approved_snapshot().is_empty(),
+            "a rung change that only moves always_ask must revoke the session grant"
+        );
+
+        // The negative control: the same rung again keeps what is granted now.
+        p.add_medium_risk_approval("touch");
+        p.apply_config(&manual);
+        assert_eq!(
+            p.medium_risk_approved_snapshot(),
+            vec!["touch".to_string()],
+            "a reload that changes nothing must keep the grant"
+        );
     }
 
     #[test]

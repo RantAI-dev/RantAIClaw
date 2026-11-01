@@ -1,6 +1,7 @@
 use super::traits::{Tool, ToolResult};
 use crate::runtime::{PreparedShellCommand, RuntimeAdapter};
-use crate::security::{Decision, SecurityPolicy};
+use crate::security::policy::CommandRiskLevel;
+use crate::security::{command_medium_risk_basenames, Decision, SecurityPolicy, SessionScope};
 use crate::tools::RATE_LIMIT_REMEDIATION;
 use async_trait::async_trait;
 use serde_json::json;
@@ -165,6 +166,20 @@ fn blocked_reason_with_remediation(reason: &str) -> String {
         return reason.to_string();
     }
     format!("{reason}{BLOCKED_COMMAND_REMEDIATION}")
+}
+
+/// What a human's answer to a shell prompt means for the audit trail.
+///
+/// `Once`, `Session` and `Persist` are all "a person said yes"; `Deny` is "a
+/// person said no". The deadline auto-deny is a `Deny` too — nobody answered,
+/// but the call did not run either, and the trail must not read as approved.
+fn decision_outcome(decision: Decision) -> crate::security::ApprovalOutcome {
+    match decision {
+        Decision::Once | Decision::Session | Decision::Persist => {
+            crate::security::ApprovalOutcome::Granted
+        }
+        Decision::Deny => crate::security::ApprovalOutcome::Denied,
+    }
 }
 
 /// Read an async pipe to EOF, appending into `buf` (kept at most `cap` bytes).
@@ -478,6 +493,9 @@ impl Tool for ShellTool {
                                 reply_target,
                             )
                             .await;
+                        // A human answered inside the tool: the audit trail has
+                        // to say so, or the record claims nobody was asked.
+                        crate::security::record_tool_approval(decision_outcome(decision));
                         match decision {
                             // Once/Session/Persist fall through to re-validate on
                             // the next loop iteration (an explicit `continue` here
@@ -515,29 +533,62 @@ impl Tool for ShellTool {
                         // risk-approval requirement — approving it would let it
                         // run (checked by re-validating with approved=true). The
                         // model can no longer self-approve (see `human_approved`
-                        // above), so ask the human. Any non-Deny decision approves
-                        // THIS run only; the risk gate re-evaluates on every call.
+                        // above), so ask the human.
                         // (A block_high_risk / subshell / redirect block fails this
                         // check and correctly falls through to the hard block below.)
+                        //
+                        // The scope of the answer depends on the risk: a
+                        // medium-risk command may hold for the rest of the
+                        // session, a high-risk one never does. The request states
+                        // which, so every surface can report the scope it really
+                        // gives.
+                        let scope = match self.security.command_risk_level(command) {
+                            CommandRiskLevel::Medium => SessionScope::MediumRisk,
+                            CommandRiskLevel::High => SessionScope::HighRisk,
+                            CommandRiskLevel::Low => SessionScope::None,
+                        };
                         let label = command
                             .split_whitespace()
                             .next()
                             .unwrap_or("command")
                             .to_string();
                         let decision = approvals
-                            .request_decision_in(
+                            .request_decision_in_scope(
                                 uuid::Uuid::new_v4(),
                                 label,
                                 command.to_string(),
                                 channel,
                                 reply_target,
+                                scope,
                             )
                             .await;
+                        // A human answered inside the tool: the audit trail has
+                        // to say so, or the record claims nobody was asked.
+                        crate::security::record_tool_approval(decision_outcome(decision));
                         match decision {
-                            // Approved for this run — fall through to re-validate
-                            // with `human_approved = true` on the next iteration.
-                            Decision::Once | Decision::Session | Decision::Persist => {
+                            // Approved for this run only — fall through to
+                            // re-validate with `human_approved = true` on the
+                            // next iteration. Nothing holds for the session.
+                            Decision::Once => {
                                 human_approved = true;
+                            }
+                            Decision::Session | Decision::Persist => {
+                                human_approved = true;
+                                // A session answer holds for the basenames this
+                                // command runs, at MEDIUM risk, for the rest of
+                                // the session. Only the segments that were
+                                // medium risk themselves are granted: a
+                                // low-risk segment in the same chain is not, so
+                                // a later medium-risk command under that
+                                // basename asks again. High risk always asks
+                                // again, so nothing is recorded there; and the
+                                // risk gate has no allowlist entry, so Persist
+                                // writes nothing to disk either.
+                                if scope == SessionScope::MediumRisk {
+                                    for name in command_medium_risk_basenames(command) {
+                                        self.security.add_medium_risk_approval(&name);
+                                    }
+                                }
                             }
                             Decision::Deny => {
                                 return Ok(ToolResult {
@@ -1320,6 +1371,150 @@ mod tests {
             .await;
     }
 
+    /// Answer every pending approval with `decision` and count how many were
+    /// asked. The count is the observable: a prompt that never happened cannot
+    /// be answered, so it says exactly how often the gate fired.
+    pub(super) fn answer_every_request(
+        approvals: Arc<PendingApprovals>,
+        decision: Decision,
+    ) -> Arc<std::sync::atomic::AtomicUsize> {
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&asked);
+        let mut rx = approvals.subscribe();
+        tokio::spawn(async move {
+            while let Ok(req) = rx.recv().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                approvals.resolve(req.id, decision);
+            }
+        });
+        asked
+    }
+
+    pub(super) fn asked_count(counter: &Arc<std::sync::atomic::AtomicUsize>) -> usize {
+        counter.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A "Session" answer to the risk gate holds for the rest of the session:
+    /// the next medium-risk call of the same basename runs without asking.
+    #[tokio::test]
+    async fn a_session_answer_to_the_risk_gate_holds_for_the_session() {
+        let security = policy_allowing(&["git"]);
+        let approvals = Arc::new(PendingApprovals::new(Some(std::time::Duration::from_secs(
+            5,
+        ))));
+        security.set_pending(approvals.clone());
+        let asked = answer_every_request(approvals.clone(), Decision::Session);
+        let tool = ShellTool::new(security.clone(), test_runtime());
+
+        let first = tool
+            .execute(json!({"command": "git checkout probe-branch"}))
+            .await
+            .expect("first command returns a result");
+        assert_eq!(
+            asked_count(&asked),
+            1,
+            "the first medium-risk run must ask: {first:?}"
+        );
+
+        let second = tool
+            .execute(json!({"command": "git checkout probe-branch-two"}))
+            .await
+            .expect("second command returns a result");
+        assert_eq!(
+            asked_count(&asked),
+            1,
+            "a session answer must hold for the next run: {second:?}"
+        );
+    }
+
+    /// A "Session" answer grants only the segments that were medium risk
+    /// themselves. The low-risk `git status` in the chain is not granted, so
+    /// `git push` — a medium-risk command under the same basename — asks
+    /// again instead of running unasked.
+    #[tokio::test]
+    async fn a_session_answer_grants_only_the_medium_risk_segments() {
+        let security = policy_allowing(&["git", "touch"]);
+        let approvals = Arc::new(PendingApprovals::new(Some(std::time::Duration::from_secs(
+            5,
+        ))));
+        security.set_pending(approvals.clone());
+        let asked = answer_every_request(approvals.clone(), Decision::Session);
+        let tool = ShellTool::new(security.clone(), test_runtime());
+
+        tool.execute(json!({"command": "git status && touch rantaiclaw_shell_grant_probe"}))
+            .await
+            .expect("first command returns a result");
+        assert_eq!(asked_count(&asked), 1, "the first medium-risk run must ask");
+
+        tool.execute(json!({"command": "git push origin main"}))
+            .await
+            .expect("second command returns a result");
+        assert_eq!(
+            asked_count(&asked),
+            2,
+            "a session answer must not grant a low-risk segment of the chain"
+        );
+    }
+
+    /// "Once" approves one run only: the next run of the same basename asks
+    /// again.
+    #[tokio::test]
+    async fn a_once_answer_to_the_risk_gate_asks_again() {
+        let security = policy_allowing(&["git"]);
+        let approvals = Arc::new(PendingApprovals::new(Some(std::time::Duration::from_secs(
+            5,
+        ))));
+        security.set_pending(approvals.clone());
+        let asked = answer_every_request(approvals.clone(), Decision::Once);
+        let tool = ShellTool::new(security.clone(), test_runtime());
+
+        tool.execute(json!({"command": "git checkout probe-branch"}))
+            .await
+            .expect("first command returns a result");
+        assert_eq!(asked_count(&asked), 1, "the first run must ask");
+
+        tool.execute(json!({"command": "git checkout probe-branch-two"}))
+            .await
+            .expect("second command returns a result");
+        assert_eq!(
+            asked_count(&asked),
+            2,
+            "a once answer must not hold for the next run"
+        );
+    }
+
+    /// High risk always asks again: a session answer grants nothing there.
+    #[tokio::test]
+    async fn a_high_risk_command_asks_again_after_a_session_answer() {
+        let security = policy_allowing(&["chmod"]);
+        let approvals = Arc::new(PendingApprovals::new(Some(std::time::Duration::from_secs(
+            5,
+        ))));
+        security.set_pending(approvals.clone());
+        let asked = answer_every_request(approvals.clone(), Decision::Session);
+        let tool = ShellTool::new(security.clone(), test_runtime());
+        let probe = std::env::temp_dir().join("rantaiclaw_shell_high_risk_probe");
+        tokio::fs::write(&probe, b"probe")
+            .await
+            .expect("write probe file");
+
+        tool.execute(json!({"command": "chmod 600 rantaiclaw_shell_high_risk_probe"}))
+            .await
+            .expect("first command returns a result");
+        assert_eq!(asked_count(&asked), 1, "the first high-risk run must ask");
+
+        tool.execute(json!({"command": "chmod 600 rantaiclaw_shell_high_risk_probe"}))
+            .await
+            .expect("second command returns a result");
+        assert_eq!(
+            asked_count(&asked),
+            2,
+            "high risk must always ask again, whatever the answer said"
+        );
+
+        let _ = tokio::fs::remove_file(&probe).await;
+    }
+
     #[tokio::test]
     async fn shell_high_risk_block_is_not_approvable() {
         let security = Arc::new(
@@ -1879,7 +2074,7 @@ mod tests {
 
 #[cfg(test)]
 mod turn_scope_tests {
-    use super::tests::{test_runtime, test_security};
+    use super::tests::{answer_every_request, asked_count, test_runtime, test_security};
     use super::*;
     use crate::security::{AutonomyLevel, Decision, PendingApprovals, PendingRequest};
     use std::sync::Arc;
@@ -1894,6 +2089,97 @@ mod turn_scope_tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("the shell tool should have registered an approval");
+    }
+
+    /// A "Session" answer to the risk gate holds for the conversation that made
+    /// it, and for no other conversation.
+    ///
+    /// The grants live on the one policy every channel shares, so before this
+    /// an owner's answer in chat A answered the gate in chat B as well — and
+    /// chat B is a chat a guest chose.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_session_answer_holds_only_in_the_conversation_that_made_it() {
+        let security = test_security(AutonomyLevel::Supervised);
+        let approvals = Arc::new(PendingApprovals::new(Some(Duration::from_secs(5))));
+        security.set_pending(approvals.clone());
+        let asked = answer_every_request(approvals.clone(), Decision::Session);
+        let tool = ShellTool::new(Arc::clone(&security), test_runtime());
+
+        // Chat A: the first run asks, and the session answer holds for the next.
+        crate::security::TURN_SCOPE
+            .scope(("telegram".to_string(), "chat-a".to_string()), async {
+                let _ = tool
+                    .execute(serde_json::json!({ "command": "git checkout probe-branch" }))
+                    .await;
+                let _ = tool
+                    .execute(serde_json::json!({ "command": "git checkout probe-branch-two" }))
+                    .await;
+            })
+            .await;
+        assert_eq!(
+            asked_count(&asked),
+            1,
+            "the session answer must hold inside the conversation that made it"
+        );
+
+        // Chat B: the same command asks again.
+        crate::security::TURN_SCOPE
+            .scope(("telegram".to_string(), "chat-b".to_string()), async {
+                let _ = tool
+                    .execute(serde_json::json!({ "command": "git checkout probe-branch" }))
+                    .await;
+            })
+            .await;
+        assert_eq!(
+            asked_count(&asked),
+            2,
+            "a grant must not answer the risk gate in another conversation"
+        );
+    }
+
+    /// A guest turn asks again in the conversation that holds the grant.
+    ///
+    /// The risk gate is the owner's only check on a guest: the guest's own
+    /// ceiling (`guest_allowed_commands`) says which commands a guest may run,
+    /// not that a medium-risk one may run unasked. So the grant the owner made
+    /// in this conversation must not answer the gate for a guest in it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_guest_turn_asks_again_inside_the_conversation_that_holds_the_grant() {
+        let security = test_security(AutonomyLevel::Supervised);
+        let approvals = Arc::new(PendingApprovals::new(Some(Duration::from_secs(5))));
+        security.set_pending(approvals.clone());
+        let asked = answer_every_request(approvals.clone(), Decision::Session);
+        let tool = ShellTool::new(Arc::clone(&security), test_runtime());
+
+        // The owner asks, and the session answer files the grant in this chat.
+        crate::security::TURN_SCOPE
+            .scope(("telegram".to_string(), "chat-a".to_string()), async {
+                let _ = tool
+                    .execute(serde_json::json!({ "command": "git checkout probe-branch" }))
+                    .await;
+            })
+            .await;
+        assert_eq!(asked_count(&asked), 1, "the owner's first run must ask");
+
+        // A guest in the same chat asks again.
+        crate::security::TURN_SCOPE
+            .scope(("telegram".to_string(), "chat-a".to_string()), async {
+                crate::security::TURN_IS_GUEST
+                    .scope(true, async {
+                        let _ = tool
+                            .execute(serde_json::json!({
+                                "command": "git checkout probe-branch"
+                            }))
+                            .await;
+                    })
+                    .await;
+            })
+            .await;
+        assert_eq!(
+            asked_count(&asked),
+            2,
+            "a grant must not answer the risk gate for a guest"
+        );
     }
 
     /// The wiring, not the mechanism: `ShellTool` must actually put the current

@@ -1381,8 +1381,16 @@ pub(crate) async fn execute_one_tool_structured(
     });
     let start = Instant::now();
 
+    // The human answer a tool received while it ran, if any. The cell is
+    // installed around this call's `execute` only, so a tool that asks a human
+    // itself (shell's two gates, `pty`, `ssh`) can report the answer and the
+    // trail stops claiming "nobody was asked" for a call a person approved.
+    // The merge with the outer gate's verdict is
+    // `security::pending::merge_tool_approval_outcome`.
+    let tool_cell = crate::security::tool_approval_cell();
     let tool_future = tool.execute(call.arguments.clone());
     let outcome = if let Some(token) = cancellation_token {
+        let cell = Arc::clone(&tool_cell);
         tokio::select! {
             () = token.cancelled() => {
                 if let Some(tx) = events {
@@ -1392,10 +1400,12 @@ pub(crate) async fn execute_one_tool_structured(
                 }
                 return Err(ToolLoopCancelled.into());
             }
-            r = tool_future => r,
+            r = crate::security::TOOL_APPROVAL.scope(cell, tool_future) => r,
         }
     } else {
-        tool_future.await
+        crate::security::TOOL_APPROVAL
+            .scope(Arc::clone(&tool_cell), tool_future)
+            .await
     };
 
     let (output, success) = match outcome {
@@ -1439,7 +1449,7 @@ pub(crate) async fn execute_one_tool_structured(
         // The gate ran before this funnel: reaching it means the call was
         // allowed. Which of the two ways it got here is what the caller passes.
         risk_level: "executed".into(),
-        approval: approval_outcome,
+        approval: crate::security::merge_tool_approval_outcome(approval_outcome, &tool_cell),
         allowed: true,
         success,
         duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -4483,6 +4493,594 @@ mod tests {
             record["action"]["approval"], "not_required",
             "nobody was asked, so the trail must not read as an approval: {text}"
         );
+    }
+
+    // ── The audit records a human answer given INSIDE a tool ───────────────
+    //
+    // The outer `ApprovalManager` gate is not the only place a human is
+    // asked. Shell asks about an unallowed basename and about a medium-risk
+    // command; `pty` and `ssh` ask about an arbitrary command. Those answers
+    // used to leave no trace: the trail could only report what the outer gate
+    // saw, so a call a person approved from inside the tool read as
+    // `not_required` — "nobody was asked", as far as the record could tell.
+
+    /// A manager whose OUTER gate never asks, so the only prompt in these
+    /// tests is the one the tool raises itself.
+    ///
+    /// `always_ask` is emptied because its default names `ssh` and `pty` — the
+    /// very tools under test — and `auto_approve` names `shell` and `ssh` so
+    /// the parallel fast path stays reachable for them.
+    fn silent_manager() -> ApprovalManager {
+        ApprovalManager::from_config(&crate::config::AutonomyConfig {
+            level: crate::security::AutonomyLevel::Supervised,
+            auto_approve: vec!["shell".into(), "ssh".into()],
+            always_ask: Vec::new(),
+            ..crate::config::AutonomyConfig::default()
+        })
+    }
+
+    /// A shell policy with an approval registry attached, so the tool can ask
+    /// a human. `allowed` is the shell allowlist in force.
+    fn shell_policy(
+        allowed: Vec<String>,
+        workspace: &std::path::Path,
+    ) -> (Arc<SecurityPolicy>, Arc<crate::security::PendingApprovals>) {
+        let pending = Arc::new(crate::security::PendingApprovals::new(Some(
+            std::time::Duration::from_secs(10),
+        )));
+        let policy = Arc::new(
+            SecurityPolicy::default()
+                .with_autonomy(crate::security::AutonomyLevel::Supervised)
+                .with_allowed_commands(allowed)
+                .with_workspace_dir(workspace.to_path_buf()),
+        );
+        policy.set_pending(pending.clone());
+        (policy, pending)
+    }
+
+    /// The native runtime the shell tool runs commands with.
+    fn native_runtime() -> Arc<dyn crate::runtime::RuntimeAdapter> {
+        Arc::new(crate::runtime::NativeRuntime::new())
+    }
+
+    /// Answer the first pending request with `decision`, from another task —
+    /// the tool is waiting on the answer, so the answer has to come from
+    /// somewhere else. Returns the handle so the test can await it and see a
+    /// failure instead of a timeout.
+    fn answer_first(
+        pending: Arc<crate::security::PendingApprovals>,
+        decision: crate::security::Decision,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            for _ in 0..300 {
+                if let Some(req) = pending.list().into_iter().next() {
+                    pending.resolve(req.id, decision);
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("the tool never registered an approval request");
+        })
+    }
+
+    /// Answer two pending requests by basename: the first with `Once`, the
+    /// second with `Deny`. Both have to be registered before either is
+    /// answered, so the two calls cannot cross over.
+    fn answer_two(
+        pending: Arc<crate::security::PendingApprovals>,
+        grant_basename: &str,
+        deny_basename: &str,
+    ) -> tokio::task::JoinHandle<()> {
+        let grant = grant_basename.to_string();
+        let deny = deny_basename.to_string();
+        tokio::spawn(async move {
+            for _ in 0..300 {
+                let list = pending.list();
+                let granted = list.iter().find(|r| r.basename == grant);
+                let refused = list.iter().find(|r| r.basename == deny);
+                if let (Some(g), Some(d)) = (granted, refused) {
+                    pending.resolve(g.id, crate::security::Decision::Once);
+                    pending.resolve(d.id, crate::security::Decision::Deny);
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("both tool approvals should have registered");
+        })
+    }
+
+    /// Write an executable probe into `dir`, so a shell command that names it
+    /// runs and succeeds.
+    #[cfg(unix)]
+    fn write_probe(dir: &std::path::Path, name: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, "#!/bin/sh\necho probe-ran\n").expect("write probe");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod probe");
+        path.to_string_lossy().into_owned()
+    }
+
+    /// A shell call whose basename is not on the allowlist asks a human from
+    /// inside the tool. When the human says yes, the trail must say so — the
+    /// outer gate never asked, so without the tool's own answer the record
+    /// would claim that nobody approved anything.
+    #[tokio::test]
+    async fn a_shell_call_a_human_approved_inside_the_tool_is_audited_as_granted() {
+        let _lock = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let profile = crate::profile::ProfileManager::active().expect("profile tree");
+        let log_path = profile.root.join("audit.log");
+        let _audit = crate::test_env::EnvGuard::set(
+            "RANTAICLAW_AUDIT_DIR_OVERRIDE",
+            profile.root.as_os_str(),
+        );
+
+        let work = tempfile::tempdir().expect("workdir");
+        let (policy, pending) = shell_policy(vec!["ls".into()], work.path());
+        let tool = crate::tools::ShellTool::new(Arc::clone(&policy), native_runtime());
+        let mgr = silent_manager();
+
+        let answerer = answer_first(pending, crate::security::Decision::Once);
+        let call = ParsedToolCall {
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "printf grant-probe"}),
+            tool_call_id: None,
+        };
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(tool)];
+        let results = execute_tool_calls_collecting(
+            std::slice::from_ref(&call),
+            &tools,
+            &NoopObserver,
+            Some(&mgr),
+            "telegram",
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            &crate::security::AuditActor::surface(),
+            Some(&policy),
+        )
+        .await
+        .expect("batch completes");
+        answerer.await.expect("the answerer task finished");
+        assert!(
+            results[0].success,
+            "the approved command must run: {:?}",
+            results[0].output
+        );
+
+        let (text, records) = audit_records_for_command(&log_path, "shell", 1).await;
+        assert_eq!(records.len(), 1, "one record for the call: {text}");
+        assert_eq!(
+            records[0]["action"]["approval"], "granted",
+            "a human approved this call inside the tool: {text}"
+        );
+    }
+
+    /// The same call, refused. The command must not run, and the trail must
+    /// read as a refusal rather than as "nobody was asked".
+    #[tokio::test]
+    async fn a_shell_call_a_human_refused_inside_the_tool_is_audited_as_denied() {
+        let _lock = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let profile = crate::profile::ProfileManager::active().expect("profile tree");
+        let log_path = profile.root.join("audit.log");
+        let _audit = crate::test_env::EnvGuard::set(
+            "RANTAICLAW_AUDIT_DIR_OVERRIDE",
+            profile.root.as_os_str(),
+        );
+
+        let work = tempfile::tempdir().expect("workdir");
+        let (policy, pending) = shell_policy(vec!["ls".into()], work.path());
+        let tool = crate::tools::ShellTool::new(Arc::clone(&policy), native_runtime());
+        let mgr = silent_manager();
+
+        let answerer = answer_first(pending, crate::security::Decision::Deny);
+        let call = ParsedToolCall {
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "printf deny-probe"}),
+            tool_call_id: None,
+        };
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(tool)];
+        let results = execute_tool_calls_collecting(
+            std::slice::from_ref(&call),
+            &tools,
+            &NoopObserver,
+            Some(&mgr),
+            "telegram",
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            &crate::security::AuditActor::surface(),
+            Some(&policy),
+        )
+        .await
+        .expect("batch completes");
+        answerer.await.expect("the answerer task finished");
+        assert!(!results[0].success, "a refused call must not run");
+
+        let (text, records) = audit_records_for_command(&log_path, "shell", 1).await;
+        assert_eq!(records.len(), 1, "one record for the call: {text}");
+        assert_eq!(
+            records[0]["action"]["approval"], "denied",
+            "a human refused this call inside the tool: {text}"
+        );
+    }
+
+    /// The shell's SECOND gate: the basename is allowed, but the command is
+    /// medium risk, so the tool asks the human before running it. The answer
+    /// has to reach the trail too.
+    #[tokio::test]
+    async fn a_medium_risk_shell_call_a_human_approved_is_audited_as_granted() {
+        let _lock = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let profile = crate::profile::ProfileManager::active().expect("profile tree");
+        let log_path = profile.root.join("audit.log");
+        let _audit = crate::test_env::EnvGuard::set(
+            "RANTAICLAW_AUDIT_DIR_OVERRIDE",
+            profile.root.as_os_str(),
+        );
+
+        let work = tempfile::tempdir().expect("workdir");
+        // `touch` is on the allowlist but is medium risk, so the basename gate
+        // is silent and the risk gate is the one that asks.
+        let (policy, pending) = shell_policy(vec!["touch".into()], work.path());
+        let tool = crate::tools::ShellTool::new(Arc::clone(&policy), native_runtime());
+        let mgr = silent_manager();
+
+        let answerer = answer_first(pending, crate::security::Decision::Once);
+        let call = ParsedToolCall {
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "touch risk_gate_probe"}),
+            tool_call_id: None,
+        };
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(tool)];
+        let results = execute_tool_calls_collecting(
+            std::slice::from_ref(&call),
+            &tools,
+            &NoopObserver,
+            Some(&mgr),
+            "telegram",
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            &crate::security::AuditActor::surface(),
+            Some(&policy),
+        )
+        .await
+        .expect("batch completes");
+        answerer.await.expect("the answerer task finished");
+        assert!(
+            results[0].success,
+            "the approved medium-risk command must run: {:?}",
+            results[0].output
+        );
+
+        let (text, records) = audit_records_for_command(&log_path, "shell", 1).await;
+        assert_eq!(records.len(), 1, "one record for the call: {text}");
+        assert_eq!(
+            records[0]["action"]["approval"], "granted",
+            "a human approved this medium-risk call inside the tool: {text}"
+        );
+    }
+
+    /// The refusal on the same gate.
+    #[tokio::test]
+    async fn a_medium_risk_shell_call_a_human_refused_is_audited_as_denied() {
+        let _lock = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let profile = crate::profile::ProfileManager::active().expect("profile tree");
+        let log_path = profile.root.join("audit.log");
+        let _audit = crate::test_env::EnvGuard::set(
+            "RANTAICLAW_AUDIT_DIR_OVERRIDE",
+            profile.root.as_os_str(),
+        );
+
+        let work = tempfile::tempdir().expect("workdir");
+        let (policy, pending) = shell_policy(vec!["touch".into()], work.path());
+        let tool = crate::tools::ShellTool::new(Arc::clone(&policy), native_runtime());
+        let mgr = silent_manager();
+
+        let answerer = answer_first(pending, crate::security::Decision::Deny);
+        let call = ParsedToolCall {
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "touch risk_gate_probe"}),
+            tool_call_id: None,
+        };
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(tool)];
+        let results = execute_tool_calls_collecting(
+            std::slice::from_ref(&call),
+            &tools,
+            &NoopObserver,
+            Some(&mgr),
+            "telegram",
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            &crate::security::AuditActor::surface(),
+            Some(&policy),
+        )
+        .await
+        .expect("batch completes");
+        answerer.await.expect("the answerer task finished");
+        assert!(!results[0].success, "a refused call must not run");
+
+        let (text, records) = audit_records_for_command(&log_path, "shell", 1).await;
+        assert_eq!(records.len(), 1, "one record for the call: {text}");
+        assert_eq!(
+            records[0]["action"]["approval"], "denied",
+            "a human refused this medium-risk call inside the tool: {text}"
+        );
+    }
+
+    /// A shell call the policy lets through without asking anybody stays
+    /// `not_required`. The cell must not invent an approval nobody gave.
+    #[tokio::test]
+    async fn a_shell_call_that_raised_no_prompt_is_audited_as_not_required() {
+        let _lock = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let profile = crate::profile::ProfileManager::active().expect("profile tree");
+        let log_path = profile.root.join("audit.log");
+        let _audit = crate::test_env::EnvGuard::set(
+            "RANTAICLAW_AUDIT_DIR_OVERRIDE",
+            profile.root.as_os_str(),
+        );
+
+        let work = tempfile::tempdir().expect("workdir");
+        // `ls` is allowed and low risk: nothing asks anybody.
+        let (policy, _pending) = shell_policy(vec!["ls".into()], work.path());
+        let tool = crate::tools::ShellTool::new(Arc::clone(&policy), native_runtime());
+        let mgr = silent_manager();
+
+        let call = ParsedToolCall {
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "ls"}),
+            tool_call_id: None,
+        };
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(tool)];
+        let results = execute_tool_calls_collecting(
+            std::slice::from_ref(&call),
+            &tools,
+            &NoopObserver,
+            Some(&mgr),
+            "telegram",
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            &crate::security::AuditActor::surface(),
+            Some(&policy),
+        )
+        .await
+        .expect("batch completes");
+        assert!(results[0].success, "the unprompted call must run");
+
+        let (text, records) = audit_records_for_command(&log_path, "shell", 1).await;
+        assert_eq!(records.len(), 1, "one record for the call: {text}");
+        assert_eq!(
+            records[0]["action"]["approval"], "not_required",
+            "nobody was asked, so the trail must not read as an approval: {text}"
+        );
+    }
+
+    /// `ssh exec` runs an arbitrary remote command, so the tool asks the human
+    /// itself. The remote call then fails — there is no session — but the
+    /// verdict under test is the one the human gave, and it has to reach the
+    /// trail.
+    #[tokio::test]
+    async fn an_ssh_call_a_human_approved_inside_the_tool_is_audited_as_granted() {
+        let _lock = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let profile = crate::profile::ProfileManager::active().expect("profile tree");
+        let log_path = profile.root.join("audit.log");
+        let _audit = crate::test_env::EnvGuard::set(
+            "RANTAICLAW_AUDIT_DIR_OVERRIDE",
+            profile.root.as_os_str(),
+        );
+
+        let (policy, pending) = shell_policy(vec!["ls".into()], tmp.path());
+        let tool = crate::tools::SshTool::new(Arc::clone(&policy));
+        let mgr = silent_manager();
+
+        let answerer = answer_first(pending, crate::security::Decision::Once);
+        let call = ParsedToolCall {
+            name: "ssh".into(),
+            arguments: serde_json::json!({
+                "action": "exec",
+                "session": "no-such-session",
+                "command": "id"
+            }),
+            tool_call_id: None,
+        };
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(tool)];
+        execute_tool_calls_collecting(
+            std::slice::from_ref(&call),
+            &tools,
+            &NoopObserver,
+            Some(&mgr),
+            "telegram",
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            &crate::security::AuditActor::surface(),
+            Some(&policy),
+        )
+        .await
+        .expect("batch completes");
+        answerer.await.expect("the answerer task finished");
+
+        let (text, records) = audit_records_for_command(&log_path, "ssh", 1).await;
+        assert_eq!(records.len(), 1, "one record for the call: {text}");
+        assert_eq!(
+            records[0]["action"]["approval"], "granted",
+            "a human approved this call inside the tool: {text}"
+        );
+    }
+
+    /// The refusal on the same gate.
+    #[tokio::test]
+    async fn an_ssh_call_a_human_refused_inside_the_tool_is_audited_as_denied() {
+        let _lock = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let profile = crate::profile::ProfileManager::active().expect("profile tree");
+        let log_path = profile.root.join("audit.log");
+        let _audit = crate::test_env::EnvGuard::set(
+            "RANTAICLAW_AUDIT_DIR_OVERRIDE",
+            profile.root.as_os_str(),
+        );
+
+        let (policy, pending) = shell_policy(vec!["ls".into()], tmp.path());
+        let tool = crate::tools::SshTool::new(Arc::clone(&policy));
+        let mgr = silent_manager();
+
+        let answerer = answer_first(pending, crate::security::Decision::Deny);
+        let call = ParsedToolCall {
+            name: "ssh".into(),
+            arguments: serde_json::json!({
+                "action": "exec",
+                "session": "no-such-session",
+                "command": "id"
+            }),
+            tool_call_id: None,
+        };
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(tool)];
+        execute_tool_calls_collecting(
+            std::slice::from_ref(&call),
+            &tools,
+            &NoopObserver,
+            Some(&mgr),
+            "telegram",
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            &crate::security::AuditActor::surface(),
+            Some(&policy),
+        )
+        .await
+        .expect("batch completes");
+        answerer.await.expect("the answerer task finished");
+
+        let (text, records) = audit_records_for_command(&log_path, "ssh", 1).await;
+        assert_eq!(records.len(), 1, "one record for the call: {text}");
+        assert_eq!(
+            records[0]["action"]["approval"], "denied",
+            "a human refused this call inside the tool: {text}"
+        );
+    }
+
+    /// The cell belongs to the CALL, not to the batch. Two shell calls that
+    /// run through the parallel fast path — each with its own basename, so
+    /// neither approval lifts the other — must end up with one `granted` and
+    /// one `denied`, never a shared verdict.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn two_parallel_shell_calls_each_carry_their_own_verdict() {
+        let _lock = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let profile = crate::profile::ProfileManager::active().expect("profile tree");
+        let log_path = profile.root.join("audit.log");
+        let _audit = crate::test_env::EnvGuard::set(
+            "RANTAICLAW_AUDIT_DIR_OVERRIDE",
+            profile.root.as_os_str(),
+        );
+
+        let work = tempfile::tempdir().expect("workdir");
+        let grant_command = write_probe(work.path(), "grant_probe");
+        let deny_command = write_probe(work.path(), "deny_probe");
+        // Neither basename is allowed, so each call takes the shell's own
+        // basename gate and asks a human of its own.
+        let (policy, pending) = shell_policy(vec!["ls".into()], work.path());
+        let tool = crate::tools::ShellTool::new(Arc::clone(&policy), native_runtime());
+        let mgr = silent_manager();
+
+        let calls = vec![
+            ParsedToolCall {
+                name: "shell".into(),
+                arguments: serde_json::json!({"command": grant_command}),
+                tool_call_id: None,
+            },
+            ParsedToolCall {
+                name: "shell".into(),
+                arguments: serde_json::json!({"command": deny_command}),
+                tool_call_id: None,
+            },
+        ];
+        // The premise of this test: the outer gate stays silent for these
+        // calls, so they DO reach the parallel fast path.
+        assert!(
+            should_execute_tools_in_parallel(&calls, Some(&mgr)),
+            "the outer gate must not gate shell here, or the parallel path is \
+             never reached and this test proves nothing"
+        );
+
+        let answerer = answer_two(pending, "grant_probe", "deny_probe");
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(tool)];
+        let results = execute_tool_calls_collecting(
+            &calls,
+            &tools,
+            &NoopObserver,
+            Some(&mgr),
+            "telegram",
+            None,
+            None,
+            None,
+            true,
+            None,
+            None,
+            &crate::security::AuditActor::surface(),
+            Some(&policy),
+        )
+        .await
+        .expect("batch completes");
+        answerer.await.expect("the answerer task finished");
+        assert!(
+            results.iter().any(|r| r.success) && results.iter().any(|r| !r.success),
+            "one call ran and one was refused: {results:?}"
+        );
+
+        let (text, records) = audit_records_for_command(&log_path, "shell", 2).await;
+        assert_eq!(records.len(), 2, "one record per call: {text}");
+        let granted = records
+            .iter()
+            .filter(|r| r["action"]["approval"] == "granted")
+            .count();
+        let denied = records
+            .iter()
+            .filter(|r| r["action"]["approval"] == "denied")
+            .count();
+        assert_eq!(
+            granted, 1,
+            "exactly one call was approved by a human: {text}"
+        );
+        assert_eq!(denied, 1, "exactly one call was refused by a human: {text}");
     }
 
     /// Runs `call` against `tool` under `ReadOnly` through the loop's funnel and

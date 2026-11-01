@@ -214,10 +214,21 @@ mod tests {
         with_home(|| {
             let profile = ProfileManager::ensure("rt-approvals-mirror").unwrap();
             let mut config = Config::default();
-            // Default carries the `ssh`/`pty` always-ask pair; Smart clears it,
-            // so this is an observable change rather than a coincidence with
-            // the default level.
-            assert!(!config.autonomy.always_ask.is_empty());
+            // Default carries the `ssh`/`pty` always-ask pair. Smart keeps the
+            // operator's own entries, so the list survives the switch — what
+            // changes is the command allowlist the preset's bundle carries.
+            assert_eq!(
+                config.autonomy.always_ask,
+                vec!["ssh".to_string(), "pty".to_string()]
+            );
+            assert!(
+                !config
+                    .autonomy
+                    .allowed_commands
+                    .iter()
+                    .any(|c| c == "which"),
+                "the default allowlist is not the Smart bundle's"
+            );
 
             let mut ctx = SetupContext {
                 profile: &profile,
@@ -230,10 +241,19 @@ mod tests {
 
             // The runtime gate reads config.autonomy — if setup leaves it at the
             // default, the preset the user picked never takes effect.
+            assert_eq!(
+                config.autonomy.always_ask,
+                vec!["ssh".to_string(), "pty".to_string()],
+                "Smart keeps the operator's always_ask entries"
+            );
             assert!(
-                config.autonomy.always_ask.is_empty(),
-                "expected the Smart encoding in config, got {:?}",
-                config.autonomy.always_ask
+                config
+                    .autonomy
+                    .allowed_commands
+                    .iter()
+                    .any(|c| c == "which"),
+                "expected the Smart bundle's allowlist in config, got {:?}",
+                config.autonomy.allowed_commands
             );
         });
     }
