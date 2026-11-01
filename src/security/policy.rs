@@ -438,6 +438,174 @@ pub fn command_segment_basenames(command: &str) -> Vec<String> {
     names
 }
 
+/// The basename of every segment of `command` that is classified Medium.
+///
+/// A "Session" answer to the risk gate grants exactly these: a segment the
+/// gate classifies Low is not granted, so a later medium-risk command that
+/// runs the same basename asks again. The names are normalised exactly as
+/// [`command_segment_basenames`] normalises them, so a granted name and a
+/// gated name are always the same string.
+pub fn command_medium_risk_basenames(command: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for segment in split_unquoted_segments(command) {
+        let cmd_part = skip_env_assignments(&segment);
+        if segment_risk_level(cmd_part) != CommandRiskLevel::Medium {
+            continue;
+        }
+        let Some(base_raw) = cmd_part.split_whitespace().next() else {
+            continue;
+        };
+        let base = base_raw
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if base.is_empty() {
+            continue;
+        }
+        names.push(base);
+    }
+    names
+}
+
+/// Classify one command segment on its own.
+///
+/// The basename and the arguments are read exactly as
+/// [`SecurityPolicy::command_risk_level`] reads them, so the classification
+/// of a segment here is the classification the risk gate judges it by.
+fn segment_risk_level(cmd_part: &str) -> CommandRiskLevel {
+    let Some(base_raw) = cmd_part.split_whitespace().next() else {
+        return CommandRiskLevel::Low;
+    };
+
+    let base = base_raw
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    // De-quote the arguments the shell will actually see so a quoted
+    // state-changing verb (e.g. `git "push"`) is still detected. A quoted
+    // *base* can't reach here allowlisted (it fails the basename match in
+    // `is_command_allowed`), so keeping the base split_whitespace is safe.
+    let args: Vec<String> = shell_argv(cmd_part)
+        .into_iter()
+        .skip(1)
+        .map(|w| w.to_ascii_lowercase())
+        .collect();
+    let joined_segment = cmd_part.to_ascii_lowercase();
+
+    // High-risk commands
+    if matches!(
+        base.as_str(),
+        "rm" | "mkfs"
+            | "dd"
+            | "shutdown"
+            | "reboot"
+            | "halt"
+            | "poweroff"
+            | "sudo"
+            | "su"
+            | "chown"
+            | "chmod"
+            | "useradd"
+            | "userdel"
+            | "usermod"
+            | "passwd"
+            | "mount"
+            | "umount"
+            | "iptables"
+            | "ufw"
+            | "firewall-cmd"
+            | "curl"
+            | "wget"
+            | "nc"
+            | "ncat"
+            | "netcat"
+            | "scp"
+            | "ssh"
+            | "ftp"
+            | "telnet"
+    ) {
+        return CommandRiskLevel::High;
+    }
+
+    // NOTE: no fork-bomb (`:(){:|:&};:`) check here — this runs on a
+    // single already-split segment (split on `;`/`|`/`&`), so the full
+    // fork-bomb string can never appear in one segment. It is already
+    // denied because `:` is not on the command allowlist.
+    if joined_segment.contains("rm -rf /") || joined_segment.contains("rm -fr /") {
+        return CommandRiskLevel::High;
+    }
+
+    // Medium-risk commands (state-changing, but not inherently destructive).
+    // Scan ALL args for the state-changing verb, not just the first: a
+    // leading global option (`git --no-pager push`, `npm --prefix . install`,
+    // `git -C /path reset`) would otherwise shift the verb out of position
+    // and misclassify the command as Low, skipping the Supervised approval
+    // gate. A rare false-positive (an arg literally equal to a verb keyword)
+    // only over-prompts, which is the safe direction for a security gate.
+    let medium = match base.as_str() {
+        "git" => args.iter().any(|verb| {
+            matches!(
+                verb.as_str(),
+                "commit"
+                    | "push"
+                    | "reset"
+                    | "clean"
+                    | "rebase"
+                    | "merge"
+                    | "cherry-pick"
+                    | "revert"
+                    | "branch"
+                    | "checkout"
+                    | "switch"
+                    | "tag"
+                    // Transport verbs: not destructive by themselves, but
+                    // they're the vector for the --upload-pack/-u RCE class
+                    // above. Risk-gating them means an unapproved
+                    // Supervised session still hits the approval prompt
+                    // even if is_args_safe's blocklist ever has a gap.
+                    | "clone"
+                    | "fetch"
+                    | "ls-remote"
+                    | "pull"
+                    // Subcommands that run an arbitrary program: bisect
+                    // run <prog>, submodule foreach '<cmd>', filter-branch.
+                    | "bisect"
+                    | "submodule"
+                    | "filter-branch"
+            )
+        }),
+        "npm" | "pnpm" | "yarn" => args.iter().any(|verb| {
+            matches!(
+                verb.as_str(),
+                "install" | "add" | "remove" | "uninstall" | "update" | "publish"
+                // run/test/exec/ci/dlx execute arbitrary package.json
+                // scripts or fetched packages.
+                    | "run" | "test" | "exec" | "ci" | "dlx"
+            )
+        }),
+        "cargo" => args.iter().any(|verb| {
+            matches!(
+                verb.as_str(),
+                "add" | "remove" | "install" | "clean" | "publish"
+                // run/build/test/bench execute a build.rs hook or
+                // project/test code.
+                    | "run" | "build" | "test" | "bench"
+            )
+        }),
+        "touch" | "mkdir" | "mv" | "cp" | "ln" => true,
+        _ => false,
+    };
+
+    if medium {
+        CommandRiskLevel::Medium
+    } else {
+        CommandRiskLevel::Low
+    }
+}
+
 /// Split a shell command into sub-commands by unquoted separators.
 ///
 /// Separators:
@@ -737,144 +905,18 @@ impl SecurityPolicy {
 
     /// Classify command risk. Any high-risk segment marks the whole command high.
     pub fn command_risk_level(&self, command: &str) -> CommandRiskLevel {
-        let mut saw_medium = false;
+        let mut risk = CommandRiskLevel::Low;
 
         for segment in split_unquoted_segments(command) {
             let cmd_part = skip_env_assignments(&segment);
-            let mut words = cmd_part.split_whitespace();
-            let Some(base_raw) = words.next() else {
-                continue;
-            };
-
-            let base = base_raw
-                .rsplit('/')
-                .next()
-                .unwrap_or("")
-                .to_ascii_lowercase();
-
-            // De-quote the arguments the shell will actually see so a quoted
-            // state-changing verb (e.g. `git "push"`) is still detected. A quoted
-            // *base* can't reach here allowlisted (it fails the basename match in
-            // `is_command_allowed`), so keeping the base split_whitespace is safe.
-            let args: Vec<String> = shell_argv(cmd_part)
-                .into_iter()
-                .skip(1)
-                .map(|w| w.to_ascii_lowercase())
-                .collect();
-            let joined_segment = cmd_part.to_ascii_lowercase();
-
-            // High-risk commands
-            if matches!(
-                base.as_str(),
-                "rm" | "mkfs"
-                    | "dd"
-                    | "shutdown"
-                    | "reboot"
-                    | "halt"
-                    | "poweroff"
-                    | "sudo"
-                    | "su"
-                    | "chown"
-                    | "chmod"
-                    | "useradd"
-                    | "userdel"
-                    | "usermod"
-                    | "passwd"
-                    | "mount"
-                    | "umount"
-                    | "iptables"
-                    | "ufw"
-                    | "firewall-cmd"
-                    | "curl"
-                    | "wget"
-                    | "nc"
-                    | "ncat"
-                    | "netcat"
-                    | "scp"
-                    | "ssh"
-                    | "ftp"
-                    | "telnet"
-            ) {
-                return CommandRiskLevel::High;
+            match segment_risk_level(cmd_part) {
+                CommandRiskLevel::High => return CommandRiskLevel::High,
+                CommandRiskLevel::Medium => risk = CommandRiskLevel::Medium,
+                CommandRiskLevel::Low => {}
             }
-
-            // NOTE: no fork-bomb (`:(){:|:&};:`) check here — this runs on a
-            // single already-split segment (split on `;`/`|`/`&`), so the full
-            // fork-bomb string can never appear in one segment. It is already
-            // denied because `:` is not on the command allowlist.
-            if joined_segment.contains("rm -rf /") || joined_segment.contains("rm -fr /") {
-                return CommandRiskLevel::High;
-            }
-
-            // Medium-risk commands (state-changing, but not inherently destructive).
-            // Scan ALL args for the state-changing verb, not just the first: a
-            // leading global option (`git --no-pager push`, `npm --prefix . install`,
-            // `git -C /path reset`) would otherwise shift the verb out of position
-            // and misclassify the command as Low, skipping the Supervised approval
-            // gate. A rare false-positive (an arg literally equal to a verb keyword)
-            // only over-prompts, which is the safe direction for a security gate.
-            let medium = match base.as_str() {
-                "git" => args.iter().any(|verb| {
-                    matches!(
-                        verb.as_str(),
-                        "commit"
-                            | "push"
-                            | "reset"
-                            | "clean"
-                            | "rebase"
-                            | "merge"
-                            | "cherry-pick"
-                            | "revert"
-                            | "branch"
-                            | "checkout"
-                            | "switch"
-                            | "tag"
-                            // Transport verbs: not destructive by themselves, but
-                            // they're the vector for the --upload-pack/-u RCE class
-                            // above. Risk-gating them means an unapproved
-                            // Supervised session still hits the approval prompt
-                            // even if is_args_safe's blocklist ever has a gap.
-                            | "clone"
-                            | "fetch"
-                            | "ls-remote"
-                            | "pull"
-                            // Subcommands that run an arbitrary program: bisect
-                            // run <prog>, submodule foreach '<cmd>', filter-branch.
-                            | "bisect"
-                            | "submodule"
-                            | "filter-branch"
-                    )
-                }),
-                "npm" | "pnpm" | "yarn" => args.iter().any(|verb| {
-                    matches!(
-                        verb.as_str(),
-                        "install" | "add" | "remove" | "uninstall" | "update" | "publish"
-                        // run/test/exec/ci/dlx execute arbitrary package.json
-                        // scripts or fetched packages.
-                            | "run" | "test" | "exec" | "ci" | "dlx"
-                    )
-                }),
-                "cargo" => args.iter().any(|verb| {
-                    matches!(
-                        verb.as_str(),
-                        "add" | "remove" | "install" | "clean" | "publish"
-                        // run/build/test/bench execute a build.rs hook or
-                        // project/test code.
-                            | "run" | "build" | "test" | "bench"
-                    )
-                }),
-                "touch" | "mkdir" | "mv" | "cp" | "ln" => true,
-                _ => false,
-            };
-
-            saw_medium |= medium;
         }
 
-        if saw_medium {
-            CommandRiskLevel::Medium
-        } else {
-            CommandRiskLevel::Low
-        }
+        risk
     }
 
     // ── Command Execution Policy Gate ──────────────────────────────────────
@@ -1963,6 +2005,31 @@ mod tests {
         assert_eq!(
             p.command_risk_level("rm -rf /tmp/test"),
             CommandRiskLevel::High
+        );
+    }
+
+    /// A "Session" answer to the risk gate grants only the segments that were
+    /// medium risk themselves. A low-risk segment in the same command is not
+    /// granted, so a later medium-risk command that runs it asks again.
+    #[test]
+    fn only_the_medium_risk_segments_are_named_for_a_grant() {
+        assert_eq!(
+            command_medium_risk_basenames("git status && touch x"),
+            vec!["touch".to_string()],
+            "a low-risk segment must not be granted"
+        );
+        assert_eq!(
+            command_medium_risk_basenames("touch a && mkdir b"),
+            vec!["touch".to_string(), "mkdir".to_string()],
+            "every medium-risk segment is granted"
+        );
+        assert!(
+            command_medium_risk_basenames("git status").is_empty(),
+            "a command with no medium-risk segment grants nothing"
+        );
+        assert!(
+            command_medium_risk_basenames("rm -rf /tmp/test").is_empty(),
+            "a high-risk segment is never granted at medium risk"
         );
     }
 

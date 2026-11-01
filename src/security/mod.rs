@@ -40,7 +40,9 @@ pub use pending::{
     tool_approval_outcome, Decision, PendingApprovals, PendingRequest, SessionScope,
     ToolApprovalCell, TOOL_APPROVAL, TURN_SCOPE,
 };
-pub use policy::{command_segment_basenames, AutonomyLevel, SecurityPolicy};
+pub use policy::{
+    command_medium_risk_basenames, command_segment_basenames, AutonomyLevel, SecurityPolicy,
+};
 #[allow(unused_imports)]
 pub use secrets::SecretStore;
 

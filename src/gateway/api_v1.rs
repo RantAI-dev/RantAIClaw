@@ -1025,7 +1025,7 @@ async fn agent_chat_stream(
                                                 scope: req.session_scope,
                                                 always_available,
                                                 grant_basenames:
-                                                    crate::security::command_segment_basenames(
+                                                    crate::security::command_medium_risk_basenames(
                                                         &req.full_command,
                                                     ),
                                             },
@@ -1074,8 +1074,9 @@ async fn agent_chat_stream(
                                                             );
                                                         }
                                                         // A medium-risk grant covers the
-                                                        // basenames the command runs, and
-                                                        // answers the risk gate only.
+                                                        // basenames of the segments that
+                                                        // were medium risk, and answers
+                                                        // the risk gate only.
                                                         crate::security::SessionScope::MediumRisk => {
                                                             for name in &request.grant_basenames {
                                                                 crate::approval::session_grants::record_session_medium_command(
@@ -1410,7 +1411,8 @@ struct ForwardedShellRequest {
     /// Whether the browser was told that an "Always" answer would hold. Only
     /// then may an answer become a grant.
     always_available: bool,
-    /// The basenames a session grant covers: every basename the command runs.
+    /// The basenames a session grant covers: the basenames of the segments
+    /// that were medium risk themselves.
     grant_basenames: Vec<String>,
 }
 
@@ -4585,6 +4587,47 @@ mod tests {
         assert!(
             second_prompt.is_none(),
             "a session answer must hold for the next message: {second:?}"
+        );
+    }
+
+    /// A "Session" answer grants only the segments that were medium risk
+    /// themselves. The low-risk `git status` in the chain is not granted, so
+    /// the conversation holds `mv` and nothing else — `git push` asks again.
+    #[tokio::test]
+    async fn console_medium_risk_session_grant_covers_only_the_medium_segments() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+        let state = scripted_state();
+        // `mv` is the medium-risk segment of the chain below; it is not on the
+        // default allowlist.
+        state
+            .config
+            .lock()
+            .autonomy
+            .allowed_commands
+            .push("mv".to_string());
+        let script = ShellToolScript::start().await;
+        let sid = fresh_session_id();
+
+        script.ask_for("git status && mv missing-source probe-target");
+        let (first, prompt) = drive_console_turn(
+            &state,
+            &script.provider(),
+            Some(sid.clone()),
+            "commit",
+            Some((true, true)),
+        )
+        .await;
+        assert!(
+            prompt.is_some(),
+            "the medium-risk chain must prompt: {first:?}"
+        );
+
+        assert_eq!(
+            crate::approval::session_grants::session_granted_medium_commands(&sid),
+            vec!["mv".to_string()],
+            "a session answer grants only the medium-risk segments of the chain"
         );
     }
 

@@ -1,7 +1,7 @@
 use super::traits::{Tool, ToolResult};
 use crate::runtime::{PreparedShellCommand, RuntimeAdapter};
 use crate::security::policy::CommandRiskLevel;
-use crate::security::{command_segment_basenames, Decision, SecurityPolicy, SessionScope};
+use crate::security::{command_medium_risk_basenames, Decision, SecurityPolicy, SessionScope};
 use crate::tools::RATE_LIMIT_REMEDIATION;
 use async_trait::async_trait;
 use serde_json::json;
@@ -576,12 +576,16 @@ impl Tool for ShellTool {
                                 human_approved = true;
                                 // A session answer holds for the basenames this
                                 // command runs, at MEDIUM risk, for the rest of
-                                // the session. High risk always asks again, so
-                                // nothing is recorded there; and the risk gate
-                                // has no allowlist entry, so Persist writes
-                                // nothing to disk either.
+                                // the session. Only the segments that were
+                                // medium risk themselves are granted: a
+                                // low-risk segment in the same chain is not, so
+                                // a later medium-risk command under that
+                                // basename asks again. High risk always asks
+                                // again, so nothing is recorded there; and the
+                                // risk gate has no allowlist entry, so Persist
+                                // writes nothing to disk either.
                                 if scope == SessionScope::MediumRisk {
-                                    for name in command_segment_basenames(command) {
+                                    for name in command_medium_risk_basenames(command) {
                                         self.security.add_medium_risk_approval(&name);
                                     }
                                 }
@@ -1420,6 +1424,35 @@ mod tests {
             asked_count(&asked),
             1,
             "a session answer must hold for the next run: {second:?}"
+        );
+    }
+
+    /// A "Session" answer grants only the segments that were medium risk
+    /// themselves. The low-risk `git status` in the chain is not granted, so
+    /// `git push` — a medium-risk command under the same basename — asks
+    /// again instead of running unasked.
+    #[tokio::test]
+    async fn a_session_answer_grants_only_the_medium_risk_segments() {
+        let security = policy_allowing(&["git", "touch"]);
+        let approvals = Arc::new(PendingApprovals::new(Some(std::time::Duration::from_secs(
+            5,
+        ))));
+        security.set_pending(approvals.clone());
+        let asked = answer_every_request(approvals.clone(), Decision::Session);
+        let tool = ShellTool::new(security.clone(), test_runtime());
+
+        tool.execute(json!({"command": "git status && touch rantaiclaw_shell_grant_probe"}))
+            .await
+            .expect("first command returns a result");
+        assert_eq!(asked_count(&asked), 1, "the first medium-risk run must ask");
+
+        tool.execute(json!({"command": "git push origin main"}))
+            .await
+            .expect("second command returns a result");
+        assert_eq!(
+            asked_count(&asked),
+            2,
+            "a session answer must not grant a low-risk segment of the chain"
         );
     }
 
