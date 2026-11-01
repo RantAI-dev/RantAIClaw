@@ -2779,7 +2779,17 @@ impl TuiApp {
     }
 
     fn reload_config(&mut self) -> anyhow::Result<()> {
-        let path = self.profile.config_toml();
+        // Read the file this process RUNS FROM — the path `Config::load`
+        // resolved and the watcher watches. The profile's own
+        // `config.toml` is a DIFFERENT file in the flat layout
+        // (`RANTAICLAW_CONFIG_DIR`), where the config lives in the flat
+        // dir while the profile still lives in
+        // `~/.rantaiclaw/profiles/<name>`: reading the profile's path
+        // there is the "config.toml changed but reload failed" report the
+        // operator sees, and the running policy never learns the new
+        // level. In the profile layout the two paths are the same file,
+        // so nothing changes there.
+        let path = self.config.config_path.clone();
         let contents = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read config from {}", path.display()))?;
         let mut config: crate::config::Config =
@@ -2794,9 +2804,16 @@ impl TuiApp {
         // to an empty path, which makes `tokio::process::Command::
         // current_dir("")` fail with "No such file or directory" at
         // spawn time — that's the "shell broken after config reload"
-        // bug. Re-derive it from the active profile so the rebuilt
-        // agent runs shell tools in the right cwd.
-        config.workspace_dir = self.profile.workspace_dir();
+        // bug. Re-derive it from the config this process booted with,
+        // which is the workspace `Config::load` resolved: next to the
+        // config file in the flat layout, in the profile dir in the
+        // profile layout. The profile's own workspace is only right in
+        // the profile layout.
+        config.workspace_dir = if self.config.workspace_dir.as_os_str().is_empty() {
+            self.profile.workspace_dir()
+        } else {
+            self.config.workspace_dir.clone()
+        };
         // Decrypt secrets before pushing to the agent. Without this the
         // agent receives encrypted blobs in `config.api_key` and friends
         // and every API call returns 401 "Missing Authentication header"
@@ -4427,7 +4444,15 @@ impl TuiApp {
         // the same way. Comparing the bytes is what stops that tick from
         // pushing a second `Reload` of the config the switch just rebuilt from
         // — the same fingerprint gate the gateway's reloader uses.
-        let on_disk = crate::config::fingerprint::fingerprint_file(&self.profile.config_toml());
+        // The bytes to compare are the bytes of the file this process RUNS
+        // FROM — the path `Config::load` resolved and the watcher watches.
+        // The profile's own `config.toml` is a DIFFERENT file in the flat
+        // layout (`RANTAICLAW_CONFIG_DIR`): fingerprinting that one here
+        // made this gate compare a file that never changes, so the second
+        // edit to the watched file matched the remembered bytes and was
+        // dropped as "the bytes this app already has". In the profile
+        // layout the two paths are the same file, so nothing changes there.
+        let on_disk = crate::config::fingerprint::fingerprint_file(&self.config.config_path);
         if *self
             .config_fingerprint
             .lock()
@@ -14858,6 +14883,136 @@ mod autonomy_live_level_tests {
             policy.effective_autonomy(),
             AutonomyLevel::ReadOnly,
             "a tightening via the preset path must reach the running policy too"
+        );
+    }
+
+    /// The reload must read the config file the watcher watches — the one
+    /// `Config::load` resolves — not a path derived from the profile
+    /// directory.
+    ///
+    /// The two diverge in the flat layout (`RANTAICLAW_CONFIG_DIR`): the
+    /// config this process runs from lives in the flat dir, while the profile
+    /// still lives in `~/.rantaiclaw/profiles/<name>`. Reading the profile's
+    /// path there is what the operator sees as "config.toml changed but
+    /// reload failed", and the running policy never learns the new level.
+    ///
+    /// TWO edits, not one. The reload path remembers the bytes it last saw
+    /// so it can skip the ticks its own writes cause. If that remembered
+    /// fingerprint comes from a different file than the one the watcher
+    /// watches, the second edit reads as a repeat of the first and is
+    /// dropped in silence — the operator tightens the level and nothing
+    /// happens. The first edit alone cannot see that: the remembered
+    /// fingerprint starts empty, so the very first tick always looks new.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_tui_reload_reads_the_config_file_the_watcher_watches() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let flat = tempfile::tempdir().expect("flat config dir");
+        let _config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", flat.path());
+        // The profile lives somewhere else entirely — the split state the
+        // flat layout produces.
+        let profile_root = tempfile::tempdir().expect("profile root");
+
+        // The path `Config::load` resolves, and the path the watcher watches.
+        let (config_path, workspace_dir) = crate::config::Config::resolve_active_paths()
+            .await
+            .expect("the active config path resolves");
+        assert_eq!(
+            config_path,
+            flat.path().join("config.toml"),
+            "the flat config dir must hold the config this process runs from"
+        );
+
+        let (mut ctx, _req_rx, _events_tx) = crate::tui::context::TuiContext::test_context();
+        let policy = Arc::new(crate::security::SecurityPolicy::from_config(
+            &crate::config::AutonomyConfig::default(),
+            &workspace_dir,
+        ));
+        ctx.security = Some(policy.clone());
+        let mut app = app_with_profile_root(ctx, profile_root.path().to_path_buf());
+        app.config.config_path = config_path.clone();
+        app.config.workspace_dir = workspace_dir;
+
+        // The watcher watches the resolved path — the file the operator edits.
+        app.config_watcher = Some(
+            crate::config::watcher::ConfigWatcher::watch(&config_path).expect("watch the config"),
+        );
+
+        // The operator edits that file.
+        std::fs::write(&config_path, "[autonomy]\nlevel = \"full\"\n")
+            .expect("write the edited config");
+
+        // The app drains the watcher once per frame; poll until the tick lands.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            app.drain_config_reload_events();
+            if policy.effective_autonomy() == AutonomyLevel::Full
+                || app
+                    .scrollback_queue
+                    .iter()
+                    .any(|(_, msg)| msg.contains("reload failed"))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the watcher never reported the edit"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        assert!(
+            !app.scrollback_queue
+                .iter()
+                .any(|(_, msg)| msg.contains("reload failed")),
+            "the reload must not fail — the TUI said: {:?}",
+            app.scrollback_queue
+        );
+        assert_eq!(
+            policy.effective_autonomy(),
+            AutonomyLevel::Full,
+            "the running policy must read the level from the file the watcher watches"
+        );
+
+        // The operator edits that same file AGAIN. A second edit is what
+        // proves the app still watches the file it reloaded from: the
+        // reload path remembers the bytes it last saw and skips a tick
+        // whose bytes match, so an edit is only picked up while the
+        // remembered bytes come from the file the watcher watches. When
+        // they come from another file, every edit after the first reads as
+        // "the bytes this app already has" and is dropped without a word.
+        std::fs::write(&config_path, "[autonomy]\nlevel = \"readonly\"\n")
+            .expect("write the second edit to the same config");
+
+        // Drain again, the same way the frame loop does.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            app.drain_config_reload_events();
+            if policy.effective_autonomy() == AutonomyLevel::ReadOnly
+                || app
+                    .scrollback_queue
+                    .iter()
+                    .any(|(_, msg)| msg.contains("reload failed"))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the watcher never reported the second edit"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        assert!(
+            !app.scrollback_queue
+                .iter()
+                .any(|(_, msg)| msg.contains("reload failed")),
+            "the second reload must not fail — the TUI said: {:?}",
+            app.scrollback_queue
+        );
+        assert_eq!(
+            policy.effective_autonomy(),
+            AutonomyLevel::ReadOnly,
+            "a second edit to the watched file must reach the running policy too"
         );
     }
 }
