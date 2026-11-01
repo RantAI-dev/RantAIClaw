@@ -977,13 +977,25 @@ async fn agent_chat_stream(
                             // they go into the policy's medium-risk set and never
                             // into the basename allowlist — re-seeding them there
                             // would also lift the unallowed-command prompt.
-                            for name in
-                                crate::approval::session_grants::session_granted_medium_commands(
-                                    sid,
+                            //
+                            // The grant belongs to this turn's conversation, so it
+                            // is filed under this turn's scope — the same scope
+                            // the turn runs under below. That is what the risk
+                            // gate reads it back from.
+                            let () = crate::security::TURN_SCOPE
+                                .scope(
+                                    ("console".to_string(), turn_scope.clone()),
+                                    async {
+                                        for name in
+                                            crate::approval::session_grants::session_granted_medium_commands(
+                                                sid,
+                                            )
+                                        {
+                                            sec.add_medium_risk_approval(&name);
+                                        }
+                                    },
                                 )
-                            {
-                                sec.add_medium_risk_approval(&name);
-                            }
+                                .await;
                         }
                     }
                     let mut shell_rx = web_approvals.subscribe();
@@ -4587,6 +4599,61 @@ mod tests {
         assert!(
             second_prompt.is_none(),
             "a session answer must hold for the next message: {second:?}"
+        );
+    }
+
+    /// A console grant belongs to its own conversation: another session's
+    /// medium-risk command asks again.
+    #[tokio::test]
+    async fn console_medium_risk_grant_does_not_answer_another_session() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+        let state = scripted_state();
+        let script = ShellToolScript::start().await;
+        let first_session = fresh_session_id();
+        let second_session = fresh_session_id();
+
+        script.ask_for("git commit -m probe");
+        let (first, prompt) = drive_console_turn(
+            &state,
+            &script.provider(),
+            Some(first_session.clone()),
+            "commit",
+            Some((true, true)),
+        )
+        .await;
+        assert!(
+            prompt.is_some(),
+            "the first session must prompt for a medium-risk command: {first:?}"
+        );
+
+        // The same conversation: the session answer holds.
+        let (same, same_prompt) = drive_console_turn(
+            &state,
+            &script.provider(),
+            Some(first_session),
+            "commit again",
+            None,
+        )
+        .await;
+        assert!(
+            same_prompt.is_none(),
+            "a session answer must hold for the next message of its own conversation: {same:?}"
+        );
+
+        // Another conversation: it asks again.
+        let (other, other_prompt) = drive_console_turn(
+            &state,
+            &script.provider(),
+            Some(second_session),
+            "commit again",
+            None,
+        )
+        .await;
+        assert!(
+            other_prompt.is_some(),
+            "another console session must ask again: {other:?}"
         );
     }
 

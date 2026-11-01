@@ -1374,7 +1374,7 @@ mod tests {
     /// Answer every pending approval with `decision` and count how many were
     /// asked. The count is the observable: a prompt that never happened cannot
     /// be answered, so it says exactly how often the gate fired.
-    fn answer_every_request(
+    pub(super) fn answer_every_request(
         approvals: Arc<PendingApprovals>,
         decision: Decision,
     ) -> Arc<std::sync::atomic::AtomicUsize> {
@@ -1390,7 +1390,7 @@ mod tests {
         asked
     }
 
-    fn asked_count(counter: &Arc<std::sync::atomic::AtomicUsize>) -> usize {
+    pub(super) fn asked_count(counter: &Arc<std::sync::atomic::AtomicUsize>) -> usize {
         counter.load(std::sync::atomic::Ordering::SeqCst)
     }
 
@@ -2074,7 +2074,7 @@ mod tests {
 
 #[cfg(test)]
 mod turn_scope_tests {
-    use super::tests::{test_runtime, test_security};
+    use super::tests::{answer_every_request, asked_count, test_runtime, test_security};
     use super::*;
     use crate::security::{AutonomyLevel, Decision, PendingApprovals, PendingRequest};
     use std::sync::Arc;
@@ -2089,6 +2089,97 @@ mod turn_scope_tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("the shell tool should have registered an approval");
+    }
+
+    /// A "Session" answer to the risk gate holds for the conversation that made
+    /// it, and for no other conversation.
+    ///
+    /// The grants live on the one policy every channel shares, so before this
+    /// an owner's answer in chat A answered the gate in chat B as well — and
+    /// chat B is a chat a guest chose.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_session_answer_holds_only_in_the_conversation_that_made_it() {
+        let security = test_security(AutonomyLevel::Supervised);
+        let approvals = Arc::new(PendingApprovals::new(Some(Duration::from_secs(5))));
+        security.set_pending(approvals.clone());
+        let asked = answer_every_request(approvals.clone(), Decision::Session);
+        let tool = ShellTool::new(Arc::clone(&security), test_runtime());
+
+        // Chat A: the first run asks, and the session answer holds for the next.
+        crate::security::TURN_SCOPE
+            .scope(("telegram".to_string(), "chat-a".to_string()), async {
+                let _ = tool
+                    .execute(serde_json::json!({ "command": "git checkout probe-branch" }))
+                    .await;
+                let _ = tool
+                    .execute(serde_json::json!({ "command": "git checkout probe-branch-two" }))
+                    .await;
+            })
+            .await;
+        assert_eq!(
+            asked_count(&asked),
+            1,
+            "the session answer must hold inside the conversation that made it"
+        );
+
+        // Chat B: the same command asks again.
+        crate::security::TURN_SCOPE
+            .scope(("telegram".to_string(), "chat-b".to_string()), async {
+                let _ = tool
+                    .execute(serde_json::json!({ "command": "git checkout probe-branch" }))
+                    .await;
+            })
+            .await;
+        assert_eq!(
+            asked_count(&asked),
+            2,
+            "a grant must not answer the risk gate in another conversation"
+        );
+    }
+
+    /// A guest turn asks again in the conversation that holds the grant.
+    ///
+    /// The risk gate is the owner's only check on a guest: the guest's own
+    /// ceiling (`guest_allowed_commands`) says which commands a guest may run,
+    /// not that a medium-risk one may run unasked. So the grant the owner made
+    /// in this conversation must not answer the gate for a guest in it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_guest_turn_asks_again_inside_the_conversation_that_holds_the_grant() {
+        let security = test_security(AutonomyLevel::Supervised);
+        let approvals = Arc::new(PendingApprovals::new(Some(Duration::from_secs(5))));
+        security.set_pending(approvals.clone());
+        let asked = answer_every_request(approvals.clone(), Decision::Session);
+        let tool = ShellTool::new(Arc::clone(&security), test_runtime());
+
+        // The owner asks, and the session answer files the grant in this chat.
+        crate::security::TURN_SCOPE
+            .scope(("telegram".to_string(), "chat-a".to_string()), async {
+                let _ = tool
+                    .execute(serde_json::json!({ "command": "git checkout probe-branch" }))
+                    .await;
+            })
+            .await;
+        assert_eq!(asked_count(&asked), 1, "the owner's first run must ask");
+
+        // A guest in the same chat asks again.
+        crate::security::TURN_SCOPE
+            .scope(("telegram".to_string(), "chat-a".to_string()), async {
+                crate::security::TURN_IS_GUEST
+                    .scope(true, async {
+                        let _ = tool
+                            .execute(serde_json::json!({
+                                "command": "git checkout probe-branch"
+                            }))
+                            .await;
+                    })
+                    .await;
+            })
+            .await;
+        assert_eq!(
+            asked_count(&asked),
+            2,
+            "a grant must not answer the risk gate for a guest"
+        );
     }
 
     /// The wiring, not the mechanism: `ShellTool` must actually put the current

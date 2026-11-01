@@ -1,13 +1,19 @@
 use parking_lot::{Mutex, RwLock};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::security::pending::PendingApprovals;
+use crate::security::pending::{current_turn_is_guest, current_turn_scope, PendingApprovals};
 use crate::security::runtime_overlay;
+
+/// The conversation a medium-risk grant belongs to: `(channel, reply_target)`.
+///
+/// The empty pair is the one-operator surface — the TUI, the CLI and the
+/// gateway's own operator paths — where there is no chat to be narrower than.
+pub type MediumGrantScope = (String, String);
 
 /// How much autonomy the agent has
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -136,16 +142,18 @@ pub struct SecurityPolicy {
     /// the same set. Optionally backed by a persisted overlay file
     /// (`<policy_dir>/runtime_allowlist.toml`).
     pub runtime_allowlist: Arc<RwLock<HashSet<String>>>,
-    /// Command basenames approved at **medium** risk for the rest of the
-    /// session.
+    /// Command basenames approved at **medium** risk, per conversation.
     ///
     /// The shell risk gate's "Session" answer lands here: the basename may run
-    /// at medium risk without asking again for the rest of the session. A
-    /// high-risk command never consults this set — it always asks again.
+    /// at medium risk without asking again — but only in the conversation that
+    /// made the grant. The key is that conversation's scope (channel and reply
+    /// target); the empty pair is the one-operator surface (TUI, CLI).
+    ///
+    /// A high-risk command never consults this set — it always asks again.
     ///
     /// Shared by handle, like `runtime_allowlist`, so every clone of a policy
     /// sees the same grants. In-memory only: nothing here reaches disk.
-    pub medium_risk_approved: Arc<RwLock<HashSet<String>>>,
+    pub medium_risk_approved: Arc<RwLock<HashMap<MediumGrantScope, HashSet<String>>>>,
     /// Where to persist additions when `add_runtime_command(_, true)` is
     /// called. `None` means runtime additions stay in-memory only
     /// (default for ad-hoc/test policies).
@@ -218,7 +226,7 @@ impl Default for SecurityPolicy {
             workspace_dir: PathBuf::from("."),
             tracker: Arc::new(ActionTracker::new()),
             runtime_allowlist: Arc::new(RwLock::new(HashSet::new())),
-            medium_risk_approved: Arc::new(RwLock::new(HashSet::new())),
+            medium_risk_approved: Arc::new(RwLock::new(HashMap::new())),
             policy_dir: None,
             pending: Arc::new(RwLock::new(None)),
         }
@@ -1516,7 +1524,7 @@ impl SecurityPolicy {
             workspace_dir: workspace_dir.to_path_buf(),
             tracker: Arc::new(ActionTracker::new()),
             runtime_allowlist: Arc::new(RwLock::new(runtime_set)),
-            medium_risk_approved: Arc::new(RwLock::new(HashSet::new())),
+            medium_risk_approved: Arc::new(RwLock::new(HashMap::new())),
             policy_dir,
             pending: Arc::new(RwLock::new(None)),
         }
@@ -1570,13 +1578,16 @@ impl SecurityPolicy {
         v
     }
 
-    /// Record that `basename` may run at **medium** risk for the rest of the
-    /// session — the shell risk gate's "Session" answer.
+    /// Record that `basename` may run at **medium** risk for the rest of this
+    /// conversation — the shell risk gate's "Session" answer.
     ///
     /// The name is normalised the way the risk gate reads it: trimmed, reduced
     /// to its basename (the last path segment) and lowercased. An empty name is
     /// ignored. In-memory only: nothing is written to disk, and a high-risk
     /// command never consults this set.
+    ///
+    /// The grant is filed under the current turn's scope, so it answers the
+    /// risk gate in the conversation that made it and in no other one.
     pub fn add_medium_risk_approval(&self, basename: &str) {
         let name = basename.trim();
         let name = name
@@ -1588,31 +1599,53 @@ impl SecurityPolicy {
         if name.is_empty() {
             return;
         }
-        self.medium_risk_approved.write().insert(name);
+        let scope = current_turn_scope();
+        self.medium_risk_approved
+            .write()
+            .entry(scope)
+            .or_default()
+            .insert(name);
     }
 
-    /// Forget every medium-risk session grant. Called when the rung changes —
-    /// the level or `always_ask`: a grant made under a looser rung must not
-    /// survive a tighter one.
+    /// Forget every medium-risk session grant, in every conversation. Called
+    /// when the rung changes — the level or `always_ask`: a grant made under a
+    /// looser rung must not survive a tighter one.
     pub fn clear_medium_risk_approvals(&self) {
         self.medium_risk_approved.write().clear();
     }
 
-    /// The basenames currently approved at medium risk for this session.
+    /// The basenames currently approved at medium risk in this conversation.
     pub fn medium_risk_approved_snapshot(&self) -> Vec<String> {
-        let set = self.medium_risk_approved.read();
-        let mut v: Vec<String> = set.iter().cloned().collect();
+        let scope = current_turn_scope();
+        let map = self.medium_risk_approved.read();
+        let mut v: Vec<String> = map
+            .get(&scope)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default();
         v.sort();
         v
     }
 
-    /// True when every segment of `command` runs a basename this session
+    /// True when every segment of `command` runs a basename this conversation
     /// approved at medium risk.
     ///
     /// A grant covers one basename, so a chained command is covered only when
     /// every segment's basename is granted. An empty command is never covered.
+    ///
+    /// Only the current conversation's grants count: a grant made elsewhere
+    /// answers nothing here.
+    ///
+    /// A guest turn inherits nothing at all: the risk gate is the owner's only
+    /// check on a guest, so the owner's own answer must not answer for them.
     fn medium_risk_is_approved(&self, command: &str) -> bool {
-        let set = self.medium_risk_approved.read();
+        if current_turn_is_guest() {
+            return false;
+        }
+        let scope = current_turn_scope();
+        let map = self.medium_risk_approved.read();
+        let Some(set) = map.get(&scope) else {
+            return false;
+        };
         let names = command_segment_basenames(command);
         !names.is_empty() && names.iter().all(|name| set.contains(name))
     }
@@ -2212,6 +2245,99 @@ mod tests {
                 .is_ok(),
             "a chain whose every segment is granted must hold"
         );
+    }
+
+    /// A medium-risk grant answers the risk gate in the conversation that made
+    /// it, and in no other conversation.
+    ///
+    /// The grants used to live on one set for the whole process, so an owner's
+    /// "Session" answer in chat A let the same command run unasked in chat B —
+    /// and in a chat B a guest chose.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_medium_risk_grant_holds_only_in_the_conversation_that_made_it() {
+        let p = SecurityPolicy::default()
+            .with_autonomy(AutonomyLevel::Supervised)
+            .with_require_approval_for_medium_risk(true)
+            .with_allowed_commands(vec!["touch".into()]);
+
+        // The grant is made in one chat.
+        crate::security::TURN_SCOPE
+            .scope(("telegram".to_string(), "chat-a".to_string()), async {
+                p.add_medium_risk_approval("touch")
+            })
+            .await;
+
+        // It answers the risk gate in that chat.
+        crate::security::TURN_SCOPE
+            .scope(("telegram".to_string(), "chat-a".to_string()), async {
+                assert_eq!(
+                    p.validate_command_execution("touch test.txt", false)
+                        .unwrap(),
+                    CommandRiskLevel::Medium,
+                    "the grant must answer the gate in the conversation that made it"
+                );
+            })
+            .await;
+
+        // It does not answer it in another chat on the same channel.
+        crate::security::TURN_SCOPE
+            .scope(("telegram".to_string(), "chat-b".to_string()), async {
+                assert!(
+                    p.validate_command_execution("touch test.txt", false)
+                        .is_err(),
+                    "a grant must not answer the gate in another conversation"
+                );
+            })
+            .await;
+
+        // Nor in the same chat id on another channel.
+        crate::security::TURN_SCOPE
+            .scope(("slack".to_string(), "chat-a".to_string()), async {
+                assert!(
+                    p.validate_command_execution("touch test.txt", false)
+                        .is_err(),
+                    "a grant must not answer the gate on another channel"
+                );
+            })
+            .await;
+    }
+
+    /// The risk gate is the owner's only check on a guest, so a grant never
+    /// answers it: a guest turn asks again, even in the conversation that
+    /// holds the grant.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_guest_turn_never_uses_a_medium_risk_grant() {
+        let p = SecurityPolicy::default()
+            .with_autonomy(AutonomyLevel::Supervised)
+            .with_require_approval_for_medium_risk(true)
+            .with_allowed_commands(vec!["touch".into()]);
+
+        crate::security::TURN_SCOPE
+            .scope(("telegram".to_string(), "chat-a".to_string()), async {
+                p.add_medium_risk_approval("touch")
+            })
+            .await;
+
+        crate::security::TURN_SCOPE
+            .scope(("telegram".to_string(), "chat-a".to_string()), async {
+                // The owner in that chat: the grant answers the gate.
+                assert!(p
+                    .validate_command_execution("touch test.txt", false)
+                    .is_ok());
+
+                // A guest in the same chat: the grant answers nothing.
+                crate::security::TURN_IS_GUEST
+                    .scope(true, async {
+                        assert!(
+                            p.validate_command_execution("touch test.txt", false)
+                                .is_err(),
+                            "a guest turn must ask again: the risk gate is the owner's \
+                                 only check on a guest"
+                        );
+                    })
+                    .await;
+            })
+            .await;
     }
 
     /// A rung change revokes the grant: a tightening must not keep a grant made

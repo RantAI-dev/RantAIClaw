@@ -167,6 +167,19 @@ tokio::task_local! {
     /// afterwards), so the tool and the loop must reach the same cell through
     /// one interior-mutable handle. See [`ToolApprovalCell`].
     pub static TOOL_APPROVAL: ToolApprovalCell;
+
+    /// Whether the current turn belongs to a guest — a sender who is not an
+    /// owner.
+    ///
+    /// The security layer owns this marker instead of reading the approval
+    /// module's `GUEST_TURN`: the dependency runs approval → security, so a
+    /// security-side reader of an approval-side marker would invert it. The
+    /// channel dispatch sets both from the same owner decision, so they cannot
+    /// disagree.
+    ///
+    /// `false` outside a turn is the safe answer: the TUI, the CLI and the
+    /// gateway's own operator paths are the operator's own turns.
+    pub static TURN_IS_GUEST: bool;
 }
 
 /// Shared handle to the human answer one tool call received.
@@ -250,6 +263,14 @@ pub fn current_turn_scope() -> (String, String) {
     TURN_SCOPE
         .try_with(|(channel, reply_target)| (channel.clone(), reply_target.clone()))
         .unwrap_or_default()
+}
+
+/// True when the current task runs a guest's turn. See [`TURN_IS_GUEST`].
+#[must_use]
+pub fn current_turn_is_guest() -> bool {
+    TURN_IS_GUEST
+        .try_with(|is_guest| *is_guest)
+        .unwrap_or(false)
 }
 
 impl PendingRequest {

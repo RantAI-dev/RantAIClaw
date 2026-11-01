@@ -125,6 +125,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the provider's error. The bind stays `127.0.0.1:11500` and the authorization and token
   endpoints stay constants; no environment variable or config key can redirect the exchange,
   and the test-only seam that can is compiled out of production paths. No config key changed.
+- **A medium-risk grant made in one channel conversation answered the risk gate in every
+  conversation.** The shell risk gate's "Session" answer recorded the basename on the one
+  process-wide policy that every channel shares, so an owner's answer in chat A let the same
+  medium-risk command run unasked in chat B — and chat B is a chat a guest chose. The grants are
+  now filed per conversation: a grant answers the risk gate only in the channel and reply
+  target that made it, and never for a guest's turn, which asks again — the risk gate is the
+  owner's only check on a guest, and the guest's own `guest_allowed_commands` ceiling says
+  which commands a guest may run, not that a medium-risk one may run unasked. The TUI, the CLI
+  and the gateway's own operator paths have no chat, so their grants stay process-wide (one
+  operator). The console keeps its per-session grants: they are re-seeded under the console
+  turn's own scope, so a session answer still holds for the next message of that conversation
+  and for no other. No config key changed; rolling back means reverting this change.
 
 ### Added
 
