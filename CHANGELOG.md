@@ -811,19 +811,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   medium-risk command asked again on every run. A pending request now states
   what an answer to it may hold for — nothing, this command, this command at
   medium risk, or this run only — and every surface answers exactly that. A
-  medium-risk `Session` answer covers the basenames the command runs for the
-  rest of the session, a chained command holds only when every segment is
-  granted, and a high-risk command always asks again. The grant answers the
-  risk gate only: it never widens the runtime allowlist, and it is dropped when
-  the autonomy level changes.
+  medium-risk `Session` answer grants only the segments the risk gate classified
+  Medium — a low-risk segment of a chain is granted nothing — and it holds for
+  the conversation that made it, never for a guest's turn; a high-risk command
+  always asks again. The grant answers the risk gate only: it never widens the
+  runtime allowlist, and it is dropped when the autonomy rung changes — the
+  level or the `always_ask` list.
 - An autonomy change reached the next turn, not the running one. The gateway's
   chat and webhook turns built their policy and approval manager once at turn
   start and nothing updated them, so a tightening the operator made mid-turn
   was not in force until that turn ended. The new autonomy now goes onto the
-  process policy and onto every turn that is still running, on every surface,
-  and a turn keeps the narrowing it was built with, so a change never widens a
-  turn past what it was built to ask. A prompt that is already open stays open
-  and is answered by the human.
+  process policy and onto every turn that is still running, on every surface —
+  cron agent jobs and the heartbeat are the exception, and pick a new level up
+  on their next run — and a turn keeps the narrowing it was built with, so a
+  change never widens a turn past what it was built to ask. A prompt that is
+  already open stays open and is answered by the human.
 - The TUI reloaded a config file it was not watching. The reload read the
   profile's own `config.toml`, but in the flat layout (`RANTAICLAW_CONFIG_DIR`)
   the watcher watches the flat directory's `config.toml`, so an edit made there

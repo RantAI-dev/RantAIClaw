@@ -76,7 +76,7 @@ Each preset sets the fields in its row to that preset's values, whatever the pre
 
 **Telling Manual from Smart.** Both are `supervised`, so the level cannot tell them apart — the `always_ask` list can, and one rule does it on every surface (CLI, TUI, console): under `supervised` the config reads **Manual** when `always_ask` holds `"*"` or names every built-in tool, and **Smart** otherwise. The shipped default `["ssh", "pty"]` therefore reads Smart: the operator's own entries do not make a profile Manual.
 
-A switch takes effect on the **next tool call**, including a turn that is already running — the running policy reads the new level at once, in both directions. A prompt that is already open stays open, and the human answers it.
+A switch takes effect on the **next tool call**, including a turn that is already running — the running policy reads the new level at once, in both directions. A prompt that is already open stays open, and the human answers it. Cron agent jobs and the heartbeat take a new level on their next run.
 
 Inside the TUI: `Shift+Tab` cycles · `/autonomy` opens an interactive picker · `/autonomy <preset>` skips the picker.
 
