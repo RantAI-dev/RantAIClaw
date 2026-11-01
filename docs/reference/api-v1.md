@@ -282,9 +282,10 @@ is on, i.e. `channels_config.autonomous_tools` is not set.
   medium-risk command it holds at medium risk for the rest of the conversation:
   the basenames that command runs stop asking, and a high-risk command still
   asks every time. Always does not persist past the conversation, a gateway
-  restart, or an autonomy preset change. The `always_available` field on the
-  `approval_request` event says whether the modal should offer it — `false` for a
-  high-risk command and for a tool forced to prompt by `always_ask` or Manual.
+  restart, an autonomy preset change, or a config reload. The `always_available`
+  field on the `approval_request` event says whether the modal should offer it —
+  `false` for a high-risk command and for a tool forced to prompt by
+  `always_ask` or Manual.
 - **Response** `200`:
   ```json
   { "resolved": true, "id": "...", "approved": true }

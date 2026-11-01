@@ -1909,6 +1909,12 @@ fn apply_reloaded_config(
     *config_fingerprint.lock() = fresh_fp;
     security.apply_config(&autonomy);
     apply_live_autonomy(live_autonomy, &autonomy);
+    // A reload can carry a rung change, and a rung change revokes the console
+    // session grants — the same grants the autonomy write and the preset
+    // change drop. The step cannot tell a rung change from any other write to
+    // the file, so it drops them on every reload: a grant must never outlive
+    // the policy it was made under.
+    crate::gateway::web_approval::clear_all_session_grants();
 }
 
 /// Watch `config.toml` and swap the running `Config` when it changes on disk,
@@ -3302,6 +3308,120 @@ mod tests {
             running.lock().autonomy.level,
             AutonomyLevel::ReadOnly,
             "the reload must swap the running config"
+        );
+    }
+
+    /// Put one medium-risk command grant and one "Always" tool grant in force
+    /// for `sid`, and return once they are readable.
+    ///
+    /// The grant store is process-wide, so a parallel test can clear it
+    /// between the record and the read. Re-seed until the grants are actually
+    /// in force, so a test that seeds them cannot pass for the wrong reason.
+    fn seed_console_session_grants(sid: &str) {
+        for _ in 0..8 {
+            crate::approval::session_grants::record_session_medium_command(sid, "git");
+            crate::gateway::web_approval::record_session_grants(
+                sid,
+                &std::collections::HashSet::from(["browser".to_string()]),
+            );
+            let medium_in_force =
+                !crate::approval::session_grants::session_granted_medium_commands(sid).is_empty();
+            let tool_in_force =
+                !crate::gateway::web_approval::session_granted_tools(sid).is_empty();
+            if medium_in_force && tool_in_force {
+                return;
+            }
+            std::thread::yield_now();
+        }
+        panic!("the console session grants could not be put in force");
+    }
+
+    /// A reload that carries a rung change revokes the console's session
+    /// grants: the medium-risk command grant and the "Always" tool grant a
+    /// session collected under the old rung must not answer the next prompt.
+    ///
+    /// The seam is the reload step (`apply_reloaded_config`) — the code the file
+    /// watcher runs on every reload, and the only path a rung change written
+    /// into `config.toml` takes. Without the clear the grants made under the
+    /// looser rung survive the tighter one.
+    ///
+    /// The lock is the crate-shared `ENV_LOCK`, the same one the console tests
+    /// hold: the grant store is process-wide, so a reload that clears it must
+    /// not land in the middle of another test's grant assertions.
+    #[test]
+    fn a_config_reload_revokes_the_console_session_grants() {
+        use crate::security::AutonomyLevel;
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let sid = "sess-reload-revokes-grants-7c04";
+        let registry = super::LiveAutonomyRegistry::default();
+        let process_policy = std::sync::Arc::new(crate::security::SecurityPolicy::default());
+        let running = std::sync::Arc::new(super::Mutex::new(crate::config::Config::default()));
+        let fingerprint = std::sync::Arc::new(super::Mutex::new("old".to_string()));
+
+        // What the file carries now: ReadOnly — a rung change from the default
+        // Supervised.
+        let mut fresh = crate::config::Config::default();
+        fresh.autonomy.level = AutonomyLevel::ReadOnly;
+
+        seed_console_session_grants(sid);
+
+        super::apply_reloaded_config(
+            &running,
+            &fingerprint,
+            fresh,
+            "new".to_string(),
+            &process_policy,
+            &registry,
+        );
+
+        assert!(
+            crate::approval::session_grants::session_granted_medium_commands(sid).is_empty(),
+            "a reload that carries a rung change must revoke the medium-risk session grants"
+        );
+        assert!(
+            crate::gateway::web_approval::session_granted_tools(sid).is_empty(),
+            "a reload that carries a rung change must revoke the Always tool grants"
+        );
+    }
+
+    /// Every reload through the reload step revokes the console's session
+    /// grants, not only the ones that carry a rung change: the step cannot
+    /// tell a rung change from any other write to the watched file, and a grant
+    /// must never outlive the policy it was made under. This is the same
+    /// fail-safe the autonomy write and the preset change already apply — the
+    /// cost of clearing too much is a re-prompt, the cost of clearing too
+    /// little is a stale grant answering the next prompt.
+    #[test]
+    fn every_config_reload_revokes_the_console_session_grants() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let sid = "sess-reload-revokes-every-grant-3b91";
+        let registry = super::LiveAutonomyRegistry::default();
+        let process_policy = std::sync::Arc::new(crate::security::SecurityPolicy::default());
+        let running = std::sync::Arc::new(super::Mutex::new(crate::config::Config::default()));
+        let fingerprint = std::sync::Arc::new(super::Mutex::new("old".to_string()));
+
+        // A reload that changes nothing about the autonomy: the running config
+        // and the reloaded one carry the same level.
+        let fresh = crate::config::Config::default();
+
+        seed_console_session_grants(sid);
+
+        super::apply_reloaded_config(
+            &running,
+            &fingerprint,
+            fresh,
+            "new".to_string(),
+            &process_policy,
+            &registry,
+        );
+
+        assert!(
+            crate::approval::session_grants::session_granted_medium_commands(sid).is_empty(),
+            "a reload must revoke the medium-risk session grants, rung change or not"
+        );
+        assert!(
+            crate::gateway::web_approval::session_granted_tools(sid).is_empty(),
+            "a reload must revoke the Always tool grants, rung change or not"
         );
     }
 
