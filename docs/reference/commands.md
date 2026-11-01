@@ -68,11 +68,15 @@ The preset's *effect* is encoded in `config.toml` as a `level` + `always_ask` pa
 | Preset | `[autonomy].level` | `[autonomy].always_ask` | `[autonomy].auto_approve` | Behaviour |
 |---|---|---|---|---|
 | `manual` | `supervised` | `["*"]` (every tool) | empty | Every shell call prompts. Read-only file/memory tools not gated. |
-| `smart` | `supervised` | empty | the default list (`file_read`, `memory_recall`) when empty, otherwise unchanged | Read-only and safe shell builtins pre-allowed (`ls`, `cd`, `echo`, `git status`, `which`, etc.). Writes prompt with an inline `[Y/A/N/Esc]` widget. |
+| `smart` | `supervised` | the operator's entries, minus `"*"` and the built-in tool names (`shell`, `file_read`, `file_write`, `web_search_tool`, `memory_store`, `memory_recall`, `browser`) | the default list (`file_read`, `memory_recall`) when empty, otherwise unchanged | Read-only and safe shell builtins pre-allowed (`ls`, `cd`, `echo`, `git status`, `which`, etc.). Writes prompt with an inline `[Y/A/N/Esc]` widget. |
 | `strict` | `readonly` | unchanged, minus `"*"` | unchanged | `shell` tool removed from the model's registry entirely, and every acting tool is refused by the autonomy gate. Agent describes commands the user can run, doesn't execute. CC plan-mode analog. |
 | `off` / `full` | `full` | unchanged, minus `"*"` | unchanged | No gating. Forbidden paths still enforced. CI / trusted-env only. |
 
-Each preset sets the fields in its row to that preset's values, whatever the previous preset left behind. `manual` then `smart` gives the same config as `smart` on a fresh config. `"*"` is Manual's mark: only `manual` keeps it, and `strict` and `off` drop it. Named entries an operator wrote (for example `ssh`, `pty`) survive `strict` and `off`. An install already left in the old `full` plus `"*"` state is repaired by running `rantaiclaw autonomy off` again.
+Each preset sets the fields in its row to that preset's values, whatever the previous preset left behind. `"*"` is Manual's mark: only `manual` keeps it, and `strict` and `off` drop it. Named entries an operator wrote (for example `ssh`, `pty`) survive `strict` and `off`, and survive `smart` as well — `smart` drops the wildcard and the built-in tool names, and leaves the operator's own entries alone. `manual` replaces the whole list with `"*"`, so a `manual` → `smart` sequence ends with `always_ask = []` where `smart` on a fresh config keeps the shipped `["ssh", "pty"]`. An install already left in the old `full` plus `"*"` state is repaired by running `rantaiclaw autonomy off` again.
+
+**Telling Manual from Smart.** Both are `supervised`, so the level cannot tell them apart — the `always_ask` list can, and one rule does it on every surface (CLI, TUI, console): under `supervised` the config reads **Manual** when `always_ask` holds `"*"` or names every built-in tool, and **Smart** otherwise. The shipped default `["ssh", "pty"]` therefore reads Smart: the operator's own entries do not make a profile Manual.
+
+A switch takes effect on the **next tool call**, including a turn that is already running — the running policy reads the new level at once, in both directions. A prompt that is already open stays open, and the human answers it.
 
 Inside the TUI: `Shift+Tab` cycles · `/autonomy` opens an interactive picker · `/autonomy <preset>` skips the picker.
 

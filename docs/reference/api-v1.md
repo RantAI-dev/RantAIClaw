@@ -278,11 +278,13 @@ is on, i.e. `channels_config.autonomous_tools` is not set.
   `true` approves the tool call once; `false` denies it.
   `"always": true` with `"approve": true` is Always. For a command outside the
   allowlist it holds until the conversation ends: the same command runs without
-  a prompt in the next message of that conversation, and nowhere else. Always
-  does not persist past the conversation, a gateway restart, or an autonomy
-  preset change. The `always_available` field on the `approval_request` event
-  says whether the modal should offer it. Medium-risk prompts, and tools forced
-  to prompt by `always_ask` or Manual, ask every time.
+  a prompt in the next message of that conversation, and nowhere else. For a
+  medium-risk command it holds at medium risk for the rest of the conversation:
+  the basenames that command runs stop asking, and a high-risk command still
+  asks every time. Always does not persist past the conversation, a gateway
+  restart, or an autonomy preset change. The `always_available` field on the
+  `approval_request` event says whether the modal should offer it — `false` for a
+  high-risk command and for a tool forced to prompt by `always_ask` or Manual.
 - **Response** `200`:
   ```json
   { "resolved": true, "id": "...", "approved": true }
@@ -1239,6 +1241,7 @@ no stored arg is taken as written.
   ```json
   {
     "level": "supervised",
+    "preset": "smart",
     "auto_approve": ["..."],
     "always_ask": ["..."],
     "allowed_commands": ["..."],
@@ -1246,11 +1249,21 @@ no stored arg is taken as written.
     "max_actions_per_hour": 20
   }
   ```
+- **`preset` names an approval preset**: `manual`, `smart`, `strict`, or `off` (`full` is
+  an alias for `off`; the legacy `L1`–`L4` ids are accepted too). The name is read
+  case-insensitively. An unknown name is refused with `400` rather than ignored — a
+  typo must not silently leave the old policy in force.
+- **Order rule**: the preset is applied **first**, then any explicit `level`,
+  `always_ask`, `auto_approve` or `allowed_commands` in the same body is written on
+  top of it. The operator's own words are the last ones, so a body that carries both
+  a preset and an explicit field ends up with the explicit field.
 - **`max_cost_per_day_cents` is accepted and ignored**, with a warning in the response. The
   money ceiling it referred to was never enforced; it was replaced by
   `[cost] max_tokens_per_day`. Sending it does not fail the request — it does nothing.
-- **Response** `200`: `{ "level": "...", "max_actions_per_hour": 20, ... }`
-- **Status codes**: `200`, `400` (unparseable `level`, or a rejected command entry), `401`.
+- **Response** `200`: `{ "level": "...", "max_actions_per_hour": 20, ... }` — the autonomy
+  config itself. The preset is not echoed back; the response carries no `preset` field.
+- **Status codes**: `200`, `400` (unparseable `level`, an unknown `preset`, or a rejected
+  command entry), `401`.
 
 ### GET / PUT /api/v1/secrets
 

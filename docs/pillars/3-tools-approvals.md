@@ -23,7 +23,7 @@ When the agent attempts a shell command not on the active preset's allowlist:
 4. **Cascading approvals** walk `&&` chains — approving `cd` then re-prompts for the next blocking basename (e.g. `python3`), capped at 6 prompts per call.
 5. **Strict preset = plan mode.** The `shell` tool is dropped from the model's tool list entirely. The agent describes commands instead of attempting them. CC plan-mode analog.
    - **Under `readonly`, a tool call runs only when the tool declares that call read-only.** The agent loop refuses every other call before the tool body starts, so MCP tools and skill tools do not run under `readonly`. A new built-in tool is refused under `readonly` until it overrides `is_read_only_call` to return true for its read-only calls. The refusal is audited as `read_only`.
-6. **Preset switching is live.** `Shift+Tab` cycles in the TUI; the runtime rebuilds the `SecurityPolicy` on each switch and the TUI re-subscribes to the fresh `PendingApprovals` broadcast (no more silent dropped approvals after a switch).
+6. **Preset switching is live.** `Shift+Tab` cycles in the TUI; the runtime rebuilds the `SecurityPolicy` on each switch and the TUI re-subscribes to the fresh `PendingApprovals` broadcast (no more silent dropped approvals after a switch). A switch governs the **next tool call**, including a turn that is already running — the running policy reads the new level at once, in both directions. A prompt that is already open stays open, and the human answers it.
 7. **The bundle is now the source of truth.** Applying a preset copies the preset's built-in list — reduced to command basenames — into `[autonomy].allowed_commands` in `config.toml`, which is what the runtime shell gate enforces. `<policy_dir>/command_allowlist.toml` holds the same list (the full glob patterns) for the model's prompt; editing it changes what the model is told, not what the gate allows.
 
 ## Vs OpenClaw / Hermes-agent
@@ -86,6 +86,8 @@ rantaiclaw autonomy <preset>            # switch (manual | smart | strict | off 
 `setup approvals` keeps a preset that is already on disk: it names the preset that is active and points at `rantaiclaw setup approvals --force`, which is what offers the picker and writes the preset you pick. `--force` regenerates the preset's policy files — `<profile>/policy/autonomy.toml` and `<profile>/policy/command_allowlist.toml` — so hand edits to them are lost.
 
 The preset a profile has is the one its marker names — `<profile>/policy/autonomy.toml` — and every surface reads that same marker: `rantaiclaw status`, `rantaiclaw autonomy`, the channel prompt, and `GET /api/v1/status` (whose `autonomy_preset` is `null` when the profile has no preset). A profile with no marker has no preset, and no surface names one for it: `config.toml` cannot tell "no preset chosen" from "the default".
+
+Manual and Smart are both `supervised`, so the level cannot tell them apart — `[autonomy].always_ask` can, and one rule does it on every surface (CLI, TUI, console): under `supervised` the config reads **Manual** when `always_ask` holds `"*"` or names every built-in tool (`shell`, `file_read`, `file_write`, `web_search_tool`, `memory_store`, `memory_recall`, `browser`), and **Smart** otherwise. The shipped default `["ssh", "pty"]` therefore reads Smart: the operator's own entries do not make a profile Manual. Switching to Smart from the CLI or the TUI keeps those operator entries — it drops `"*"` and the built-in tool names, not the whole list.
 
 Inside the TUI:
 - `Shift+Tab` — cycle Manual → Smart → Strict → Off → Manual

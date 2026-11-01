@@ -22,6 +22,11 @@ and is deliberately unaffected. So are the logs, at `~/.rantaiclaw/logs/`.
 Setting only `RANTAICLAW_CONFIG_DIR` therefore gives you a split state: config
 from the custom directory, approval policy and profile data from the real home.
 
+A running TUI reloads the config file its watcher watches — the path
+`Config::load` resolved — so in the flat layout an edit to `<dir>/config.toml`
+applies to the running session. It does not watch the profile's own
+`config.toml`, which in that layout is a different file.
+
 **Overrides pin the profile.** While `RANTAICLAW_CONFIG_DIR`, `RANTAICLAW_WORKSPACE`
 or a non-pointer marker is in effect, it keeps the current profile in effect:
 `profile use <other>`, `--profile <other>` and `RANTAICLAW_PROFILE=<other>` are
@@ -647,12 +652,14 @@ Web console (`rantaiclaw ui start`) settings.
 | `require_approval_for_medium_risk` | `true` | approval gate for medium-risk commands; binds the `shell` tool and a cron job's command, not skill tools |
 | `block_high_risk_commands` | `false` | hard block for high-risk commands; binds the `shell` tool and a cron job's command, not skill tools |
 | `auto_approve` | `["file_read", "memory_recall"]` | tool operations always auto-approved |
-| `always_ask` | `["ssh", "pty"]` | tool operations that always require approval, even after an "Always". Also the Manual-vs-Smart discriminator — `rantaiclaw autonomy <preset>` and the web console both rewrite this field (see [commands](commands.md#autonomy)). `"*"` is Manual's mark and only Manual keeps it: `strict` and `off` drop it and keep every named entry, and a console write that sets `level` to `readonly` or `full` without sending `always_ask` drops it the same way |
+| `always_ask` | `["ssh", "pty"]` | tool operations that always require approval, even after an "Always". Also the Manual-vs-Smart discriminator — `rantaiclaw autonomy <preset>` and the web console both rewrite this field (see [commands](commands.md#autonomy)). `"*"` is Manual's mark and only Manual keeps it: `strict` and `off` drop it and keep every named entry, and a console write that sets `level` to `readonly` or `full` without sending `always_ask` drops it the same way. `smart` keeps the operator's own entries (`ssh`, `pty`) and drops only `"*"` and the built-in tool names (`shell`, `file_read`, `file_write`, `web_search_tool`, `memory_store`, `memory_recall`, `browser`) |
 
 Notes:
 
 - `always_ask` is not a preset. The preset is named by the profile's marker, `<profile>/policy/autonomy.toml` — the one source of truth every surface reads (`rantaiclaw status`, `rantaiclaw autonomy`, the channel prompt, `GET /api/v1/status`). `config.toml` carries the `level` + `always_ask` a preset switched on the CLI writes, and on its own cannot say whether a preset was ever chosen: a profile with no marker reads as *no preset*, not as the default.
+- Manual and Smart are both `supervised`, so the level cannot tell them apart — `always_ask` can, and one rule does it on every surface (CLI, TUI, console): under `supervised` the config reads **Manual** when `always_ask` holds `"*"` or names every built-in tool, and **Smart** otherwise. The shipped default `["ssh", "pty"]` therefore reads Smart; the operator's own entries do not make a profile Manual.
 - The marker and the `[autonomy]` section are written together by every sanctioned path, so a disagreement means a hand edit or a failed write. When they disagree, the model is told no preset — a prompt never describes a preset whose level differs from the `level` in force — and `rantaiclaw status` / `rantaiclaw autonomy` warn with the resync command.
+- An autonomy change governs the **next tool call**, including a turn that is already running — the running policy reads the new level at once, in both directions. A prompt that is already open stays open, and the human answers it.
 - `level = "full"` skips medium-risk approval gating for shell execution, while still enforcing configured guardrails.
 - `auto_approve` takes exact tool names, not patterns. An MCP tool is listed by its full name, `mcp__<server>__<tool>`, so `auto_approve = ["mcp__audit__echo"]` lets that one tool run without a prompt under `supervised`. On a surface with no approver (a terminal run whose stdin is not a terminal, a scheduled job, or a chat with no owner), a tool that needs approval is refused, the model is told no approver was available, and the operator log names the tool and how to allow it.
 - Shell separator/operator parsing is quote-aware. Characters like `;` inside quoted arguments are treated as literals, not command separators.
