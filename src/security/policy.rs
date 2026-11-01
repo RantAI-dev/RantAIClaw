@@ -2263,7 +2263,7 @@ mod tests {
         // The grant is made in one chat.
         crate::security::TURN_SCOPE
             .scope(("telegram".to_string(), "chat-a".to_string()), async {
-                p.add_medium_risk_approval("touch")
+                p.add_medium_risk_approval("touch");
             })
             .await;
 
@@ -2314,7 +2314,7 @@ mod tests {
 
         crate::security::TURN_SCOPE
             .scope(("telegram".to_string(), "chat-a".to_string()), async {
-                p.add_medium_risk_approval("touch")
+                p.add_medium_risk_approval("touch");
             })
             .await;
 
