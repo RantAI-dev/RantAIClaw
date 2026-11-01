@@ -898,6 +898,18 @@ async fn agent_chat_stream(
                     std::sync::Arc<crate::approval::ApprovalManager>,
                 > = None;
                 let mut shell_approval_forwarder: Option<tokio::task::JoinHandle<()>> = None;
+                // Register the turn's policy as live, whether or not the turn
+                // gates tools: an autonomy change written to the config governs
+                // this turn's next tool call too, not only the next turn's.
+                // The policy runs the global config — it is the Layer-B command
+                // gate and the ReadOnly gate of the tool loop — so it carries no
+                // narrowing of its own.
+                crate::gateway::register_live_autonomy(
+                    &live_autonomy,
+                    agent.security().as_ref(),
+                    None,
+                    crate::gateway::web_approval::AutonomyOverlay::Global,
+                );
                 if gate_tools {
                     // Exempt `shell` from the Layer-A tool-gate: the shell tool has
                     // its own command-level gate (Layer-B, handled below), so gating
@@ -908,18 +920,11 @@ async fn agent_chat_stream(
                     let manager = std::sync::Arc::new(
                         crate::approval::ApprovalManager::from_config(&autonomy),
                     );
-                    // Register the turn's live autonomy sources. The policy runs
-                    // the global config (it is the Layer-B command gate), the
-                    // manager keeps the console's shell exemption — its Layer-A
-                    // gate must not come back and show two modals for one
-                    // command. Two entries, one per target: the narrowing
-                    // belongs to the manager alone.
-                    crate::gateway::register_live_autonomy(
-                        &live_autonomy,
-                        agent.security().as_ref(),
-                        None,
-                        crate::gateway::web_approval::AutonomyOverlay::Global,
-                    );
+                    // Register the turn's approval manager as live too. It keeps
+                    // the console's shell exemption — its Layer-A gate must not
+                    // come back and show two modals for one command. The
+                    // narrowing belongs to the manager alone: the policy above
+                    // is registered with the plain overlay.
                     crate::gateway::register_live_autonomy(
                         &live_autonomy,
                         None,
@@ -3148,6 +3153,12 @@ mod tests {
             .collect()
     }
 
+    /// Answers held back until the test releases them, keyed by the number of
+    /// tool results the request's history carries. A held answer parks the
+    /// agent between two calls, so a test can change the autonomy at that point
+    /// with no timing race.
+    type HeldAnswers = Arc<parking_lot::Mutex<Vec<(usize, Arc<tokio::sync::Notify>)>>>;
+
     /// A local OpenAI-compatible server for the console tests. Each request
     /// whose history carries N tool results gets one `shell` tool call for the
     /// Nth configured command; once the commands run out it answers in text.
@@ -3157,6 +3168,7 @@ mod tests {
     struct ShellToolScript {
         commands: Arc<parking_lot::Mutex<Vec<String>>>,
         requests: Arc<parking_lot::Mutex<usize>>,
+        holds: HeldAnswers,
         addr: std::net::SocketAddr,
         _task: tokio::task::JoinHandle<()>,
     }
@@ -3165,6 +3177,7 @@ mod tests {
     struct ShellToolScriptState {
         commands: Arc<parking_lot::Mutex<Vec<String>>>,
         requests: Arc<parking_lot::Mutex<usize>>,
+        holds: HeldAnswers,
     }
 
     async fn shell_tool_script_answer(
@@ -3183,6 +3196,18 @@ mod tests {
             .unwrap_or(0);
         let next = state.commands.lock().get(done).cloned();
         let has_next = next.is_some();
+        // A held answer waits for the test to release it. The agent parks
+        // there, so a test can change the autonomy between two calls without
+        // racing the turn.
+        let held = state
+            .holds
+            .lock()
+            .iter()
+            .find(|(results, _)| *results == done)
+            .map(|(_, notify)| Arc::clone(notify));
+        if let Some(notify) = held {
+            notify.notified().await;
+        }
         let frames = if let Some(command) = next {
             let arguments = serde_json::json!({ "command": command }).to_string();
             vec![serde_json::json!({
@@ -3220,11 +3245,13 @@ mod tests {
         async fn start() -> Self {
             let commands = Arc::new(parking_lot::Mutex::new(Vec::new()));
             let requests = Arc::new(parking_lot::Mutex::new(0usize));
+            let holds = Arc::new(parking_lot::Mutex::new(Vec::new()));
             let app = axum::Router::new()
                 .fallback(shell_tool_script_answer)
                 .with_state(ShellToolScriptState {
                     commands: Arc::clone(&commands),
                     requests: Arc::clone(&requests),
+                    holds: Arc::clone(&holds),
                 });
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
@@ -3236,6 +3263,7 @@ mod tests {
             Self {
                 commands,
                 requests,
+                holds,
                 addr,
                 _task: task,
             }
@@ -3254,6 +3282,16 @@ mod tests {
         /// distinct — a grant for one basename answers the next call too.
         fn ask_for_sequence(&self, commands: &[&str]) {
             *self.commands.lock() = commands.iter().map(|c| (*c).to_string()).collect();
+        }
+
+        /// Hold the answer for the request whose history carries `results` tool
+        /// results, and hand back the release. The agent parks there until the
+        /// test releases it, so a change made in between lands before the next
+        /// call — no timing race.
+        fn hold_answer(&self, results: usize) -> Arc<tokio::sync::Notify> {
+            let notify = Arc::new(tokio::sync::Notify::new());
+            self.holds.lock().push((results, Arc::clone(&notify)));
+            notify
         }
     }
 
@@ -4883,6 +4921,75 @@ mod tests {
             approval_request_count(&events),
             2,
             "each call prompts once: {events:?}"
+        );
+        let ends: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|e| e["type"] == "tool_call_end")
+            .collect();
+        assert_eq!(ends.len(), 2, "both calls must end: {events:?}");
+        assert_eq!(
+            ends[0]["ok"], true,
+            "the first call ran before the change: {events:?}"
+        );
+        assert_eq!(
+            ends[1]["ok"], false,
+            "the second call must be refused under ReadOnly: {events:?}"
+        );
+    }
+
+    /// The same invariant on a turn that does NOT gate tools: with
+    /// `autonomous_tools = true` the console has no approval modal and no
+    /// approval backend, but the level a change writes still governs the NEXT
+    /// tool call of the turn that is running.
+    ///
+    /// The agent is parked between the two calls (the script holds its second
+    /// answer), so the change lands before the second call is even requested —
+    /// the test does not depend on how fast the turn runs.
+    #[tokio::test]
+    async fn console_a_level_change_to_readonly_refuses_the_next_call_without_the_tool_gate() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+        let state = empty_allowlist_state(tmp.path());
+        {
+            let mut config = state.config.lock();
+            // The tool gate is off: no modal, no approval backend.
+            config.channels_config.autonomous_tools = true;
+            // One allowed basename, so the first call runs instead of asking.
+            // Under `autonomous_tools` there is nobody to ask.
+            config.autonomy.allowed_commands = vec!["echo".to_string()];
+        }
+        let script = ShellToolScript::start().await;
+        let sid = fresh_session_id();
+
+        script.ask_for_sequence(&["echo one", "echo two"]);
+        // Hold the answer for the request that carries one tool result: the
+        // agent parks there, between the two calls.
+        let release = script.hold_answer(1);
+        let mut hook = once_hook(
+            |events| events.iter().any(|e| e["type"] == "tool_call_end"),
+            move |state: AppState| {
+                let release = Arc::clone(&release);
+                Box::pin(async move {
+                    put_autonomy(&state, "readonly").await;
+                    release.notify_one();
+                })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            },
+        );
+        let (events, prompt) = drive_console_turn_with_hook(
+            &state,
+            &script.provider(),
+            Some(sid),
+            "run them",
+            None,
+            Some(&mut *hook),
+        )
+        .await;
+
+        assert!(
+            prompt.is_none(),
+            "the tool gate is off, so nothing may be asked: {events:?}"
         );
         let ends: Vec<&serde_json::Value> = events
             .iter()
