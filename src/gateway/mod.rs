@@ -1886,6 +1886,31 @@ fn try_consume_gateway_store_code(state: &AppState, code: &str) -> Option<String
     }
 }
 
+/// Swap a reloaded config into the running state and push its autonomy onto
+/// the process policy and onto every live turn.
+///
+/// The autonomy that reaches the policies is the RELOADED one: a reload that
+/// changed the autonomy governs the next tool call on a turn that is already
+/// running — in both directions — and not only on the next turn.
+///
+/// This is the step behind the file watcher, kept separate so it can be
+/// exercised without a watcher: the watcher is a notify callback with a
+/// debounce, and the decision a reload makes belongs here.
+fn apply_reloaded_config(
+    config: &Arc<Mutex<Config>>,
+    config_fingerprint: &Arc<Mutex<String>>,
+    fresh: Config,
+    fresh_fp: String,
+    security: &Arc<SecurityPolicy>,
+    live_autonomy: &LiveAutonomyRegistry,
+) {
+    let autonomy = fresh.autonomy.clone();
+    *config.lock() = fresh;
+    *config_fingerprint.lock() = fresh_fp;
+    security.apply_config(&autonomy);
+    apply_live_autonomy(live_autonomy, &autonomy);
+}
+
 /// Watch `config.toml` and swap the running `Config` when it changes on disk,
 /// so a provider/model edit made elsewhere (the TUI, a direct edit) is reflected
 /// by the gateway and the web console without a restart. Reloads the WATCHED
@@ -1959,13 +1984,16 @@ fn spawn_config_reloader(
                         &fresh.gateway.paired_tokens,
                         fresh.gateway.require_pairing,
                     );
-                    let autonomy = fresh.autonomy.clone();
-                    *config.lock() = fresh;
-                    *config_fingerprint.lock() = fresh_fp;
                     // An autonomy change in the file governs the next tool call
                     // on every live turn, in both directions.
-                    security.apply_config(&autonomy);
-                    apply_live_autonomy(&live_autonomy, &autonomy);
+                    apply_reloaded_config(
+                        &config,
+                        &config_fingerprint,
+                        fresh,
+                        fresh_fp,
+                        &security,
+                        &live_autonomy,
+                    );
                     tracing::info!(target: "gateway", "config.toml changed — reloaded running config");
                 }
                 Err(e) => {
@@ -3220,6 +3248,60 @@ mod tests {
         assert!(
             policy.medium_risk_approved_snapshot().is_empty(),
             "a rung change must revoke the medium-risk grants of a running turn"
+        );
+    }
+
+    /// A reload pushes the new autonomy onto a turn that is running right now:
+    /// the reloader's fan-out reaches the registered policy, so that turn's next
+    /// tool call reads the level the file now carries.
+    ///
+    /// The seam is the reload step (`apply_reloaded_config`) — the code the file
+    /// watcher runs on every reload. The watcher itself is a notify callback
+    /// with a debounce, so a test that waited for it would be a timing test;
+    /// the step behind it is what decides whether a running turn follows the
+    /// file.
+    #[test]
+    fn a_config_reload_reaches_a_running_turn() {
+        use crate::security::AutonomyLevel;
+        let registry = super::LiveAutonomyRegistry::default();
+        let policy = std::sync::Arc::new(crate::security::SecurityPolicy::default());
+        super::register_live_autonomy(
+            &registry,
+            Some(&policy),
+            None,
+            super::web_approval::AutonomyOverlay::Global,
+        );
+        let process_policy = std::sync::Arc::new(crate::security::SecurityPolicy::default());
+        let running = std::sync::Arc::new(super::Mutex::new(crate::config::Config::default()));
+        let fingerprint = std::sync::Arc::new(super::Mutex::new("old".to_string()));
+
+        // What the file carries now: ReadOnly.
+        let mut fresh = crate::config::Config::default();
+        fresh.autonomy.level = AutonomyLevel::ReadOnly;
+
+        super::apply_reloaded_config(
+            &running,
+            &fingerprint,
+            fresh,
+            "new".to_string(),
+            &process_policy,
+            &registry,
+        );
+
+        assert_eq!(
+            policy.effective_autonomy(),
+            AutonomyLevel::ReadOnly,
+            "the reload must reach the turn that is running"
+        );
+        assert_eq!(
+            process_policy.effective_autonomy(),
+            AutonomyLevel::ReadOnly,
+            "the reload must reach the process policy too"
+        );
+        assert_eq!(
+            running.lock().autonomy.level,
+            AutonomyLevel::ReadOnly,
+            "the reload must swap the running config"
         );
     }
 

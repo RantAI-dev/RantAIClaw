@@ -3831,6 +3831,54 @@ mod tests {
         );
     }
 
+    /// An autonomy write drops the medium-risk grants of the process policy —
+    /// the one the webhook tools share — even when the write keeps the rung.
+    ///
+    /// The rung check alone would not do it: a write that keeps the level and
+    /// the `always_ask` list is not a rung change, and a grant made under the
+    /// level in force must not answer the risk gate after the operator touched
+    /// the autonomy.
+    #[tokio::test]
+    async fn an_autonomy_write_clears_the_medium_risk_grants() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp root");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let _dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", tmp.path());
+        let mut config = Config::default();
+        config.config_path = tmp.path().join("config.toml");
+        config.workspace_dir = tmp.path().join("workspace");
+        let state = console_state(config);
+
+        state.security.add_medium_risk_approval("touch");
+        assert_eq!(
+            state.security.medium_risk_approved_snapshot(),
+            vec!["touch".to_string()],
+            "the grant must be in force before the write"
+        );
+
+        // The same level: the write keeps the rung, so the policy's own rung
+        // check leaves the grant alone. The write must drop it anyway.
+        let body: AutonomyBody =
+            serde_json::from_value(serde_json::json!({ "level": "supervised" }))
+                .expect("autonomy body");
+        let response = Box::pin(set_autonomy(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(body),
+        ))
+        .await
+        .expect("autonomy write must succeed");
+        assert!(
+            response.0.is_object(),
+            "the handler returns the stored autonomy"
+        );
+
+        assert!(
+            state.security.medium_risk_approved_snapshot().is_empty(),
+            "an autonomy write must drop the medium-risk grants"
+        );
+    }
+
     /// The only `connect_lark` path this suite can exercise without a live
     /// Lark/Feishu endpoint: both credential fields omitted, so
     /// `plan_lark_credentials` returns `KeepExisting` and the probe (and any
