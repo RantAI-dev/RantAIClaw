@@ -604,6 +604,14 @@ async fn set_model(
 pub(crate) struct AutonomyBody {
     #[serde(default)]
     level: Option<String>,
+    /// The approval preset to apply (`manual`, `smart`, `strict`, `off`).
+    ///
+    /// The preset is applied first, so an explicit `level`/`always_ask`/
+    /// `auto_approve`/`allowed_commands` in the same body wins over it: the
+    /// operator's own words are the last ones. An unknown name is rejected
+    /// rather than ignored — a typo must not silently keep the old policy.
+    #[serde(default)]
+    preset: Option<String>,
     #[serde(default)]
     auto_approve: Option<Vec<String>>,
     #[serde(default)]
@@ -642,14 +650,13 @@ fn parse_level(s: &str) -> Option<AutonomyLevel> {
     }
 }
 
-/// Whether a request's `level` moves autonomy to `readonly` or `full`. Only
-/// these two levels drop Manual's `"*"` when `always_ask` is not sent. An
-/// unparseable level is rejected by `set_autonomy`, so it never reaches the rule.
-fn sets_readonly_or_full(level: Option<&str>) -> bool {
-    matches!(
-        level.and_then(parse_level),
-        Some(AutonomyLevel::ReadOnly | AutonomyLevel::Full)
-    )
+/// Whether a request ends up at the `readonly` or `full` level. Only these
+/// two levels drop Manual's `"*"` when `always_ask` is not sent. A preset
+/// counts: `{preset:"off"}` ends at Full and `{preset:"strict"}` at ReadOnly,
+/// so a preset-only body is classified like an explicit level. An unparseable
+/// level is rejected by `set_autonomy`, so it never reaches the rule.
+fn sets_readonly_or_full(level: Option<AutonomyLevel>) -> bool {
+    matches!(level, Some(AutonomyLevel::ReadOnly | AutonomyLevel::Full))
 }
 
 pub(crate) async fn set_autonomy(
@@ -659,10 +666,37 @@ pub(crate) async fn set_autonomy(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
     let (_guard, mut cfg) = lock_and_load(&state).await?;
-    let level_is_readonly_or_full = sets_readonly_or_full(body.level.as_deref());
-    if let Some(l) = body.level {
-        cfg.autonomy.level =
-            parse_level(&l).ok_or_else(|| err_400(format!("invalid autonomy level: {l}")))?;
+    // The explicit level, parsed before anything is written so an invalid one
+    // is rejected rather than half-applied.
+    let explicit_level = match body.level.as_deref() {
+        Some(l) => {
+            Some(parse_level(l).ok_or_else(|| err_400(format!("invalid autonomy level: {l}")))?)
+        }
+        None => None,
+    };
+    // The preset the body names, parsed before it is applied so an unknown
+    // name is rejected rather than ignored.
+    let preset = match body.preset.as_deref() {
+        Some(name) => Some(
+            crate::approval::policy_writer::PolicyPreset::from_str_ci(name)
+                .map_err(|e| err_400(e.to_string()))?,
+        ),
+        None => None,
+    };
+    // The preset is applied before the explicit fields, so a body that carries
+    // both a preset and an explicit `level`/`always_ask`/`auto_approve`/
+    // `allowed_commands` ends up with the explicit value — the operator's word
+    // is the last one.
+    if let Some(preset) = preset {
+        crate::approval::policy_writer::apply_preset_to_config(&mut cfg, preset);
+    }
+    // The level the request ends up with: the explicit `level` if the body sent
+    // one, else the level the preset implies, else none — a body that names
+    // neither asks for no level change, and the stored level stays untouched.
+    let resulting_level = explicit_level.or_else(|| preset.map(|p| p.autonomy_level()));
+    let level_is_readonly_or_full = sets_readonly_or_full(resulting_level);
+    if let Some(level) = explicit_level {
+        cfg.autonomy.level = level;
     }
     if let Some(v) = body.auto_approve {
         cfg.autonomy.auto_approve = validate_tool_entries(v)?;
@@ -3654,6 +3688,17 @@ mod tests {
         initial: &crate::config::AutonomyConfig,
         body: serde_json::Value,
     ) -> crate::config::AutonomyConfig {
+        try_put_autonomy(initial, body)
+            .await
+            .expect("autonomy write must succeed")
+    }
+
+    /// The same drive, keeping the handler's error so a rejected body can be
+    /// asserted on.
+    async fn try_put_autonomy(
+        initial: &crate::config::AutonomyConfig,
+        body: serde_json::Value,
+    ) -> Result<crate::config::AutonomyConfig, ApiError> {
         let _env = crate::test_env::ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().expect("temp root");
         let _home = crate::test_env::HomeGuard::set(tmp.path());
@@ -3670,14 +3715,77 @@ mod tests {
             HeaderMap::new(),
             Json(body),
         ))
-        .await
-        .expect("autonomy write must succeed");
+        .await?;
         assert!(
             response.0.is_object(),
             "the handler returns the stored autonomy"
         );
         let stored = state.config.lock().autonomy.clone();
-        stored
+        Ok(stored)
+    }
+
+    /// A body that names a preset applies that preset: the level moves back to
+    /// Supervised and the Smart bundle's command allowlist replaces the stored
+    /// one. The operator's own `always_ask` entries survive the switch.
+    #[tokio::test]
+    async fn a_preset_body_applies_the_preset_bundle() {
+        let initial = crate::config::AutonomyConfig {
+            level: crate::security::AutonomyLevel::Full,
+            ..crate::config::AutonomyConfig::default()
+        };
+        let stored = put_autonomy(&initial, serde_json::json!({ "preset": "smart" })).await;
+
+        assert_eq!(stored.level, crate::security::AutonomyLevel::Supervised);
+        assert_eq!(
+            stored.always_ask,
+            vec!["ssh".to_string(), "pty".to_string()],
+            "Smart keeps the operator's always_ask entries"
+        );
+        assert!(
+            stored.allowed_commands.iter().any(|c| c == "which"),
+            "the Smart bundle's allowlist replaces the stored one, got {:?}",
+            stored.allowed_commands
+        );
+    }
+
+    /// An explicit field in the same body wins over the preset: the operator
+    /// named the list, so the preset's own rule does not apply to it.
+    #[tokio::test]
+    async fn an_explicit_always_ask_wins_over_the_preset_in_the_same_body() {
+        let initial = crate::config::AutonomyConfig {
+            level: crate::security::AutonomyLevel::Full,
+            ..crate::config::AutonomyConfig::default()
+        };
+        // "shell" is the discriminating value: it names a built-in tool that
+        // Smart's own rule removes, so if the preset were applied after the
+        // explicit list its retain would drop "shell" and the final list would
+        // come back empty. Only the correct order — preset first, then the
+        // explicit fields written on top — keeps the list at exactly
+        // `["shell"]`.
+        let stored = put_autonomy(
+            &initial,
+            serde_json::json!({ "preset": "smart", "always_ask": ["shell"] }),
+        )
+        .await;
+
+        assert_eq!(
+            stored.always_ask,
+            vec!["shell".to_string()],
+            "the explicit list replaces the preset's"
+        );
+        assert_eq!(stored.level, crate::security::AutonomyLevel::Supervised);
+    }
+
+    /// A preset name the gateway does not know is rejected, not ignored: the
+    /// operator asked for a policy, and a typo must not silently keep the old
+    /// one.
+    #[tokio::test]
+    async fn an_unknown_preset_name_is_rejected() {
+        let initial = crate::config::AutonomyConfig::default();
+        let err = try_put_autonomy(&initial, serde_json::json!({ "preset": "bogus" }))
+            .await
+            .expect_err("an unknown preset name must be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
     /// Setting `level` to `full` without sending `always_ask` drops Manual's

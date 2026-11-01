@@ -3810,12 +3810,12 @@ async fn snapshot_fallback_warns_once() {
 }
 
 /// The runtime defaults name the marker's preset only when it implies the
-/// level the gate enforces. The config cannot stand in for the marker: the
-/// shipped `always_ask` is non-empty, so a config-derived preset called a
-/// profile that chose nothing "Manual". And a marker that drifted from the
-/// gate's level names no preset at all — a prompt that described "read-only"
-/// while the gate runs Supervised (or the reverse) would describe a policy
-/// the runtime is not running.
+/// level the gate enforces. The config cannot stand in for the marker: it
+/// cannot tell "no preset was chosen" from "the default", so a config-derived
+/// preset names a preset for a profile that chose nothing. And a marker that
+/// drifted from the gate's level names no preset at all — a prompt that
+/// described "read-only" while the gate runs Supervised (or the reverse) would
+/// describe a policy the runtime is not running.
 #[test]
 fn the_runtime_defaults_name_no_preset_the_gate_does_not_enforce() {
     use crate::approval::policy_writer::PolicyPreset;
@@ -3829,7 +3829,7 @@ fn the_runtime_defaults_name_no_preset_the_gate_does_not_enforce() {
     );
     assert!(
         !config.autonomy.always_ask.is_empty(),
-        "the shipped default `always_ask` is what made a fresh profile look Manual"
+        "the shipped default `always_ask` names the operator's own tools"
     );
 
     let policy_dir = tempfile::tempdir().expect("temp policy dir");

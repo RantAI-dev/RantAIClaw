@@ -5186,8 +5186,10 @@ mod tests {
             json["autonomy_preset"]
         );
 
-        // The marker names it — and it wins over the config, which still says
-        // Manual (a non-empty `always_ask` under `Supervised`).
+        // The marker names it — and it wins over the config, which names no
+        // preset of its own (a `Supervised` level with one built-in tool named
+        // reads as Smart under the config-derived rule, and a profile that
+        // chose nothing must not be named at all).
         std::fs::write(
             profile.policy_dir().join("autonomy.toml"),
             "[autonomy]\npreset = \"strict\"\n",

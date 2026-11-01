@@ -99,9 +99,9 @@ mod tests {
     use super::*;
 
     /// A profile that never chose a preset has none. The shipped default
-    /// `always_ask` is non-empty, so a value derived from the config calls
-    /// that profile Manual — which is why the marker, not the config, is the
-    /// signal that a preset was chosen at all.
+    /// `always_ask` names only the operator's own tools, so a value derived
+    /// from the config calls that profile Smart — which is why the marker, not
+    /// the config, is the signal that a preset was chosen at all.
     #[test]
     fn a_profile_without_the_marker_has_no_preset() {
         let dir = tempfile::tempdir().expect("temp policy dir");
@@ -113,11 +113,11 @@ mod tests {
         );
         assert!(
             !config.autonomy.always_ask.is_empty(),
-            "the shipped default `always_ask` is what made a fresh profile look Manual"
+            "the shipped default `always_ask` names the operator's own tools"
         );
         assert_eq!(
             crate::approval::policy_writer::preset_for_autonomy(&config.autonomy),
-            crate::approval::policy_writer::PolicyPreset::Manual,
+            crate::approval::policy_writer::PolicyPreset::Smart,
             "the config-derived value — the one a surface must not report"
         );
         assert_eq!(
