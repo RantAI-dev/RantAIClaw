@@ -1269,6 +1269,10 @@ pub(crate) async fn execute_one_tool_structured(
     // funnel used to write the constant `true` for both, which is why the trail
     // could not prove that anybody had approved anything.
     approval_outcome: crate::security::ApprovalOutcome,
+    // True only when that approval was given to a prompt that showed every
+    // argument of the call uncut. Only then may a tool that asks for itself
+    // skip its own prompt; a yes to a summary covers only the summary.
+    approval_showed_full_args: bool,
     // Identity of who asked for the call. Chat sends a sender id + role
     // (owner or guest); non-chat surfaces send `AuditActor::surface()`
     // and the audit carries `user_id = None`, `role = None`. A surface that
@@ -1387,7 +1391,12 @@ pub(crate) async fn execute_one_tool_structured(
     // trail stops claiming "nobody was asked" for a call a person approved.
     // The merge with the outer gate's verdict is
     // `security::pending::merge_tool_approval_outcome`.
-    let tool_cell = crate::security::tool_approval_cell();
+    //
+    // A call the outer gate already put in front of a human, with every
+    // argument shown, starts with that answer in the cell, so a tool that would
+    // ask again does not.
+    let tool_cell =
+        crate::security::tool_approval_cell_after(approval_outcome, approval_showed_full_args);
     let tool_future = tool.execute(call.arguments.clone());
     let outcome = if let Some(token) = cancellation_token {
         let cell = Arc::clone(&tool_cell);
@@ -1523,6 +1532,7 @@ pub(crate) async fn execute_tool_calls_collecting(
                 // anything here — whatever the policy allowed, it allowed
                 // silently.
                 crate::security::ApprovalOutcome::NotRequired,
+                false,
                 audit_actor,
                 security,
             )
@@ -1536,6 +1546,7 @@ pub(crate) async fn execute_tool_calls_collecting(
         // was asked", and only the approval branch below — the one place a
         // human is actually consulted — may raise it to `Granted`.
         let mut approval_outcome = crate::security::ApprovalOutcome::NotRequired;
+        let mut approval_showed_full_args = false;
 
         // Role ceiling (guests): deny disallowed tools / out-of-allowlist shell
         // commands outright — a hard ceiling, never escalated to an owner.
@@ -1724,6 +1735,7 @@ pub(crate) async fn execute_tool_calls_collecting(
                 }
                 // Past the denial branch: a human was asked and said yes.
                 approval_outcome = crate::security::ApprovalOutcome::Granted;
+                approval_showed_full_args = verdict.args_shown_in_full;
             }
         }
 
@@ -1743,6 +1755,7 @@ pub(crate) async fn execute_tool_calls_collecting(
                 events,
                 channel_name,
                 approval_outcome,
+                approval_showed_full_args,
                 audit_actor,
                 security,
             )
@@ -6220,6 +6233,7 @@ done
                 crate::approval::Verdict {
                     response: ApprovalResponse::No,
                     basis: crate::approval::DecisionBasis::NoAnswer,
+                    args_shown_in_full: false,
                 }
             }
         }

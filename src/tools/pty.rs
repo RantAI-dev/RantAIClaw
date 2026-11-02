@@ -164,6 +164,11 @@ impl PtyTool {
         if self.security.effective_autonomy() == crate::security::AutonomyLevel::Full {
             return None;
         }
+        // The outer approval gate may already have put this call in front of a
+        // human, who said yes. Asking again would show the same question twice.
+        if crate::security::call_already_approved() {
+            return None;
+        }
         let Some(approvals) = self.security.pending() else {
             return Some(fail(format!(
                 "Action blocked: `{label}` runs an arbitrary command and needs approval, but no \
@@ -446,6 +451,99 @@ impl Tool for PtyTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The outer approval gate asked a human about this call and got a yes. The
+    /// tool must not put the same question to the user a second time.
+    #[tokio::test]
+    async fn a_call_the_outer_gate_already_approved_is_not_asked_again() {
+        let policy = Arc::new(
+            SecurityPolicy::default().with_autonomy(crate::security::AutonomyLevel::Supervised),
+        );
+        let approvals = Arc::new(crate::security::PendingApprovals::new(Some(
+            std::time::Duration::from_secs(5),
+        )));
+        policy.set_pending(approvals.clone());
+        let mut rx = approvals.subscribe();
+        let t = PtyTool::new(policy);
+        let cell = crate::security::tool_approval_cell_after(
+            crate::security::ApprovalOutcome::Granted,
+            true,
+        );
+        let refusal = crate::security::TOOL_APPROVAL
+            .scope(cell, t.require_command_approval("pty start", "ls"))
+            .await;
+        assert!(refusal.is_none(), "an approved call proceeds");
+        assert!(
+            rx.try_recv().is_err(),
+            "a call a human already approved must not raise a second request"
+        );
+    }
+
+    /// An outer prompt that cut the arguments (the summary other surfaces show
+    /// stops a value at 80 characters) was answered yes. That covers only what
+    /// was shown, so the tool still asks, with the full command.
+    #[tokio::test]
+    async fn a_yes_to_a_cut_summary_does_not_skip_the_tools_own_prompt() {
+        let policy = Arc::new(
+            SecurityPolicy::default().with_autonomy(crate::security::AutonomyLevel::Supervised),
+        );
+        let approvals = Arc::new(crate::security::PendingApprovals::new(Some(
+            std::time::Duration::from_secs(5),
+        )));
+        policy.set_pending(approvals.clone());
+        let mut rx = approvals.subscribe();
+        let responder = tokio::spawn({
+            let approvals = approvals.clone();
+            async move {
+                let request = rx.recv().await.expect("one request");
+                let full = request.full_command.clone();
+                approvals.resolve(request.id, crate::security::Decision::Deny);
+                full
+            }
+        });
+        let t = PtyTool::new(policy);
+        let cell = crate::security::tool_approval_cell_after(
+            crate::security::ApprovalOutcome::Granted,
+            false,
+        );
+        let refusal = crate::security::TOOL_APPROVAL
+            .scope(cell, t.require_command_approval("pty start", "ls"))
+            .await;
+        let shown = responder.await.expect("the tool asked");
+        assert_eq!(shown, "ls", "the tool asks with the full command");
+        assert!(refusal.is_some(), "the refusal stops the call");
+    }
+
+    /// The control for the test above: with no earlier answer the tool still
+    /// asks, and a refusal stops the call.
+    #[tokio::test]
+    async fn a_call_nobody_approved_is_asked_and_a_refusal_stops_it() {
+        let policy = Arc::new(
+            SecurityPolicy::default().with_autonomy(crate::security::AutonomyLevel::Supervised),
+        );
+        let approvals = Arc::new(crate::security::PendingApprovals::new(Some(
+            std::time::Duration::from_secs(5),
+        )));
+        policy.set_pending(approvals.clone());
+        let mut rx = approvals.subscribe();
+        let responder = tokio::spawn({
+            let approvals = approvals.clone();
+            async move {
+                let request = rx.recv().await.expect("one request");
+                approvals.resolve(request.id, crate::security::Decision::Deny);
+            }
+        });
+        let t = PtyTool::new(policy);
+        let cell = crate::security::tool_approval_cell_after(
+            crate::security::ApprovalOutcome::NotRequired,
+            false,
+        );
+        let refusal = crate::security::TOOL_APPROVAL
+            .scope(cell, t.require_command_approval("pty start", "ls"))
+            .await;
+        responder.await.expect("the responder saw the request");
+        assert!(refusal.is_some(), "a refused call must not proceed");
+    }
 
     #[tokio::test]
     async fn start_without_an_approver_is_refused() {

@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 
 use crate::lifecycle::binary_path::{BinaryInfo, InstallKind};
 use crate::profile::{paths, sentinel, ProfileManager};
+use crate::service;
 
 #[allow(
     clippy::struct_excessive_bools,
@@ -503,15 +504,28 @@ fn try_uninstall_daemon() {
         Ok(p) => p,
         Err(_) => return,
     };
-    let mut cmd = std::process::Command::new(exe);
-    cmd.args(["service", "uninstall"]);
-    cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::null());
-    if let Ok(status) = cmd.status() {
-        if status.success() {
-            println!("  daemon service unit removed");
-        }
+    let removed = remove_daemon_unit(service::daemon_unit_file(), || {
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args(["service", "uninstall"]);
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        // `service uninstall` exits 0 when no unit is installed, so its exit
+        // status says nothing about whether a unit was removed.
+        let _ = cmd.status();
+    });
+    if removed {
+        println!("  daemon service unit removed");
     }
+}
+
+/// Run `run_uninstall` and report whether it removed the daemon unit: the
+/// unit file existed before the call and is gone after it. `unit_file` is
+/// `None` where the platform keeps no unit file (the removal cannot be
+/// observed, so none is claimed).
+fn remove_daemon_unit(unit_file: Option<PathBuf>, run_uninstall: impl FnOnce()) -> bool {
+    let existed_before = unit_file.as_deref().is_some_and(Path::exists);
+    run_uninstall();
+    existed_before && unit_file.as_deref().is_some_and(|f| !f.exists())
 }
 
 fn self_delete_binary(path: &Path) -> Result<()> {
@@ -716,6 +730,45 @@ mod tests {
             yes: true,
             dry_run: false,
         }
+    }
+
+    #[test]
+    fn remove_daemon_unit_claims_nothing_when_no_unit_was_installed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = tmp.path().join("rantaiclaw.service");
+        let mut ran = false;
+        // `service uninstall` exits 0 with nothing to remove; the runner does
+        // the same.
+        let removed = remove_daemon_unit(Some(unit), || ran = true);
+        assert!(ran, "the uninstall command still runs");
+        assert!(!removed);
+    }
+
+    #[test]
+    fn remove_daemon_unit_reports_removal_when_the_unit_file_is_gone_afterwards() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = tmp.path().join("rantaiclaw.service");
+        fs::write(&unit, "[Unit]\n").unwrap();
+        let unit_for_runner = unit.clone();
+        let removed = remove_daemon_unit(Some(unit), || {
+            fs::remove_file(&unit_for_runner).unwrap();
+        });
+        assert!(removed);
+    }
+
+    #[test]
+    fn remove_daemon_unit_claims_nothing_when_the_unit_file_survives() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = tmp.path().join("rantaiclaw.service");
+        fs::write(&unit, "[Unit]\n").unwrap();
+        let removed = remove_daemon_unit(Some(unit.clone()), || {});
+        assert!(!removed);
+        assert!(unit.exists());
+    }
+
+    #[test]
+    fn remove_daemon_unit_claims_nothing_without_a_known_unit_location() {
+        assert!(!remove_daemon_unit(None, || {}));
     }
 
     #[test]

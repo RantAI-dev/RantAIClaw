@@ -291,6 +291,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Tool-call audit records go to the directory of the loaded config.** The tool-call records were
+  written to `<profile>/audit.log` under the real home even when `RANTAICLAW_CONFIG_DIR` (or
+  `RANTAICLAW_WORKSPACE`) moved the config elsewhere, while config-change records went to the
+  `audit.log` next to that config. Both now use the directory the config loader resolves, so a
+  sandboxed run no longer writes into the operator's own audit log. With no override the directory is
+  still the active profile's. A non-profile `active_workspace.toml` marker now moves the tool-call
+  records to that marker's directory, like the config. If the loader cannot locate the config, the
+  record is dropped with a warning and not written elsewhere.
+
+- **A tool on `always_ask` prompts in the TUI at every autonomy level, as it does in the console.**
+  The TUI agent had no approval gate of its own, so under `full` the `pty` and `ssh` tools (which skip
+  their own prompt there) ran with no question although the shipped `always_ask` names both. The TUI
+  now asks in its approval pane for exactly the tools on the list, and for no others: a tool outside
+  the list keeps the gates it carries. The `shell` tool keeps asking about each command and is not
+  asked about twice, except under the `*` wildcard, which asks for `shell` as it does in the console.
+  An answer holds for that call only and adds nothing to the command allowlist. In the TUI a `pty` or
+  `ssh` call that a person already approved at this prompt, which shows every argument, does not ask a
+  second time. The console, channel and CLI prompts cut long values, so the tools still ask there with
+  the full command.
+
+- **`uninstall` reports a removed daemon service unit only when one was removed.** It printed
+  "daemon service unit removed" whenever `rantaiclaw service uninstall` exited 0, which it also does
+  when no unit is installed (and always does in a debug build). The line now appears only when the
+  unit file existed before the call and is gone after it.
+
 - **`models refresh` tells a mistyped provider from one with no model list.** `rantaiclaw models
   refresh --provider x`, `doctor models --provider x` and the console's refresh button answered an
   unknown name with "does not support live model discovery yet", the sentence for a real provider

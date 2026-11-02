@@ -36,9 +36,10 @@ pub use audit::{
 pub use pairing::PairingGuard;
 #[allow(unused_imports)]
 pub use pending::{
-    current_turn_is_guest, current_turn_scope, merge_tool_approval_outcome, record_tool_approval,
-    tool_approval_cell, tool_approval_outcome, Decision, PendingApprovals, PendingRequest,
-    SessionScope, ToolApprovalCell, TOOL_APPROVAL, TURN_IS_GUEST, TURN_SCOPE,
+    call_already_approved, current_turn_is_guest, current_turn_scope, merge_tool_approval_outcome,
+    record_tool_approval, tool_approval_cell, tool_approval_cell_after, tool_approval_outcome,
+    Decision, PendingApprovals, PendingRequest, SessionScope, ToolApprovalCell, TOOL_APPROVAL,
+    TURN_IS_GUEST, TURN_SCOPE,
 };
 pub use policy::{command_medium_risk_basenames, AutonomyLevel, SecurityPolicy};
 #[allow(unused_imports)]

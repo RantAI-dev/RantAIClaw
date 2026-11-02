@@ -210,8 +210,9 @@ A stale document asserting an active security control is worse than silence, so:
   nested depth, not only at the top level.
 - **The tool-call audit trail is on, but `[security.audit]` still configures
   nothing.** Every tool call — executed and refused — now writes one JSON record to
-  `<profile>/audit.log` (channel, tool name, approved, allowed, succeeded,
-  duration; never the arguments). `channel` names the surface the call came from:
+  `audit.log` next to the loaded `config.toml` (the profile directory, unless
+  `RANTAICLAW_CONFIG_DIR`, `RANTAICLAW_WORKSPACE` or a workspace marker points elsewhere):
+  channel, tool name, approved, allowed, succeeded, duration; never the arguments. `channel` names the surface the call came from:
   `cli`, `tui`, `console` (the web console, streaming and non-streaming), a chat channel
   name such as `telegram` or `discord`, or one of the non-chat surfaces `webhook`, `delegate`
   and `scheduler`. A call refused under `readonly` is written with
