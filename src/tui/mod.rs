@@ -1,6 +1,8 @@
 #[cfg(feature = "tui")]
 mod app;
 #[cfg(feature = "tui")]
+mod approval;
+#[cfg(feature = "tui")]
 pub mod async_bridge;
 #[cfg(feature = "tui")]
 mod commands;

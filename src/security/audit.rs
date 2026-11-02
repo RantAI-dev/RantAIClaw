@@ -272,7 +272,8 @@ impl AuditActor {
     }
 }
 
-/// Append one tool-call record to the active profile's audit log.
+/// Append one tool-call record to the audit log in the directory of the
+/// config the process loaded.
 ///
 /// **Best-effort by construction.** The agent must not stop because a log write
 /// failed, and must not pay a synchronous disk write per tool call, so the
@@ -285,46 +286,79 @@ impl AuditActor {
 /// answers "what ran, was it approved, did it succeed", which is what the
 /// operator-facing docs have always claimed it answers.
 ///
+/// **The directory is the loaded config's.** Outside tests it comes from the
+/// resolver `Config::load_or_init` uses ([`audit_dir_of_loaded_config`]), so a
+/// run that points `RANTAICLAW_CONFIG_DIR` elsewhere writes its tool-call
+/// records next to the config-change records, never into the operator's
+/// profile. When the resolver fails the record is dropped with a `warn`; it is
+/// not written anywhere else.
+///
 /// **Test builds cannot reach the operator profile by accident.** Under
 /// `cfg(test)` the directory is read from the `RANTAICLAW_AUDIT_DIR_OVERRIDE`
 /// env var; if it is unset (or empty) the record is dropped with a `debug`
 /// log line. A test that wants to capture audit records must point that var
 /// at a temp directory while holding `crate::test_env::ENV_LOCK`, e.g. via
 /// `crate::test_env::EnvGuard::set("RANTAICLAW_AUDIT_DIR_OVERRIDE", tmp.path())`.
-/// Under `cfg(not(test))` the path is resolved from the active profile name,
-/// unchanged from before.
 pub fn record_tool_call(record: ToolCallRecord) {
     if tokio::runtime::Handle::try_current().is_err() {
         return;
     }
-    let Some(dir) = audit_dir_for_record() else {
-        return;
-    };
-    tokio::task::spawn_blocking(move || {
-        let Ok(logger) = AuditLogger::new(crate::config::AuditConfig::default(), dir) else {
+    let dir = audit_dir_for_record();
+    tokio::spawn(async move {
+        let Some(dir) = dir.await else {
             return;
         };
-        if let Err(e) = logger.log_command_event(CommandExecutionLog {
-            channel: &record.channel,
-            command: &record.tool,
-            risk_level: &record.risk_level,
-            approval: record.approval,
-            allowed: record.allowed,
-            success: record.success,
-            duration_ms: record.duration_ms,
-            sender: record.sender.as_deref(),
-            role: record.role.as_deref(),
-        }) {
-            tracing::warn!(target: "security", error = %e, "failed to write tool-call audit record");
-        }
+        // A join error means the blocking worker panicked or the runtime is
+        // shutting down; the record is best-effort either way.
+        let _ = tokio::task::spawn_blocking(move || write_tool_call_record(dir, &record)).await;
     });
 }
 
-/// Resolve the directory `record_tool_call` should write into. Under
-/// `cfg(test)` the operator's home is never reachable unless an env-var
-/// override is set by the caller (typically a test holding `ENV_LOCK`); under
-/// `cfg(not(test))` the active profile directory is used as before.
-fn audit_dir_for_record() -> Option<PathBuf> {
+/// Append `record` to the audit log in `dir`. Every failure is a `warn!`.
+pub(crate) fn write_tool_call_record(dir: PathBuf, record: &ToolCallRecord) {
+    let Ok(logger) = AuditLogger::new(crate::config::AuditConfig::default(), dir) else {
+        return;
+    };
+    if let Err(e) = logger.log_command_event(CommandExecutionLog {
+        channel: &record.channel,
+        command: &record.tool,
+        risk_level: &record.risk_level,
+        approval: record.approval,
+        allowed: record.allowed,
+        success: record.success,
+        duration_ms: record.duration_ms,
+        sender: record.sender.as_deref(),
+        role: record.role.as_deref(),
+    }) {
+        tracing::warn!(target: "security", error = %e, "failed to write tool-call audit record");
+    }
+}
+
+/// The directory of the config this process loaded: the directory that holds
+/// its `config.toml`, found by the same resolver `Config::load_or_init` uses
+/// (`RANTAICLAW_CONFIG_DIR`, `RANTAICLAW_WORKSPACE`, the `active_workspace.toml`
+/// marker, then the active profile). Every audit record goes here, so the
+/// records of one process share one `audit.log`.
+///
+/// The resolver reads nothing but the marker and creates nothing but the
+/// active profile's tree. It returns an error, and this function does not fall
+/// back to another directory, when the resolver does.
+pub(crate) async fn audit_dir_of_loaded_config() -> Result<PathBuf> {
+    let (config_path, _workspace) = crate::config::Config::resolve_active_paths().await?;
+    config_path.parent().map(Path::to_path_buf).ok_or_else(|| {
+        anyhow::anyhow!(
+            "config path {} has no parent directory",
+            config_path.display()
+        )
+    })
+}
+
+/// Resolve the directory `record_tool_call` should write into, as a future
+/// the caller spawns. Under `cfg(test)` the operator's home is never reachable
+/// unless an env-var override is set by the caller (typically a test holding
+/// `ENV_LOCK`); the variable is read when this function is called, not when the
+/// future is polled. Outside tests the loaded config's directory is used.
+fn audit_dir_for_record() -> impl std::future::Future<Output = Option<PathBuf>> + Send {
     #[cfg(test)]
     {
         // Test build: refuse the real operator profile. A test that wants to
@@ -332,7 +366,7 @@ fn audit_dir_for_record() -> Option<PathBuf> {
         // (crate::test_env::EnvGuard::set("RANTAICLAW_AUDIT_DIR_OVERRIDE", …)
         // while holding ENV_LOCK); otherwise the record is dropped with a
         // debug log line and no file is written.
-        match std::env::var_os("RANTAICLAW_AUDIT_DIR_OVERRIDE") {
+        let dir = match std::env::var_os("RANTAICLAW_AUDIT_DIR_OVERRIDE") {
             Some(v) if !v.is_empty() => Some(PathBuf::from(v)),
             _ => {
                 tracing::debug!(
@@ -342,13 +376,24 @@ fn audit_dir_for_record() -> Option<PathBuf> {
                 );
                 None
             }
-        }
+        };
+        async move { dir }
     }
     #[cfg(not(test))]
     {
-        Some(crate::profile::paths::profile_dir(
-            &crate::profile::ProfileManager::resolve_active_name(),
-        ))
+        async {
+            match audit_dir_of_loaded_config().await {
+                Ok(dir) => Some(dir),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "security",
+                        error = %e,
+                        "no audit directory for the loaded config; dropping the tool-call audit record"
+                    );
+                    None
+                }
+            }
+        }
     }
 }
 
@@ -853,6 +898,100 @@ mod tests {
         assert!(
             log.exists(),
             "with the override set, record_tool_call must write to <override>/audit.log"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_dir_of_loaded_config_is_the_config_dir_override() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let home = TempDir::new().expect("tempdir");
+        let config_dir = TempDir::new().expect("tempdir");
+        let _home = crate::test_env::HomeGuard::set(home.path());
+        let _profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
+        let _workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+        let _config = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", config_dir.path());
+
+        let dir = audit_dir_of_loaded_config().await.expect("resolve");
+
+        assert_eq!(dir, config_dir.path());
+    }
+
+    #[tokio::test]
+    async fn audit_dir_of_loaded_config_is_the_profile_dir_without_an_override() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let home = TempDir::new().expect("tempdir");
+        let _home = crate::test_env::HomeGuard::set(home.path());
+        let _profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
+        let _workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+        let _config = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
+        // The one test of the default branch: opt out of the isolation guard,
+        // with HOME pointing at a temp dir so nothing real is reachable.
+        let _allow = crate::test_env::EnvGuard::set("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR", "1");
+
+        let dir = audit_dir_of_loaded_config().await.expect("resolve");
+
+        assert_eq!(
+            dir,
+            crate::profile::paths::profile_dir("default"),
+            "the normal layout keeps the audit log in the active profile directory"
+        );
+        assert!(dir.starts_with(home.path()), "got: {dir:?}");
+    }
+
+    #[tokio::test]
+    async fn audit_dir_of_loaded_config_fails_when_the_profile_does_not_exist() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let home = TempDir::new().expect("tempdir");
+        let _home = crate::test_env::HomeGuard::set(home.path());
+        let _profile = crate::test_env::EnvGuard::set("RANTAICLAW_PROFILE", "no_such_profile");
+        let _workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+        let _config = crate::test_env::EnvGuard::unset("RANTAICLAW_CONFIG_DIR");
+        let _allow = crate::test_env::EnvGuard::set("RANTAICLAW_TEST_ALLOW_REAL_CONFIG_DIR", "1");
+
+        let result = audit_dir_of_loaded_config().await;
+
+        assert!(
+            result.is_err(),
+            "a config that cannot be located has no audit directory, got: {result:?}"
+        );
+        assert!(
+            !crate::profile::paths::profile_dir("no_such_profile").exists(),
+            "resolving must not create the missing profile"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_call_record_lands_in_the_loaded_config_dir() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let home = TempDir::new().expect("tempdir");
+        let config_dir = TempDir::new().expect("tempdir");
+        let _home = crate::test_env::HomeGuard::set(home.path());
+        let _profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
+        let _workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+        let _config = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", config_dir.path());
+
+        let dir = audit_dir_of_loaded_config().await.expect("resolve");
+        write_tool_call_record(
+            dir,
+            &ToolCallRecord {
+                channel: "test-channel".into(),
+                sender: None,
+                role: None,
+                tool: "noop".into(),
+                risk_level: "executed".into(),
+                approval: ApprovalOutcome::NotRequired,
+                allowed: true,
+                success: true,
+                duration_ms: 1,
+            },
+        );
+
+        let log = std::fs::read_to_string(config_dir.path().join("audit.log"))
+            .expect("the record is in the config dir's audit.log");
+        assert!(log.contains("noop"), "got: {log}");
+        assert!(
+            !crate::profile::paths::audit_log("default").exists(),
+            "nothing is written into the profile dir under HOME"
         );
     }
 

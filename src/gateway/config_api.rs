@@ -2854,6 +2854,61 @@ mod tests {
         );
     }
 
+    /// One process, one audit directory: the config-change record and a
+    /// tool-call record both land in the `audit.log` next to the loaded
+    /// config when `RANTAICLAW_CONFIG_DIR` points away from the profile.
+    #[tokio::test]
+    async fn config_change_and_tool_call_records_share_the_loaded_config_dir() {
+        use crate::security::audit::{audit_dir_of_loaded_config, write_tool_call_record};
+        use crate::security::{ApprovalOutcome, ToolCallRecord};
+
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let home = tempfile::tempdir().expect("tempdir");
+        let config_dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_env::HomeGuard::set(home.path());
+        let _profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
+        let _workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+        let _config_dir =
+            crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", config_dir.path());
+
+        let cfg = Config {
+            config_path: config_dir.path().join("config.toml"),
+            ..Config::default()
+        };
+        audit_config_change(&cfg, "autonomy");
+        write_tool_call_record(
+            audit_dir_of_loaded_config().await.expect("resolve"),
+            &ToolCallRecord {
+                channel: "test-channel".into(),
+                sender: None,
+                role: None,
+                tool: "noop_tool".into(),
+                risk_level: "executed".into(),
+                approval: ApprovalOutcome::NotRequired,
+                allowed: true,
+                success: true,
+                duration_ms: 1,
+            },
+        );
+
+        let log_path = config_dir.path().join("audit.log");
+        let mut log = String::new();
+        // The config-change append runs on a blocking worker; wait for it.
+        for _ in 0..100 {
+            log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            if log.contains("config_change") && log.contains("noop_tool") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(log.contains("config_change"), "config change record: {log}");
+        assert!(log.contains("noop_tool"), "tool call record: {log}");
+        assert!(
+            !crate::profile::paths::audit_log("default").exists(),
+            "nothing is written into the profile dir under HOME"
+        );
+    }
+
     #[test]
     fn validate_tool_entries_rejects_malformed_and_trims() {
         // Empty / whitespace / multi-token entries can never match the exact-string

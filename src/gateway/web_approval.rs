@@ -112,6 +112,7 @@ impl ApprovalBackend for WebModalApprovalBackend {
                 Verdict {
                     response: ApprovalResponse::No,
                     basis: DecisionBasis::NoAnswer,
+                    args_shown_in_full: false,
                 }
             }
             Decision::Deny => {

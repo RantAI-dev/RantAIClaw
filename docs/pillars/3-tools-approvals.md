@@ -11,7 +11,7 @@ The blast radius surface. Every tool call routes through one approval gate befor
 - v0.6.50 Smart/Strict UX overhaul (inline Y/A/N prompt, plan-mode Strict, cascading approvals)
 - Command allowlist + path traversal + injection blocking
 - Rate limiting (default 20 actions/hour)
-- Tool-call audit log at `<profile>/audit.log` — one JSON record per call: channel (the surface the call came from: `cli`, `tui`, `console`, or a chat channel name), tool name, whether it was approved, whether it was allowed, whether it succeeded, and how long it took. Tool **arguments** are never recorded.
+- Tool-call audit log at `audit.log` next to the loaded `config.toml` — the profile directory, unless `RANTAICLAW_CONFIG_DIR`, `RANTAICLAW_WORKSPACE` or a workspace marker points the config elsewhere; config-change records go to the same file. One JSON record per call: channel (the surface the call came from: `cli`, `tui`, `console`, or a chat channel name), tool name, whether it was approved, whether it was allowed, whether it succeeded, and how long it took. Tool **arguments** are never recorded.
 
 ## v0.6.50 approval UX (Claude Code parity)
 
@@ -64,7 +64,7 @@ src/tools/         ← Tool trait dispatch
   ↓ execute
 src/security/      ← rate limit + audit
   ↓ result
-<profile>/audit.log  ← one JSON record per tool call (executed AND refused)
+audit.log  ← next to the loaded config.toml (the profile dir by default); one JSON record per tool call (executed AND refused)
 ```
 
 ## Trait extension point

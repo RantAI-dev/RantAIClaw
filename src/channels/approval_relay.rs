@@ -487,6 +487,7 @@ impl ApprovalBackend for ChatRelayApprovalBackend {
             Decision::Deny if outcome.timed_out => Verdict {
                 response: ApprovalResponse::No,
                 basis: DecisionBasis::NoAnswer,
+                args_shown_in_full: false,
             },
             // An owner (or anyone, for a Deny) said No in the chat.
             Decision::Deny => Verdict::answered(ApprovalResponse::No),

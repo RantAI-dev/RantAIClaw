@@ -151,6 +151,10 @@ impl TuiAgentActor {
                         match crate::agent::Agent::from_config(&config).await {
                             Ok(mut new_agent) => {
                                 new_agent.set_surface("tui");
+                                crate::tui::approval::attach_tool_approval(
+                                    &mut new_agent,
+                                    &config.autonomy,
+                                );
                                 self.carry_history_into(&mut new_agent);
                                 let mcp_tools_by_server = new_agent.mcp_tools_by_server();
                                 let mcp_servers_configured: Vec<String> =
@@ -315,6 +319,10 @@ impl TuiAgentActor {
                         match crate::agent::Agent::from_config(&config).await {
                             Ok(mut new_agent) => {
                                 new_agent.set_surface("tui");
+                                crate::tui::approval::attach_tool_approval(
+                                    &mut new_agent,
+                                    &config.autonomy,
+                                );
                                 self.carry_history_into(&mut new_agent);
                                 let mcp_tools_by_server = new_agent.mcp_tools_by_server();
                                 let mcp_servers_configured: Vec<String> =

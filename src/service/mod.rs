@@ -1505,7 +1505,29 @@ pub(crate) fn systemd_user_unit_dir() -> Result<PathBuf> {
 
 fn linux_service_file(config: &Config) -> Result<PathBuf> {
     let _ = config;
+    systemd_unit_file()
+}
+
+fn systemd_unit_file() -> Result<PathBuf> {
     Ok(systemd_user_unit_dir()?.join("rantaiclaw.service"))
+}
+
+/// The file the daemon service unit lives in on this platform: the launchd
+/// plist on macOS, the systemd user unit or the OpenRC init script on Linux,
+/// chosen by the same detection `service uninstall` uses. `None` where there
+/// is no single unit file to look at (Windows scheduled task) or the init
+/// system cannot be detected.
+pub(crate) fn daemon_unit_file() -> Option<PathBuf> {
+    if cfg!(target_os = "macos") {
+        return macos_service_file().ok();
+    }
+    if cfg!(target_os = "linux") {
+        return match InitSystem::Auto.resolve().ok()? {
+            InitSystem::Openrc => Some(PathBuf::from("/etc/init.d/rantaiclaw")),
+            _ => systemd_unit_file().ok(),
+        };
+    }
+    None
 }
 
 fn run_checked(command: &mut Command) -> Result<()> {

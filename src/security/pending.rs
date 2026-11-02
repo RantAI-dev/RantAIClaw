@@ -223,6 +223,38 @@ pub fn record_tool_approval(outcome: ApprovalOutcome) {
     });
 }
 
+/// A cell for a call whose outer gate has already decided.
+///
+/// When the outer `ApprovalManager` gate put the call in front of a human, got
+/// a yes, and the prompt showed every argument in full, the cell starts out
+/// holding that answer, so a tool that asks again can see it was asked about
+/// already. A yes to a prompt that cut the arguments covers only what it
+/// showed, so it leaves the cell empty, as does any other outer outcome.
+#[must_use]
+pub fn tool_approval_cell_after(
+    outer: ApprovalOutcome,
+    args_shown_in_full: bool,
+) -> ToolApprovalCell {
+    let answer = match outer {
+        ApprovalOutcome::Granted if args_shown_in_full => Some(ApprovalOutcome::Granted),
+        _ => None,
+    };
+    Arc::new(Mutex::new(answer))
+}
+
+/// True when a human has already approved the call that is running.
+///
+/// A tool that asks a human itself (`pty`, `ssh`) reads this before it asks,
+/// and does not ask again when the outer gate has already put the same call in
+/// front of one. A refusal never reaches the tool, so a grant is the only
+/// answer this can hold.
+#[must_use]
+pub fn call_already_approved() -> bool {
+    TOOL_APPROVAL
+        .try_with(|cell| *cell.lock() == Some(ApprovalOutcome::Granted))
+        .unwrap_or(false)
+}
+
 /// The human answer recorded in `cell`, if any.
 #[must_use]
 pub fn tool_approval_outcome(cell: &ToolApprovalCell) -> Option<ApprovalOutcome> {

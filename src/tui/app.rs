@@ -9129,6 +9129,7 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
     let (mut agent, agent_boot_error) = match Agent::from_config(&app_config).await {
         Ok(mut agent) => {
             agent.set_surface("tui");
+            crate::tui::approval::attach_tool_approval(&mut agent, &app_config.autonomy);
             (Some(agent), None)
         }
         Err(e) => {
@@ -14609,6 +14610,76 @@ mod autonomy_keybinding_tests {
         assert!(
             !message.contains("persisted"),
             "a risk-gate answer persists nothing: {message}"
+        );
+    }
+
+    /// An `always_ask` tool reaches the approval pane through the registry the
+    /// pane already drains. The answer holds for that call only: the tool's name
+    /// is not a shell command, so nothing is written to the command allowlist,
+    /// and "persist" must not claim a file was written.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_always_ask_tool_request_shows_in_the_pane_and_widens_no_allowlist() {
+        use crate::approval::{
+            ApprovalBackend, ApprovalManager, ApprovalRequest, ApprovalResponse,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut ctx, _req_rx, _events_tx) = crate::tui::context::TuiContext::test_context();
+        let security = std::sync::Arc::new(crate::security::SecurityPolicy::default());
+        let approvals = std::sync::Arc::new(crate::security::PendingApprovals::new(None));
+        security.set_pending(approvals.clone());
+        ctx.security = Some(security.clone());
+        let mut app = app_with_profile_root(ctx, dir.path().to_path_buf());
+        app.pending_approvals_rx = Some(approvals.subscribe());
+
+        let backend = crate::tui::approval::TuiApprovalBackend::new(security.clone());
+        let manager = ApprovalManager::from_config(&crate::config::AutonomyConfig::default());
+        let request = ApprovalRequest {
+            tool_name: "ssh".to_string(),
+            arguments: serde_json::json!({ "action": "exec", "command": "id" }),
+        };
+        let decision = tokio::spawn(async move { backend.decide(&manager, &request).await });
+        for _ in 0..500 {
+            if !approvals.list().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+
+        app.drain_events();
+        let shown = app
+            .pending_approval
+            .clone()
+            .expect("the request must reach the approval pane");
+        assert_eq!(shown.basename, "ssh");
+        assert_eq!(
+            shown.full_command, r#"{"action":"exec","command":"id"}"#,
+            "the pane shows every argument of the call"
+        );
+        assert_eq!(
+            shown.session_scope,
+            crate::security::SessionScope::HighRisk,
+            "an always_ask answer holds for this call only"
+        );
+
+        app.resolve_pending_approval(crate::security::Decision::Persist);
+
+        assert_eq!(
+            decision.await.expect("the request resolves"),
+            ApprovalResponse::Yes
+        );
+        assert!(
+            security.runtime_allowlist_snapshot().is_empty(),
+            "answering for the `ssh` tool must not allow the `ssh` command"
+        );
+        let message = app
+            .scrollback_queue
+            .last()
+            .map(|(_, text)| text.clone())
+            .unwrap_or_default();
+        assert!(
+            message.contains("this run only") && !message.contains("persisted"),
+            "the message must state the scope the answer has: {message}"
         );
     }
 

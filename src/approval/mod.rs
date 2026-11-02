@@ -66,6 +66,12 @@ pub enum DecisionBasis {
 pub struct Verdict {
     pub response: ApprovalResponse,
     pub basis: DecisionBasis,
+    /// True only when the prompt that was answered showed every argument of the
+    /// call, uncut. A tool that asks for itself with the full command may then
+    /// skip its own prompt. Prompts built from `summarize_args` cut a value at
+    /// 80 characters, so a yes to one covers only what was shown and this stays
+    /// false.
+    pub args_shown_in_full: bool,
 }
 
 impl Verdict {
@@ -74,6 +80,15 @@ impl Verdict {
         Self {
             response,
             basis: DecisionBasis::Answered,
+            args_shown_in_full: false,
+        }
+    }
+
+    /// An answer a person gave to a prompt that showed every argument in full.
+    pub fn answered_with_full_args(response: ApprovalResponse) -> Self {
+        Self {
+            args_shown_in_full: true,
+            ..Self::answered(response)
         }
     }
 
@@ -82,6 +97,7 @@ impl Verdict {
         Self {
             response: ApprovalResponse::No,
             basis: DecisionBasis::NoApprover,
+            args_shown_in_full: false,
         }
     }
 }
@@ -142,6 +158,16 @@ pub struct ApprovalManager {
     /// tightens autonomy also tightens the approval gate. `None` keeps the
     /// snapshot behaviour for callers that rebuild per turn anyway.
     policy: Option<Arc<crate::security::SecurityPolicy>>,
+    /// Gate only the tools `always_ask` forces to prompt. Every other tool is
+    /// left to the gates it carries itself (the shell tool's command gates, the
+    /// workspace and path checks). Set by surfaces that never gated tools
+    /// generally and must not start to, such as the TUI.
+    always_ask_only: bool,
+    /// Tools whose own `always_ask` entry this manager does not enforce,
+    /// because the tool asks for itself. The shell tool has command-level
+    /// gates, so a named entry for it would ask twice for one command. The
+    /// `"*"` wildcard still applies to them.
+    left_to_tool_gate: HashSet<String>,
 }
 
 impl ApprovalManager {
@@ -152,7 +178,28 @@ impl ApprovalManager {
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
             policy: None,
+            always_ask_only: false,
+            left_to_tool_gate: HashSet::new(),
         }
+    }
+
+    /// Gate only the tools `always_ask` forces to prompt, at every autonomy
+    /// level but `ReadOnly`. A tool outside the list proceeds to its own gates,
+    /// as it does when the surface has no manager at all.
+    #[must_use]
+    pub fn gating_only_always_ask(mut self) -> Self {
+        self.always_ask_only = true;
+        self
+    }
+
+    /// Do not enforce an `always_ask` entry that names `tool_name`: the tool
+    /// asks for itself, and a second prompt would ask twice for one call. Only
+    /// the literal entry is dropped. `"*"` still forces the prompt, exactly as
+    /// the console does after `exempt_shell_from_tool_gate`.
+    #[must_use]
+    pub fn leaving_to_tool_gate(mut self, tool_name: &str) -> Self {
+        self.left_to_tool_gate.insert(tool_name.to_string());
+        self
     }
 
     /// Attach a live policy so the autonomy level is read at decision time.
@@ -194,15 +241,18 @@ impl ApprovalManager {
     fn forces_prompt(&self, tool_name: &str) -> bool {
         // `"*"` is the wildcard the Manual preset writes: it forces EVERY tool to
         // prompt, so the list can never drift from the registry.
+        // A tool that asks for itself ignores its own named entry, not `"*"`.
+        let named = !self.left_to_tool_gate.contains(tool_name);
         match &self.policy {
             Some(p) => p
                 .fields()
                 .always_ask
                 .iter()
-                .any(|t| t == "*" || t == tool_name),
+                .any(|t| t == "*" || (named && t == tool_name)),
             None => {
                 let snapshot = self.autonomy.read();
-                snapshot.always_ask.contains(tool_name) || snapshot.always_ask.contains("*")
+                (named && snapshot.always_ask.contains(tool_name))
+                    || snapshot.always_ask.contains("*")
             }
         }
     }
@@ -248,6 +298,11 @@ impl ApprovalManager {
         // the default list is not empty — it ships `["ssh", "pty"]`.
         if self.forces_prompt(tool_name) {
             return true;
+        }
+
+        // The list is the whole gate on this surface.
+        if self.always_ask_only {
+            return false;
         }
 
         // Full autonomy never prompts, except for the `always_ask` list above.
@@ -1042,6 +1097,101 @@ mod tests {
         let mgr = ApprovalManager::from_config(&config);
         assert!(!mgr.needs_approval("shell"));
         assert!(!mgr.needs_approval("ssh"));
+    }
+
+    // ── gating_only_always_ask / leaving_to_tool_gate ──────────
+
+    /// A surface that gates only the `always_ask` list asks for exactly those
+    /// tools, at every level but `ReadOnly`, and for nothing else. `Supervised`
+    /// would otherwise prompt for every tool outside `auto_approve`.
+    #[test]
+    fn gating_only_always_ask_prompts_for_the_listed_tools_alone() {
+        for level in [AutonomyLevel::Supervised, AutonomyLevel::Full] {
+            let config = AutonomyConfig {
+                level,
+                always_ask: vec!["pty".into()],
+                auto_approve: vec![],
+                ..AutonomyConfig::default()
+            };
+            let mgr = ApprovalManager::from_config(&config).gating_only_always_ask();
+            assert!(mgr.needs_approval("pty"), "{level:?}: a listed tool asks");
+            assert!(
+                !mgr.needs_approval("file_write"),
+                "{level:?}: an unlisted tool is left to its own gates"
+            );
+        }
+    }
+
+    #[test]
+    fn gating_only_always_ask_keeps_the_wildcard_and_readonly_rules() {
+        let wildcard = AutonomyConfig {
+            level: AutonomyLevel::Supervised,
+            always_ask: vec!["*".into()],
+            ..AutonomyConfig::default()
+        };
+        let mgr = ApprovalManager::from_config(&wildcard).gating_only_always_ask();
+        assert!(mgr.needs_approval("file_write"), "`*` forces every tool");
+
+        let readonly = AutonomyConfig {
+            level: AutonomyLevel::ReadOnly,
+            always_ask: vec!["pty".into()],
+            ..AutonomyConfig::default()
+        };
+        let mgr = ApprovalManager::from_config(&readonly).gating_only_always_ask();
+        assert!(
+            !mgr.needs_approval("pty"),
+            "ReadOnly refuses; nothing to ask"
+        );
+    }
+
+    /// The TUI's decision for `shell` must be the console's, for every
+    /// `always_ask` value: the console drops a literal `shell` entry
+    /// (`exempt_shell_from_tool_gate`) and lets `"*"` keep forcing the prompt.
+    #[test]
+    fn the_shell_decision_matches_the_consoles_for_every_always_ask_value() {
+        for level in [AutonomyLevel::Supervised, AutonomyLevel::Full] {
+            for always_ask in [vec![], vec!["shell"], vec!["*"], vec!["pty"]] {
+                let config = AutonomyConfig {
+                    level,
+                    always_ask: always_ask.iter().map(|t| (*t).to_string()).collect(),
+                    ..AutonomyConfig::default()
+                };
+                let mut console_config = config.clone();
+                crate::gateway::web_approval::exempt_shell_from_tool_gate(&mut console_config);
+                let console = ApprovalManager::from_config(&console_config);
+                let tui = ApprovalManager::from_config(&config)
+                    .gating_only_always_ask()
+                    .leaving_to_tool_gate("shell");
+                assert_eq!(
+                    tui.needs_approval("shell"),
+                    console.needs_approval("shell"),
+                    "{level:?} always_ask={always_ask:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_tool_left_to_its_own_gate_ignores_its_named_entry_but_not_the_wildcard() {
+        let named = AutonomyConfig {
+            level: AutonomyLevel::Supervised,
+            always_ask: vec!["shell".into(), "pty".into()],
+            ..AutonomyConfig::default()
+        };
+        let mgr = ApprovalManager::from_config(&named)
+            .gating_only_always_ask()
+            .leaving_to_tool_gate("shell");
+        assert!(!mgr.needs_approval("shell"), "the named entry is dropped");
+        assert!(mgr.needs_approval("pty"), "other tools are unaffected");
+
+        let wildcard = AutonomyConfig {
+            always_ask: vec!["*".into()],
+            ..named
+        };
+        let mgr = ApprovalManager::from_config(&wildcard)
+            .gating_only_always_ask()
+            .leaving_to_tool_gate("shell");
+        assert!(mgr.needs_approval("shell"), "`*` still forces the prompt");
     }
 
     // ── apply_config ──────────────────────────────────────────
