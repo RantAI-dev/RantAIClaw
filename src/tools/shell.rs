@@ -1456,6 +1456,109 @@ mod tests {
         );
     }
 
+    /// A chain that mixes a low-risk and a medium-risk segment is covered by
+    /// one Session answer: the low-risk `cd` is never granted and never needs
+    /// to be, so the same chain runs again without asking.
+    #[tokio::test]
+    async fn a_session_answer_holds_for_a_chain_with_a_low_risk_segment() {
+        let security = policy_allowing(&["cd", "touch"]);
+        let approvals = Arc::new(PendingApprovals::new(Some(std::time::Duration::from_secs(
+            5,
+        ))));
+        security.set_pending(approvals.clone());
+        let asked = answer_every_request(approvals.clone(), Decision::Session);
+        let tool = ShellTool::new(security.clone(), test_runtime());
+        let command = "cd . && touch rantaiclaw_shell_grant_probe";
+
+        tool.execute(json!({ "command": command }))
+            .await
+            .expect("first command returns a result");
+        assert_eq!(asked_count(&asked), 1, "the first medium-risk run must ask");
+
+        tool.execute(json!({ "command": command }))
+            .await
+            .expect("second command returns a result");
+        assert_eq!(
+            asked_count(&asked),
+            1,
+            "a session answer must hold for the same chain, low-risk segment included"
+        );
+    }
+
+    /// The grant from a chain covers only the medium-risk basenames it named.
+    /// `git push` is a different medium-risk basename, so it asks.
+    #[tokio::test]
+    async fn a_chain_grant_does_not_cover_an_ungranted_medium_risk_command() {
+        let security = policy_allowing(&["cd", "touch", "git"]);
+        let approvals = Arc::new(PendingApprovals::new(Some(std::time::Duration::from_secs(
+            5,
+        ))));
+        security.set_pending(approvals.clone());
+        let asked = answer_every_request(approvals.clone(), Decision::Session);
+        let tool = ShellTool::new(security.clone(), test_runtime());
+
+        tool.execute(json!({"command": "cd . && touch rantaiclaw_shell_grant_probe"}))
+            .await
+            .expect("first command returns a result");
+        assert_eq!(asked_count(&asked), 1, "the first medium-risk run must ask");
+
+        tool.execute(json!({"command": "cd . && git push origin main"}))
+            .await
+            .expect("second command returns a result");
+        assert_eq!(
+            asked_count(&asked),
+            2,
+            "git was never granted, so the chain that runs it must ask"
+        );
+    }
+
+    /// A session answer on `touch` does not cover a chain that adds a
+    /// high-risk segment: high risk asks on its own, whatever was granted. The
+    /// first request is answered Session and every later one Deny, so the
+    /// `rm` never runs.
+    #[tokio::test]
+    async fn a_session_grant_does_not_cover_a_chain_with_a_high_risk_segment() {
+        let security = policy_allowing(&["touch", "rm"]);
+        let approvals = Arc::new(PendingApprovals::new(Some(std::time::Duration::from_secs(
+            5,
+        ))));
+        security.set_pending(approvals.clone());
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&asked);
+        let resolver = approvals.clone();
+        let mut rx = approvals.subscribe();
+        tokio::spawn(async move {
+            while let Ok(req) = rx.recv().await {
+                let nth = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let decision = if nth == 0 {
+                    Decision::Session
+                } else {
+                    Decision::Deny
+                };
+                resolver.resolve(req.id, decision);
+            }
+        });
+        let tool = ShellTool::new(security.clone(), test_runtime());
+
+        tool.execute(json!({"command": "touch rantaiclaw_shell_grant_probe"}))
+            .await
+            .expect("first command returns a result");
+        assert_eq!(asked_count(&asked), 1, "the first medium-risk run must ask");
+
+        let res = tool
+            .execute(json!({
+                "command": "touch rantaiclaw_shell_grant_probe && rm -rf rantaiclaw_shell_high_risk_probe"
+            }))
+            .await
+            .expect("second command returns a result");
+        assert_eq!(
+            asked_count(&asked),
+            2,
+            "the chain with a high-risk segment must ask despite the touch grant"
+        );
+        assert!(!res.success, "a denied high-risk chain must not run");
+    }
+
     /// "Once" approves one run only: the next run of the same basename asks
     /// again.
     #[tokio::test]

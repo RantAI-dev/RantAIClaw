@@ -420,39 +420,17 @@ enum QuoteState {
     Double,
 }
 
-/// The basename of every segment of a command string.
-///
-/// Segments are split on unquoted shell operators, leading environment
-/// assignments are skipped, and the leading path is dropped — the same
-/// derivation [`SecurityPolicy::command_risk_level`] uses, so a basename read
-/// here is the basename that command's risk was judged by.
-pub fn command_segment_basenames(command: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    for segment in split_unquoted_segments(command) {
-        let cmd_part = skip_env_assignments(&segment);
-        let Some(base_raw) = cmd_part.split_whitespace().next() else {
-            continue;
-        };
-        let base = base_raw
-            .rsplit('/')
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if base.is_empty() {
-            continue;
-        }
-        names.push(base);
-    }
-    names
-}
-
 /// The basename of every segment of `command` that is classified Medium.
 ///
 /// A "Session" answer to the risk gate grants exactly these: a segment the
 /// gate classifies Low is not granted, so a later medium-risk command that
-/// runs the same basename asks again. The names are normalised exactly as
-/// [`command_segment_basenames`] normalises them, so a granted name and a
-/// gated name are always the same string.
+/// runs the same basename asks again. The lookup in
+/// [`SecurityPolicy::validate_command_execution`] needs exactly these names
+/// too, so what a grant records and what the gate checks are the same set.
+///
+/// Segments are split on unquoted shell operators, leading environment
+/// assignments are skipped, and the leading path is dropped, the same
+/// derivation [`SecurityPolicy::command_risk_level`] uses.
 pub fn command_medium_risk_basenames(command: &str) -> Vec<String> {
     let mut names = Vec::new();
     for segment in split_unquoted_segments(command) {
@@ -943,9 +921,9 @@ impl SecurityPolicy {
     /// not depend on the allowlist or the autonomy level, so `full` is covered
     /// and an approval cannot lift it.
     ///
-    /// A medium-risk command whose every segment's basename carries a session
-    /// grant is treated as approved: that is what a "Session" answer to the
-    /// risk gate means. The grant is never consulted for high risk — a
+    /// A medium-risk command whose every medium-risk segment's basename carries
+    /// a session grant is treated as approved: that is what a "Session" answer
+    /// to the risk gate means. The grant is never consulted for high risk, a
     /// high-risk command always asks again.
     pub fn validate_command_execution(
         &self,
@@ -1626,11 +1604,13 @@ impl SecurityPolicy {
         v
     }
 
-    /// True when every segment of `command` runs a basename this conversation
-    /// approved at medium risk.
+    /// True when every medium-risk segment of `command` runs a basename this
+    /// conversation approved at medium risk.
     ///
     /// A grant covers one basename, so a chained command is covered only when
-    /// every segment's basename is granted. An empty command is never covered.
+    /// every medium-risk segment's basename is granted. Low-risk segments are
+    /// never granted and are not checked. A command with no medium-risk
+    /// segment is never covered.
     ///
     /// Only the current conversation's grants count: a grant made elsewhere
     /// answers nothing here.
@@ -1646,7 +1626,7 @@ impl SecurityPolicy {
         let Some(set) = map.get(&scope) else {
             return false;
         };
-        let names = command_segment_basenames(command);
+        let names = command_medium_risk_basenames(command);
         !names.is_empty() && names.iter().all(|name| set.contains(name))
     }
 
