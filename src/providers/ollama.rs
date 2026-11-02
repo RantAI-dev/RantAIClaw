@@ -1,4 +1,5 @@
 use crate::multimodal;
+use crate::providers::local_refusal::LocalRefusal;
 use crate::providers::traits::{
     ChatMessage, ChatResponse, Provider, ProviderCapabilities, ProviderUsage, ToolCall,
 };
@@ -159,17 +160,17 @@ impl OllamaProvider {
         let normalized_model = model.strip_suffix(":cloud").unwrap_or(model).to_string();
 
         if requests_cloud && self.is_local_endpoint() {
-            anyhow::bail!(
-                "Model '{}' requested cloud routing, but Ollama endpoint is local. Configure api_url with a remote Ollama endpoint.",
-                model
-            );
+            return Err(LocalRefusal::new(format!(
+                "Model '{model}' requested cloud routing, but Ollama endpoint is local. Configure api_url with a remote Ollama endpoint."
+            ))
+            .into());
         }
 
         if requests_cloud && self.api_key.is_none() {
-            anyhow::bail!(
-                "Model '{}' requested cloud routing, but no API key is configured. Set OLLAMA_API_KEY or config api_key.",
-                model
-            );
+            return Err(LocalRefusal::new(format!(
+                "Model '{model}' requested cloud routing, but no API key is configured. Set OLLAMA_API_KEY or config api_key."
+            ))
+            .into());
         }
 
         let should_auth = self.api_key.is_some() && !self.is_local_endpoint();
@@ -960,6 +961,30 @@ mod tests {
         assert!(error
             .to_string()
             .contains("requested cloud routing, but no API key is configured"));
+    }
+
+    /// Both cloud-routing refusals are decided before anything is sent, as a
+    /// typed error the retry wrapper recognises. The sentences are what the
+    /// operator has always seen.
+    #[test]
+    fn cloud_routing_refusals_are_local_refusals() {
+        let local = OllamaProvider::new(None, Some("ollama-key"))
+            .resolve_request_details("qwen3:cloud")
+            .expect_err("cloud suffix should fail on local endpoint");
+        assert!(crate::providers::local_refusal::is_local_refusal(&local));
+        assert_eq!(
+            local.to_string(),
+            "Model 'qwen3:cloud' requested cloud routing, but Ollama endpoint is local. Configure api_url with a remote Ollama endpoint."
+        );
+
+        let keyless = OllamaProvider::new(Some("https://ollama.com"), None)
+            .resolve_request_details("qwen3:cloud")
+            .expect_err("cloud suffix should require API key");
+        assert!(crate::providers::local_refusal::is_local_refusal(&keyless));
+        assert_eq!(
+            keyless.to_string(),
+            "Model 'qwen3:cloud' requested cloud routing, but no API key is configured. Set OLLAMA_API_KEY or config api_key."
+        );
     }
 
     #[test]

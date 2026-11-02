@@ -14,6 +14,9 @@ use reqwest::{
     Client,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+use super::renewing_credential::RenewingCredential;
 
 /// A provider that speaks the OpenAI-compatible chat completions API.
 /// Used by: Venice, Vercel AI Gateway, Cloudflare AI Gateway, Moonshot,
@@ -22,6 +25,9 @@ pub struct OpenAiCompatibleProvider {
     pub(crate) name: String,
     pub(crate) base_url: String,
     pub(crate) credential: Option<String>,
+    /// A credential that expires and is renewed at request time. When set, it
+    /// is sent in place of `credential`.
+    renewing_credential: Option<Arc<RenewingCredential>>,
     pub(crate) auth_header: AuthStyle,
     /// When false, do not fall back to /v1/responses on chat completions 404.
     /// GLM/Zhipu does not support the responses API.
@@ -111,11 +117,33 @@ impl OpenAiCompatibleProvider {
             name: name.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
             credential: credential.map(ToString::to_string),
+            renewing_credential: None,
             auth_header: auth_style,
             supports_responses_fallback,
             user_agent: user_agent.map(ToString::to_string),
             merge_system_into_user,
         }
+    }
+
+    /// Send a credential that is renewed when it expires, instead of the fixed
+    /// one given at construction.
+    pub(crate) fn with_renewing_credential(mut self, credential: Arc<RenewingCredential>) -> Self {
+        self.renewing_credential = Some(credential);
+        self
+    }
+
+    /// The credential to send with this request. A renewing credential is
+    /// renewed here if it has expired; a failed renewal fails the request.
+    async fn current_credential(&self) -> anyhow::Result<String> {
+        if let Some(renewing) = self.renewing_credential.as_ref() {
+            return renewing.current().await;
+        }
+        self.credential.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} API key not set. Run `rantaiclaw onboard` or set the appropriate env var.",
+                self.name
+            )
+        })
     }
 
     /// Collect all `system` role messages, concatenate their content,
@@ -1341,12 +1369,7 @@ impl Provider for OpenAiCompatibleProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} API key not set. Run `rantaiclaw onboard` or set the appropriate env var.",
-                self.name
-            )
-        })?;
+        let credential = &self.current_credential().await?;
 
         let mut messages = Vec::new();
 
@@ -1470,12 +1493,7 @@ impl Provider for OpenAiCompatibleProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} API key not set. Run `rantaiclaw onboard` or set the appropriate env var.",
-                self.name
-            )
-        })?;
+        let credential = &self.current_credential().await?;
 
         let effective_messages = if self.merge_system_into_user {
             Self::flatten_system_messages(messages)
@@ -1576,12 +1594,7 @@ impl Provider for OpenAiCompatibleProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} API key not set. Run `rantaiclaw onboard` or set the appropriate env var.",
-                self.name
-            )
-        })?;
+        let credential = &self.current_credential().await?;
 
         let effective_messages = if self.merge_system_into_user {
             Self::flatten_system_messages(messages)
@@ -1678,12 +1691,7 @@ impl Provider for OpenAiCompatibleProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} API key not set. Run `rantaiclaw onboard` or set the appropriate env var.",
-                self.name
-            )
-        })?;
+        let credential = &self.current_credential().await?;
 
         let tools = Self::convert_tool_specs(request.tools);
         let effective_messages = if self.merge_system_into_user {
@@ -1818,16 +1826,7 @@ impl Provider for OpenAiCompatibleProvider {
         temperature: f64,
         text_tx: tokio::sync::mpsc::Sender<String>,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self
-            .credential
-            .as_ref()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "{} API key not set. Run `rantaiclaw onboard` or set the appropriate env var.",
-                    self.name
-                )
-            })?
-            .clone();
+        let credential = self.current_credential().await?;
 
         let tools = Self::convert_tool_specs(request.tools);
         let effective_messages = if self.merge_system_into_user {
@@ -2028,19 +2027,18 @@ impl Provider for OpenAiCompatibleProvider {
         temperature: f64,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-        let credential = match self.credential.as_ref() {
-            Some(value) => value.clone(),
-            None => {
-                let provider_name = self.name.clone();
-                return stream::once(async move {
-                    Err(StreamError::Provider(format!(
-                        "{} API key not set",
-                        provider_name
-                    )))
-                })
-                .boxed();
-            }
-        };
+        if self.credential.is_none() && self.renewing_credential.is_none() {
+            let provider_name = self.name.clone();
+            return stream::once(async move {
+                Err(StreamError::Provider(format!(
+                    "{} API key not set",
+                    provider_name
+                )))
+            })
+            .boxed();
+        }
+        let fixed_credential = self.credential.clone();
+        let renewing_credential = self.renewing_credential.clone();
 
         let mut messages = Vec::new();
         if let Some(sys) = system_prompt {
@@ -2071,6 +2069,20 @@ impl Provider for OpenAiCompatibleProvider {
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
         tokio::spawn(async move {
+            // The credential is resolved here, not when the stream is created,
+            // so a login that expired in the meantime is renewed first.
+            let credential = match (renewing_credential, fixed_credential) {
+                (Some(renewing), _) => match renewing.current().await {
+                    Ok(credential) => credential,
+                    Err(error) => {
+                        let _ = tx.send(Err(StreamError::Provider(error.to_string()))).await;
+                        return;
+                    }
+                },
+                (None, Some(credential)) => credential,
+                (None, None) => return,
+            };
+
             // Build request with auth
             let mut req_builder = client.post(&url).json(&request);
 
@@ -2125,13 +2137,14 @@ impl Provider for OpenAiCompatibleProvider {
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
-        if let Some(credential) = self.credential.as_ref() {
+        if self.credential.is_some() || self.renewing_credential.is_some() {
+            let credential = self.current_credential().await?;
             // Hit the chat completions URL with a GET to establish the connection pool.
             // The server will likely return 405 Method Not Allowed, which is fine -
             // the goal is TLS handshake and HTTP/2 negotiation.
             let url = self.chat_completions_url();
             let _ = self
-                .apply_auth_header(self.http_client().get(&url), credential)
+                .apply_auth_header(self.http_client().get(&url), &credential)
                 .send()
                 .await?;
         }

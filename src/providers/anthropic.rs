@@ -1,3 +1,4 @@
+use crate::providers::local_refusal::LocalRefusal;
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
     Provider, ProviderUsage, ToolCall as ProviderToolCall,
@@ -441,6 +442,16 @@ impl AnthropicProvider {
     fn http_client(&self) -> Client {
         crate::config::build_runtime_proxy_client_with_timeouts("provider.anthropic", 120, 10)
     }
+
+    /// The credential, or a local refusal when none is set.
+    fn require_credential(&self) -> anyhow::Result<&String> {
+        self.credential.as_ref().ok_or_else(|| {
+            LocalRefusal::new(
+                "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token).",
+            )
+            .into()
+        })
+    }
 }
 
 #[async_trait]
@@ -452,11 +463,7 @@ impl Provider for AnthropicProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token)."
-            )
-        })?;
+        let credential = self.require_credential()?;
 
         let request = ChatRequest {
             model: model.to_string(),
@@ -494,11 +501,7 @@ impl Provider for AnthropicProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token)."
-            )
-        })?;
+        let credential = self.require_credential()?;
 
         let (system_prompt, mut messages) = Self::convert_messages(request.messages);
 
@@ -701,6 +704,37 @@ mod tests {
             err.contains("credentials not set"),
             "Expected key error, got: {err}"
         );
+    }
+
+    /// A missing credential is refused before anything is sent, as a typed
+    /// error the retry wrapper recognises. The sentence is what the operator
+    /// has always seen.
+    #[tokio::test]
+    async fn missing_credential_is_refused_as_a_local_refusal() {
+        let provider = AnthropicProvider::new(None);
+        let sentence =
+            "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token).";
+
+        let error = provider
+            .chat_with_system(None, "hello", "claude-3-opus", 0.7)
+            .await
+            .expect_err("a provider with no credential must refuse");
+        assert!(crate::providers::local_refusal::is_local_refusal(&error));
+        assert_eq!(error.to_string(), sentence);
+
+        let error = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &[],
+                    tools: None,
+                },
+                "claude-3-opus",
+                0.7,
+            )
+            .await
+            .expect_err("a provider with no credential must refuse");
+        assert!(crate::providers::local_refusal::is_local_refusal(&error));
+        assert_eq!(error.to_string(), sentence);
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! via environment variables. SigV4 signing is implemented manually
 //! using hmac/sha2 crates — no AWS SDK dependency.
 
+use crate::providers::local_refusal::LocalRefusal;
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
     Provider, ProviderCapabilities, ProviderUsage, ToolCall as ProviderToolCall, ToolsPayload,
@@ -426,10 +427,11 @@ impl BedrockProvider {
 
     fn require_credentials(&self) -> anyhow::Result<&AwsCredentials> {
         self.credentials.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
+            LocalRefusal::new(
                 "AWS Bedrock credentials not set. Set AWS_ACCESS_KEY_ID and \
-                 AWS_SECRET_ACCESS_KEY environment variables."
+                 AWS_SECRET_ACCESS_KEY environment variables.",
             )
+            .into()
         })
     }
 
@@ -1155,6 +1157,23 @@ mod tests {
         assert!(
             err.contains("credentials not set"),
             "Expected credentials error, got: {err}"
+        );
+    }
+
+    /// A missing credential is refused before anything is sent, as a typed
+    /// error the retry wrapper recognises. The sentence is what the operator
+    /// has always seen.
+    #[tokio::test]
+    async fn missing_credentials_are_refused_as_a_local_refusal() {
+        let provider = BedrockProvider { credentials: None };
+        let error = provider
+            .chat_with_system(None, "hello", "anthropic.claude-sonnet-4-6", 0.7)
+            .await
+            .expect_err("a provider with no credentials must refuse");
+        assert!(crate::providers::local_refusal::is_local_refusal(&error));
+        assert_eq!(
+            error.to_string(),
+            "AWS Bedrock credentials not set. Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables."
         );
     }
 

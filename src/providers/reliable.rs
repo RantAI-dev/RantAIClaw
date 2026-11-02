@@ -1,4 +1,4 @@
-use super::gemini_error::GeminiAuthError;
+use super::local_refusal::is_local_refusal;
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamOptions, StreamResult,
 };
@@ -22,15 +22,12 @@ fn is_non_retryable(err: &anyhow::Error) -> bool {
         return true;
     }
 
-    // A Gemini credential refusal is decided locally, before anything is
-    // sent: the credential is missing, or the CLI login has expired. A retry
-    // cannot change the outcome — it can only spend the operator's time
-    // waiting out a backoff that ends in the same sentence. The refusal is a
-    // type, so it is recognised here and not by its wording.
-    if err
-        .chain()
-        .any(|cause| cause.downcast_ref::<GeminiAuthError>().is_some())
-    {
+    // A refusal decided locally, before anything is sent, cannot change on a
+    // retry: a credential is not set, or the request names a route the
+    // configuration cannot serve. A retry can only wait out a backoff that
+    // ends in the same sentence. The refusal is a type, so it is recognised
+    // here and not by its wording.
+    if is_local_refusal(err) {
         return true;
     }
 
@@ -917,6 +914,8 @@ impl Provider for ReliableProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::gemini_error::GeminiAuthError;
+    use crate::providers::local_refusal::LocalRefusal;
     // `AtomicUsize` is test-only since the key-rotation counter was removed.
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
@@ -977,6 +976,29 @@ mod tests {
 
     #[async_trait]
     impl Provider for CallCounter {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(self.refusal.clone().into())
+        }
+    }
+
+    /// A provider that counts the calls it receives and answers each with a
+    /// local refusal it holds as a value.
+    ///
+    /// It has no send path, so no test using it can reach a network.
+    struct LocalRefusalCounter {
+        calls: Arc<AtomicUsize>,
+        refusal: LocalRefusal,
+    }
+
+    #[async_trait]
+    impl Provider for LocalRefusalCounter {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -1406,6 +1428,82 @@ mod tests {
             1,
             "a refused Gemini CLI login must not be retried"
         );
+    }
+
+    /// Every refusal a provider decides locally, with the sentence it shows
+    /// the operator. A retry cannot change any of them, so each fails the turn
+    /// after one call even though the retry budget allows four.
+    #[tokio::test]
+    async fn a_local_refusal_is_not_retried() {
+        let refusals = [
+            (
+                "anthropic",
+                "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token).",
+            ),
+            (
+                "ollama endpoint",
+                "Model 'user_a:cloud' requested cloud routing, but Ollama endpoint is local. Configure api_url with a remote Ollama endpoint.",
+            ),
+            (
+                "ollama key",
+                "Model 'user_a:cloud' requested cloud routing, but no API key is configured. Set OLLAMA_API_KEY or config api_key.",
+            ),
+            (
+                "bedrock",
+                "AWS Bedrock credentials not set. Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables.",
+            ),
+            (
+                "openai codex profile",
+                "OpenAI Codex auth profile not found. Run `rantaiclaw auth login --provider openai-codex`.",
+            ),
+            (
+                "openai codex account",
+                "OpenAI Codex account id not found in auth profile/token. Run `rantaiclaw auth login --provider openai-codex` again.",
+            ),
+        ];
+
+        for (name, sentence) in refusals {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider = ReliableProvider::new(
+                vec![(
+                    name.into(),
+                    Box::new(LocalRefusalCounter {
+                        calls: Arc::clone(&calls),
+                        refusal: LocalRefusal::new(sentence),
+                    }) as Box<dyn Provider>,
+                )],
+                3,
+                1,
+            );
+
+            let error = provider
+                .simple_chat("hello", "example-model", 0.0)
+                .await
+                .expect_err("a local refusal must fail the turn");
+            assert!(error.to_string().contains(sentence), "{name}: {error}");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "{name}: a local refusal must not be retried"
+            );
+        }
+    }
+
+    /// The type decides, not the wording: a refusal whose sentence looks like
+    /// a transient failure is still final, and a plain error with the same
+    /// sentence is still retried. A context layer added by a caller does not
+    /// hide the type.
+    #[test]
+    fn a_local_refusal_is_recognised_by_type_not_wording() {
+        let sentence = "upstream connection reset, try again";
+        assert!(
+            !is_non_retryable(&anyhow::anyhow!(sentence)),
+            "the plain error must stay retryable"
+        );
+        assert!(is_non_retryable(&LocalRefusal::new(sentence).into()));
+        assert!(is_non_retryable(
+            &anyhow::Error::from(LocalRefusal::new(sentence)).context("while sending the turn")
+        ));
     }
 
     /// The same for the "no credential" refusal.
