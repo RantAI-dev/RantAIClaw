@@ -281,7 +281,20 @@ jobs.
 
 `models list` prints the cached model catalog for a provider (falling back to a curated list when uncached), marking the default model — no network call. Defaults to the configured default provider.
 
-`models refresh` currently supports live catalog refresh for provider IDs: `openrouter`, `openai`, `anthropic`, `groq`, `mistral`, `deepseek`, `xai`, `together-ai`, `gemini`, `ollama`, `llamacpp`, `astrai`, `venice`, `fireworks`, `cohere`, `moonshot`, `glm`, `zai`, `qwen`, and `nvidia`.
+`models refresh` fetches a provider's model list and caches it under the workspace `state/` directory. Providers that support it:
+
+- `openrouter`, `openai`, `anthropic`, `groq`, `mistral`, `deepseek`, `xai`, `together-ai`, `gemini`, `ollama`, `llamacpp`, `astrai`, `venice`, `fireworks`, `cohere`, `moonshot`, `glm`, `zai`, `qwen`, and `nvidia`.
+- Custom endpoints: `custom:<url>` fetches `<url>/models` and `anthropic-custom:<url>` fetches `<url>/v1/models`. See [custom endpoints](providers.md#custom-endpoints).
+
+Behavior:
+
+- A cached list younger than 12 hours is served as is. `--force` fetches again.
+- Every provider except local Ollama and llama.cpp needs a key. The key is the one the provider uses for chat requests: the config key first, then the provider's environment variable. A key goes only to the provider's own endpoint.
+- Gemini needs an API key (`GEMINI_API_KEY` or a key in config). A Gemini CLI login cannot list models.
+- When a fetch fails and an older list is cached, the older list is served and the failure is printed. With no cached list the command fails.
+- A provider that has no model-list endpoint is refused with "does not support live model discovery yet". A name that is not a provider is refused with "Unknown provider" and a pointer to `rantaiclaw providers`.
+
+A model missing from the list still works. Type its ID with `/model <id>` or set `default_model` in config. Every refusal above ends with this way forward, and nothing checks the ID against the list.
 
 ### `channel`
 

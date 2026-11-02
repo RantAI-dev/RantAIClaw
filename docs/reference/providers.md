@@ -249,6 +249,14 @@ default_provider = "custom:https://your-api.example.com"
 default_provider = "anthropic-custom:https://your-api.example.com"
 ```
 
+`rantaiclaw models refresh` lists the models of a custom endpoint:
+
+- `custom:<url>` asks `<url>/models`, the sibling of the `/chat/completions` path that chat requests use. A base that already ends in `/chat/completions` is replaced by `/models`, and a bare origin such as `custom:http://host:8080` gives `http://host:8080/models`.
+- `anthropic-custom:<url>` asks `<url>/v1/models`, the sibling of the `/v1/messages` path that chat requests use.
+- The request carries the key chat requests send to that URL. For `custom:` that is the config key, then `RANTAICLAW_API_KEY`, then `API_KEY`. For `anthropic-custom:` it is the order in [Anthropic family credential order](#anthropic-family-credential-order). With no key, no request is sent, because chat does not run without one either.
+- The list is cached under the provider string as written in config, so two custom endpoints keep separate lists.
+- A failed request, a non-2xx answer, or an answer with no model IDs fails the refresh, leaves any earlier cache as it was, and ends with the `/model <id>` and `default_model` way forward.
+
 ## MiniMax OAuth Setup (config.toml)
 
 Set the MiniMax provider and OAuth placeholder in config:
