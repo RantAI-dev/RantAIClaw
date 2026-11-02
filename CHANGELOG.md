@@ -811,12 +811,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   medium-risk command asked again on every run. A pending request now states
   what an answer to it may hold for — nothing, this command, this command at
   medium risk, or this run only — and every surface answers exactly that. A
-  medium-risk `Session` answer grants only the segments the risk gate classified
-  Medium — a low-risk segment of a chain is granted nothing — and it holds for
-  the conversation that made it, never for a guest's turn; a high-risk command
-  always asks again. The grant answers the risk gate only: it never widens the
-  runtime allowlist, and it is dropped when the autonomy rung changes — the
-  level or the `always_ask` list.
+  medium-risk `Session` answer holds for the whole chained command after one
+  answer. A low-risk segment such as `cd` needs no grant. The check covers
+  exactly the medium-risk segments the answer recorded, so a chain with an
+  ungranted medium-risk segment still asks. The same check applies to cron
+  validation of a chain. The answer holds for the conversation that made it,
+  never for a guest's turn, and a high-risk command always asks again. The
+  grant answers the risk gate only: it never widens the runtime allowlist, and
+  it is dropped when the autonomy rung changes — the level or the `always_ask`
+  list.
 - An autonomy change reached the next turn, not the running one. The gateway's
   chat and webhook turns built their policy and approval manager once at turn
   start and nothing updated them, so a tightening the operator made mid-turn

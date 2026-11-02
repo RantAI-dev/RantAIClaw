@@ -2438,6 +2438,7 @@ enum Extra {
 #[derive(Clone)]
 struct Options {
     guest_tools: Vec<&'static str>,
+    guest_commands: Vec<&'static str>,
     crowded_core_memory: bool,
     skills_mode: crate::config::SkillsPromptInjectionMode,
     owners: Vec<&'static str>,
@@ -2449,12 +2450,19 @@ impl Options {
     fn guest_tools(tools: &[&'static str]) -> Self {
         Self {
             guest_tools: tools.to_vec(),
+            guest_commands: Vec::new(),
             crowded_core_memory: false,
             skills_mode: crate::config::SkillsPromptInjectionMode::Full,
             owners: vec![OWNER_SENDER],
             autonomous_tools: true,
             extras: Vec::new(),
         }
+    }
+
+    /// Lists shell-command globs a guest may run (`guest_allowed_commands`).
+    fn guest_commands(mut self, commands: &[&'static str]) -> Self {
+        self.guest_commands = commands.to_vec();
+        self
     }
 
     /// Configures a sub-agent, which puts `delegate` in the registry.
@@ -2731,6 +2739,11 @@ impl Deployment {
                     .guest_tools
                     .iter()
                     .map(|t| (*t).to_string())
+                    .collect(),
+                guest_allowed_commands: options
+                    .guest_commands
+                    .iter()
+                    .map(|c| (*c).to_string())
                     .collect(),
                 autonomous_tools: options.autonomous_tools,
                 ..crate::config::schema::ChannelsConfig::default()
@@ -5507,6 +5520,80 @@ async fn an_approval_prompt_for_a_guest_call_uploads_nothing_and_shows_the_argum
         !turn.attachable.contains(prompt),
         "the channel was allowed to read markers from the prompt: {prompt}"
     );
+}
+
+/// The owner answers the shell risk gate with Session, and the same command then
+/// runs again for the owner in that chat without a question. A guest who sends
+/// the same command in the same chat is asked anyway: the owner's answer is not
+/// the guest's. This holds only if dispatch marks the guest's turn, so the case
+/// goes through `process_channel_message` and not through `scope_channel_turn`.
+/// The owner has allowlisted the command for guests, so the guest gate lets it
+/// through to the risk gate.
+#[tokio::test]
+async fn an_owner_session_answer_to_the_risk_gate_does_not_cover_a_guest_in_the_same_chat() {
+    let deployment =
+        Deployment::start(Options::guest_tools(&["shell"]).guest_commands(&["git checkout *"]))
+            .await;
+    let approvals = deployment
+        .ctx
+        .security
+        .pending()
+        .expect("the runtime binds a registry for risk-gate requests");
+    // The risk gate waits on this registry for the production deadline, and
+    // the deployment only shortens the tool registry's. Answer each request as
+    // it arrives: the first with Session, every later one with Deny.
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&asked);
+    let resolver = Arc::clone(&approvals);
+    let mut requests = approvals.subscribe();
+    tokio::spawn(async move {
+        while let Ok(request) = requests.recv().await {
+            let nth = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let decision = if nth == 0 {
+                crate::security::Decision::Session
+            } else {
+                crate::security::Decision::Deny
+            };
+            resolver.resolve(request.id, decision);
+        }
+    });
+    let asked_so_far = || asked.load(std::sync::atomic::Ordering::SeqCst);
+    let script = || {
+        vec![
+            call(
+                "shell",
+                serde_json::json!({ "command": "git checkout rantaiclaw_probe_branch" }),
+            ),
+            "Done.".to_string(),
+        ]
+    };
+
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        deployment
+            .turn_in(OWNER_SENDER, GROUP_CHAT, false, "switch branch", script())
+            .await;
+        assert_eq!(asked_so_far(), 1, "the owner's first run must ask");
+
+        deployment
+            .turn_in(OWNER_SENDER, GROUP_CHAT, false, "switch branch", script())
+            .await;
+        assert_eq!(
+            asked_so_far(),
+            1,
+            "control: the owner's session answer holds in this chat"
+        );
+
+        deployment
+            .turn_in(GUEST_SENDER, GROUP_CHAT, false, "switch branch", script())
+            .await;
+        assert_eq!(
+            asked_so_far(),
+            2,
+            "a guest in the same chat must be asked, not covered by the owner's answer"
+        );
+    })
+    .await
+    .expect("the turns finish before the deadline");
 }
 
 /// The same prompt on an owner's turn in a group. The owner is not the one at

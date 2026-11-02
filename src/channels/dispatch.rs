@@ -978,6 +978,11 @@ pub(crate) enum TurnEnd {
 /// guest's turn with a grant, and `src/security` cannot depend on
 /// `src/approval` — that dependency runs the other way. The dispatch states the
 /// owner's decision once, here, so the chat scope and the role cannot disagree.
+///
+/// Every channel tool path must run inside this scope. A turn outside it counts
+/// as the operator: `pending.rs` returns the operator bucket and not-guest when
+/// `TURN_SCOPE` is unset, so a session grant made there answers for every
+/// sender.
 fn scope_channel_turn<'a, T: 'a>(
     scope: (String, String),
     sender_is_owner: bool,
