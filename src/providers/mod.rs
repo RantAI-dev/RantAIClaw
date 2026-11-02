@@ -28,12 +28,14 @@ pub mod copilot;
 pub mod gemini;
 pub mod gemini_cli;
 pub(crate) mod gemini_error;
+pub(crate) mod local_refusal;
 pub mod ollama;
 #[cfg(feature = "legacy-providers")]
 pub mod openai;
 pub mod openai_codex;
 pub mod openrouter;
 pub mod reliable;
+mod renewing_credential;
 pub mod rig_native;
 pub mod router;
 pub mod traits;
@@ -49,8 +51,10 @@ pub use traits::{
 use crate::auth::anthropic_token::{detect_auth_kind, AnthropicAuthKind};
 use compatible::{AuthStyle, OpenAiCompatibleProvider};
 use reliable::ReliableProvider;
+use renewing_credential::{RenewedToken, RenewingCredential};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const MAX_API_ERROR_CHARS: usize = 200;
 const MINIMAX_INTL_BASE_URL: &str = "https://api.minimax.io/v1";
@@ -196,6 +200,23 @@ pub(crate) fn is_doubao_alias(name: &str) -> bool {
     matches!(name, "doubao" | "volcengine" | "ark" | "doubao-cn")
 }
 
+/// Where an OAuth refresh request goes. Unit tests point it at a local
+/// listener so a refresh never reaches the network.
+#[cfg(test)]
+static TEST_TOKEN_ENDPOINT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn oauth_token_endpoint(production: &'static str) -> String {
+    #[cfg(test)]
+    if let Some(url) = TEST_TOKEN_ENDPOINT
+        .lock()
+        .expect("test endpoint lock")
+        .clone()
+    {
+        return url;
+    }
+    production.to_string()
+}
+
 #[derive(Clone, Copy, Debug)]
 enum MinimaxOauthRegion {
     Global,
@@ -203,11 +224,11 @@ enum MinimaxOauthRegion {
 }
 
 impl MinimaxOauthRegion {
-    fn token_endpoint(self) -> &'static str {
-        match self {
+    fn token_endpoint(self) -> String {
+        oauth_token_endpoint(match self {
             Self::Global => MINIMAX_OAUTH_GLOBAL_TOKEN_ENDPOINT,
             Self::Cn => MINIMAX_OAUTH_CN_TOKEN_ENDPOINT,
-        }
+        })
     }
 }
 
@@ -274,7 +295,12 @@ struct QwenOauthTokenResponse {
 
 #[derive(Clone, Default)]
 struct QwenOauthProviderContext {
+    /// A token that can be sent as it is: an explicit key, the env token, or a
+    /// login token that still has life left when the provider is built.
     credential: Option<String>,
+    /// Present when the credential comes from the Qwen login. It re-reads the
+    /// login file and refreshes at request time, and replaces `credential`.
+    login: Option<Arc<RenewingCredential>>,
     base_url: Option<String>,
 }
 
@@ -285,6 +311,7 @@ impl std::fmt::Debug for QwenOauthProviderContext {
                 "credential",
                 &self.credential.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("login", &self.login.as_ref().map(|_| "[renewing]"))
             .field("base_url", &self.base_url)
             .finish()
     }
@@ -371,19 +398,24 @@ fn normalized_qwen_expiry_millis(raw: i64) -> i64 {
     }
 }
 
-fn qwen_oauth_token_expired(credentials: &QwenOauthCredentials) -> bool {
-    let Some(expiry) = credentials.expiry_date else {
-        return false;
-    };
+fn qwen_oauth_expiry(credentials: &QwenOauthCredentials) -> Option<std::time::SystemTime> {
+    let millis =
+        u64::try_from(normalized_qwen_expiry_millis(credentials.expiry_date?)).unwrap_or(0);
+    Some(std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis))
+}
 
-    let expiry_millis = normalized_qwen_expiry_millis(expiry);
-    let now_millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
-        .unwrap_or(i64::MAX);
-
-    expiry_millis <= now_millis.saturating_add(30_000)
+/// The access token in a login, with its expiry. `None` when the login holds
+/// no usable token.
+fn qwen_oauth_login_token(credentials: &QwenOauthCredentials) -> Option<RenewedToken> {
+    let token = credentials
+        .access_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    Some(RenewedToken {
+        token: token.to_string(),
+        expires_at: qwen_oauth_expiry(credentials),
+    })
 }
 
 fn refresh_qwen_oauth_access_token(refresh_token: &str) -> anyhow::Result<QwenOauthCredentials> {
@@ -395,7 +427,7 @@ fn refresh_qwen_oauth_access_token(refresh_token: &str) -> anyhow::Result<QwenOa
         .unwrap_or_else(|_| reqwest::blocking::Client::new());
 
     let response = client
-        .post(QWEN_OAUTH_TOKEN_ENDPOINT)
+        .post(oauth_token_endpoint(QWEN_OAUTH_TOKEN_ENDPOINT))
         .header("Content-Type", "application/x-www-form-urlencoded")
         .header("Accept", "application/json")
         .form(&[
@@ -420,7 +452,10 @@ fn refresh_qwen_oauth_access_token(refresh_token: &str) -> anyhow::Result<QwenOa
             .or_else(|| parsed.as_ref().and_then(|payload| payload.error.as_deref()))
             .filter(|msg| !msg.trim().is_empty())
             .unwrap_or(body.as_str());
-        anyhow::bail!("Qwen OAuth refresh failed (HTTP {status}): {detail}");
+        anyhow::bail!(
+            "Qwen OAuth refresh failed (HTTP {status}): {}",
+            sanitize_api_error(detail)
+        );
     }
 
     let payload =
@@ -432,7 +467,7 @@ fn refresh_qwen_oauth_access_token(refresh_token: &str) -> anyhow::Result<QwenOa
         .filter(|value| !value.trim().is_empty())
     {
         let detail = payload.error_description.as_deref().unwrap_or(error_code);
-        anyhow::bail!("Qwen OAuth refresh failed: {detail}");
+        anyhow::bail!("Qwen OAuth refresh failed: {}", sanitize_api_error(detail));
     }
 
     let access_token = payload
@@ -471,6 +506,78 @@ fn refresh_qwen_oauth_access_token(refresh_token: &str) -> anyhow::Result<QwenOa
     })
 }
 
+/// A refresh token the server issued in place of `replaced`. Kept in memory
+/// only: the login file belongs to the Qwen CLI and is never written.
+struct QwenRotatedRefreshToken {
+    replaced: String,
+    rotated: String,
+}
+
+type QwenRefreshRotation = std::sync::Mutex<Option<QwenRotatedRefreshToken>>;
+
+/// A new access token for the Qwen login, called when the held one is gone or
+/// has little life left.
+///
+/// The login file is read again first: a login made with the Qwen CLI since
+/// the last renewal is used as it is. Only when it holds nothing better is the
+/// refresh token exchanged. The file is never written, since it belongs to the
+/// Qwen CLI.
+fn renew_qwen_oauth_login(rotation: &QwenRefreshRotation) -> anyhow::Result<RenewedToken> {
+    const FIX: &str = "Log in again with the `qwen` CLI, or set QWEN_OAUTH_TOKEN.";
+
+    let cached = read_qwen_oauth_cached_credentials();
+    if let Some(token) = cached.as_ref().and_then(qwen_oauth_login_token) {
+        if token.has_life_beyond_margin() {
+            return Ok(token);
+        }
+    }
+
+    let source_refresh_token = read_non_empty_env(QWEN_OAUTH_REFRESH_TOKEN_ENV).or_else(|| {
+        cached
+            .as_ref()
+            .and_then(|credentials| credentials.refresh_token.clone())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    });
+    let Some(source_refresh_token) = source_refresh_token else {
+        if cached.is_none() {
+            anyhow::bail!("No Qwen Code login was found. {FIX}");
+        }
+        anyhow::bail!("The Qwen Code login has expired and holds no refresh token. {FIX}");
+    };
+
+    // A refresh token the server rotated is newer than the one in the file,
+    // but only while the file still holds the token it replaced. A different
+    // token in the file is a new login and wins.
+    let mut rotation = rotation
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let refresh_token = match rotation.as_ref() {
+        Some(rotated) if rotated.replaced == source_refresh_token => rotated.rotated.clone(),
+        _ => source_refresh_token.clone(),
+    };
+
+    let refreshed = refresh_qwen_oauth_access_token(&refresh_token).map_err(|error| {
+        anyhow::anyhow!("The Qwen Code login could not be renewed ({error}). {FIX}")
+    })?;
+    if let Some(rotated) = refreshed
+        .refresh_token
+        .clone()
+        .filter(|token| *token != refresh_token)
+    {
+        *rotation = Some(QwenRotatedRefreshToken {
+            replaced: source_refresh_token,
+            rotated,
+        });
+    }
+    let mut token = qwen_oauth_login_token(&refreshed)
+        .ok_or_else(|| anyhow::anyhow!("The Qwen Code login could not be renewed. {FIX}"))?;
+    token.expires_at.get_or_insert_with(|| {
+        std::time::SystemTime::now() + renewing_credential::ASSUMED_LIFETIME
+    });
+    Ok(token)
+}
+
 fn resolve_qwen_oauth_context(credential_override: Option<&str>) -> QwenOauthProviderContext {
     let override_value = credential_override
         .map(str::trim)
@@ -483,56 +590,46 @@ fn resolve_qwen_oauth_context(credential_override: Option<&str>) -> QwenOauthPro
         if !placeholder_requested {
             return QwenOauthProviderContext {
                 credential: Some(explicit.to_string()),
+                login: None,
                 base_url: None,
             };
         }
     }
 
-    let mut cached = read_qwen_oauth_cached_credentials();
+    let cached = read_qwen_oauth_cached_credentials();
 
     let env_token = read_non_empty_env(QWEN_OAUTH_TOKEN_ENV);
     let env_refresh_token = read_non_empty_env(QWEN_OAUTH_REFRESH_TOKEN_ENV);
     let env_resource_url = read_non_empty_env(QWEN_OAUTH_RESOURCE_URL_ENV);
 
-    if env_token.is_none() {
-        let refresh_token = env_refresh_token.clone().or_else(|| {
-            cached
-                .as_ref()
-                .and_then(|credentials| credentials.refresh_token.clone())
-        });
-
-        let should_refresh = cached.as_ref().is_some_and(qwen_oauth_token_expired)
-            || cached
-                .as_ref()
-                .and_then(|credentials| credentials.access_token.as_deref())
-                .is_none_or(|value| value.trim().is_empty());
-
-        if should_refresh {
-            if let Some(refresh_token) = refresh_token.as_deref() {
-                match refresh_qwen_oauth_access_token(refresh_token) {
-                    Ok(refreshed) => {
-                        cached = Some(refreshed);
-                    }
-                    Err(error) => {
-                        tracing::warn!(error = %error, "Qwen OAuth refresh failed");
-                    }
-                }
-            }
-        }
-    }
-
-    let mut credential = env_token.or_else(|| {
-        cached
+    // The login is used when no env token is set and either something to log
+    // in with exists or the placeholder asks for the login. Building never
+    // calls the network: an expired token is renewed by the first request.
+    let held = cached.as_ref().and_then(qwen_oauth_login_token);
+    let has_login_source = held.is_some()
+        || env_refresh_token.is_some()
+        || cached
             .as_ref()
-            .and_then(|credentials| credentials.access_token.clone())
+            .and_then(|credentials| credentials.refresh_token.as_deref())
+            .is_some_and(|value| !value.trim().is_empty());
+    let login = (env_token.is_none() && (has_login_source || placeholder_requested)).then(|| {
+        let rotation = QwenRefreshRotation::default();
+        Arc::new(RenewingCredential::new(held.clone(), move || {
+            renew_qwen_oauth_login(&rotation)
+        }))
     });
+
+    let login_token = held
+        .filter(RenewedToken::has_life_beyond_margin)
+        .map(|token| token.token);
+    let mut credential = env_token.or(login_token);
     credential = credential
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string);
 
-    if credential.is_none() && !placeholder_requested {
+    if credential.is_none() && login.is_none() && !placeholder_requested {
         credential = read_non_empty_env("DASHSCOPE_API_KEY");
     }
 
@@ -548,6 +645,7 @@ fn resolve_qwen_oauth_context(credential_override: Option<&str>) -> QwenOauthPro
 
     QwenOauthProviderContext {
         credential,
+        login,
         base_url,
     }
 }
@@ -567,7 +665,7 @@ fn refresh_minimax_oauth_access_token(name: &str, refresh_token: &str) -> anyhow
         .unwrap_or_else(|_| reqwest::blocking::Client::new());
 
     let response = client
-        .post(endpoint)
+        .post(&endpoint)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .header("Accept", "application/json")
         .form(&[
@@ -592,7 +690,10 @@ fn refresh_minimax_oauth_access_token(name: &str, refresh_token: &str) -> anyhow
             .and_then(|base| base.status_msg.as_deref())
             .filter(|msg| !msg.trim().is_empty())
             .unwrap_or(body.as_str());
-        anyhow::bail!("MiniMax OAuth refresh failed (HTTP {status}): {detail}");
+        anyhow::bail!(
+            "MiniMax OAuth refresh failed (HTTP {status}): {}",
+            sanitize_api_error(detail)
+        );
     }
 
     if let Some(payload) = parsed {
@@ -603,7 +704,10 @@ fn refresh_minimax_oauth_access_token(name: &str, refresh_token: &str) -> anyhow
                     .as_ref()
                     .and_then(|base| base.status_msg.as_deref())
                     .unwrap_or(status_text);
-                anyhow::bail!("MiniMax OAuth refresh failed: {detail}");
+                anyhow::bail!(
+                    "MiniMax OAuth refresh failed: {}",
+                    sanitize_api_error(detail)
+                );
             }
         }
 
@@ -620,16 +724,37 @@ fn refresh_minimax_oauth_access_token(name: &str, refresh_token: &str) -> anyhow
     anyhow::bail!("MiniMax OAuth refresh response missing access_token");
 }
 
-fn resolve_minimax_oauth_refresh_token(name: &str) -> Option<String> {
-    let refresh_token = read_non_empty_env(MINIMAX_OAUTH_REFRESH_TOKEN_ENV)?;
+/// A new MiniMax access token from the refresh token in the environment.
+/// Called by the renewing credential when the held token is gone or about to
+/// expire; the refresh response names no expiry, so the token is assumed to
+/// last `ASSUMED_LIFETIME`.
+fn renew_minimax_oauth_token(name: &str) -> anyhow::Result<RenewedToken> {
+    const FIX: &str =
+        "Set a fresh MINIMAX_OAUTH_REFRESH_TOKEN, or set MINIMAX_OAUTH_TOKEN or MINIMAX_API_KEY.";
 
-    match refresh_minimax_oauth_access_token(name, &refresh_token) {
-        Ok(token) => Some(token),
-        Err(error) => {
-            tracing::warn!(provider = name, error = %error, "MiniMax OAuth refresh failed");
-            None
-        }
-    }
+    let refresh_token = read_non_empty_env(MINIMAX_OAUTH_REFRESH_TOKEN_ENV)
+        .ok_or_else(|| anyhow::anyhow!("No MiniMax refresh token is set. {FIX}"))?;
+    let token = refresh_minimax_oauth_access_token(name, &refresh_token).map_err(|error| {
+        anyhow::anyhow!("The MiniMax login could not be renewed ({error}). {FIX}")
+    })?;
+    Ok(RenewedToken {
+        token,
+        expires_at: Some(std::time::SystemTime::now() + renewing_credential::ASSUMED_LIFETIME),
+    })
+}
+
+/// Whether MiniMax authenticates by renewing an access token from
+/// `MINIMAX_OAUTH_REFRESH_TOKEN`. An explicit key and the static env tokens
+/// outrank it, and the generic fallback keys do not. Reads the environment
+/// only, never the network.
+fn minimax_refresh_token_in_use(name: &str, credential_override: Option<&str>) -> bool {
+    let override_value = credential_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    is_minimax_alias(name)
+        && override_value.is_none_or(is_minimax_oauth_placeholder)
+        && resolve_minimax_static_credential().is_none()
+        && read_non_empty_env(MINIMAX_OAUTH_REFRESH_TOKEN_ENV).is_some()
 }
 
 /// Normalize a provider name/alias to a stable canonical form for keying
@@ -670,6 +795,31 @@ fn minimax_base_url(name: &str) -> Option<&'static str> {
         Some(MINIMAX_INTL_BASE_URL)
     } else {
         None
+    }
+}
+
+/// The MiniMax provider for `name` at `base_url`. `api_key` is the configured
+/// key, `key` the credential resolved from it. When a refresh token is the
+/// credential, the provider renews its access token at request time.
+fn build_minimax_provider(
+    name: &str,
+    base_url: &str,
+    api_key: Option<&str>,
+    key: Option<&str>,
+) -> OpenAiCompatibleProvider {
+    let provider = OpenAiCompatibleProvider::new_merge_system_into_user(
+        "MiniMax",
+        base_url,
+        key,
+        AuthStyle::Bearer,
+    );
+    if minimax_refresh_token_in_use(name, api_key) {
+        let name = name.to_string();
+        provider.with_renewing_credential(Arc::new(RenewingCredential::new(None, move || {
+            renew_minimax_oauth_token(&name)
+        })))
+    } else {
+        provider
     }
 }
 
@@ -882,19 +1032,6 @@ pub async fn api_error(provider: &str, response: reqwest::Response) -> anyhow::E
     anyhow::anyhow!("{provider} API error ({status}): {sanitized}")
 }
 
-/// Resolve API key for a provider from config and environment variables.
-///
-/// Resolution order:
-/// 1. Explicitly provided `api_key` parameter (trimmed, filtered if empty)
-/// 2. Provider-specific environment variable (e.g., `ANTHROPIC_OAUTH_TOKEN`, `OPENROUTER_API_KEY`)
-/// 3. Generic fallback variables (`RANTAICLAW_API_KEY`, `API_KEY`)
-///
-/// For Anthropic, the provider-specific env var is `ANTHROPIC_OAUTH_TOKEN` (for setup-tokens)
-/// followed by `ANTHROPIC_API_KEY` (for regular API keys).
-///
-/// For MiniMax, OAuth mode supports `api_key = "minimax-oauth"`, resolving credentials from
-/// `MINIMAX_OAUTH_TOKEN` first, then `MINIMAX_API_KEY`, and finally
-/// `MINIMAX_OAUTH_REFRESH_TOKEN` (automatic access-token refresh).
 /// True when `name` resolves a usable credential — from `config_key` (an
 /// explicit config/api_key value) or a provider-specific env var. Providers that
 /// need no key (or none is configured/env-set) return `false`; the gateway uses
@@ -912,6 +1049,12 @@ pub fn has_usable_credential(
     }
 
     if resolve_provider_credential_with_kind(name, config_key, state_dir, None).is_some() {
+        return true;
+    }
+
+    // A MiniMax refresh token is exchanged for an access token when a request
+    // is sent. Having one set is enough here; the exchange is not attempted.
+    if minimax_refresh_token_in_use(name, config_key) {
         return true;
     }
 
@@ -997,10 +1140,24 @@ fn is_anthropic_family(name: &str) -> bool {
     credential_base_name(name) == "anthropic"
 }
 
-/// The credential a provider name resolves to with no state dir: the override,
-/// then the env vars, then the generic fallback. The anthropic family's auth
-/// profile needs a state dir, so callers that have one use
-/// [`resolve_provider_credential_with_kind`].
+/// Resolve API key for a provider from config and environment variables, with
+/// no state dir.
+///
+/// Resolution order:
+/// 1. Explicitly provided `api_key` parameter (trimmed, filtered if empty)
+/// 2. Provider-specific environment variable (e.g., `ANTHROPIC_OAUTH_TOKEN`, `OPENROUTER_API_KEY`)
+/// 3. Generic fallback variables (`RANTAICLAW_API_KEY`, `API_KEY`)
+///
+/// For Anthropic, the provider-specific env var is `ANTHROPIC_OAUTH_TOKEN` (for setup-tokens)
+/// followed by `ANTHROPIC_API_KEY` (for regular API keys).
+///
+/// For MiniMax, OAuth mode supports `api_key = "minimax-oauth"`, resolving credentials from
+/// `MINIMAX_OAUTH_TOKEN` first, then `MINIMAX_API_KEY`. This function does not use
+/// `MINIMAX_OAUTH_REFRESH_TOKEN`: the provider exchanges it for an access token
+/// when a request is sent (see `build_minimax_provider`).
+///
+/// The anthropic family's auth profile needs a state dir, so callers that have one
+/// use [`resolve_provider_credential_with_kind`].
 fn resolve_provider_credential(name: &str, credential_override: Option<&str>) -> Option<String> {
     resolve_provider_credential_with_kind(name, credential_override, None, None)
         .map(|(credential, _kind)| credential)
@@ -1026,9 +1183,6 @@ fn resolve_provider_credential_with_kind(
             if is_minimax_alias(name) && is_minimax_oauth_placeholder(trimmed_override) {
                 minimax_oauth_placeholder_requested = true;
                 if let Some(credential) = resolve_minimax_static_credential() {
-                    return Some((credential, None));
-                }
-                if let Some(credential) = resolve_minimax_oauth_refresh_token(name) {
                     return Some((credential, None));
                 }
             } else {
@@ -1098,12 +1252,6 @@ fn resolve_provider_credential_with_kind(
             if !value.is_empty() {
                 return Some((value.to_string(), None));
             }
-        }
-    }
-
-    if is_minimax_alias(env_name) {
-        if let Some(credential) = resolve_minimax_oauth_refresh_token(name) {
-            return Some((credential, None));
         }
     }
 
@@ -1382,14 +1530,12 @@ fn create_provider_with_url_and_options(
                 AuthStyle::Bearer,
             )))
         }
-        name if minimax_base_url(name).is_some() => Ok(Box::new(
-            OpenAiCompatibleProvider::new_merge_system_into_user(
-                "MiniMax",
-                minimax_base_url(name).expect("checked in guard"),
-                key,
-                AuthStyle::Bearer,
-            )
-        )),
+        name if minimax_base_url(name).is_some() => Ok(Box::new(build_minimax_provider(
+            name,
+            minimax_base_url(name).expect("checked in guard"),
+            api_key,
+            key,
+        ))),
         "bedrock" | "aws-bedrock" => Ok(Box::new(bedrock::BedrockProvider::new())),
         name if is_qwen_oauth_alias(name) => {
             let base_url = api_url
@@ -1399,13 +1545,19 @@ fn create_provider_with_url_and_options(
                 .or_else(|| qwen_oauth_context.as_ref().and_then(|context| context.base_url.clone()))
                 .unwrap_or_else(|| QWEN_OAUTH_BASE_FALLBACK_URL.to_string());
 
-            Ok(Box::new(OpenAiCompatibleProvider::new_with_user_agent(
+            let provider = OpenAiCompatibleProvider::new_with_user_agent(
                 "Qwen Code",
                 &base_url,
                 key,
                 AuthStyle::Bearer,
                 "QwenCode/1.0",
-            )))
+            );
+            Ok(Box::new(
+                match qwen_oauth_context.as_ref().and_then(|context| context.login.clone()) {
+                    Some(login) => provider.with_renewing_credential(login),
+                    None => provider,
+                },
+            ))
         }
         name if is_qianfan_alias(name) => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Qianfan", "https://aip.baidubce.com", key, AuthStyle::Bearer,
@@ -2026,6 +2178,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             name: "ovhcloud",
             display_name: "OVHcloud AI Endpoints",
             aliases: &["ovh"],
+            local: false,
+        },
+        ProviderInfo {
+            name: "astrai",
+            display_name: "Astrai",
+            aliases: &[],
             local: false,
         },
     ]
@@ -3499,6 +3657,18 @@ pub(crate) mod tests {
         }
     }
 
+    /// The factory builds `astrai`, so `rantaiclaw providers` must name it.
+    #[test]
+    fn astrai_is_listed() {
+        let astrai = list_providers()
+            .into_iter()
+            .find(|provider| provider.name == "astrai")
+            .expect("astrai is built by the factory and must be listed");
+        assert_eq!(astrai.display_name, "Astrai");
+        assert!(!astrai.local);
+        assert!(create_provider(astrai.name, Some("provider-test-credential")).is_ok());
+    }
+
     #[test]
     fn listed_providers_and_aliases_are_constructible() {
         for provider in list_providers() {
@@ -4175,5 +4345,604 @@ pub(crate) mod tests {
             .to_string();
         assert!(plain_err.contains("anthropic"), "{plain_err}");
         assert!(plain_err.contains("ANTHROPIC_API_KEY"), "{plain_err}");
+    }
+
+    // ---- Renewal of an expiring login at request time ----------------------
+    //
+    // The token endpoint and the chat endpoint are one local listener: the
+    // refresh call goes to `<uri>/token` through `TEST_TOKEN_ENDPOINT` and the
+    // chat request to `<uri>/v1/chat/completions`, so nothing leaves the host.
+
+    /// Points the OAuth refresh at a local URL and clears it on drop.
+    struct TokenEndpointOverride;
+
+    impl TokenEndpointOverride {
+        fn set(url: String) -> Self {
+            *TEST_TOKEN_ENDPOINT.lock().expect("test endpoint lock") = Some(url);
+            Self
+        }
+    }
+
+    impl Drop for TokenEndpointOverride {
+        fn drop(&mut self) {
+            *TEST_TOKEN_ENDPOINT.lock().expect("test endpoint lock") = None;
+        }
+    }
+
+    /// A local listener that answers `POST /token` with `token_response` and any
+    /// chat completion with a fixed reply.
+    async fn login_endpoint(token_response: wiremock::ResponseTemplate) -> wiremock::MockServer {
+        let server = fake_chat_endpoint().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(token_response)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn renewed_token_response(access_token: &str) -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": access_token,
+            "refresh_token": "refresh-rotated",
+            "expires_in": 3600,
+        }))
+    }
+
+    async fn refresh_calls(server: &wiremock::MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|req| req.url.path() == "/token")
+            .count()
+    }
+
+    /// The `Authorization` header of each chat request, in order.
+    async fn chat_authorization(server: &wiremock::MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|req| req.url.path() == "/v1/chat/completions")
+            .filter_map(|req| req.headers.get("authorization"))
+            .map(|value| value.to_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    fn unix_millis_from_now(offset_secs: i64) -> i64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after the epoch");
+        i64::try_from(now.as_millis()).expect("millis fit") + offset_secs * 1000
+    }
+
+    /// Writes the login file the Qwen CLI keeps under `home`.
+    fn write_qwen_login(
+        home: &Path,
+        access_token: &str,
+        refresh_token: &str,
+        expires_in_secs: i64,
+    ) {
+        let dir = home.join(".qwen");
+        std::fs::create_dir_all(&dir).expect("login dir");
+        let body = serde_json::json!({
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "expiry_date": unix_millis_from_now(expires_in_secs),
+        });
+        std::fs::write(dir.join("oauth_creds.json"), body.to_string()).expect("login file");
+    }
+
+    fn qwen_login_provider(server: &wiremock::MockServer, api_key: &str) -> Box<dyn Provider> {
+        create_provider_with_url(
+            "qwen-oauth",
+            Some(api_key),
+            Some(&format!("{}/v1", server.uri())),
+        )
+        .expect("the provider builds")
+    }
+
+    /// A login with less than the renewal margin left is renewed when the next
+    /// request is sent, not when the provider is built, and that request
+    /// carries the new token.
+    #[tokio::test]
+    async fn qwen_login_near_expiry_is_renewed_on_the_next_request() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::test_env::HomeGuard::set(home.path());
+        let _resource = crate::test_env::EnvGuard::unset(QWEN_OAUTH_RESOURCE_URL_ENV);
+        let server = login_endpoint(renewed_token_response("token-renewed")).await;
+        let _endpoint = TokenEndpointOverride::set(format!("{}/token", server.uri()));
+        write_qwen_login(home.path(), "token-stale", "refresh-user-a", 60);
+
+        let provider = qwen_login_provider(&server, QWEN_OAUTH_PLACEHOLDER);
+        assert_eq!(refresh_calls(&server).await, 0, "building must not refresh");
+
+        provider
+            .simple_chat("hi", "mock-model", 0.0)
+            .await
+            .expect("the renewed login answers");
+
+        assert_eq!(refresh_calls(&server).await, 1);
+        assert_eq!(
+            chat_authorization(&server).await,
+            vec!["Bearer token-renewed".to_string()]
+        );
+    }
+
+    /// A login that is still good is sent as it is and never refreshed.
+    #[tokio::test]
+    async fn qwen_login_with_life_left_is_not_refreshed() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::test_env::HomeGuard::set(home.path());
+        let _resource = crate::test_env::EnvGuard::unset(QWEN_OAUTH_RESOURCE_URL_ENV);
+        let server = login_endpoint(renewed_token_response("token-renewed")).await;
+        let _endpoint = TokenEndpointOverride::set(format!("{}/token", server.uri()));
+        write_qwen_login(home.path(), "token-valid", "refresh-user-a", 3600);
+
+        let provider = qwen_login_provider(&server, QWEN_OAUTH_PLACEHOLDER);
+        for _ in 0..2 {
+            provider
+                .simple_chat("hi", "mock-model", 0.0)
+                .await
+                .expect("the login answers");
+        }
+
+        assert_eq!(refresh_calls(&server).await, 0);
+        assert_eq!(
+            chat_authorization(&server).await,
+            vec!["Bearer token-valid".to_string(); 2]
+        );
+    }
+
+    /// A login made with the Qwen CLI after the provider was built is read at
+    /// renewal time and used without a refresh call.
+    #[tokio::test]
+    async fn qwen_login_written_after_build_is_read_at_renewal() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::test_env::HomeGuard::set(home.path());
+        let _resource = crate::test_env::EnvGuard::unset(QWEN_OAUTH_RESOURCE_URL_ENV);
+        let server = login_endpoint(renewed_token_response("token-renewed")).await;
+        let _endpoint = TokenEndpointOverride::set(format!("{}/token", server.uri()));
+        write_qwen_login(home.path(), "token-stale", "refresh-user-a", 60);
+
+        let provider = qwen_login_provider(&server, QWEN_OAUTH_PLACEHOLDER);
+        write_qwen_login(home.path(), "token-from-new-login", "refresh-user-a", 3600);
+        provider
+            .simple_chat("hi", "mock-model", 0.0)
+            .await
+            .expect("the new login answers");
+
+        assert_eq!(refresh_calls(&server).await, 0);
+        assert_eq!(
+            chat_authorization(&server).await,
+            vec!["Bearer token-from-new-login".to_string()]
+        );
+    }
+
+    /// With no login at all when the provider is built, one made later is used.
+    #[tokio::test]
+    async fn qwen_provider_built_without_a_login_uses_one_made_later() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::test_env::HomeGuard::set(home.path());
+        let _resource = crate::test_env::EnvGuard::unset(QWEN_OAUTH_RESOURCE_URL_ENV);
+        let server = login_endpoint(renewed_token_response("token-renewed")).await;
+        let _endpoint = TokenEndpointOverride::set(format!("{}/token", server.uri()));
+
+        let provider = qwen_login_provider(&server, QWEN_OAUTH_PLACEHOLDER);
+        write_qwen_login(home.path(), "token-from-new-login", "refresh-user-a", 3600);
+        provider
+            .simple_chat("hi", "mock-model", 0.0)
+            .await
+            .expect("the new login answers");
+
+        assert_eq!(refresh_calls(&server).await, 0);
+        assert_eq!(
+            chat_authorization(&server).await,
+            vec!["Bearer token-from-new-login".to_string()]
+        );
+    }
+
+    /// An explicit key and an env token are sent as they are, however stale the
+    /// login file is, and never refreshed.
+    #[tokio::test]
+    async fn qwen_explicit_key_and_env_token_are_never_refreshed() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::test_env::HomeGuard::set(home.path());
+        let _resource = crate::test_env::EnvGuard::unset(QWEN_OAUTH_RESOURCE_URL_ENV);
+        let server = login_endpoint(renewed_token_response("token-renewed")).await;
+        let _endpoint = TokenEndpointOverride::set(format!("{}/token", server.uri()));
+        write_qwen_login(home.path(), "token-stale", "refresh-user-a", -3600);
+
+        let explicit = qwen_login_provider(&server, "key-explicit");
+        explicit
+            .simple_chat("hi", "mock-model", 0.0)
+            .await
+            .expect("the explicit key answers");
+
+        let _token = crate::test_env::EnvGuard::set(QWEN_OAUTH_TOKEN_ENV, "token-from-env");
+        let from_env = qwen_login_provider(&server, QWEN_OAUTH_PLACEHOLDER);
+        from_env
+            .simple_chat("hi", "mock-model", 0.0)
+            .await
+            .expect("the env token answers");
+
+        assert_eq!(refresh_calls(&server).await, 0);
+        assert_eq!(
+            chat_authorization(&server).await,
+            vec![
+                "Bearer key-explicit".to_string(),
+                "Bearer token-from-env".to_string()
+            ]
+        );
+    }
+
+    /// A refresh the server refuses fails that request with a sentence that
+    /// names the fix, and nothing is sent to the chat endpoint.
+    #[tokio::test]
+    async fn qwen_refresh_failure_names_the_fix_and_sends_nothing() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::test_env::HomeGuard::set(home.path());
+        let _resource = crate::test_env::EnvGuard::unset(QWEN_OAUTH_RESOURCE_URL_ENV);
+        let server = login_endpoint(wiremock::ResponseTemplate::new(400).set_body_json(
+            serde_json::json!({"error": "invalid_grant", "error_description": "refresh token revoked sk-fake-secret-value-0000"}),
+        ))
+        .await;
+        let _endpoint = TokenEndpointOverride::set(format!("{}/token", server.uri()));
+        write_qwen_login(home.path(), "token-stale", "refresh-user-a", -3600);
+
+        let provider = qwen_login_provider(&server, QWEN_OAUTH_PLACEHOLDER);
+        let error = provider
+            .simple_chat("hi", "mock-model", 0.0)
+            .await
+            .expect_err("a refused refresh fails the request")
+            .to_string();
+
+        assert!(error.contains("`qwen`"), "{error}");
+        assert!(error.contains(QWEN_OAUTH_TOKEN_ENV), "{error}");
+        assert!(!error.contains("token-stale"), "{error}");
+        assert!(!error.contains("refresh-user-a"), "{error}");
+        assert!(error.contains("revoked"), "{error}");
+        assert!(
+            !error.contains("sk-fake-secret-value-0000"),
+            "a secret in the server's message must not reach the error: {error}"
+        );
+        assert!(chat_authorization(&server).await.is_empty());
+    }
+
+    /// The streaming path renews the login too.
+    #[tokio::test]
+    async fn qwen_streaming_request_carries_the_renewed_token() {
+        use futures_util::StreamExt;
+
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::test_env::HomeGuard::set(home.path());
+        let _resource = crate::test_env::EnvGuard::unset(QWEN_OAUTH_RESOURCE_URL_ENV);
+        let server = login_endpoint(renewed_token_response("token-renewed")).await;
+        let _endpoint = TokenEndpointOverride::set(format!("{}/token", server.uri()));
+        write_qwen_login(home.path(), "token-stale", "refresh-user-a", 60);
+
+        let provider = qwen_login_provider(&server, QWEN_OAUTH_PLACEHOLDER);
+        let mut stream = provider.stream_chat_with_system(
+            None,
+            "hi",
+            "mock-model",
+            0.0,
+            traits::StreamOptions::new(true),
+        );
+        while stream.next().await.is_some() {}
+
+        assert_eq!(refresh_calls(&server).await, 1);
+        assert_eq!(
+            chat_authorization(&server).await,
+            vec!["Bearer token-renewed".to_string()]
+        );
+    }
+
+    fn minimax_refresh_response(access_token: &str) -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "success",
+            "access_token": access_token,
+        }))
+    }
+
+    /// The MiniMax provider the factory builds for `minimax-oauth`, pointed at
+    /// the local listener.
+    fn minimax_login_provider(
+        server: &wiremock::MockServer,
+        api_key: Option<&str>,
+    ) -> OpenAiCompatibleProvider {
+        let key = resolve_provider_credential("minimax-oauth", api_key);
+        build_minimax_provider(
+            "minimax-oauth",
+            &format!("{}/v1", server.uri()),
+            api_key,
+            key.as_deref(),
+        )
+    }
+
+    /// Environment for a MiniMax refresh-token login: nothing else configured.
+    fn minimax_refresh_env() -> Vec<crate::test_env::EnvGuard> {
+        vec![
+            crate::test_env::EnvGuard::unset(MINIMAX_OAUTH_TOKEN_ENV),
+            crate::test_env::EnvGuard::unset(MINIMAX_API_KEY_ENV),
+            crate::test_env::EnvGuard::unset(MINIMAX_OAUTH_REGION_ENV),
+            crate::test_env::EnvGuard::set(MINIMAX_OAUTH_REFRESH_TOKEN_ENV, "refresh-user-a"),
+        ]
+    }
+
+    /// A refresh token is exchanged when the first request is sent, not when
+    /// the provider is built, and that request carries the new access token.
+    #[tokio::test]
+    async fn minimax_refresh_token_is_exchanged_on_the_first_request() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _minimax = minimax_refresh_env();
+        let _generic = crate::test_env::EnvGuard::set("RANTAICLAW_API_KEY", "key-generic");
+        let server = login_endpoint(minimax_refresh_response("minimax-renewed")).await;
+        let _endpoint = TokenEndpointOverride::set(format!("{}/token", server.uri()));
+
+        let provider = minimax_login_provider(&server, Some(MINIMAX_OAUTH_PLACEHOLDER));
+        assert_eq!(refresh_calls(&server).await, 0, "building must not refresh");
+
+        provider
+            .simple_chat("hi", "mock-model", 0.0)
+            .await
+            .expect("the renewed token answers");
+
+        assert_eq!(refresh_calls(&server).await, 1);
+        assert_eq!(
+            chat_authorization(&server).await,
+            vec!["Bearer minimax-renewed".to_string()]
+        );
+    }
+
+    /// A renewed access token is kept: later requests send it without another
+    /// refresh call.
+    #[tokio::test]
+    async fn minimax_renewed_token_is_not_refreshed_again_while_it_lasts() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _minimax = minimax_refresh_env();
+        let _generic = crate::test_env::EnvGuard::set("RANTAICLAW_API_KEY", "key-generic");
+        let server = login_endpoint(minimax_refresh_response("minimax-renewed")).await;
+        let _endpoint = TokenEndpointOverride::set(format!("{}/token", server.uri()));
+
+        let provider = minimax_login_provider(&server, None);
+        for _ in 0..3 {
+            provider
+                .simple_chat("hi", "mock-model", 0.0)
+                .await
+                .expect("the renewed token answers");
+        }
+
+        assert_eq!(refresh_calls(&server).await, 1);
+        assert_eq!(
+            chat_authorization(&server).await,
+            vec!["Bearer minimax-renewed".to_string(); 3]
+        );
+    }
+
+    /// An explicit key and an env token are sent as they are even when a
+    /// refresh token is also set, and never refreshed.
+    #[tokio::test]
+    async fn minimax_explicit_key_and_env_token_are_never_refreshed() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _minimax = minimax_refresh_env();
+        let server = login_endpoint(minimax_refresh_response("minimax-renewed")).await;
+        let _endpoint = TokenEndpointOverride::set(format!("{}/token", server.uri()));
+
+        let explicit = minimax_login_provider(&server, Some("key-explicit"));
+        explicit
+            .simple_chat("hi", "mock-model", 0.0)
+            .await
+            .expect("the explicit key answers");
+
+        let _token = crate::test_env::EnvGuard::set(MINIMAX_OAUTH_TOKEN_ENV, "token-from-env");
+        let from_env = minimax_login_provider(&server, Some(MINIMAX_OAUTH_PLACEHOLDER));
+        from_env
+            .simple_chat("hi", "mock-model", 0.0)
+            .await
+            .expect("the env token answers");
+
+        assert_eq!(refresh_calls(&server).await, 0);
+        assert_eq!(
+            chat_authorization(&server).await,
+            vec![
+                "Bearer key-explicit".to_string(),
+                "Bearer token-from-env".to_string()
+            ]
+        );
+    }
+
+    /// A refused refresh fails that request with a sentence that names the
+    /// fix, and nothing reaches the chat endpoint.
+    #[tokio::test]
+    async fn minimax_refresh_failure_names_the_fix_and_sends_nothing() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _minimax = minimax_refresh_env();
+        let server = login_endpoint(wiremock::ResponseTemplate::new(401).set_body_json(
+            serde_json::json!({"base_resp": {"status_msg": "refresh token revoked sk-fake-secret-value-0000"}}),
+        ))
+        .await;
+        let _endpoint = TokenEndpointOverride::set(format!("{}/token", server.uri()));
+
+        let provider = minimax_login_provider(&server, None);
+        let error = provider
+            .simple_chat("hi", "mock-model", 0.0)
+            .await
+            .expect_err("a refused refresh fails the request")
+            .to_string();
+
+        assert!(error.contains(MINIMAX_OAUTH_REFRESH_TOKEN_ENV), "{error}");
+        assert!(error.contains(MINIMAX_OAUTH_TOKEN_ENV), "{error}");
+        assert!(!error.contains("refresh-user-a"), "{error}");
+        assert!(error.contains("revoked"), "{error}");
+        assert!(
+            !error.contains("sk-fake-secret-value-0000"),
+            "a secret in the server's message must not reach the error: {error}"
+        );
+        assert!(chat_authorization(&server).await.is_empty());
+    }
+
+    /// Asking whether MiniMax has a usable credential does not call the
+    /// network: a refresh token that is set counts.
+    #[tokio::test]
+    async fn minimax_credential_check_does_not_refresh() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let refresh_env = minimax_refresh_env();
+        let server = login_endpoint(minimax_refresh_response("minimax-renewed")).await;
+        let _endpoint = TokenEndpointOverride::set(format!("{}/token", server.uri()));
+
+        assert!(has_usable_credential(
+            "minimax-oauth",
+            Some(MINIMAX_OAUTH_PLACEHOLDER),
+            None
+        ));
+        assert!(has_usable_credential("minimax", None, None));
+        assert_eq!(refresh_calls(&server).await, 0);
+
+        drop(refresh_env);
+        let _none = crate::test_env::EnvGuard::unset(MINIMAX_OAUTH_REFRESH_TOKEN_ENV);
+        assert!(!has_usable_credential(
+            "minimax-oauth",
+            Some(MINIMAX_OAUTH_PLACEHOLDER),
+            None
+        ));
+    }
+
+    fn rotating_token_response() -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "token-renewed",
+            "refresh_token": "refresh-rotated-b",
+            "expires_in": 60,
+        }))
+    }
+
+    /// The body of each refresh request, in order.
+    async fn refresh_bodies(server: &wiremock::MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|req| req.url.path() == "/token")
+            .map(|req| String::from_utf8_lossy(&req.body).into_owned())
+            .collect()
+    }
+
+    /// A refresh token the server rotated is kept in memory and sent at the
+    /// next renewal; the login file is not written.
+    #[tokio::test]
+    async fn qwen_rotated_refresh_token_is_used_for_the_next_renewal() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::test_env::HomeGuard::set(home.path());
+        let _resource = crate::test_env::EnvGuard::unset(QWEN_OAUTH_RESOURCE_URL_ENV);
+        let server = login_endpoint(rotating_token_response()).await;
+        let _endpoint = TokenEndpointOverride::set(format!("{}/token", server.uri()));
+        write_qwen_login(home.path(), "token-stale", "refresh-file-a", 60);
+        let login_file = home.path().join(".qwen/oauth_creds.json");
+        let file_before = std::fs::read(&login_file).expect("login file");
+
+        let provider = qwen_login_provider(&server, QWEN_OAUTH_PLACEHOLDER);
+        for _ in 0..2 {
+            provider
+                .simple_chat("hi", "mock-model", 0.0)
+                .await
+                .expect("the renewed login answers");
+        }
+
+        let bodies = refresh_bodies(&server).await;
+        assert_eq!(bodies.len(), 2, "{bodies:?}");
+        assert!(
+            bodies[0].contains("refresh_token=refresh-file-a"),
+            "{bodies:?}"
+        );
+        assert!(
+            bodies[1].contains("refresh_token=refresh-rotated-b"),
+            "{bodies:?}"
+        );
+        assert_eq!(std::fs::read(&login_file).expect("login file"), file_before);
+    }
+
+    /// A login made with the Qwen CLI after a rotation has a different refresh
+    /// token in the file, and that one wins over the rotated one.
+    #[tokio::test]
+    async fn qwen_new_login_refresh_token_outranks_a_rotated_one() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::test_env::HomeGuard::set(home.path());
+        let _resource = crate::test_env::EnvGuard::unset(QWEN_OAUTH_RESOURCE_URL_ENV);
+        let server = login_endpoint(rotating_token_response()).await;
+        let _endpoint = TokenEndpointOverride::set(format!("{}/token", server.uri()));
+        write_qwen_login(home.path(), "token-stale", "refresh-file-a", 60);
+
+        let provider = qwen_login_provider(&server, QWEN_OAUTH_PLACEHOLDER);
+        provider
+            .simple_chat("hi", "mock-model", 0.0)
+            .await
+            .expect("the renewed login answers");
+        write_qwen_login(home.path(), "token-stale-2", "refresh-file-c", -3600);
+        provider
+            .simple_chat("hi", "mock-model", 0.0)
+            .await
+            .expect("the renewed login answers");
+
+        let bodies = refresh_bodies(&server).await;
+        assert_eq!(bodies.len(), 2, "{bodies:?}");
+        assert!(
+            bodies[1].contains("refresh_token=refresh-file-c"),
+            "{bodies:?}"
+        );
+    }
+
+    /// A refusal whose body is not JSON is quoted without secrets.
+    #[tokio::test]
+    async fn qwen_refresh_failure_with_a_raw_body_hides_secrets() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::test_env::HomeGuard::set(home.path());
+        let _resource = crate::test_env::EnvGuard::unset(QWEN_OAUTH_RESOURCE_URL_ENV);
+        let server = login_endpoint(
+            wiremock::ResponseTemplate::new(500)
+                .set_body_string("gateway error for sk-fake-secret-value-0000"),
+        )
+        .await;
+        let _endpoint = TokenEndpointOverride::set(format!("{}/token", server.uri()));
+        write_qwen_login(home.path(), "token-stale", "refresh-user-a", -3600);
+
+        let provider = qwen_login_provider(&server, QWEN_OAUTH_PLACEHOLDER);
+        let error = provider
+            .simple_chat("hi", "mock-model", 0.0)
+            .await
+            .expect_err("a failed refresh fails the request")
+            .to_string();
+
+        assert!(error.contains("gateway error"), "{error}");
+        assert!(error.contains(QWEN_OAUTH_TOKEN_ENV), "{error}");
+        assert!(!error.contains("sk-fake-secret-value-0000"), "{error}");
     }
 }

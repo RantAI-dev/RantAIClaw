@@ -105,10 +105,16 @@ ANTHROPIC_API_KEY, store a key in config, or paste an auth profile`.
 | `lmstudio` | `lm-studio` | Yes | (optional; local by default) |
 | `llamacpp` | `llama.cpp` | Yes | `LLAMACPP_API_KEY` (optional; only if server auth is enabled) |
 | `nvidia` | `nvidia-nim`, `build.nvidia.com` | No | `NVIDIA_API_KEY` |
+| `astrai` | — | No | `ASTRAI_API_KEY` |
 
 The OpenAI-compatible, Anthropic, OpenRouter, Ollama, Copilot and Bedrock providers
 report the token counts that feed the daily token ceiling (`[cost] max_tokens_per_day`);
 a provider that does not report them adds nothing to the day's total.
+
+A request that a provider refuses before sending anything fails the turn at once, with no
+retry and no backoff wait, because a retry would end in the same sentence. These refusals
+are a missing Anthropic, AWS Bedrock or OpenAI Codex credential, an OpenAI Codex login that
+names no account, and an Ollama `:cloud` model on a local endpoint or without an API key.
 
 ### Gemini Notes
 
@@ -256,7 +262,7 @@ Then provide one of the following credentials via environment variables:
 
 - `MINIMAX_OAUTH_TOKEN` (preferred, direct access token)
 - `MINIMAX_API_KEY` (legacy/static token)
-- `MINIMAX_OAUTH_REFRESH_TOKEN` (auto-refreshes access token at startup)
+- `MINIMAX_OAUTH_REFRESH_TOKEN` (exchanged for an access token when a request needs one, and again when that token is about 30 minutes old; the refresh response names no expiry, so 30 minutes is assumed)
 
 Optional:
 
@@ -283,7 +289,16 @@ Credential resolution for `qwen-code`:
 2. `QWEN_OAUTH_TOKEN`
 3. `~/.qwen/oauth_creds.json` (reuses Qwen Code cached OAuth credentials)
 4. Optional refresh via `QWEN_OAUTH_REFRESH_TOKEN` (or cached refresh token)
-5. If no OAuth placeholder is used, `DASHSCOPE_API_KEY` can still be used as fallback
+5. If no OAuth placeholder is used and there is no Qwen login at all (no token or refresh token in
+   `~/.qwen/oauth_creds.json` and no `QWEN_OAUTH_REFRESH_TOKEN`), `DASHSCOPE_API_KEY` is used instead.
+   A login that exists but cannot be renewed does not fall back to it: the request fails with the fix.
+
+The login is renewed while the daemon runs. A request made when the access token has
+under two minutes left (or has expired) first re-reads `~/.qwen/oauth_creds.json`, so a
+login made with the Qwen CLI afterwards is used, and only then exchanges the refresh token.
+RantaiClaw never writes that file. A failed renewal fails that request and names the fix:
+log in again with `qwen`, or set `QWEN_OAUTH_TOKEN`. An explicit key and `QWEN_OAUTH_TOKEN`
+are sent as they are and never refreshed.
 
 Optional endpoint override:
 

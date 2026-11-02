@@ -1,5 +1,6 @@
 use crate::auth::openai_oauth::extract_account_id_from_jwt;
 use crate::auth::AuthService;
+use crate::providers::local_refusal::LocalRefusal;
 use crate::providers::traits::{ChatMessage, Provider};
 use crate::providers::ProviderRuntimeOptions;
 use async_trait::async_trait;
@@ -369,6 +370,19 @@ async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<St
     extract_responses_text(&parsed).ok_or_else(|| anyhow::anyhow!("No response from OpenAI Codex"))
 }
 
+/// The account id of the login: the stored one, else the one inside the access
+/// token. A local refusal when neither names it.
+fn account_id_or_refusal(stored: Option<String>, access_token: &str) -> anyhow::Result<String> {
+    stored
+        .or_else(|| extract_account_id_from_jwt(access_token))
+        .ok_or_else(|| {
+            LocalRefusal::new(
+                "OpenAI Codex account id not found in auth profile/token. Run `rantaiclaw auth login --provider openai-codex` again.",
+            )
+            .into()
+        })
+}
+
 impl OpenAiCodexProvider {
     async fn send_responses_request(
         &self,
@@ -385,18 +399,14 @@ impl OpenAiCodexProvider {
             .get_valid_openai_access_token(self.auth_profile_override.as_deref())
             .await?
             .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "OpenAI Codex auth profile not found. Run `rantaiclaw auth login --provider openai-codex`."
+                LocalRefusal::new(
+                    "OpenAI Codex auth profile not found. Run `rantaiclaw auth login --provider openai-codex`.",
                 )
             })?;
-        let account_id = profile
-            .and_then(|profile| profile.account_id)
-            .or_else(|| extract_account_id_from_jwt(&access_token))
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "OpenAI Codex account id not found in auth profile/token. Run `rantaiclaw auth login --provider openai-codex` again."
-                )
-            })?;
+        let account_id = account_id_or_refusal(
+            profile.and_then(|profile| profile.account_id),
+            &access_token,
+        )?;
         let normalized_model = normalize_model_id(model);
 
         let request = ResponsesRequest {
@@ -640,5 +650,45 @@ data: [DONE]
         assert_eq!(input.len(), 1);
         let json = serde_json::to_value(&input[0]).unwrap();
         assert_eq!(json["role"], "user");
+    }
+
+    /// With no stored login the request is refused before anything is sent,
+    /// as a typed error the retry wrapper recognises. The sentence is what
+    /// the operator has always seen.
+    #[tokio::test]
+    async fn missing_login_is_refused_as_a_local_refusal() {
+        let state_dir = tempfile::tempdir().expect("temp state dir");
+        let provider = OpenAiCodexProvider::new(&ProviderRuntimeOptions {
+            rantaiclaw_dir: Some(state_dir.path().to_path_buf()),
+            secrets_encrypt: false,
+            ..ProviderRuntimeOptions::default()
+        });
+
+        let error = provider
+            .chat_with_system(None, "hello", "gpt-5-codex", 0.0)
+            .await
+            .expect_err("a provider with no login must refuse");
+        assert!(crate::providers::local_refusal::is_local_refusal(&error));
+        assert_eq!(
+            error.to_string(),
+            "OpenAI Codex auth profile not found. Run `rantaiclaw auth login --provider openai-codex`."
+        );
+    }
+
+    /// A login that names no account id is refused the same way. The token
+    /// here is not a JWT, so the fallback cannot supply one either.
+    #[test]
+    fn missing_account_id_is_refused_as_a_local_refusal() {
+        let error = account_id_or_refusal(None, "not-a-jwt")
+            .expect_err("no account id anywhere must refuse");
+        assert!(crate::providers::local_refusal::is_local_refusal(&error));
+        assert_eq!(
+            error.to_string(),
+            "OpenAI Codex account id not found in auth profile/token. Run `rantaiclaw auth login --provider openai-codex` again."
+        );
+
+        let account_id = account_id_or_refusal(Some("acct_user_a".into()), "not-a-jwt")
+            .expect("a stored account id must be used");
+        assert_eq!(account_id, "acct_user_a");
     }
 }

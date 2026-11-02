@@ -8132,7 +8132,7 @@ mod tests {
         let factory = build_tools_factory(
             runtime,
             Arc::new(MockMemory),
-            Arc::new(SecurityPolicy::default()),
+            Arc::new(SecurityPolicy::default().with_workspace_dir(ws.path().to_path_buf())),
         );
 
         let args = |n: u32| serde_json::json!({ "path": format!("n{n}.txt"), "content": "hi" });
@@ -8183,7 +8183,7 @@ mod tests {
         let factory = build_tools_factory(
             runtime,
             Arc::new(MockMemory),
-            Arc::new(SecurityPolicy::default()),
+            Arc::new(SecurityPolicy::default().with_workspace_dir(ws.path().to_path_buf())),
         );
 
         let args = serde_json::json!({ "path": "note.txt", "content": "hi" });

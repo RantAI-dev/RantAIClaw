@@ -290,6 +290,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A Qwen Code or MiniMax login that expires while the daemon runs is renewed.** Both providers
+  resolved their access token once, when the provider was built, and the gateway and the channels
+  keep a provider for days, so every turn after the expiry sent the expired token until a restart.
+  The token is now held in memory and renewed by the request that finds it expired or within two
+  minutes of expiry. Qwen Code re-reads `~/.qwen/oauth_creds.json` first (a login made with the
+  `qwen` CLI since then is used as it is) and only then exchanges the refresh token; the file is
+  never written. MiniMax exchanges `MINIMAX_OAUTH_REFRESH_TOKEN`; its refresh response names no
+  expiry, so a refreshed token is assumed good for 30 minutes. The exchange runs on the blocking
+  pool, so it no longer blocks the async runtime, and building a provider or asking
+  `has_usable_credential` no longer calls the network. A refresh that fails fails that request with
+  a sentence that names the fix. An explicit key and an env token are sent as they are.
+
+- **A request refused before anything is sent is no longer retried.** A missing Anthropic, AWS
+  Bedrock or OpenAI Codex credential, an OpenAI Codex login without an account id, and an Ollama
+  `:cloud` model on a local endpoint or without an API key each waited out the retry backoff
+  (about 3.5 s with the defaults) and then failed with the same sentence. They now fail at once.
+  The sentences are unchanged.
+
+- `rantaiclaw providers` lists `astrai`, which the factory already built.
+
 - The OpenRC units written before the profile doors always pinned a profile with
   `RANTAICLAW_PROFILE` and ran `--config-dir /etc/rantaiclaw daemon`, so the config came from
   `/etc/rantaiclaw` while the per-profile stores followed the pinned profile — the split the profile
