@@ -47,13 +47,14 @@ ignore = [
     # this entry does not list). RUSTSEC-2025-0168 / CVE-2025-29787, the
     # advisory this entry was written against, is patched in >= 2.3.0 and so
     # does not affect 8.6.0. Since 2026-10-17 three further advisories do
-    # affect 8.6.0: RUSTSEC-2026-0367, -0368 and -0369, all about `extract()`
-    # unpacking archive entries to disk. Those three are waived by id in the
+    # affect 8.6.0: RUSTSEC-2026-0367, -0368 and -0369. Since 2026-10-22 a
+    # fourth, RUSTSEC-2026-0429, does too. All four are about `extract()`
+    # unpacking archive entries to disk, and all four are waived by id in the
     # advisory ignore list below, not by this entry.
     #
     # REMOVE once calamine and docx-rs both accept zip 9 and the lockfile picks
     # it up (or 8.6.0 is un-yanked).
-    { crate = "zip@8.6.0", reason = "no in-range non-yanked zip exists: yanked with every 7.x/8.x release (checked 2026-10-16, only 9.0.3 remains); calamine 0.36.1 and docx-rs 0.4.22 pin ^8.6; the three 2026-10 extract() advisories are waived by RUSTSEC id in the advisory ignore; remove once both accept zip 9" },
+    { crate = "zip@8.6.0", reason = "no in-range non-yanked zip exists: yanked with every 7.x/8.x release (checked 2026-10-16, only 9.0.3 remains); calamine 0.36.1 and docx-rs 0.4.22 pin ^8.6; the four extract() advisories (RUSTSEC-2026-0367, -0368, -0369 and -0429) are waived by RUSTSEC id in the advisory ignore; remove once both accept zip 9" },
     # bitmaps v3.2.1 — unsound `Bitmap::try_from(&[u8])`, no patched version.
     # Reached only through the opt-in `channel-matrix` feature via matrix-sdk 0.18
     # → imbl 6.1.0 → bitmaps (verified: `cargo tree -i bitmaps` with default
@@ -160,22 +161,26 @@ ignore = [
     # font parser flagged unmaintained; parse-only path over operator-supplied
     # documents, no fixed release (lopdf 0.42 is current). Revisit on a lopdf bump.
     "RUSTSEC-2026-0192",
-    # zip 8.6.0 — RUSTSEC-2026-0367, RUSTSEC-2026-0368 and RUSTSEC-2026-0369
-    # (three 2026-10 advisories, patched only in >= 9.0.0). All three concern
-    # `ZipArchive::extract()` / `ZipStreamReader::extract()`, which unpack
-    # archive entries to disk; nothing in `src/` calls into the zip crate
-    # directly, and the only reach is `kb-office`'s calamine 0.36.1 and
-    # docx-rs 0.4.22, which both read entries into memory (calamine never
-    # calls `extract`; docx-rs reads through `ZipArchive<Cursor<&[u8]>>`).
+    # zip 8.6.0 — RUSTSEC-2026-0367, RUSTSEC-2026-0368, RUSTSEC-2026-0369 and
+    # RUSTSEC-2026-0429 (four 2026-10 advisories, patched only in >= 9.0.0).
+    # All four concern `ZipArchive::extract()` / `ZipStreamReader::extract()`,
+    # which unpack archive entries to disk.
+    # RUSTSEC-2026-0429 is the one where `ZipArchive::extract()` aborts the
+    # process on a symlink entry with a large declared size. Nothing in `src/`
+    # calls into the zip crate directly, and the only reach is `kb-office`'s
+    # calamine 0.36.1 and docx-rs 0.4.22, which both read entries into memory
+    # (calamine never calls `extract`; docx-rs reads through
+    # `ZipArchive<Cursor<&[u8]>>`). Neither crate contains an `extract(` call.
     # No default build contains zip at all. No in-range zip release exists to
     # move to: every 7.x/8.x was yanked (see the yanked entry above) and both
     # dependers still pin ^8.6.
     #
-    # REVIEW BY 2026-11-15: drop these three ids once calamine and docx-rs
+    # REVIEW BY 2026-11-15: drop these four ids once calamine and docx-rs
     # accept zip 9 and the lockfile picks it up.
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
+    "RUSTSEC-2026-0429",
     # webpki-roots v0.26.11 — RUSTSEC-2026-0381, emSign root removed from the
     # bundled root list. The advisory matches 0.26.11 by version number only:
     # 0.26.x is a wrapper that depends on `webpki-roots` 1.x, the crate that
