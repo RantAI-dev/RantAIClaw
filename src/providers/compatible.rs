@@ -50,6 +50,36 @@ pub enum AuthStyle {
     Custom(String),
 }
 
+/// Whether `base_url` already names the chat endpoint itself, so nothing is
+/// appended to it.
+fn is_full_chat_endpoint(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url)
+        .map(|url| {
+            url.path()
+                .trim_end_matches('/')
+                .ends_with("/chat/completions")
+        })
+        .unwrap_or_else(|_| {
+            base_url
+                .trim_end_matches('/')
+                .ends_with("/chat/completions")
+        })
+}
+
+/// The model-list URL beside the chat endpoint of `base_url`: the same base the
+/// chat path resolves, with a trailing `/chat/completions` replaced by
+/// `/models`. A bare origin gets `<origin>/models`, as chat gets
+/// `<origin>/chat/completions`.
+pub(crate) fn models_url_for_base(base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    let root = if is_full_chat_endpoint(base) {
+        base.strip_suffix("/chat/completions").unwrap_or(base)
+    } else {
+        base
+    };
+    format!("{root}/models")
+}
+
 impl OpenAiCompatibleProvider {
     pub fn new(
         name: &str,
@@ -204,19 +234,7 @@ impl OpenAiCompatibleProvider {
     /// This allows custom providers with non-standard endpoints (e.g., VolcEngine ARK uses
     /// `/api/coding/v3/chat/completions` instead of `/v1/chat/completions`).
     fn chat_completions_url(&self) -> String {
-        let has_full_endpoint = reqwest::Url::parse(&self.base_url)
-            .map(|url| {
-                url.path()
-                    .trim_end_matches('/')
-                    .ends_with("/chat/completions")
-            })
-            .unwrap_or_else(|_| {
-                self.base_url
-                    .trim_end_matches('/')
-                    .ends_with("/chat/completions")
-            });
-
-        if has_full_endpoint {
+        if is_full_chat_endpoint(&self.base_url) {
             self.base_url.clone()
         } else {
             format!("{}/chat/completions", self.base_url)
@@ -2487,6 +2505,71 @@ mod tests {
             p.chat_completions_url(),
             "https://my-api.example.com/v2/llm/chat/completions-proxy/chat/completions"
         );
+    }
+
+    #[test]
+    fn models_url_for_base_appends_models_to_the_base_path() {
+        assert_eq!(
+            models_url_for_base("https://api.example.com/v1"),
+            "https://api.example.com/v1/models"
+        );
+        assert_eq!(
+            models_url_for_base("https://api.example.com/v1/"),
+            "https://api.example.com/v1/models"
+        );
+    }
+
+    #[test]
+    fn models_url_for_base_replaces_a_full_chat_endpoint() {
+        assert_eq!(
+            models_url_for_base("https://ark.example.com/api/coding/v3/chat/completions"),
+            "https://ark.example.com/api/coding/v3/models"
+        );
+        assert_eq!(
+            models_url_for_base("https://api.example.com/v1/chat/completions/"),
+            "https://api.example.com/v1/models"
+        );
+    }
+
+    #[test]
+    fn models_url_for_base_keeps_a_bare_origin_without_adding_v1() {
+        // Chat posts to `<origin>/chat/completions` for a bare origin, so the
+        // model list sits beside it at `<origin>/models`.
+        assert_eq!(
+            models_url_for_base("http://127.0.0.1:8080"),
+            "http://127.0.0.1:8080/models"
+        );
+    }
+
+    #[test]
+    fn models_url_for_base_requires_the_exact_chat_suffix() {
+        assert_eq!(
+            models_url_for_base("https://api.example.com/v2/chat/completions-proxy"),
+            "https://api.example.com/v2/chat/completions-proxy/models"
+        );
+    }
+
+    /// The model list is the sibling of the chat endpoint for every base shape.
+    #[test]
+    fn models_url_for_base_is_the_sibling_of_the_chat_endpoint() {
+        for base in [
+            "https://api.example.com",
+            "https://api.example.com/",
+            "https://api.example.com/v1",
+            "https://api.example.com/v1/",
+            "https://api.example.com/api/coding/v3/chat/completions",
+            "https://api.example.com/v2/chat/completions-proxy",
+        ] {
+            let chat = make_provider("test", base, None).chat_completions_url();
+            let prefix = chat
+                .strip_suffix("/chat/completions")
+                .unwrap_or_else(|| panic!("chat url for {base} is {chat}"));
+            assert_eq!(
+                models_url_for_base(base),
+                format!("{prefix}/models"),
+                "{base}"
+            );
+        }
     }
 
     #[test]

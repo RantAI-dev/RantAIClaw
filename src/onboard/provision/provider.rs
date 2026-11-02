@@ -365,6 +365,25 @@ impl TuiProvisioner for ProviderProvisioner {
                     // `rantaiclaw setup`, the repair path — before the TUI
                     // existed.
                     if crate::providers::create_provider(provider_name, None).is_ok() {
+                        // A keyless Gemini builds, so the check above cannot
+                        // tell a working login from none. Ask for the
+                        // credential itself: config key, env key or CLI login.
+                        if matches!(provider_name, "gemini" | "google" | "google-gemini")
+                            && !crate::providers::has_usable_credential(provider_name, None, None)
+                        {
+                            send(
+                                &events,
+                                ProvisionEvent::Message {
+                                    severity: Severity::Warn,
+                                    text: "Gemini has no API key and no Gemini CLI login yet. \
+                                           The agent will start, but every turn fails until you \
+                                           run `gemini` to log in or set GEMINI_API_KEY. \
+                                           No restart is needed after either."
+                                        .into(),
+                                },
+                            )
+                            .await?;
+                        }
                         break;
                     }
                     send(
@@ -791,6 +810,91 @@ mod tests {
         let key_prompts = t.prompts().iter().filter(|l| l.contains("API key")).count();
         assert_eq!(key_prompts, 2, "re-enter must re-open the key prompt");
         assert!(t.aborted(), "second abort must still abort");
+    }
+
+    /// Every `Warn` message the run sent, in order.
+    fn warnings(t: &crate::onboard::provision::test_support::Transcript) -> Vec<String> {
+        t.events
+            .iter()
+            .filter_map(|e| match e {
+                super::ProvisionEvent::Message {
+                    severity: super::Severity::Warn,
+                    text,
+                } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn gemini_setup_with_empty_key(
+    ) -> (Config, crate::onboard::provision::test_support::Transcript) {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let profile = scratch_profile(tmp.path());
+        let mut config = Config::default();
+        let t = drive(
+            &ProviderProvisioner::new(),
+            &mut config,
+            &profile,
+            vec![
+                Answer::Pick(PICK_TIER_RECOMMENDED),
+                Answer::Pick(pick_provider("gemini")),
+                Answer::Text(""),
+                Answer::Pick(0), // default model
+            ],
+        )
+        .await;
+        (config, t)
+    }
+
+    /// A keyless Gemini builds, so the factory check passes it. With no Gemini
+    /// CLI login either, every turn would fail; the operator hears that once,
+    /// and saving stays allowed because a later login needs no restart.
+    #[tokio::test]
+    async fn gemini_with_no_key_and_no_login_saves_with_one_warning() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let (_home, _home_guard) = crate::providers::gemini_cli::gemini_home();
+
+        let (config, t) = gemini_setup_with_empty_key().await;
+
+        assert!(t.configured(), "saving stays allowed, got {:?}", t.outcome);
+        assert_eq!(config.default_provider.as_deref(), Some("gemini"));
+        let warnings = warnings(&t);
+        assert_eq!(warnings.len(), 1, "exactly one warning: {warnings:?}");
+        assert!(warnings[0].contains("every turn fails"));
+        assert!(warnings[0].contains("`gemini`"));
+        assert!(warnings[0].contains("GEMINI_API_KEY"));
+        assert!(warnings[0].contains("No restart"));
+    }
+
+    #[tokio::test]
+    async fn gemini_with_a_valid_cli_login_saves_without_a_warning() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let (home, _home_guard) = crate::providers::gemini_cli::gemini_home();
+        crate::providers::gemini_cli::write_gemini_creds_with_expiry(
+            &home,
+            "ya29.mock-token",
+            3_600_000,
+        );
+
+        let (_config, t) = gemini_setup_with_empty_key().await;
+
+        assert!(t.configured(), "got {:?}", t.outcome);
+        assert!(warnings(&t).is_empty(), "got {:?}", warnings(&t));
+    }
+
+    #[tokio::test]
+    async fn gemini_with_an_exported_key_saves_without_a_warning() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let (_home, _home_guard) = crate::providers::gemini_cli::gemini_home();
+        let _key = VarGuard::set("GEMINI_API_KEY", "AIzaSy-example-key");
+
+        let (_config, t) = gemini_setup_with_empty_key().await;
+
+        assert!(t.configured(), "got {:?}", t.outcome);
+        assert!(warnings(&t).is_empty(), "got {:?}", warnings(&t));
     }
 
     /// The capability split: openrouter constructs keyless

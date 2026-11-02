@@ -140,6 +140,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Custom endpoints support `models refresh`.** `custom:<url>` fetches `<url>/models` and `anthropic-custom:<url>` fetches `<url>/v1/models`, with the key chat requests send to that URL. The list is cached under the provider string as written, and a failed fetch keeps the earlier cache.
 - The console's `approval_request` event carries `always_available`. It is `true` when an Always answer holds for the rest of the conversation, and `false` when the modal should not offer Always (a high-risk command, or a tool forced to prompt by `always_ask` or Manual).
 - `rantaiclaw usage` prints today's token total for the active workspace, the daily ceiling from
   `[cost] max_tokens_per_day`, the percentage used, and per-model lines. A model with no configured
@@ -289,6 +290,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   TUI, the console) deletes it.
 
 ### Fixed
+
+- **`models refresh` tells a mistyped provider from one with no model list.** `rantaiclaw models
+  refresh --provider x`, `doctor models --provider x` and the console's refresh button answered an
+  unknown name with "does not support live model discovery yet", the sentence for a real provider
+  that has no model-list endpoint. An unknown name now gets "Unknown provider 'x'. Run
+  `rantaiclaw providers` to see the supported names." A listed name or alias, `custom:` and
+  `anthropic-custom:` still reach the existing checks.
+
+- **Every refused model refresh says how to use a newer model.** A provider with no model list, and
+  a fetch that needs a key (including the Gemini one, which now names `GEMINI_API_KEY` and says the
+  Gemini CLI login cannot list models), end with "type its ID with /model <id> or set
+  default_model". The console's refresh `detail` now carries the whole cause, not only the outer
+  "failed to refresh models" line, and the setup wizard's live-fetch failure line points at "Custom
+  model ID".
+
+- **The TUI setup warns about a Gemini with no key and no CLI login.** Since a keyless Gemini
+  builds, the empty-key check saved it without a word and every turn then failed. Setup now saves
+  as before but shows one warning that every turn fails until `gemini` is run or `GEMINI_API_KEY`
+  is set, and that no restart is needed after either. An exported key or a valid CLI login shows
+  no warning.
 
 - **A Qwen Code or MiniMax login that expires while the daemon runs is renewed.** Both providers
   resolved their access token once, when the provider was built, and the gateway and the channels

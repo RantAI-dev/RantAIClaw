@@ -3007,7 +3007,8 @@ async fn provider_models_refresh(
         "age_secs": cat.age_secs,
         "count": count,
         "refreshed": refresh_err.is_none(),
-        "detail": refresh_err.map(|e| e.to_string()),
+        "detail": refresh_err
+            .map(|e| crate::providers::scrub_secret_patterns(&format!("{e:#}"))),
     })))
 }
 
@@ -3600,6 +3601,62 @@ mod tests {
         let source_str = resp["sessions"][0]["source"].as_str().expect("source");
         assert_eq!(id_str, channel_id);
         assert_eq!(source_str, "channel");
+    }
+
+    /// The console shows `detail` as the reason a refresh did nothing, so it
+    /// carries the whole cause (the missing key) and the way forward, not only
+    /// the outer "failed to refresh" line.
+    #[tokio::test]
+    async fn provider_models_refresh_detail_carries_cause_and_way_forward() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let state = test_state();
+        state.config.lock().workspace_dir = workspace.path().to_path_buf();
+
+        let Json(body) =
+            provider_models_refresh(State(state), HeaderMap::new(), Path("gemini".to_string()))
+                .await
+                .expect("a failed refresh is still a 200");
+
+        assert_eq!(body["refreshed"], false);
+        let detail = body["detail"].as_str().expect("detail text");
+        assert!(detail.contains("GEMINI_API_KEY"), "detail: {detail}");
+        assert!(detail.contains("/model"), "detail: {detail}");
+    }
+
+    /// `detail` is shown in the console, which hides `api_url` secrets
+    /// everywhere else, so a refresh failure must not print the request URL.
+    #[tokio::test]
+    async fn provider_models_refresh_detail_does_not_echo_the_api_url_secret() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _no_proxy = crate::test_env::EnvGuard::set("NO_PROXY", "127.0.0.1,localhost");
+        let _no_proxy_lower = crate::test_env::EnvGuard::set("no_proxy", "127.0.0.1,localhost");
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(401)
+            .create_async()
+            .await;
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let state = test_state();
+        {
+            let mut config = state.config.lock();
+            config.workspace_dir = workspace.path().to_path_buf();
+            config.default_provider = Some("llamacpp".to_string());
+            config.api_url = Some(format!("{}/v1?key=MARKER_VALUE", server.url()));
+        }
+
+        let Json(body) =
+            provider_models_refresh(State(state), HeaderMap::new(), Path("llamacpp".to_string()))
+                .await
+                .expect("a failed refresh is still a 200");
+
+        assert_eq!(body["refreshed"], false);
+        let detail = body["detail"].as_str().expect("detail text");
+        assert!(detail.contains("401"), "detail: {detail}");
+        assert!(!detail.contains("MARKER_VALUE"), "detail: {detail}");
     }
 
     #[tokio::test]

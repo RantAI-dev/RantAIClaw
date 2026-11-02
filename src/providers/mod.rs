@@ -1308,6 +1308,50 @@ fn parse_custom_provider_url(
     }
 }
 
+/// The wire format of a `custom:` or `anthropic-custom:` endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CustomEndpointKind {
+    OpenAiCompatible,
+    Anthropic,
+}
+
+/// The format and base URL of a `custom:<url>` or `anthropic-custom:<url>`
+/// provider string, parsed as the factory parses it. `None` for any other name;
+/// `Some(Err)` when the URL after the prefix is missing, unparseable or not
+/// http(s).
+pub(crate) fn parse_custom_endpoint(
+    name: &str,
+) -> Option<anyhow::Result<(CustomEndpointKind, String)>> {
+    if let Some(raw_url) = name.strip_prefix("custom:") {
+        return Some(
+            parse_custom_provider_url(raw_url, "Custom provider", "custom:https://your-api.com")
+                .map(|url| (CustomEndpointKind::OpenAiCompatible, url)),
+        );
+    }
+    let raw_url = name.strip_prefix("anthropic-custom:")?;
+    Some(
+        parse_custom_provider_url(
+            raw_url,
+            "Anthropic-custom provider",
+            "anthropic-custom:https://your-api.com",
+        )
+        .map(|url| (CustomEndpointKind::Anthropic, url)),
+    )
+}
+
+/// The credential the chat path sends to the endpoint named `name`, for a
+/// caller that sends its own request there: `config_key` first, then (for the
+/// anthropic family, when `state_dir` is given) the stored auth profile, then
+/// the provider's env vars, then `RANTAICLAW_API_KEY` / `API_KEY`.
+pub(crate) fn resolve_chat_credential(
+    name: &str,
+    config_key: Option<&str>,
+    state_dir: Option<&Path>,
+) -> Option<String> {
+    resolve_provider_credential_with_kind(name, config_key, state_dir, None)
+        .map(|(credential, _kind)| credential)
+}
+
 /// Anthropic OAuth "setup-tokens" (`sk-ant-oat01-…`) authenticate via
 /// `Authorization: Bearer` + the `anthropic-beta` header — which rig-core's
 /// Anthropic client does not send (it uses `x-api-key`). Detect them so the

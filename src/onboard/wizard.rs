@@ -1543,29 +1543,67 @@ pub fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)>
 }
 
 fn supports_live_model_fetch(provider_name: &str) -> bool {
-    matches!(
-        canonical_provider_name(provider_name),
-        "openrouter"
-            | "openai"
-            | "anthropic"
-            | "groq"
-            | "mistral"
-            | "deepseek"
-            | "xai"
-            | "together-ai"
-            | "gemini"
-            | "ollama"
-            | "llamacpp"
-            | "astrai"
-            | "venice"
-            | "fireworks"
-            | "cohere"
-            | "moonshot"
-            | "glm"
-            | "zai"
-            | "qwen"
-            | "nvidia"
-    )
+    // A custom endpoint serves its own model list; its URL is validated when
+    // the list is fetched.
+    crate::providers::parse_custom_endpoint(provider_name).is_some()
+        || matches!(
+            canonical_provider_name(provider_name),
+            "openrouter"
+                | "openai"
+                | "anthropic"
+                | "groq"
+                | "mistral"
+                | "deepseek"
+                | "xai"
+                | "together-ai"
+                | "gemini"
+                | "ollama"
+                | "llamacpp"
+                | "astrai"
+                | "venice"
+                | "fireworks"
+                | "cohere"
+                | "moonshot"
+                | "glm"
+                | "zai"
+                | "qwen"
+                | "nvidia"
+        )
+}
+
+/// Whether `provider_name` is something the provider factory accepts: a listed
+/// name or alias, or a `custom:` / `anthropic-custom:` endpoint. The factory
+/// matches names exactly, so this does not fold case. The URL after the prefix
+/// is left to the fetch to validate.
+fn is_known_provider_name(provider_name: &str) -> bool {
+    let name = provider_name.trim();
+    let name = crate::providers::canonical_china_provider_name(name).unwrap_or(name);
+    name.starts_with("custom:")
+        || name.starts_with("anthropic-custom:")
+        || crate::providers::list_providers()
+            .iter()
+            .any(|info| info.name == name || info.aliases.contains(&name))
+}
+
+/// What to do when the model list cannot be fetched. Any model ID works without
+/// the list, so every refusal on the refresh path ends with this.
+const TYPE_MODEL_ID_HINT: &str =
+    "To use a model the list does not show, type its ID with /model <id> or set default_model.";
+
+/// Refuse a provider the model refresh cannot serve, saying whether the name is
+/// wrong or the provider just has no model-list endpoint.
+fn ensure_model_refresh_supported(provider_name: &str) -> Result<()> {
+    if supports_live_model_fetch(provider_name) {
+        return Ok(());
+    }
+    if !is_known_provider_name(provider_name) {
+        anyhow::bail!(
+            "Unknown provider '{provider_name}'. Run `rantaiclaw providers` to see the supported names."
+        );
+    }
+    anyhow::bail!(
+        "Provider '{provider_name}' does not support live model discovery yet. {TYPE_MODEL_ID_HINT}"
+    );
 }
 
 fn models_endpoint_for_provider(provider_name: &str) -> Option<&'static str> {
@@ -1724,14 +1762,18 @@ fn fetch_openai_compatible_models(
     if let Some(api_key) = api_key {
         request = request.bearer_auth(api_key);
     } else if !allow_unauthenticated {
-        bail!("model fetch requires API key for endpoint {safe_endpoint}");
+        bail!("model fetch requires API key for endpoint {safe_endpoint}. {TYPE_MODEL_ID_HINT}");
     }
 
+    // reqwest prints the request URL in its own errors, and `endpoint` may carry
+    // a credential in its query string, so drop the URL from every error.
     let payload: Value = request
         .send()
         .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(|e| e.without_url())
         .with_context(|| format!("model fetch failed: GET {safe_endpoint}"))?
         .json()
+        .map_err(|e| e.without_url())
         .context("failed to parse model list response")?;
 
     Ok(parse_openai_compatible_model_ids(&payload))
@@ -1747,22 +1789,29 @@ fn fetch_openrouter_models(api_key: Option<&str>) -> Result<Vec<String>> {
     let payload: Value = request
         .send()
         .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(|e| e.without_url())
         .context("model fetch failed: GET https://openrouter.ai/api/v1/models")?
         .json()
+        .map_err(|e| e.without_url())
         .context("failed to parse OpenRouter model list response")?;
 
     Ok(parse_openai_compatible_model_ids(&payload))
 }
 
-fn fetch_anthropic_models(api_key: Option<&str>) -> Result<Vec<String>> {
+const ANTHROPIC_MODELS_URL: &str = "https://api.anthropic.com/v1/models";
+
+fn fetch_anthropic_models(models_url: &str, api_key: Option<&str>) -> Result<Vec<String>> {
     let Some(api_key) = api_key else {
-        bail!("Anthropic model fetch requires API key or OAuth token");
+        bail!("Anthropic model fetch requires API key or OAuth token. {TYPE_MODEL_ID_HINT}");
     };
 
+    let Ok(parsed) = reqwest::Url::parse(models_url) else {
+        bail!("model fetch endpoint is not a valid URL ({REDACTED_ENDPOINT})");
+    };
+    let safe_endpoint = redact_endpoint_for_display(models_url);
+
     let client = build_model_fetch_client()?;
-    let mut request = client
-        .get("https://api.anthropic.com/v1/models")
-        .header("anthropic-version", "2023-06-01");
+    let mut request = client.get(parsed).header("anthropic-version", "2023-06-01");
 
     if api_key.starts_with("sk-ant-oat01-") {
         request = request
@@ -1774,7 +1823,8 @@ fn fetch_anthropic_models(api_key: Option<&str>) -> Result<Vec<String>> {
 
     let response = request
         .send()
-        .context("model fetch failed: GET https://api.anthropic.com/v1/models")?;
+        .map_err(|e| e.without_url())
+        .with_context(|| format!("model fetch failed: GET {safe_endpoint}"))?;
 
     let status = response.status();
     if !status.is_success() {
@@ -1784,6 +1834,7 @@ fn fetch_anthropic_models(api_key: Option<&str>) -> Result<Vec<String>> {
 
     let payload: Value = response
         .json()
+        .map_err(|e| e.without_url())
         .context("failed to parse Anthropic model list response")?;
 
     Ok(parse_openai_compatible_model_ids(&payload))
@@ -1791,7 +1842,9 @@ fn fetch_anthropic_models(api_key: Option<&str>) -> Result<Vec<String>> {
 
 fn fetch_gemini_models(api_key: Option<&str>) -> Result<Vec<String>> {
     let Some(api_key) = api_key else {
-        bail!("Gemini model fetch requires API key");
+        bail!(
+            "Gemini model fetch requires an API key (set GEMINI_API_KEY); the Gemini CLI login cannot list models. {TYPE_MODEL_ID_HINT}"
+        );
     };
 
     let client = build_model_fetch_client()?;
@@ -1830,8 +1883,10 @@ fn fetch_ollama_models(base_url: &str) -> Result<Vec<String>> {
         .get(parsed)
         .send()
         .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(|e| e.without_url())
         .with_context(|| format!("model fetch failed: GET {safe_endpoint}"))?
         .json()
+        .map_err(|e| e.without_url())
         .context("failed to parse Ollama model list response")?;
 
     Ok(parse_ollama_model_ids(&payload))
@@ -1907,12 +1962,65 @@ fn active_provider_api_url<'a>(config: &'a Config, provider_name: &str) -> Optio
     }
 }
 
+/// Fetch the model list of a `custom:<url>` or `anthropic-custom:<url>`
+/// endpoint from the URL the chat path posts beside, with the key the chat path
+/// would send there. The key goes only to the host in the provider string. An
+/// endpoint that cannot be asked, refuses, or answers no model IDs fails with
+/// the way forward, and the caller leaves the cache as it was.
+fn fetch_custom_endpoint_models(
+    kind: crate::providers::CustomEndpointKind,
+    base_url: &str,
+    key: Option<&str>,
+) -> Result<Vec<String>> {
+    let (models_url, fetched) = match kind {
+        crate::providers::CustomEndpointKind::OpenAiCompatible => {
+            let url = crate::providers::compatible::models_url_for_base(base_url);
+            let fetched = fetch_openai_compatible_models(&url, key, false);
+            (url, fetched)
+        }
+        crate::providers::CustomEndpointKind::Anthropic => {
+            let url = format!("{}/v1/models", base_url.trim_end_matches('/'));
+            let fetched = fetch_anthropic_models(&url, key);
+            (url, fetched)
+        }
+    };
+    let safe_endpoint = redact_endpoint_for_display(&models_url);
+
+    match fetched {
+        Ok(models) if !models.is_empty() => Ok(models),
+        Ok(_) => bail!("{safe_endpoint} returned no model IDs. {TYPE_MODEL_ID_HINT}"),
+        // Without a key both fetches refuse before sending a request, and the
+        // refusal already carries the way forward.
+        Err(error) if key.is_none() => Err(error),
+        Err(error) => {
+            let mut cause = crate::providers::scrub_secret_patterns(&format!("{error:#}"));
+            if let Ok(parsed) = reqwest::Url::parse(&models_url) {
+                cause = cause.replace(parsed.as_str(), &safe_endpoint);
+            }
+            cause = cause.replace(&models_url, &safe_endpoint);
+            bail!("model list request to {safe_endpoint} failed ({cause}). {TYPE_MODEL_ID_HINT}")
+        }
+    }
+}
+
 fn fetch_live_models_for_provider(
     provider_name: &str,
     api_key: &str,
     provider_api_url: Option<&str>,
+    state_dir: Option<&Path>,
 ) -> Result<Vec<String>> {
     let requested_provider_name = provider_name;
+    if let Some(parsed) = crate::providers::parse_custom_endpoint(requested_provider_name) {
+        let (kind, base_url) = parsed?;
+        // The key the chat path sends to this URL, which for these two forms
+        // is not the wizard's per-provider env var.
+        let key = crate::providers::resolve_chat_credential(
+            requested_provider_name,
+            Some(api_key),
+            state_dir,
+        );
+        return fetch_custom_endpoint_models(kind, &base_url, key.as_deref());
+    }
     let provider_name = canonical_provider_name(provider_name);
     let ollama_remote = provider_name == "ollama" && ollama_uses_remote_endpoint(provider_api_url);
     let api_key = if api_key.trim().is_empty() {
@@ -1940,7 +2048,7 @@ fn fetch_live_models_for_provider(
 
     let models = match provider_name {
         "openrouter" => fetch_openrouter_models(api_key.as_deref())?,
-        "anthropic" => fetch_anthropic_models(api_key.as_deref())?,
+        "anthropic" => fetch_anthropic_models(ANTHROPIC_MODELS_URL, api_key.as_deref())?,
         "gemini" => fetch_gemini_models(api_key.as_deref())?,
         "ollama" => {
             // Ask the configured endpoint what it serves, remote or local. This
@@ -2343,9 +2451,7 @@ pub fn run_models_refresh(
         anyhow::bail!("Provider name cannot be empty");
     }
 
-    if !supports_live_model_fetch(&provider_name) {
-        anyhow::bail!("Provider '{provider_name}' does not support live model discovery yet");
-    }
+    ensure_model_refresh_supported(&provider_name)?;
 
     if !force {
         if let Some(cached) = load_cached_models_for_provider(
@@ -2379,7 +2485,12 @@ pub fn run_models_refresh(
         .unwrap_or_default();
     let provider_api_url = active_provider_api_url(config, &provider_name);
 
-    match fetch_live_models_for_provider(&provider_name, &api_key, provider_api_url) {
+    match fetch_live_models_for_provider(
+        &provider_name,
+        &api_key,
+        provider_api_url,
+        config.config_path.parent(),
+    ) {
         Ok(models) if !models.is_empty() => {
             cache_live_models_for_provider(&config.workspace_dir, &provider_name, &models)?;
             println!(
@@ -2447,9 +2558,7 @@ pub(crate) fn probe_provider_catalog_quiet(
     if provider_name.is_empty() {
         anyhow::bail!("Provider name cannot be empty");
     }
-    if !supports_live_model_fetch(provider_name) {
-        anyhow::bail!("Provider '{provider_name}' does not support live model discovery yet");
-    }
+    ensure_model_refresh_supported(provider_name)?;
 
     if !force {
         if let Some(cached) = load_cached_models_for_provider(
@@ -2468,7 +2577,12 @@ pub(crate) fn probe_provider_catalog_quiet(
         .unwrap_or_default();
     let provider_api_url = active_provider_api_url(config, provider_name);
 
-    match fetch_live_models_for_provider(provider_name, &api_key, provider_api_url) {
+    match fetch_live_models_for_provider(
+        provider_name,
+        &api_key,
+        provider_api_url,
+        config.config_path.parent(),
+    ) {
         Ok(models) if !models.is_empty() => {
             let count = models.len();
             cache_live_models_for_provider(&config.workspace_dir, provider_name, &models)?;
@@ -3176,6 +3290,7 @@ pub(crate) fn setup_provider(
                     provider_name,
                     &api_key,
                     provider_api_url.as_deref(),
+                    None,
                 ) {
                     Ok(live_model_ids) if !live_model_ids.is_empty() => {
                         cache_live_models_for_provider(
@@ -3194,7 +3309,7 @@ pub(crate) fn setup_provider(
                     }
                     Err(error) => {
                         print_bullet(&format!(
-                            "Live fetch failed ({}); using cached/curated list.",
+                            "Live fetch failed ({}); using cached/curated list. Pick \"Custom model ID\" to type any model.",
                             style(error.to_string()).yellow()
                         ));
 
@@ -8127,17 +8242,561 @@ mod tests {
     fn run_models_refresh_rejects_unsupported_provider() {
         let tmp = TempDir::new().unwrap();
 
+        // A real provider with no model-list endpoint, so the test stays offline.
         let config = Config {
             workspace_dir: tmp.path().to_path_buf(),
-            // Use a non-provider channel key to keep this test deterministic and offline.
-            default_provider: Some("imessage".to_string()),
+            default_provider: Some("copilot".to_string()),
             ..Config::default()
         };
 
         let err = run_models_refresh(&config, None, true).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("does not support live model discovery"));
+        assert!(
+            message.contains("/model"),
+            "an unsupported provider must say how to use a newer model: {message}"
+        );
+    }
+
+    #[test]
+    fn run_models_refresh_refuses_unknown_provider_as_unknown() {
+        let tmp = TempDir::new().unwrap();
+        let config = Config {
+            workspace_dir: tmp.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        let err = run_models_refresh(&config, Some("not-a-provider"), true).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("Unknown provider 'not-a-provider'"));
+        assert!(message.contains("rantaiclaw providers"));
+        assert!(!message.contains("does not support live model discovery"));
+    }
+
+    #[test]
+    fn run_models_refresh_treats_a_listed_alias_as_known() {
+        let tmp = TempDir::new().unwrap();
+        let config = Config {
+            workspace_dir: tmp.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        let err = run_models_refresh(&config, Some(" github-copilot "), true).unwrap_err();
         assert!(err
             .to_string()
             .contains("does not support live model discovery"));
+    }
+
+    /// The factory matches names exactly, so `OpenAI` is not a provider name.
+    /// It is refused as unknown, not as a provider without a model list.
+    #[test]
+    fn run_models_refresh_refuses_a_wrong_case_name_as_unknown() {
+        let tmp = TempDir::new().unwrap();
+        let config = Config {
+            workspace_dir: tmp.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        let err = run_models_refresh(&config, Some("OpenAI"), true).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("Unknown provider 'OpenAI'"), "{message}");
+        assert!(!message.contains("does not support live model discovery"));
+    }
+
+    #[test]
+    fn probe_provider_catalog_quiet_refuses_unknown_provider_as_unknown() {
+        let tmp = TempDir::new().unwrap();
+        let config = Config {
+            workspace_dir: tmp.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        let err = probe_provider_catalog_quiet(&config, "not-a-provider", true).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("Unknown provider 'not-a-provider'"));
+        assert!(message.contains("rantaiclaw providers"));
+    }
+
+    #[test]
+    fn probe_provider_catalog_quiet_unsupported_provider_names_a_way_forward() {
+        let tmp = TempDir::new().unwrap();
+        let config = Config {
+            workspace_dir: tmp.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        let err = probe_provider_catalog_quiet(&config, "copilot", true).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("does not support live model discovery"));
+        assert!(message.contains("/model"));
+    }
+
+    #[test]
+    fn known_provider_name_accepts_listed_names_and_custom_prefixes() {
+        assert!(is_known_provider_name("copilot"));
+        assert!(is_known_provider_name("google"));
+        assert!(is_known_provider_name("minimax-cn"));
+        assert!(!is_known_provider_name("Google"));
+        assert!(is_known_provider_name("custom:http://127.0.0.1:1/v1"));
+        assert!(is_known_provider_name(
+            "anthropic-custom:http://127.0.0.1:1"
+        ));
+        assert!(!is_known_provider_name("not-a-provider"));
+        assert!(!is_known_provider_name("imessage"));
+    }
+
+    #[test]
+    fn missing_key_refusals_name_a_way_forward() {
+        let gemini = fetch_gemini_models(None).unwrap_err().to_string();
+        assert!(gemini.contains("GEMINI_API_KEY"));
+        assert!(gemini.contains("Gemini CLI login cannot list models"));
+        assert!(gemini.contains("/model"));
+
+        let anthropic = fetch_anthropic_models(ANTHROPIC_MODELS_URL, None)
+            .unwrap_err()
+            .to_string();
+        assert!(anthropic.contains("/model"));
+
+        // No request leaves the process: the missing key is refused first.
+        let compatible =
+            fetch_openai_compatible_models("https://api.example.com/v1/models", None, false)
+                .unwrap_err()
+                .to_string();
+        assert!(compatible.contains("requires API key"));
+        assert!(compatible.contains("/model"));
+    }
+
+    #[test]
+    fn run_models_refresh_keeps_the_way_forward_when_the_key_is_missing() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let tmp = TempDir::new().unwrap();
+        let config = Config {
+            workspace_dir: tmp.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        let err = run_models_refresh(&config, Some("gemini"), true).unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(chain.contains("failed to refresh models for provider 'gemini'"));
+        assert!(chain.contains("GEMINI_API_KEY"));
+        assert!(chain.contains("/model"));
+    }
+
+    // ── custom endpoints ─────────────────────────────────────────
+
+    /// A loopback listener must never be routed through a proxy from the
+    /// developer's shell.
+    fn loopback_no_proxy() -> (crate::test_env::EnvGuard, crate::test_env::EnvGuard) {
+        (
+            crate::test_env::EnvGuard::set("NO_PROXY", "127.0.0.1,localhost"),
+            crate::test_env::EnvGuard::set("no_proxy", "127.0.0.1,localhost"),
+        )
+    }
+
+    fn custom_endpoint_config(workspace: &Path, provider: &str, api_key: Option<&str>) -> Config {
+        Config {
+            workspace_dir: workspace.to_path_buf(),
+            default_provider: Some(provider.to_string()),
+            api_key: api_key.map(str::to_string),
+            ..Config::default()
+        }
+    }
+
+    fn cached_ids(workspace: &Path, provider: &str) -> Option<Vec<String>> {
+        let mut ids = load_any_cached_models_for_provider(workspace, provider)
+            .unwrap()
+            .map(|cached| cached.models)?;
+        ids.sort();
+        Some(ids)
+    }
+
+    #[test]
+    fn run_models_refresh_custom_endpoint_caches_listed_ids_and_sends_the_configured_key() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _proxy = loopback_no_proxy();
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/v1/models")
+            .match_header("authorization", "Bearer key-for-test-0000")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"data":[{"id":"model-b"},{"id":"model-a"}]}"#)
+            .create();
+        let provider = format!("custom:{}/v1", server.url());
+        let tmp = TempDir::new().unwrap();
+        let config = custom_endpoint_config(tmp.path(), &provider, Some("key-for-test-0000"));
+
+        let outcome = run_models_refresh(&config, None, true).unwrap();
+
+        assert!(matches!(
+            outcome,
+            ModelRefreshOutcome::FetchedLive { count: 2 }
+        ));
+        mock.assert();
+        assert_eq!(
+            cached_ids(tmp.path(), &provider),
+            Some(vec!["model-a".to_string(), "model-b".to_string()])
+        );
+    }
+
+    #[test]
+    fn run_models_refresh_custom_endpoint_keeps_two_endpoints_apart() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _proxy = loopback_no_proxy();
+        let mut first = mockito::Server::new();
+        let mut second = mockito::Server::new();
+        let _first_mock = first
+            .mock("GET", "/models")
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"first-model"}]}"#)
+            .create();
+        let _second_mock = second
+            .mock("GET", "/models")
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"second-model"}]}"#)
+            .create();
+        let first_name = format!("custom:{}", first.url());
+        let second_name = format!("custom:{}", second.url());
+        let tmp = TempDir::new().unwrap();
+        let mut config = custom_endpoint_config(tmp.path(), &first_name, None);
+        for name in [&first_name, &second_name] {
+            config
+                .provider_api_keys
+                .insert(name.clone(), "key-for-test-0000".to_string());
+        }
+
+        run_models_refresh(&config, Some(&first_name), true).unwrap();
+        run_models_refresh(&config, Some(&second_name), true).unwrap();
+
+        assert_eq!(
+            cached_ids(tmp.path(), &first_name),
+            Some(vec!["first-model".to_string()])
+        );
+        assert_eq!(
+            cached_ids(tmp.path(), &second_name),
+            Some(vec!["second-model".to_string()])
+        );
+    }
+
+    #[test]
+    fn run_models_refresh_anthropic_custom_endpoint_uses_the_anthropic_shape() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _proxy = loopback_no_proxy();
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/v1/models")
+            .match_header("x-api-key", "key-for-test-0000")
+            .match_header("anthropic-version", "2023-06-01")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"data":[{"id":"claude-test-b"},{"id":"claude-test-a"}]}"#)
+            .create();
+        let provider = format!("anthropic-custom:{}", server.url());
+        let tmp = TempDir::new().unwrap();
+        let config = custom_endpoint_config(tmp.path(), &provider, Some("key-for-test-0000"));
+
+        let outcome = run_models_refresh(&config, None, true).unwrap();
+
+        assert!(matches!(
+            outcome,
+            ModelRefreshOutcome::FetchedLive { count: 2 }
+        ));
+        mock.assert();
+        assert_eq!(
+            cached_ids(tmp.path(), &provider),
+            Some(vec![
+                "claude-test-a".to_string(),
+                "claude-test-b".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn run_models_refresh_custom_endpoint_that_answers_404_fails_with_a_way_forward() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _proxy = loopback_no_proxy();
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/v1/models")
+            .with_status(404)
+            .with_body("not found")
+            .create();
+        let provider = format!("custom:{}/v1", server.url());
+        let tmp = TempDir::new().unwrap();
+        let config = custom_endpoint_config(tmp.path(), &provider, Some("key-for-test-0000"));
+
+        let err = run_models_refresh(&config, None, true).unwrap_err();
+
+        mock.assert();
+        let chain = format!("{err:#}");
+        assert!(chain.contains("404"), "chain: {chain}");
+        assert!(chain.contains("/model"), "chain: {chain}");
+        assert!(chain.contains("default_model"), "chain: {chain}");
+        assert!(
+            !model_cache_path(tmp.path()).exists(),
+            "a failed fetch must not create the cache"
+        );
+    }
+
+    #[test]
+    fn run_models_refresh_custom_endpoint_that_answers_404_keeps_the_earlier_cache() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _proxy = loopback_no_proxy();
+        let mut server = mockito::Server::new();
+        let _mock = server
+            .mock("GET", "/models")
+            .with_status(404)
+            .with_body("not found")
+            .create();
+        let provider = format!("custom:{}", server.url());
+        let tmp = TempDir::new().unwrap();
+        cache_live_models_for_provider(tmp.path(), &provider, &["earlier-model".to_string()])
+            .unwrap();
+        let config = custom_endpoint_config(tmp.path(), &provider, Some("key-for-test-0000"));
+
+        let outcome = run_models_refresh(&config, None, true).unwrap();
+
+        assert!(matches!(
+            outcome,
+            ModelRefreshOutcome::ServedStaleCache {
+                reason: StaleCacheReason::FetchFailed,
+                ..
+            }
+        ));
+        assert_eq!(
+            cached_ids(tmp.path(), &provider),
+            Some(vec!["earlier-model".to_string()])
+        );
+    }
+
+    #[test]
+    fn run_models_refresh_custom_endpoint_with_an_unparsable_list_fails_with_a_way_forward() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _proxy = loopback_no_proxy();
+        let mut server = mockito::Server::new();
+        let _mock = server
+            .mock("GET", "/v1/models")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"object":"list","models":"none"}"#)
+            .create();
+        let provider = format!("custom:{}/v1", server.url());
+        let tmp = TempDir::new().unwrap();
+        let config = custom_endpoint_config(tmp.path(), &provider, Some("key-for-test-0000"));
+
+        let err = run_models_refresh(&config, None, true).unwrap_err();
+
+        let chain = format!("{err:#}");
+        assert!(chain.contains("returned no model IDs"), "chain: {chain}");
+        assert!(chain.contains("/model"), "chain: {chain}");
+        assert!(!model_cache_path(tmp.path()).exists());
+    }
+
+    #[test]
+    fn run_models_refresh_custom_endpoint_without_a_key_sends_no_request() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _proxy = loopback_no_proxy();
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/v1/models")
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"model-a"}]}"#)
+            .expect(0)
+            .create();
+        let provider = format!("custom:{}/v1", server.url());
+        let tmp = TempDir::new().unwrap();
+        let config = custom_endpoint_config(tmp.path(), &provider, None);
+
+        let err = run_models_refresh(&config, None, true).unwrap_err();
+
+        mock.assert();
+        let chain = format!("{err:#}");
+        assert!(chain.contains("requires API key"), "chain: {chain}");
+        assert!(chain.contains("/model"), "chain: {chain}");
+    }
+
+    /// The key is the one the chat path sends: the config key first, then the
+    /// generic `RANTAICLAW_API_KEY` fallback. `custom:` has no provider env var,
+    /// which the wizard's own env lookup did not know.
+    #[test]
+    fn run_models_refresh_custom_endpoint_prefers_the_config_key_over_the_environment() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _proxy = loopback_no_proxy();
+        let _env_key =
+            crate::test_env::EnvGuard::set("RANTAICLAW_API_KEY", "env-key-for-test-0000");
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/models")
+            .match_header("authorization", "Bearer key-for-test-0000")
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"model-a"}]}"#)
+            .create();
+        let provider = format!("custom:{}", server.url());
+        let tmp = TempDir::new().unwrap();
+        let config = custom_endpoint_config(tmp.path(), &provider, Some("key-for-test-0000"));
+
+        run_models_refresh(&config, None, true).unwrap();
+
+        mock.assert();
+    }
+
+    #[test]
+    fn run_models_refresh_custom_endpoint_falls_back_to_the_generic_environment_key() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _proxy = loopback_no_proxy();
+        let _env_key =
+            crate::test_env::EnvGuard::set("RANTAICLAW_API_KEY", "env-key-for-test-0000");
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/models")
+            .match_header("authorization", "Bearer env-key-for-test-0000")
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"model-a"}]}"#)
+            .create();
+        let provider = format!("custom:{}", server.url());
+        let tmp = TempDir::new().unwrap();
+        let config = custom_endpoint_config(tmp.path(), &provider, None);
+
+        run_models_refresh(&config, None, true).unwrap();
+
+        mock.assert();
+    }
+
+    #[test]
+    fn run_models_refresh_custom_endpoint_with_an_invalid_url_names_the_format() {
+        let tmp = TempDir::new().unwrap();
+        let config =
+            custom_endpoint_config(tmp.path(), "custom:not-a-url", Some("key-for-test-0000"));
+
+        let err = run_models_refresh(&config, None, true).unwrap_err();
+
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("custom:https://your-api.com"),
+            "chain: {chain}"
+        );
+    }
+
+    // ── endpoint secrets in fetch errors ─────────────────────────
+
+    const URL_SECRET_MARKER: &str = "MARKER_VALUE";
+
+    /// A configured `api_url` can carry a credential in its query string. The
+    /// whole error chain reaches the console, so no fetcher may let reqwest
+    /// print the request URL into it.
+    fn api_url_secret_config(workspace: &Path, provider: &str, api_url: String) -> Config {
+        Config {
+            workspace_dir: workspace.to_path_buf(),
+            default_provider: Some(provider.to_string()),
+            api_url: Some(api_url),
+            ..Config::default()
+        }
+    }
+
+    fn assert_chain_hides_marker(err: &anyhow::Error) {
+        let chain = format!("{err:#}");
+        assert!(
+            !chain.contains(URL_SECRET_MARKER),
+            "the error chain echoes the URL secret: {chain}"
+        );
+    }
+
+    /// A loopback port nothing listens on.
+    fn closed_loopback_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    #[test]
+    fn run_models_refresh_llamacpp_status_error_does_not_echo_the_api_url_secret() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _proxy = loopback_no_proxy();
+        let mut server = mockito::Server::new();
+        let _mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(401)
+            .create();
+        let tmp = TempDir::new().unwrap();
+        let config = api_url_secret_config(
+            tmp.path(),
+            "llamacpp",
+            format!("{}/v1?key={URL_SECRET_MARKER}", server.url()),
+        );
+
+        let err = run_models_refresh(&config, None, true).unwrap_err();
+
+        assert!(format!("{err:#}").contains("401"), "got {err:#}");
+        assert_chain_hides_marker(&err);
+    }
+
+    #[test]
+    fn run_models_refresh_llamacpp_connection_error_does_not_echo_the_api_url_secret() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _proxy = loopback_no_proxy();
+        let port = closed_loopback_port();
+        let tmp = TempDir::new().unwrap();
+        let config = api_url_secret_config(
+            tmp.path(),
+            "llamacpp",
+            format!("http://127.0.0.1:{port}/v1?key={URL_SECRET_MARKER}"),
+        );
+
+        let err = run_models_refresh(&config, None, true).unwrap_err();
+
+        assert_chain_hides_marker(&err);
+    }
+
+    #[test]
+    fn run_models_refresh_ollama_status_error_does_not_echo_the_api_url_secret() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _proxy = loopback_no_proxy();
+        let mut server = mockito::Server::new();
+        let _mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(401)
+            .create();
+        let tmp = TempDir::new().unwrap();
+        let config = api_url_secret_config(
+            tmp.path(),
+            "ollama",
+            format!("{}?key={URL_SECRET_MARKER}", server.url()),
+        );
+
+        let err = run_models_refresh(&config, None, true).unwrap_err();
+
+        assert!(format!("{err:#}").contains("401"), "got {err:#}");
+        assert_chain_hides_marker(&err);
+    }
+
+    #[test]
+    fn run_models_refresh_ollama_connection_error_does_not_echo_the_api_url_secret() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _proxy = loopback_no_proxy();
+        let port = closed_loopback_port();
+        let tmp = TempDir::new().unwrap();
+        let config = api_url_secret_config(
+            tmp.path(),
+            "ollama",
+            format!("http://127.0.0.1:{port}?key={URL_SECRET_MARKER}"),
+        );
+
+        let err = run_models_refresh(&config, None, true).unwrap_err();
+
+        assert_chain_hides_marker(&err);
     }
 
     // ── provider_env_var ────────────────────────────────────────
