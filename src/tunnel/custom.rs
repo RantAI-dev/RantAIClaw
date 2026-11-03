@@ -198,6 +198,7 @@ mod tests {
 
     /// Without a `url_pattern` there is nothing to match, so the tunnel is
     /// started but reports no URL: the local address is never shown as public.
+    #[cfg(unix)]
     #[tokio::test]
     async fn start_without_pattern_reports_no_url() {
         let dir = tempfile::tempdir().expect("tempdir");

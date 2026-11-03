@@ -291,6 +291,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **pulldown-cmark 0.13.6, for RUSTSEC-2026-0433.** The advisory (quadratic parsing of nested image
+  wikilinks) is fixed in 0.13.6, so the lockfile takes `pulldown-cmark` 0.13.5 → 0.13.6 and the
+  advisory is no longer waived in `deny.toml` or in the Security Audit job's ignore list. The affected
+  path needs `Options::ENABLE_WIKILINKS`, which RantaiClaw never enables: `src/channels/format/ast.rs`
+  sets `Options::empty()` plus `ENABLE_TABLES` and `ENABLE_STRIKETHROUGH`. `Cargo.toml` is unchanged,
+  because 0.13.6 stays inside the existing `0.13` requirement. `Cargo.lock` only.
+
 - **Tool-call audit records go to the directory of the loaded config.** The tool-call records were
   written to `<profile>/audit.log` under the real home even when `RANTAICLAW_CONFIG_DIR` (or
   `RANTAICLAW_WORKSPACE`) moved the config elsewhere, while config-change records went to the
