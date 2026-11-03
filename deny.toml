@@ -194,17 +194,6 @@ ignore = [
     # webpki-roots 1.x (checked 2026-10-20: tokio-tungstenite 0.30.0 still
     # requests ^0.26), and remove the 0.26.11 entry from Cargo.lock with it.
     "RUSTSEC-2026-0381",
-    # pulldown-cmark 0.13.5, RUSTSEC-2026-0433 (2026-10-28): quadratic parsing of
-    # nested image wikilinks. The path is reached only with
-    # `Options::ENABLE_WIKILINKS`. `src/channels/format/ast.rs` enables only
-    # tables and strikethrough, and ruma-events (opt-in `channel-matrix`) does
-    # not enable wikilinks either, so the path is unreachable. Fixed in >= 0.13.6
-    # by a plain lockfile bump (`cargo update -p pulldown-cmark`); the bump is a
-    # follow-up.
-    #
-    # REVIEW BY 2026-11-15: drop this id after pulldown-cmark is bumped to
-    # >= 0.13.6 in Cargo.lock.
-    "RUSTSEC-2026-0433",
 ]
 
 [licenses]

@@ -312,6 +312,7 @@ mod tests {
         assert!(!tunnel.health_check().await);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn stop_without_started_process_is_ok() {
         // Never the real `tailscale`: this machine's tailscale is a live
@@ -329,6 +330,7 @@ mod tests {
     /// program and the subcommand. The fake answers `status --json` and then
     /// removes itself, so the `serve` spawn that follows finds no program to
     /// run.
+    #[cfg(unix)]
     #[tokio::test]
     async fn missing_program_serve_error_names_the_program() {
         let dir = tempfile::tempdir().expect("tempdir");
