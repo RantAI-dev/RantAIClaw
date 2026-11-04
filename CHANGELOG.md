@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **calamine 0.38.0, for RUSTSEC-2026-0436.** The advisory (panic and unbounded allocation in the
+  CFB/OLE2 parser on malformed input, CVSS 7.5 HIGH) is denial of service only: a directory stream
+  whose length is not a multiple of 128 trips a bounds-checked panic in `Directory::from_slice`, and
+  a crafted self-referential DIFAT chain grows an allocation without bound, so a 512-byte file can
+  crash the reader thread or exhaust memory. RantaiClaw reaches the parser through the `kb-office`
+  feature's spreadsheet reader, which opens `calamine::Xls` on `.xls` ingested through the knowledge
+  base (`src/kb/file/office.rs`); the impact lands only when that opt-in feature is enabled and a
+  crafted spreadsheet is ingested. The `Cargo.toml` requirement moves `0.36` → `0.38`, because
+  0.38.0 is outside the existing `0.36` requirement, and the lockfile takes `calamine` 0.36.1 →
+  0.38.0. A patched release exists, so no advisory waiver was added to `deny.toml` or the Security
+  Audit job's ignore list; the bump clears the finding instead of waiving it.
+
 - **pulldown-cmark 0.13.5, for RUSTSEC-2026-0414.** The advisory (exponential event growth
   with `ENABLE_WIKILINKS`, CVSS 7.5 HIGH) is a denial of service: parsing untrusted Markdown with
   that option grows the event list exponentially and exhausts memory. The lockfile takes
