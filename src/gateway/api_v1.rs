@@ -1379,7 +1379,24 @@ fn chat_config_from_body(
     body: &ChatRequestBody,
 ) -> Result<crate::config::Config, (StatusCode, Json<ErrorBody>)> {
     let mut config = state.config.lock().clone();
+    let original_default_provider = config.default_provider.clone();
     if let Some(p) = body.provider.clone() {
+        // The provider id arrives in the request body, so it is caller-chosen:
+        // a `custom:` / `anthropic-custom:` id the operator has not configured
+        // is refused before any agent is built or any request is made.
+        if let Err(e) = config.ensure_caller_provider_allowed(&p) {
+            return Err(err_400(format!("{e:#}")));
+        }
+        // The top-level `api_key` is the active default provider's key
+        // (`resolve_key_for_provider` hands it to whatever `default_provider`
+        // names). When the caller switches to a different provider, clear it on
+        // this request's config so it cannot follow the switch; the new
+        // provider still resolves its own `provider_api_keys` entry and env
+        // var, exactly as it would as a fallback provider. Same string as the
+        // configured default → the operator's own provider → key stays.
+        if original_default_provider.as_deref() != Some(p.as_str()) {
+            config.api_key = None;
+        }
         config.default_provider = Some(p);
     }
     if let Some(m) = body.model.clone() {
@@ -2962,7 +2979,10 @@ async fn provider_models(
     let cat = crate::onboard::wizard::provider_model_catalog(&workspace_dir, &id);
     let count = cat.models.len();
     Ok(Json(serde_json::json!({
-        "provider": id,
+        // The id may be a caller-chosen `custom:` URL whose userinfo and query
+        // are places credentials turn up; the response echoes the same redacted
+        // key the cache stores.
+        "provider": crate::onboard::wizard::model_cache_provider_key(&id),
         "models": cat.models,
         "default": cat.default_model,
         "source": cat.source,
@@ -2981,6 +3001,15 @@ async fn provider_models_refresh(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
     let config = state.config.lock().clone();
+    // The id arrives on the URL path, so it is caller-chosen. A `custom:` /
+    // `anthropic-custom:` id the operator has not configured must be refused
+    // with 400 here — `run_models_refresh` would otherwise send the stored
+    // credentials (the Anthropic profile token, the env keys) to the host the
+    // id names. Every other refresh failure keeps the `200 { refreshed: false }`
+    // shape the console already handles.
+    if let Err(e) = config.ensure_caller_provider_allowed(&id) {
+        return Err(err_400(format!("{e:#}")));
+    }
     let id_for_refresh = id.clone();
     // Best-effort: a live fetch can fail (e.g. the provider needs an API key that
     // isn't configured). That's a normal, non-fatal condition — log it and still
@@ -3000,7 +3029,9 @@ async fn provider_models_refresh(
     let cat = crate::onboard::wizard::provider_model_catalog(&workspace_dir, &id);
     let count = cat.models.len();
     Ok(Json(serde_json::json!({
-        "provider": id,
+        // Same redacted key the cache stores: the raw caller-chosen id can
+        // carry userinfo and a query, and neither belongs in a response.
+        "provider": crate::onboard::wizard::model_cache_provider_key(&id),
         "models": cat.models,
         "default": cat.default_model,
         "source": cat.source,
@@ -3354,6 +3385,15 @@ mod tests {
         mut hook: Option<TurnHook<'_>>,
     ) -> (Vec<serde_json::Value>, Option<serde_json::Value>) {
         use http_body_util::BodyExt;
+        // The fixture's endpoint is caller-chosen (`custom:http://<loopback>`),
+        // so the fixture must configure it the way an operator would — a stored
+        // key — before the chat. Without this, `chat_config_from_body` refuses
+        // the turn (see the unconfigured-provider refusal tests).
+        state
+            .config
+            .lock()
+            .provider_api_keys
+            .insert(provider.to_string(), "key-for-test-0000".to_string());
         let mut headers = HeaderMap::new();
         headers.insert("accept", "text/event-stream".parse().unwrap());
         let response = agent_chat_dispatch(
@@ -3623,6 +3663,192 @@ mod tests {
         let detail = body["detail"].as_str().expect("detail text");
         assert!(detail.contains("GEMINI_API_KEY"), "detail: {detail}");
         assert!(detail.contains("/model"), "detail: {detail}");
+    }
+
+    /// A loopback listener must never be routed through a proxy from the
+    /// developer's shell (the sibling helper in `onboard::wizard` tests).
+    fn loopback_no_proxy() -> (crate::test_env::EnvGuard, crate::test_env::EnvGuard) {
+        (
+            crate::test_env::EnvGuard::set("NO_PROXY", "127.0.0.1,localhost"),
+            crate::test_env::EnvGuard::set("no_proxy", "127.0.0.1,localhost"),
+        )
+    }
+
+    /// `anthropic-custom:` ids make the refresh hand the stored Anthropic
+    /// profile token (`config_path.parent()` is the state dir) to the host the
+    /// id names. An id the operator never configured must be refused with 400
+    /// before any request — the loopback listener stays at zero hits and the
+    /// refusal must not echo the credential.
+    #[tokio::test]
+    async fn provider_models_refresh_refuses_an_unconfigured_anthropic_custom_endpoint_without_a_request(
+    ) {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _proxy = loopback_no_proxy();
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"claude-test-a"}]}"#)
+            .expect(0)
+            .create_async()
+            .await;
+        let state_dir = tempfile::tempdir().expect("temp state dir");
+        let store = crate::auth::profiles::AuthProfilesStore::new(state_dir.path(), true);
+        store
+            .upsert_profile(
+                crate::auth::profiles::AuthProfile {
+                    id: crate::auth::default_profile_id("anthropic"),
+                    provider: "anthropic".into(),
+                    profile_name: "default".into(),
+                    kind: crate::auth::profiles::AuthProfileKind::Token,
+                    account_id: None,
+                    workspace_id: None,
+                    token_set: None,
+                    token: Some("sk-ant-oat01-MARKER_TOKEN".into()),
+                    metadata: std::collections::BTreeMap::new(),
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                },
+                true,
+            )
+            .await
+            .expect("store anthropic profile");
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let state = test_state();
+        {
+            let mut config = state.config.lock();
+            config.workspace_dir = workspace.path().to_path_buf();
+            // The refresh resolves the stored profile from `config_path.parent()`,
+            // so it must point at the temp state dir.
+            config.config_path = state_dir.path().join("config.toml");
+        }
+        let provider_id = format!("anthropic-custom:{}", server.url());
+
+        let Err((status, Json(body))) =
+            provider_models_refresh(State(state), HeaderMap::new(), Path(provider_id.clone()))
+                .await
+        else {
+            panic!("an unconfigured caller-chosen endpoint must be refused");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.error, "bad_request");
+        let detail = body.detail.expect("refusal detail");
+        assert!(detail.contains("not configured"), "detail: {detail}");
+        assert!(detail.contains("127.0.0.1"), "detail: {detail}");
+        assert!(!detail.contains("MARKER_TOKEN"), "detail: {detail}");
+        mock.assert();
+    }
+
+    /// The generic env key must not ride to a caller-named host either: an
+    /// unconfigured `custom:` id is refused with 400 and the loopback listener
+    /// records zero requests.
+    #[tokio::test]
+    async fn provider_models_refresh_refuses_an_unconfigured_custom_endpoint_with_env_key_without_a_request(
+    ) {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _proxy = loopback_no_proxy();
+        let _env_key = crate::test_env::EnvGuard::set("RANTAICLAW_API_KEY", "key-for-test-0000");
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"model-a"}]}"#)
+            .expect(0)
+            .create_async()
+            .await;
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let state = test_state();
+        state.config.lock().workspace_dir = workspace.path().to_path_buf();
+        let provider_id = format!("custom:{}", server.url());
+
+        let Err((status, Json(body))) =
+            provider_models_refresh(State(state), HeaderMap::new(), Path(provider_id)).await
+        else {
+            panic!("an unconfigured caller-chosen endpoint must be refused");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.error, "bad_request");
+        let detail = body.detail.expect("refusal detail");
+        assert!(detail.contains("not configured"), "detail: {detail}");
+        assert!(!detail.contains("key-for-test-0000"), "detail: {detail}");
+        mock.assert();
+    }
+
+    /// A CONFIGURED `custom:` id whose URL carries userinfo and a query key
+    /// refreshes successfully, but neither secret may reach `models_cache.json`
+    /// or the refresh response: both carry the redacted id, the catalog lookup
+    /// with the raw id finds the entry stored under the redacted key, and a
+    /// second refresh updates that same (single) entry instead of duplicating it.
+    #[tokio::test]
+    async fn provider_models_refresh_redacts_url_secrets_from_the_cache_and_the_response() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _proxy = loopback_no_proxy();
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"model-a"},{"id":"model-b"}]}"#)
+            .expect(2)
+            .create_async()
+            .await;
+        let base = format!("{}/v1", server.url());
+        let with_userinfo = base.replacen("http://", "http://user:pass@", 1);
+        let provider_id = format!("custom:{with_userinfo}?key=marker-secret-0000");
+        let expected_redacted = format!("custom:{base}");
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let state = test_state();
+        {
+            let mut config = state.config.lock();
+            config.workspace_dir = workspace.path().to_path_buf();
+            // The stored key is what configures the host; it must also never
+            // reach the cache or the response.
+            config
+                .provider_api_keys
+                .insert(provider_id.clone(), "stored-key-for-test-0000".into());
+        }
+
+        let cache_file = workspace.path().join("state").join("models_cache.json");
+        for _ in 0..2 {
+            let Ok(Json(response)) = provider_models_refresh(
+                State(state.clone()),
+                HeaderMap::new(),
+                Path(provider_id.clone()),
+            )
+            .await
+            else {
+                panic!("a configured caller-chosen endpoint must refresh");
+            };
+            assert_eq!(response["refreshed"], true, "response: {response}");
+            assert_eq!(response["source"], "cache", "response: {response}");
+            assert_eq!(
+                response["provider"], expected_redacted,
+                "response: {response}"
+            );
+            let response_text = response.to_string();
+            assert!(
+                !response_text.contains("user:pass")
+                    && !response_text.contains("marker-secret-0000")
+                    && !response_text.contains("stored-key-for-test-0000"),
+                "response echoed a secret: {response_text}"
+            );
+
+            let raw = std::fs::read_to_string(&cache_file).expect("cache file written");
+            assert!(
+                !raw.contains("user:pass")
+                    && !raw.contains("marker-secret-0000")
+                    && !raw.contains("stored-key-for-test-0000")
+                    && !raw.contains(&provider_id),
+                "cache file carries a URL secret: {raw}"
+            );
+            let parsed: serde_json::Value = serde_json::from_str(&raw).expect("cache json");
+            let entries = parsed["entries"].as_array().expect("cache entries");
+            assert_eq!(entries.len(), 1, "cache entries: {raw}");
+            assert_eq!(entries[0]["provider"], expected_redacted, "cache: {raw}");
+        }
+        mock.assert();
     }
 
     /// `detail` is shown in the console, which hides `api_url` secrets
@@ -5298,6 +5524,172 @@ mod tests {
         assert!(
             matches!(res, Err((StatusCode::UNAUTHORIZED, _))),
             "missing bearer must be rejected"
+        );
+    }
+
+    /// A caller-supplied `provider` that names its own host
+    /// (`custom:<url>`) and that the operator never configured must be refused
+    /// with 400 before any agent is built — nothing reaches the loopback
+    /// listener, whatever credentials the host could otherwise borrow.
+    #[tokio::test]
+    async fn agent_chat_sync_refuses_an_unconfigured_custom_provider_without_a_request() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _proxy = loopback_no_proxy();
+        // HOME pin only matters if the gate is gone: the red path builds an
+        // agent, which reads the active profile from `HOME`.
+        let home = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(home.path());
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"choices":[]}"#)
+            .expect(0)
+            .create_async()
+            .await;
+        let state = test_state();
+
+        let Err((status, Json(body))) = agent_chat_sync(
+            State(state),
+            HeaderMap::new(),
+            Json(ChatRequestBody {
+                message: "hi".into(),
+                model: None,
+                provider: Some(format!("custom:{}", server.url())),
+                temperature: None,
+                session_id: None,
+                context: None,
+                render_mode: None,
+            }),
+        )
+        .await
+        else {
+            panic!("an unconfigured caller-chosen provider must be refused");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.error, "bad_request");
+        let detail = body.detail.expect("refusal detail");
+        assert!(detail.contains("not configured"), "detail: {detail}");
+        assert!(detail.contains("127.0.0.1"), "detail: {detail}");
+        mock.assert();
+    }
+
+    /// The generic env keys must not open the door: with `RANTAICLAW_API_KEY`
+    /// and `API_KEY` set and no config key at all, an unconfigured caller-chosen
+    /// provider is still refused with 400 and zero requests.
+    #[tokio::test]
+    async fn agent_chat_sync_refuses_an_unconfigured_custom_provider_even_with_generic_env_keys() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _proxy = loopback_no_proxy();
+        let _rantaiclaw_key =
+            crate::test_env::EnvGuard::set("RANTAICLAW_API_KEY", "key-for-test-0000");
+        let _generic_key = crate::test_env::EnvGuard::set("API_KEY", "key-for-test-0001");
+        let home = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(home.path());
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"choices":[]}"#)
+            .expect(0)
+            .create_async()
+            .await;
+        let state = test_state();
+
+        let Err((status, Json(body))) = agent_chat_sync(
+            State(state),
+            HeaderMap::new(),
+            Json(ChatRequestBody {
+                message: "hi".into(),
+                model: None,
+                provider: Some(format!("custom:{}", server.url())),
+                temperature: None,
+                session_id: None,
+                context: None,
+                render_mode: None,
+            }),
+        )
+        .await
+        else {
+            panic!("an unconfigured caller-chosen provider must be refused");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.error, "bad_request");
+        assert!(body
+            .detail
+            .expect("refusal detail")
+            .contains("not configured"));
+        mock.assert();
+    }
+
+    /// The top-level `api_key` is the ACTIVE default provider's key. When the
+    /// caller switches the chat to a different (built-in) provider, the key must
+    /// not follow the switch: the new provider resolves its own
+    /// `provider_api_keys` entry, not the key that belongs to the old default.
+    #[test]
+    fn chat_config_from_body_clears_the_top_level_key_when_the_caller_switches_provider() {
+        let state = test_state();
+        {
+            let mut config = state.config.lock();
+            config.default_provider = Some("openai".to_string());
+            config.api_key = Some("top-level-key-for-test-0000".to_string());
+            config
+                .provider_api_keys
+                .insert("groq".into(), "groq-key-for-test-0000".into());
+        }
+        let body = ChatRequestBody {
+            message: "hi".into(),
+            model: None,
+            provider: Some("groq".into()),
+            temperature: None,
+            session_id: None,
+            context: None,
+            render_mode: None,
+        };
+
+        let config = chat_config_from_body(&state, &body).expect("a built-in switch is allowed");
+
+        assert_eq!(config.default_provider.as_deref(), Some("groq"));
+        assert_eq!(
+            config.api_key, None,
+            "the top-level key must not follow the provider switch"
+        );
+        assert_eq!(
+            config.resolve_key_for_provider("groq").as_deref(),
+            Some("groq-key-for-test-0000"),
+            "the new provider keeps its own stored key"
+        );
+    }
+
+    /// Switching to the provider that is ALREADY the configured default keeps
+    /// the top-level key: that is the operator's own provider, not a switch.
+    #[test]
+    fn chat_config_from_body_keeps_the_top_level_key_when_the_provider_is_unchanged() {
+        let state = test_state();
+        {
+            let mut config = state.config.lock();
+            config.default_provider = Some("openai".to_string());
+            config.api_key = Some("top-level-key-for-test-0000".to_string());
+        }
+        let body = ChatRequestBody {
+            message: "hi".into(),
+            model: None,
+            provider: Some("openai".into()),
+            temperature: None,
+            session_id: None,
+            context: None,
+            render_mode: None,
+        };
+
+        let config = chat_config_from_body(&state, &body).expect("the default provider is allowed");
+
+        assert_eq!(config.default_provider.as_deref(), Some("openai"));
+        assert_eq!(
+            config.api_key.as_deref(),
+            Some("top-level-key-for-test-0000"),
+            "the active provider's own key stays"
         );
     }
 

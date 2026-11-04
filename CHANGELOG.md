@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Caller-chosen custom provider ids must be configured.** The chat request's
+  `provider` field accepted a caller-chosen endpoint from v0.10.0-alpha through
+  v0.33.0-alpha, and the `POST /api/v1/providers/{id}/models/refresh` route did
+  the same in unreleased builds after v0.33.0-alpha: the gateway sent the
+  operator's top-level `api_key`, the generic `RANTAICLAW_API_KEY` / `API_KEY`
+  env keys and the matching provider env keys to whatever host the request
+  named, and the refresh route additionally exposed the stored Anthropic
+  profile token. Any paired gateway client could do this, and so could anyone
+  who could reach the gateway when pairing was off. A caller-chosen
+  `custom:<url>` / `anthropic-custom:<url>` id is now accepted only when the
+  exact id is configured — as `default_provider`, a `[[model_routes]]` entry, a
+  `reliability.fallback_providers` entry, an agents/gateway-agents provider, or
+  a `provider_api_keys` key — and is otherwise refused with `400` (gateway) or
+  an error (CLI) naming the redacted endpoint, before any outbound request
+  leaves. Built-in names and other `<base>-custom:` aliases aim at fixed hosts
+  and keep working. The chat route also stops the top-level `api_key` from
+  following a provider switch: a provider named in the body resolves only its
+  own `provider_api_keys` entry and env key. `models_cache.json` and the
+  refresh responses no longer carry URL userinfo or query strings; legacy cache
+  entries are rewritten on save (newest wins). Rotate the top-level key and
+  provider keys after upgrading if the gateway was ever reachable by a client
+  that is not trusted. A paired client has operator rights over provider
+  config — a config write may point the agent at any endpoint; what a caller
+  cannot do without writing config is borrow a stored credential for an
+  unconfigured host.
+
 - **pulldown-cmark 0.13.5, for RUSTSEC-2026-0414.** The advisory (exponential event growth
   with `ENABLE_WIKILINKS`, CVSS 7.5 HIGH) is a denial of service: parsing untrusted Markdown with
   that option grows the event list exponentially and exhausts memory. The lockfile takes

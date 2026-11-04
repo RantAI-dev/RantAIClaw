@@ -90,6 +90,8 @@ When `[secrets] encrypt` is on (the default), these provider credentials are wri
 
 The channel and tunnel tokens are not encrypted. They are stored as plaintext inside `config.toml`; the file is mode 0600, but its contents are not encrypted. The fields are `channels_config` bot, access, app and signing tokens and secrets for Discord, Slack, Mattermost, Matrix, WhatsApp, Linq, Nextcloud Talk, Lark (including its webhook `encrypt_key`), DingTalk, QQ and the webhook, the email and IRC passwords, and `tunnel.ngrok.auth_token` and `tunnel.cloudflare.token`. Protect that file as you would any credential store.
 
+A gateway client that holds a paired token has operator rights over provider config, so a config write (for example `PUT /api/v1/config/model` or the console) may point the agent at any endpoint. What a caller cannot do without writing config is borrow a stored credential for a host the operator never configured: a caller-chosen `custom:<url>` or `anthropic-custom:<url>` id is refused until the operator configures it.
+
 The runtime sets no mode on the profile directories, `brain.db` or `sessions.db`, and the list above is not exhaustive for other files. For every path without a mode, the operator's umask decides. The `systemd --user` installer writes the unit file with no mode. The OpenRC installer, which runs as root and uses `/etc/rantaiclaw`, sets 0750 on the workspace and the log directory, and 0600 on `config.toml`, `.secret_key` and `auth-profiles.json`.
 
 ## Groups
