@@ -2159,9 +2159,13 @@ fn save_model_cache_state(workspace_dir: &Path, state: &ModelCacheState) -> Resu
 
 /// The key a provider id is stored and looked up under in `models_cache.json`.
 /// A caller-chosen `custom:` / `anthropic-custom:` id IS a URL, and its userinfo
-/// and query are places credentials turn up, so it is reduced to
-/// [`redact_endpoint_for_display`] of the endpoint; every other id is its own
-/// key. One helper for the write ([`cache_live_models_for_provider`]), the reads
+/// and query are places credentials turn up, so one that carries them is
+/// reduced to [`redact_endpoint_for_display`] of the endpoint. An id whose URL
+/// carries none of those is already secret-free and is kept verbatim: a key
+/// rebuilt from parsed URL parts is not identity (a bare origin gains `/`,
+/// because that is `Url::path()`), and a mangled key breaks the picker's
+/// lookup and the persisted provider id. Every other id is its own key. One
+/// helper for the write ([`cache_live_models_for_provider`]), the reads
 /// ([`load_cached_models_for_provider_internal`]) and the gateway echoes, so
 /// they cannot drift apart.
 pub(crate) fn model_cache_provider_key(provider_name: &str) -> String {
@@ -2171,6 +2175,15 @@ pub(crate) fn model_cache_provider_key(provider_name: &str) -> String {
     };
     if prefix != "custom" && prefix != "anthropic-custom" {
         return id.to_string();
+    }
+    if let Ok(url) = reqwest::Url::parse(endpoint) {
+        if url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+        {
+            return id.to_string();
+        }
     }
     format!("{prefix}:{}", redact_endpoint_for_display(endpoint))
 }
@@ -8227,6 +8240,34 @@ mod tests {
 
         let stale_any = load_any_cached_models_for_provider(tmp.path(), "openai").unwrap();
         assert!(stale_any.is_some());
+    }
+
+    /// A bare-origin id — no userinfo, no password, no query, no fragment —
+    /// carries no URL secret, so it is its own cache key verbatim. Rebuilding
+    /// it from parsed URL parts is not identity: `Url::path()` returns `/` for
+    /// a bare origin, and the added slash makes the picker's lookup miss the
+    /// entry and persists a mangled provider id. An id whose URL does carry a
+    /// secret still collapses to the secret-free form.
+    #[test]
+    fn model_cache_provider_key_keeps_a_clean_bare_origin_id_verbatim() {
+        assert_eq!(
+            model_cache_provider_key("custom:http://localhost:1234"),
+            "custom:http://localhost:1234"
+        );
+        assert_eq!(
+            model_cache_provider_key("anthropic-custom:https://127.0.0.1:9/v1"),
+            "anthropic-custom:https://127.0.0.1:9/v1"
+        );
+        // Trimming stays: surrounding whitespace is not part of the id.
+        assert_eq!(
+            model_cache_provider_key(" custom:http://localhost:1234 "),
+            "custom:http://localhost:1234"
+        );
+        // A secret-bearing id still lands on the secret-free form.
+        assert_eq!(
+            model_cache_provider_key("custom:https://user:pass@127.0.0.1:9/v1?key=k"),
+            "custom:https://127.0.0.1:9/v1"
+        );
     }
 
     /// Entries an older build stored under the raw caller-chosen id carry the
