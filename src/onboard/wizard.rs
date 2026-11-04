@@ -2157,6 +2157,64 @@ fn save_model_cache_state(workspace_dir: &Path, state: &ModelCacheState) -> Resu
     Ok(())
 }
 
+/// The key a provider id is stored and looked up under in `models_cache.json`.
+/// A caller-chosen `custom:` / `anthropic-custom:` id IS a URL, and its userinfo
+/// and query are places credentials turn up, so one that carries them is
+/// reduced to [`redact_endpoint_for_display`] of the endpoint. An id whose URL
+/// carries none of those is already secret-free and is kept verbatim: a key
+/// rebuilt from parsed URL parts is not identity (a bare origin gains `/`,
+/// because that is `Url::path()`), and a mangled key breaks the picker's
+/// lookup and the persisted provider id. Every other id is its own key. One
+/// helper for the write ([`cache_live_models_for_provider`]), the reads
+/// ([`load_cached_models_for_provider_internal`]) and the gateway echoes, so
+/// they cannot drift apart.
+pub(crate) fn model_cache_provider_key(provider_name: &str) -> String {
+    let id = provider_name.trim();
+    let Some((prefix, endpoint)) = id.split_once(':') else {
+        return id.to_string();
+    };
+    if prefix != "custom" && prefix != "anthropic-custom" {
+        return id.to_string();
+    }
+    if let Ok(url) = reqwest::Url::parse(endpoint) {
+        if url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+        {
+            return id.to_string();
+        }
+    }
+    format!("{prefix}:{}", redact_endpoint_for_display(endpoint))
+}
+
+/// Rewrite entries that an older build stored under a raw caller-chosen id: the
+/// id is a URL whose userinfo and query are places credentials turn up, so the
+/// entry moves to its [`model_cache_provider_key`]. Entries that collapse onto
+/// one key are deduplicated, newest `fetched_at_unix` winning.
+fn rewrite_model_cache_entries_to_redacted_keys(entries: &mut Vec<ModelCacheEntry>) {
+    for entry in entries.iter_mut() {
+        let key = model_cache_provider_key(&entry.provider);
+        if entry.provider != key {
+            entry.provider = key;
+        }
+    }
+    let mut deduped: Vec<ModelCacheEntry> = Vec::with_capacity(entries.len());
+    for entry in entries.drain(..) {
+        match deduped
+            .iter_mut()
+            .find(|existing| existing.provider == entry.provider)
+        {
+            Some(existing) if entry.fetched_at_unix >= existing.fetched_at_unix => {
+                *existing = entry;
+            }
+            Some(_) => {}
+            None => deduped.push(entry),
+        }
+    }
+    *entries = deduped;
+}
+
 pub(crate) fn cache_live_models_for_provider(
     workspace_dir: &Path,
     provider_name: &str,
@@ -2168,18 +2226,20 @@ pub(crate) fn cache_live_models_for_provider(
     }
 
     let mut state = load_model_cache_state(workspace_dir)?;
+    rewrite_model_cache_entries_to_redacted_keys(&mut state.entries);
     let now = now_unix_secs();
+    let cache_key = model_cache_provider_key(provider_name);
 
     if let Some(entry) = state
         .entries
         .iter_mut()
-        .find(|entry| entry.provider == provider_name)
+        .find(|entry| entry.provider == cache_key)
     {
         entry.fetched_at_unix = now;
         entry.models = normalized_models;
     } else {
         state.entries.push(ModelCacheEntry {
-            provider: provider_name.to_string(),
+            provider: cache_key,
             fetched_at_unix: now,
             models: normalized_models,
         });
@@ -2195,11 +2255,12 @@ fn load_cached_models_for_provider_internal(
 ) -> Result<Option<CachedModels>> {
     let state = load_model_cache_state(workspace_dir)?;
     let now = now_unix_secs();
+    let cache_key = model_cache_provider_key(provider_name);
 
     let Some(entry) = state
         .entries
         .into_iter()
-        .find(|entry| entry.provider == provider_name)
+        .find(|entry| entry.provider == cache_key)
     else {
         return Ok(None);
     };
@@ -2441,6 +2502,11 @@ pub fn run_models_refresh(
     provider_override: Option<&str>,
     force: bool,
 ) -> Result<ModelRefreshOutcome> {
+    // An explicit id comes from a caller (a CLI flag or the gateway route). A
+    // caller-chosen `custom:` / `anthropic-custom:` endpoint must be configured
+    // before any stored credential may reach the host it names; when no id is
+    // passed, every id below comes from the config itself, which is the
+    // operator's own choice.
     let provider_name = provider_override
         .or(config.default_provider.as_deref())
         .unwrap_or("openrouter")
@@ -2450,6 +2516,8 @@ pub fn run_models_refresh(
     if provider_name.is_empty() {
         anyhow::bail!("Provider name cannot be empty");
     }
+
+    config.ensure_caller_provider_allowed(&provider_name)?;
 
     ensure_model_refresh_supported(&provider_name)?;
 
@@ -2558,6 +2626,10 @@ pub(crate) fn probe_provider_catalog_quiet(
     if provider_name.is_empty() {
         anyhow::bail!("Provider name cannot be empty");
     }
+    // Same rule as `run_models_refresh`: the id arrives from a caller
+    // (`doctor models --provider`), so a caller-chosen custom endpoint must be
+    // configured before the cache read and before any request.
+    config.ensure_caller_provider_allowed(provider_name)?;
     ensure_model_refresh_supported(provider_name)?;
 
     if !force {
@@ -8170,6 +8242,93 @@ mod tests {
         assert!(stale_any.is_some());
     }
 
+    /// A bare-origin id — no userinfo, no password, no query, no fragment —
+    /// carries no URL secret, so it is its own cache key verbatim. Rebuilding
+    /// it from parsed URL parts is not identity: `Url::path()` returns `/` for
+    /// a bare origin, and the added slash makes the picker's lookup miss the
+    /// entry and persists a mangled provider id. An id whose URL does carry a
+    /// secret still collapses to the secret-free form.
+    #[test]
+    fn model_cache_provider_key_keeps_a_clean_bare_origin_id_verbatim() {
+        assert_eq!(
+            model_cache_provider_key("custom:http://localhost:1234"),
+            "custom:http://localhost:1234"
+        );
+        assert_eq!(
+            model_cache_provider_key("anthropic-custom:https://127.0.0.1:9/v1"),
+            "anthropic-custom:https://127.0.0.1:9/v1"
+        );
+        // Trimming stays: surrounding whitespace is not part of the id.
+        assert_eq!(
+            model_cache_provider_key(" custom:http://localhost:1234 "),
+            "custom:http://localhost:1234"
+        );
+        // A secret-bearing id still lands on the secret-free form.
+        assert_eq!(
+            model_cache_provider_key("custom:https://user:pass@127.0.0.1:9/v1?key=k"),
+            "custom:https://127.0.0.1:9/v1"
+        );
+    }
+
+    /// Entries an older build stored under the raw caller-chosen id carry the
+    /// URL's userinfo and query — places credentials turn up — on disk. The next
+    /// save rewrites such entries to their redacted cache key, drops the
+    /// duplicates onto the newest `fetched_at_unix`, and a read with the raw id
+    /// still finds the surviving entry.
+    #[test]
+    fn cache_save_rewrites_legacy_raw_entries_to_the_redacted_form_and_drops_duplicates() {
+        let tmp = TempDir::new().unwrap();
+        let legacy = ModelCacheState {
+            entries: vec![
+                ModelCacheEntry {
+                    provider: "custom:https://user:pass@127.0.0.1:9/v1?key=legacy-secret-0000"
+                        .to_string(),
+                    fetched_at_unix: 1_000_000,
+                    models: vec!["legacy-model-a".to_string()],
+                },
+                ModelCacheEntry {
+                    provider: "custom:https://other:pw@127.0.0.1:9/v1?token=legacy-secret-0001"
+                        .to_string(),
+                    fetched_at_unix: 2_000_000,
+                    models: vec!["legacy-model-b".to_string()],
+                },
+            ],
+        };
+        save_model_cache_state(tmp.path(), &legacy).unwrap();
+
+        cache_live_models_for_provider(tmp.path(), "openai", &["fresh-model".to_string()]).unwrap();
+
+        let raw = std::fs::read_to_string(model_cache_path(tmp.path())).unwrap();
+        assert!(
+            !raw.contains("user:pass")
+                && !raw.contains("other:pw")
+                && !raw.contains("legacy-secret-0000")
+                && !raw.contains("legacy-secret-0001"),
+            "cache file carries a URL secret: {raw}"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let entries = parsed["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "duplicates must collapse: {raw}");
+        let redacted = entries
+            .iter()
+            .find(|entry| entry["provider"] == "custom:https://127.0.0.1:9/v1")
+            .expect("redacted entry");
+        assert_eq!(redacted["fetched_at_unix"], 2_000_000, "newest wins: {raw}");
+        assert_eq!(
+            redacted["models"],
+            serde_json::json!(["legacy-model-b"]),
+            "the surviving entry keeps the newest entry's models: {raw}"
+        );
+
+        let cached = load_any_cached_models_for_provider(
+            tmp.path(),
+            "custom:https://user:pass@127.0.0.1:9/v1?key=legacy-secret-0000",
+        )
+        .unwrap()
+        .expect("a read with the raw id finds the redacted entry");
+        assert_eq!(cached.models, vec!["legacy-model-b".to_string()]);
+    }
+
     #[test]
     fn run_models_refresh_uses_fresh_cache_without_network() {
         let tmp = TempDir::new().unwrap();
@@ -8621,6 +8780,75 @@ mod tests {
         let chain = format!("{err:#}");
         assert!(chain.contains("requires API key"), "chain: {chain}");
         assert!(chain.contains("/model"), "chain: {chain}");
+    }
+
+    /// A config that does NOT configure the loopback endpoint: the caller-named
+    /// id arrives only as the override, which is exactly the case the gate must
+    /// refuse — the operator never pointed any config field at that host.
+    fn config_with_default_builtin(workspace: &Path) -> Config {
+        Config {
+            workspace_dir: workspace.to_path_buf(),
+            default_provider: Some("openai".to_string()),
+            ..Config::default()
+        }
+    }
+
+    /// A caller-chosen `custom:` id the operator never configured must be
+    /// refused before any request leaves, even with the generic env key set:
+    /// `RANTAICLAW_API_KEY` would otherwise ride to whichever host the id names.
+    #[test]
+    fn run_models_refresh_refuses_an_unconfigured_custom_endpoint_without_a_request() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _proxy = loopback_no_proxy();
+        let _env_key = crate::test_env::EnvGuard::set("RANTAICLAW_API_KEY", "key-for-test-0000");
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"model-a"}]}"#)
+            .expect(0)
+            .create();
+        let tmp = TempDir::new().unwrap();
+        let config = config_with_default_builtin(tmp.path());
+        let provider = format!("custom:{}", server.url());
+
+        let err = run_models_refresh(&config, Some(&provider), true).unwrap_err();
+
+        mock.assert();
+        let chain = format!("{err:#}");
+        assert!(chain.contains("not configured"), "chain: {chain}");
+        assert!(chain.contains("127.0.0.1"), "chain: {chain}");
+        assert!(!chain.contains("key-for-test-0000"), "chain: {chain}");
+    }
+
+    /// The `doctor models` sweep resolves the credential for the id the caller
+    /// passed, so an unconfigured caller-chosen endpoint is refused before the
+    /// cache read and before any request.
+    #[test]
+    fn probe_provider_catalog_quiet_refuses_an_unconfigured_custom_endpoint_without_a_request() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _proxy = loopback_no_proxy();
+        let _env_key = crate::test_env::EnvGuard::set("RANTAICLAW_API_KEY", "key-for-test-0000");
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"model-a"}]}"#)
+            .expect(0)
+            .create();
+        let tmp = TempDir::new().unwrap();
+        let config = config_with_default_builtin(tmp.path());
+        let provider = format!("custom:{}", server.url());
+
+        let err = probe_provider_catalog_quiet(&config, &provider, true).unwrap_err();
+
+        mock.assert();
+        let chain = format!("{err:#}");
+        assert!(chain.contains("not configured"), "chain: {chain}");
+        assert!(chain.contains("127.0.0.1"), "chain: {chain}");
+        assert!(!chain.contains("key-for-test-0000"), "chain: {chain}");
     }
 
     /// The key is the one the chat path sends: the config key first, then the

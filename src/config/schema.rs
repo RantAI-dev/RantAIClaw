@@ -4302,6 +4302,42 @@ fn has_ollama_cloud_credential(config_api_key: Option<&str>) -> bool {
         })
 }
 
+/// Whether `id` names a host the caller chose itself. `custom:<url>` and
+/// `anthropic-custom:<url>` are the only forms `crate::providers`
+/// `parse_custom_endpoint` — the authority on this set — parses into a URL;
+/// every other id (built-in names and other `<base>-custom:` aliases) aims at a
+/// fixed host, so the id never picks where a credential goes. The check is
+/// local because `src/config` sits below `src/providers` and must not import
+/// from it.
+fn names_caller_chosen_host(id: &str) -> bool {
+    let id = id.trim();
+    id.starts_with("custom:") || id.starts_with("anthropic-custom:")
+}
+
+/// Render a caller-supplied provider id for an operator-facing message without
+/// echoing it verbatim. Same rule as `onboard::wizard`'s
+/// `redact_endpoint_for_display` (which `src/config` cannot import): a value
+/// that parses as a URL is reduced to scheme + host + path — userinfo, query
+/// and fragment are dropped because all three are places API keys turn up — and
+/// anything unparseable is replaced outright.
+fn redact_provider_id_for_display(id: &str) -> String {
+    const REDACTED_PROVIDER_ID: &str = "<endpoint redacted>";
+    let Some((prefix, endpoint)) = id.trim().split_once(':') else {
+        return REDACTED_PROVIDER_ID.to_string();
+    };
+    let Ok(url) = reqwest::Url::parse(endpoint) else {
+        return REDACTED_PROVIDER_ID.to_string();
+    };
+    let Some(host) = url.host_str() else {
+        return REDACTED_PROVIDER_ID.to_string();
+    };
+    let endpoint = match url.port() {
+        Some(port) => format!("{}://{host}:{port}{}", url.scheme(), url.path()),
+        None => format!("{}://{host}{}", url.scheme(), url.path()),
+    };
+    format!("{prefix}:{endpoint}")
+}
+
 impl Config {
     /// Resolve the API key to use for a specific provider.
     ///
@@ -4321,6 +4357,71 @@ impl Config {
             self.api_key.as_deref(),
             provider,
         )
+    }
+
+    /// Whether a provider id that arrived from a caller may run on this
+    /// config's credentials.
+    ///
+    /// Any id that does not name its own host (see [`names_caller_chosen_host`])
+    /// is accepted: a built-in name or a `<base>-custom:` alias aims at a fixed
+    /// host, so the id does not choose where credentials go. A `custom:` /
+    /// `anthropic-custom:` id IS the host, so it is accepted only when the
+    /// operator configured that exact id — as `default_provider`, a
+    /// `[[model_routes]]` entry, a `reliability.fallback_providers` entry, an
+    /// `[agents.*]` provider, a `[gateway_agents.*]` provider, or by storing a
+    /// key for it under `provider_api_keys` (an operator who stored a key for a
+    /// custom id configured that host). Embedding routes are excluded: their
+    /// factory takes no env credential. Compared trimmed, exact string
+    /// equality — no normalisation that could make two different hosts equal.
+    pub fn is_configured_provider_id(&self, id: &str) -> bool {
+        if !names_caller_chosen_host(id) {
+            return true;
+        }
+        let id = id.trim();
+        let default_provider_matches = self
+            .default_provider
+            .as_deref()
+            .is_some_and(|provider| provider.trim() == id);
+        let model_route_matches = self
+            .model_routes
+            .iter()
+            .any(|route| route.provider.trim() == id);
+        let fallback_matches = self
+            .reliability
+            .fallback_providers
+            .iter()
+            .any(|provider| provider.trim() == id);
+        let agent_matches = self
+            .agents
+            .values()
+            .any(|agent| agent.provider.trim() == id);
+        let gateway_agent_matches = self.gateway_agents.values().any(|agent| {
+            agent
+                .provider
+                .as_deref()
+                .is_some_and(|provider| provider.trim() == id)
+        });
+        let stored_key_matches = self.provider_api_keys.keys().any(|key| key.trim() == id);
+        default_provider_matches
+            || model_route_matches
+            || fallback_matches
+            || agent_matches
+            || gateway_agent_matches
+            || stored_key_matches
+    }
+
+    /// [`Config::is_configured_provider_id`] with the caller-facing refusal.
+    /// The message names the id with its endpoint redacted (never a credential)
+    /// and says how to configure it, so a caller that legitimately needs the
+    /// endpoint knows the operator-side fix.
+    pub fn ensure_caller_provider_allowed(&self, id: &str) -> Result<()> {
+        if self.is_configured_provider_id(id) {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "provider '{}' is not configured. A caller-named custom endpoint is refused until the operator configured it: set it as `default_provider`, add a `[[model_routes]]` entry, add it to `reliability.fallback_providers`, or store a key for it under `provider_api_keys`.",
+            redact_provider_id_for_display(id)
+        );
     }
 
     /// Whether this config stores a credential for its provider: a
@@ -6297,6 +6398,134 @@ mod tests {
         // provider with no stored key → None, so the env-var fallback applies
         // instead of sending the wrong key.
         assert_eq!(cfg.resolve_key_for_provider("anthropic"), None);
+    }
+
+    // ── caller-chosen provider ids ───────────────────────────
+    // A `custom:` / `anthropic-custom:` id names its own host, so a caller can
+    // aim a stored credential anywhere it likes. `is_configured_provider_id`
+    // accepts such an id only when the operator configured it.
+
+    #[test]
+    async fn is_configured_provider_id_accepts_ids_that_do_not_name_a_host() {
+        let cfg = Config::default();
+        // Built-ins and `<base>-custom:` aliases aim at fixed hosts; only the
+        // two `parse_custom_endpoint` forms let the id choose the host.
+        assert!(cfg.is_configured_provider_id("openai"));
+        assert!(cfg.is_configured_provider_id("openai-custom:https://10.0.0.9"));
+        assert!(cfg.is_configured_provider_id(""));
+    }
+
+    #[test]
+    async fn is_configured_provider_id_accepts_a_custom_endpoint_from_any_configured_field() {
+        let custom = "custom:https://127.0.0.1:9/v1".to_string();
+        let anthropic_custom = "anthropic-custom:https://127.0.0.1:9/v1".to_string();
+
+        let mut cfg = Config::default();
+        cfg.default_provider = Some(custom.clone());
+        assert!(cfg.is_configured_provider_id(&custom), "default_provider");
+
+        let mut cfg = Config::default();
+        cfg.model_routes.push(ModelRouteConfig {
+            hint: "fast".into(),
+            provider: custom.clone(),
+            model: "m".into(),
+            api_key: None,
+        });
+        assert!(cfg.is_configured_provider_id(&custom), "model_routes");
+
+        let mut cfg = Config::default();
+        cfg.reliability.fallback_providers = vec![custom.clone()];
+        assert!(
+            cfg.is_configured_provider_id(&custom),
+            "reliability.fallback_providers"
+        );
+
+        let mut cfg = Config::default();
+        cfg.agents.insert(
+            "worker".into(),
+            DelegateAgentConfig {
+                provider: custom.clone(),
+                model: "m".into(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+            },
+        );
+        assert!(cfg.is_configured_provider_id(&custom), "agents");
+
+        let mut cfg = Config::default();
+        cfg.gateway_agents.insert(
+            "persona".into(),
+            GatewayAgentConfig {
+                workspace_dir: PathBuf::from("/tmp/rantaiclaw-test-workspace"),
+                provider: Some(custom.clone()),
+                model: None,
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                allowed_tools: Vec::new(),
+                max_tool_iterations: 10,
+                default: false,
+            },
+        );
+        assert!(cfg.is_configured_provider_id(&custom), "gateway_agents");
+
+        let mut cfg = Config::default();
+        cfg.provider_api_keys
+            .insert(custom.clone(), "key-for-test-0000".into());
+        assert!(cfg.is_configured_provider_id(&custom), "provider_api_keys");
+
+        let mut cfg = Config::default();
+        cfg.provider_api_keys
+            .insert(anthropic_custom.clone(), "key-for-test-0000".into());
+        assert!(
+            cfg.is_configured_provider_id(&anthropic_custom),
+            "provider_api_keys covers anthropic-custom too"
+        );
+    }
+
+    #[test]
+    async fn is_configured_provider_id_rejects_an_unconfigured_custom_endpoint() {
+        let cfg = Config::default();
+        assert!(!cfg.is_configured_provider_id("custom:https://127.0.0.1:9/v1"));
+        assert!(!cfg.is_configured_provider_id("anthropic-custom:https://127.0.0.1:9/v1"));
+        // Trimmed exact equality only: whitespace is tolerated, but a different
+        // host, port or path is a different endpoint and never matches.
+        let mut cfg = Config::default();
+        cfg.default_provider = Some("custom:https://10.0.0.1:9/v1".into());
+        assert!(cfg.is_configured_provider_id("  custom:https://10.0.0.1:9/v1  "));
+        assert!(!cfg.is_configured_provider_id("custom:https://10.0.0.2:9/v1"));
+        assert!(!cfg.is_configured_provider_id("custom:https://10.0.0.1:10/v1"));
+        assert!(!cfg.is_configured_provider_id("custom:https://10.0.0.1:9/v2"));
+    }
+
+    #[test]
+    async fn ensure_caller_provider_allowed_redacts_the_endpoint_and_says_how_to_configure() {
+        let cfg = Config::default();
+        let err = cfg
+            .ensure_caller_provider_allowed(
+                "custom:https://user:pass@127.0.0.1:9/v1?key=topsecretkey-0000",
+            )
+            .expect_err("an unconfigured caller-chosen endpoint must be refused");
+        let chain = format!("{err:#}");
+        assert!(chain.contains("not configured"), "chain: {chain}");
+        assert!(chain.contains("127.0.0.1"), "chain: {chain}");
+        assert!(!chain.contains("user:pass"), "chain: {chain}");
+        assert!(!chain.contains("topsecretkey-0000"), "chain: {chain}");
+        assert!(!chain.contains("?key="), "chain: {chain}");
+        assert!(chain.contains("default_provider"), "chain: {chain}");
+        assert!(chain.contains("model_routes"), "chain: {chain}");
+        assert!(chain.contains("fallback_providers"), "chain: {chain}");
+        assert!(chain.contains("provider_api_keys"), "chain: {chain}");
+
+        let mut cfg = Config::default();
+        cfg.default_provider = Some("custom:https://127.0.0.1:9/v1".into());
+        cfg.ensure_caller_provider_allowed("custom:https://127.0.0.1:9/v1")
+            .expect("the configured endpoint is allowed");
     }
 
     #[test]

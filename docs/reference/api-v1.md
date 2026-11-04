@@ -45,6 +45,12 @@ user authenticates).
   If you are reading this against an older checkout, verify that fix has
   landed before relying on this route being auth-gated.
 
+A paired client has operator rights over provider config, so a config
+write may point the agent at any endpoint. What a caller cannot do
+without writing config is borrow a stored credential for a host the
+operator never configured: caller-chosen `custom:<url>` and
+`anthropic-custom:<url>` ids are refused until configured.
+
 A `401` response body looks like:
 
 ```json
@@ -209,6 +215,13 @@ tokens, session ids, or paths.
   present, is placed in the prompt as clearly-framed reference material for
   **this turn only** — it is not persisted with the user message and never
   enters replayed history, so retrieved documents do not compound across turns.
+- **`provider`**: names the provider for this turn. A caller-chosen
+  `custom:<url>` or `anthropic-custom:<url>` id must be configured, under the
+  same rule as the models-refresh route; an unconfigured id is refused with
+  `400` before any agent runs. When the body switches to a provider other
+  than the configured `default_provider`, the top-level `api_key` does not
+  follow the switch — the named provider resolves only its own
+  `provider_api_keys` entry and env key.
 - **`message` is the user's words.** Anything a client adds for rendering or
   context travels in its own field, and only `message` is persisted. A client
   that appends its own instructions to `message` gets them stored as part of the
@@ -1155,6 +1168,13 @@ is created first.
   **best-effort and non-fatal** — it logs a warning and still returns the
   existing (cache/curated) catalog with `refreshed: false` rather than a
   `500`; only a panicked background task produces a `500`.
+- **Caller-chosen ids**: the `{id}` path segment comes from the caller. A
+  `custom:<url>` or `anthropic-custom:<url>` id is accepted only when the
+  operator configured that exact id (what counts as configured is listed
+  under [custom endpoints](providers.md#custom-endpoints)); otherwise the
+  route responds `400` with a redacted message and makes no outbound
+  request. Every other failure keeps the `200 { "refreshed": false }`
+  shape the console already handles.
 - **Response** `200`:
   ```json
   {
