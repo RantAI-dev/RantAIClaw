@@ -7,174 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Security
+## [0.34.0-alpha] — 2026-11-05
 
-- **calamine 0.38.0, for RUSTSEC-2026-0436.** The advisory (panic and unbounded allocation in the
-  CFB/OLE2 parser on malformed input, CVSS 7.5 HIGH) is denial of service only: a directory stream
-  whose length is not a multiple of 128 trips a bounds-checked panic in `Directory::from_slice`, and
-  a crafted self-referential DIFAT chain grows an allocation without bound, so a 512-byte file can
-  crash the reader thread or exhaust memory. RantaiClaw reaches the parser through the `kb-office`
-  feature's spreadsheet reader, which opens `calamine::Xls` on `.xls` ingested through the knowledge
-  base (`src/kb/file/office.rs`); the impact lands only when that opt-in feature is enabled and a
-  crafted spreadsheet is ingested. The `Cargo.toml` requirement moves `0.36` → `0.38`, because
-  0.38.0 is outside the existing `0.36` requirement, and the lockfile takes `calamine` 0.36.1 →
-  0.38.0. A patched release exists, so no advisory waiver was added to `deny.toml` or the Security
-  Audit job's ignore list; the bump clears the finding instead of waiving it.
+The hardening release. A caller can no longer borrow a stored credential for a host the
+operator did not configure, an autonomy change reaches the turn that is already running, the
+console's Always answer holds for the conversation, Telegram and WhatsApp Web accept documents,
+and a provider login that expires while the daemon runs is renewed or reported at once.
 
-- **Caller-chosen custom provider ids must be configured.** The chat request's
-  `provider` field accepted a caller-chosen endpoint from v0.10.0-alpha through
-  v0.33.0-alpha, and the `POST /api/v1/providers/{id}/models/refresh` route did
-  the same in unreleased builds after v0.33.0-alpha: the gateway sent the
-  operator's top-level `api_key`, the generic `RANTAICLAW_API_KEY` / `API_KEY`
-  env keys and the matching provider env keys to whatever host the request
-  named, and the refresh route additionally exposed the stored Anthropic
-  profile token. Any paired gateway client could do this, and so could anyone
-  who could reach the gateway when pairing was off. A caller-chosen
-  `custom:<url>` / `anthropic-custom:<url>` id is now accepted only when the
-  exact id is configured — as `default_provider`, a `[[model_routes]]` entry, a
-  `reliability.fallback_providers` entry, an agents/gateway-agents provider, or
-  a `provider_api_keys` key — and is otherwise refused with `400` (gateway) or
-  an error (CLI) naming the redacted endpoint, before any outbound request
-  leaves. Built-in names and other `<base>-custom:` aliases aim at fixed hosts
-  and keep working. The chat route also stops the top-level `api_key` from
-  following a provider switch: a provider named in the body resolves only its
-  own `provider_api_keys` entry and env key. `models_cache.json` and the
-  refresh responses no longer carry URL userinfo or query strings; legacy cache
-  entries are rewritten on save (newest wins). Rotate the top-level key and
-  provider keys after upgrading if the gateway was ever reachable by a client
-  that is not trusted. A paired client has operator rights over provider
-  config — a config write may point the agent at any endpoint; what a caller
-  cannot do without writing config is borrow a stored credential for an
-  unconfigured host.
+**Does not roll back cleanly to v0.33.0-alpha.** The config schema moves from **38** to **40**:
+v39 changes the default of `[browser] allowed_domains` from `[]` to `["*"]` and leaves an
+existing value as written, and v40 removes `[channels_config] cli`. A config this binary writes
+does not load on v0.33.0-alpha, which reads schema 38. The migrator leaves the previous file as
+`config.toml.bak` next to `config.toml`, but the first later save (pairing, `permissions add`,
+the TUI, the console) deletes it, so it helps only if nothing has saved the config since the
+upgrade. Without it, set `schema_version = 38` in `config.toml` by hand. v39 changed a default
+and v40 removed one key that v0.33.0-alpha fills from its default, so nothing else is lost. The
+sessions store stays at version **2** and no other store changed its schema. One file does
+change: `models_cache.json` stores a custom endpoint whose id carries userinfo, a query or a
+fragment under its redacted id, and legacy entries are rewritten on save.
 
-- **pulldown-cmark 0.13.5, for RUSTSEC-2026-0414.** The advisory (exponential event growth
-  with `ENABLE_WIKILINKS`, CVSS 7.5 HIGH) is a denial of service: parsing untrusted Markdown with
-  that option grows the event list exponentially and exhausts memory. The lockfile takes
-  `pulldown-cmark` 0.13.4 → 0.13.5. RantaiClaw never enabled the affected option.
-  `src/channels/format/ast.rs` sets `Options::empty()` plus `ENABLE_TABLES` and
-  `ENABLE_STRIKETHROUGH`, so the vulnerable path was not reachable. A patched release exists, so
-  no advisory waiver was added to `deny.toml` or the Security Audit job's ignore list; the bump
-  clears the finding instead of waiving it. `Cargo.toml` is unchanged, because 0.13.5 stays inside
-  the existing `0.13` requirement. `Cargo.lock` only.
+What an operator will actually notice:
 
-- **RUSTSEC-2026-0387 fixed: the `ssh` transport runs on the patched crypto stack.** The advisory
-  (timing variability in operations intended to be constant-time) is fixed only in
-  `crypto-bigint` >= 0.7.6, which `russh` 0.60.3 could never select: it pins
-  `crypto-bigint = "=0.7.0-rc.28"` exactly, so `cargo update` refuses the bump. The transport
-  now uses `russh` 0.63.3, whose `crypto-bigint ^0.7.3` requirement resolves to the patched
-  0.7.10, and the advisory is no longer waived in `deny.toml` or the Security Audit job's ignore
-  list. Host keys already pinned in `ssh_known_hosts.json` keep the same fingerprints and the
-  same accept-or-refuse outcomes, and the offered key-exchange and host-key algorithm lists are
-  unchanged. One refusal is explicit now: a server that presents an OpenSSH certificate host
-  key is refused with a message that says so, and nothing is pinned — certificates were never
-  accepted, so the behaviour does not change, only the clarity of the error. No config key
-  changed.
-
-- **A scheduled shell job ran with the daemon's whole environment.** The cron
-  scheduler spawned the job's command with no `env_clear()`, so the child inherited
-  every variable the daemon holds — a provider API key, a channel token. The model
-  could schedule such a job itself through the `cron_add` tool and read the output
-  back through `cron_runs` or the job's `last_output`, so every daemon-held secret
-  was readable by the model. A shell job now runs with the same cleared environment
-  the agent's `shell` tool gives a command: an empty environment, then only the
-  allowlisted functional variables in `SAFE_ENV_VARS`, then the
-  `[skills.entries.<n>]` env overlay, then the loaded skills' own tools directories
-  appended to the child's `PATH`. `SAFE_ENV_VARS` is unchanged and the agent's
-  `shell` tool behaves exactly as before. This holds for every shell job,
-  operator-created ones included — `created_by` cannot separate them reliably, so
-  it is not used — and for every way a job is run (the scheduler, `cron run`, the
-  `cron_run` tool, the gateway route, the TUI), because all of them dispatch
-  through the same function. An operator job that needs a secret reads it itself:
-  `sh -c '. ~/.config/myjob.env && mycmd'`. No config key changed and nothing
-  migrates, so rolling back means reverting this change. One limit remains: the
-  job runs through `sh -lc`, a login shell, so it still sources the operator's own
-  `/etc/profile` and `~/.profile`; the agent's `shell` tool runs a non-login shell
-  and does not source profiles. Those files are readable by the agent's shell
-  anyway, so this does not widen what the model can reach, but the two are not
-  byte-identical.
-- **ctutils 0.4.4, for RUSTSEC-2026-0385.** The lockfile takes `ctutils` 0.4.2 → 0.4.4. The
-  `ctutils::Choice` mask generators are `const fn`, so before 0.4.4 the generated code could
-  branch on the secret value on common platforms, and the `u128` comparisons could branch on
-  32-bit targets; 0.4.4 removes those branches and checks the generated code with BINSEC.
-  Reached via `crypto-bigint` ← `elliptic-curve` / `rsa` ← `russh`, so the default build (the
-  `ssh` tool) is affected. No config key and no behaviour of RantaiClaw itself changed.
-  `Cargo.lock` only.
-- **tokio 1.53.3, for RUSTSEC-2026-0386.** The lockfile takes `tokio` 1.53.1 → 1.53.3.
-  `tokio::io::unix::AsyncFd` offers safe constructors (`new`, `with_interest`, `try_new`,
-  `try_with_interest`) that take any `T: AsRawFd`, so safe code could build an `AsyncFd` from an
-  arbitrary or already-closed file descriptor, and closing a duplicated descriptor whose number
-  the runtime then reused could free an allocation the I/O driver still points at — a
-  use-after-free when a readiness event fired. From 1.53.3 the constructors are deprecated in
-  favour of the unsafe `AsyncFd::register`, which asks the caller to prove the descriptor stays
-  valid and unchanged. RantaiClaw's own code never constructs an `AsyncFd`, so the unsound path
-  was not reachable here, but the advisory fails the License & Supply Chain check on every
-  branch. No config key and no behaviour of RantaiClaw itself changed. `Cargo.lock` only.
-- An approval reply that names a request handle typed for an expired or unknown request approved the unrelated pending request when exactly one was still pending in the same chat. The relay now refuses that path and answers the reply itself: nothing pending matches the token, and the reply lists what is still answerable in this chat — whichever verb carries the handle (`approve`, `allow`, `y`, `n`, with or without a `--persist` tail). A `/approve` or `/deny` reply that names no pending request is also answered by the relay instead of being forwarded to the model. A reply that names a command (`/approve kubectl`) no longer resolves anything — the request handle or the exact tool name does; 0.33.0-alpha resolved such a reply when one request was pending.
-- On the prompt (XML) tool protocol, a tool's output could close its `<tool_result>` frame and inject text the model read as a separate result; the output and the frame's attribute values are now escaped so each result stays one frame. MCP tool output had no size limit; it is now capped at 1 MiB with a marker saying how many bytes were dropped.
-- The shell, `pty`, `ssh exec`, skill tools and cron jobs refuse a command that names a credential
-  directory (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.kube`, `~/.netrc`,
-  `~/.azure`, `~/.config/gcloud`, or a profile `secrets` directory), at every autonomy
-  level, with no approval prompt that can lift it. The check is best effort: a command
-  reaches a credential directory without naming it through `cd`, a variable other than
-  `HOME`, a glob, command substitution or an interpreter. Operating-system containment is
-  `[runtime].kind`. A redirect glued to its target (`echo x >~/.ssh/authorized_keys`) is
-  refused the same as the bare path.
-- Under `readonly` (the Strict preset), MCP tools and skill tools no longer run. The agent loop
-  refuses every tool call that the tool has not declared read-only, before the tool body starts.
-  The same gate refuses any future tool that does not declare its read calls. Read tools keep
-  running: `file_read`, `glob_search`, `memory_recall`, `cron_list`, `cron_runs`, `web_search_tool`,
-  `pdf_read`, `image_info`, `session_search`, the task reads `get_task`, `list_tasks` and
-  `read_comments`, the skill reads `skills_list`, `skill_view` and `skills_search`,
-  `git_operations` status, diff, log and branch, `proxy_config` `get` and `list_services`, the
-  composio `list`, `list_accounts` and `connected_accounts` actions, and the `pty` `screen`, `wait`
-  and `stop` actions. Under `supervised` and `full` nothing changes.
-- `[[model_routes]].api_key` and `[[embedding_routes]].api_key` are encrypted at rest like every
-  other provider key when `[secrets] encrypt` is on (the default). Before this, a route key was the
-  one provider credential written to `config.toml` as plaintext. The config API already withholds
-  it. Downgrade hazard: a config saved by this build holds `enc2:` route keys, and a binary from
-  before this change sends the literal `enc2:…` string as the route's key, so the route fails to
-  authenticate. Rolling back means reverting, then re-entering any route key saved in between.
-  Channel and tunnel tokens are still plaintext and are not part of this change.
-- A ClawHub skill file listed in the version manifest without a `sha256` (for example a script or `SKILL.toml`) was installed unverified: only the literal `SKILL.md` had to carry a hash, and every other entry was verified only when one happened to be present. Installs and updates now validate the whole manifest before fetching anything and refuse a version that lists any file without a valid 64-hex hash, naming the file; `skills update` keeps the installed version. Skills already installed are not re-verified, changed or removed.
-- The `ssh` tool checked the server key against `ssh_known_hosts.json` and failed open: a store that
-  could not be read or parsed was treated as an empty store, so the connection ran with the server
-  key unverified, and the store was then rewritten with that one entry, dropping every host pinned
-  before; a write that failed was ignored, so the host stayed unpinned while the connection ran.
-  The check now fails closed: an unreadable, unparseable or unwritable store refuses the
-  connection, and the store is written atomically through a temporary file that is renamed over the
-  target, so it can no longer be left half-written. A changed server key is now reported as a
-  changed key with the stored and the presented fingerprint, where the connection used to fail with
-  `Unknown server key`. A host already on record with the same key is unaffected: the store is not
-  rewritten and its permissions are not changed. Operator cost: a store that is already corrupt or
-  unwritable is now refused where the connection previously went through, and the message names
-  the file and how to repair it.
-
-- **An MCP OAuth login could be completed by the wrong callback.** The loopback listener the
-  flow binds on `127.0.0.1:11500` accepted the first request that arrived with a `code`,
-  whatever page it came from, and the authorization URL carried neither a `state` nor a PKCE
-  challenge — so any local process that hit the port first (a preconnect, a preview, a
-  malicious page) could hand the login a code of its choosing and have it exchanged. A
-  callback is now bound to its session: the authorization URL carries a one-time `state` and
-  an S256 `code_challenge`, the token exchange sends the matching `code_verifier`, and the
-  listener keeps the login alive across stray traffic — a wrong redirect slug, a missing
-  `state`, or a `state` that does not match this login is answered with a plain error page
-  and ignored, compared in constant time so a local prober cannot time its way to the
-  expected value. An `error=` parameter carrying the right `state` still ends the flow with
-  the provider's error. The bind stays `127.0.0.1:11500` and the authorization and token
-  endpoints stay constants; no environment variable or config key can redirect the exchange,
-  and the test-only seam that can is compiled out of production paths. No config key changed.
-- **A medium-risk grant made in one channel conversation answered the risk gate in every
-  conversation.** The shell risk gate's "Session" answer recorded the basename on the one
-  process-wide policy that every channel shares, so an owner's answer in chat A let the same
-  medium-risk command run unasked in chat B — and chat B is a chat a guest chose. The grants are
-  now filed per conversation: a grant answers the risk gate only in the channel and reply
-  target that made it, and never for a guest's turn, which asks again — the risk gate is the
-  owner's only check on a guest, and the guest's own `guest_allowed_commands` ceiling says
-  which commands a guest may run, not that a medium-risk one may run unasked. The TUI, the CLI
-  and the gateway's own operator paths have no chat, so their grants stay process-wide (one
-  operator). The console keeps its per-session grants: they are re-seeded under the console
-  turn's own scope, so a session answer still holds for the next message of that conversation
-  and for no other. No config key changed; rolling back means reverting this change.
+- **A stored credential no longer reaches a host the operator did not configure.** From
+  v0.10.0-alpha through v0.33.0-alpha, the chat request's `provider` field accepted a
+  caller-chosen `custom:<url>` or `anthropic-custom:<url>` endpoint, and the gateway sent the
+  operator's top-level `api_key` and the matching env keys to that host. Any paired client could
+  do this, and so could anyone who could reach the gateway while pairing was off. Such an id is
+  now refused with `400` unless the exact id is configured. **If the gateway was ever reachable
+  by a client you do not trust, rotate the top-level `api_key` and the provider keys after
+  upgrading.** See the first Security entry.
+- **An autonomy change applies to the turn that is running.** The gateway built its policy once
+  at turn start, so a tightening made mid-turn waited for the next turn. A `Session` answer to the
+  shell risk gate now covers a whole chained command, the audit trail records every human answer,
+  and a tool on `always_ask` prompts in the TUI at every level. `PUT /api/v1/config/autonomy`
+  takes a `preset` field, and the Smart preset keeps your own `always_ask` entries on every
+  surface.
+- **Always in the console holds for the conversation.** The `approval_request` event carries
+  `always_available`, and the modal offers Always only when it holds. This binary pins claw-ui
+  **v0.3.31**, which gates Always on `always_available` and sends `preset` when it moves the
+  autonomy rung. Both need this runtime.
+- **Telegram and WhatsApp Web accept documents** (PDF, DOCX, TXT), parsed in a child process
+  with 10 MiB, 50-page and 20-second limits. A DOCX needs the `kb-office` feature.
+- **Provider logins.** A Qwen Code or MiniMax token that expires while the daemon runs is
+  renewed, the Gemini CLI login is read when a request is sent, a refused Gemini login fails at
+  once, and a request refused before it is sent is no longer retried. `models refresh` covers
+  custom endpoints, and every refusal says how to use a newer model.
+- **`[browser] allowed_domains` defaults to `["*"]`** (schema 39), so `browser` and
+  `browser_open` take a public host on a fresh install. An existing config is left as written.
+- **Tools refuse more.** One list of credential directories is refused by every tool, a redirect
+  into one is refused, `readonly` refuses every acting tool at one gate, the `ssh` known-hosts
+  store fails closed, ClawHub refuses a file listed without a valid `sha256`, an MCP OAuth login
+  binds its callback to its session, and a scheduled shell job runs with the agent shell's
+  environment instead of the daemon's.
+- **The daemon and profiles.** A config that cannot be loaded exits with code 78, a profile switch
+  moves one profile and the daemon follows it, and a fresh install reaches the first-run wizard.
+- **Dependency advisories fixed:** RUSTSEC-2026-0436 (calamine), 0414 and 0433 (pulldown-cmark),
+  0387 (the `ssh` transport on russh 0.63.3), 0385 (ctutils), 0386 (tokio), 0381, 0382 and 0383
+  (rustls-webpki and webpki-roots) and 0338 to 0342 (quinn-proto). The `zip` extract advisories
+  stay waived on an unreachable path; the zip entry under Security says why.
 
 ### Added
 
@@ -254,6 +144,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **claw-ui pinned to v0.3.31.** The console's Always gating reads the `always_available` field of the
+  `approval_request` event, and its autonomy rung writes send `preset` to `PUT /api/v1/config/autonomy`. Both
+  fields come from this runtime, so the console needs this binary. `ui install` and `ui update` fetch that tag by
+  default; `--ref` still overrides per invocation.
 - The config loader now warns about an unknown key at any depth, not only at
   the top level. A mistyped nested key such as `knowledge.retention_days` was
   dropped silently; the warning now names the full dotted path and suggests a
@@ -314,6 +208,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `supervised`, the config reads Manual when `always_ask` holds `"*"` or names
   every built-in tool, and Smart otherwise. The shipped default
   `["ssh", "pty"]` therefore reads as Smart everywhere.
+- `docs/pillars/4-skills-mcp.md` has a section, "Which limits bind a skill tool", that says which
+  limits apply to a skill tool. The `shell` tool's `allowed_commands` and risk levels bind the `shell` tool and a cron job's
+  command and bind no skill tool, and the path limits `forbidden_paths` and `workspace_only` bind the file tools, the `ssh`
+  tool's local path and a cron job's path-shaped argument. The `readonly` refusal does apply to a skill tool. The
+  `channels.md`, `config.md` and `per-role-permissions.md` references are corrected to match.
 
 ### Removed
 
@@ -328,13 +227,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   TUI, the console) deletes it.
 
 ### Fixed
-
-- **pulldown-cmark 0.13.6, for RUSTSEC-2026-0433.** The advisory (quadratic parsing of nested image
-  wikilinks) is fixed in 0.13.6, so the lockfile takes `pulldown-cmark` 0.13.5 → 0.13.6 and the
-  advisory is no longer waived in `deny.toml` or in the Security Audit job's ignore list. The affected
-  path needs `Options::ENABLE_WIKILINKS`, which RantaiClaw never enables: `src/channels/format/ast.rs`
-  sets `Options::empty()` plus `ENABLE_TABLES` and `ENABLE_STRIKETHROUGH`. `Cargo.toml` is unchanged,
-  because 0.13.6 stays inside the existing `0.13` requirement. `Cargo.lock` only.
 
 - **Tool-call audit records go to the directory of the loaded config.** The tool-call records were
   written to `<profile>/audit.log` under the real home even when `RANTAICLAW_CONFIG_DIR` (or
@@ -949,6 +841,218 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runs from, which is the same file in the profile layout. The gate also
   remembered the profile file's bytes, so a second edit to the watched file
   could be dropped as bytes the app already had.
+
+### Security
+
+- **Caller-chosen custom provider ids must be configured.** The chat request's
+  `provider` field accepted a caller-chosen endpoint from v0.10.0-alpha through
+  v0.33.0-alpha, and the `POST /api/v1/providers/{id}/models/refresh` route did
+  the same in builds of main after v0.33.0-alpha that no release carried: the gateway sent the
+  operator's top-level `api_key`, the generic `RANTAICLAW_API_KEY` / `API_KEY`
+  env keys and the matching provider env keys to whatever host the request
+  named, and the refresh route additionally exposed the stored Anthropic
+  profile token. Any paired gateway client could do this, and so could anyone
+  who could reach the gateway when pairing was off. A caller-chosen
+  `custom:<url>` / `anthropic-custom:<url>` id is now accepted only when the
+  exact id is configured — as `default_provider`, a `[[model_routes]]` entry, a
+  `reliability.fallback_providers` entry, an agents/gateway-agents provider, or
+  a `provider_api_keys` key — and is otherwise refused with `400` (gateway) or
+  an error (CLI) naming the redacted endpoint, before any outbound request
+  leaves. Built-in names and other `<base>-custom:` aliases aim at fixed hosts
+  and keep working. The chat route also stops the top-level `api_key` from
+  following a provider switch: a provider named in the body resolves only its
+  own `provider_api_keys` entry and env key. `models_cache.json` and the
+  refresh responses no longer carry URL userinfo or query strings; legacy cache
+  entries are rewritten on save (newest wins). Rotate the top-level key and
+  provider keys after upgrading if the gateway was ever reachable by a client
+  that is not trusted. A paired client has operator rights over provider
+  config — a config write may point the agent at any endpoint; what a caller
+  cannot do without writing config is borrow a stored credential for an
+  unconfigured host.
+
+- **calamine 0.38.0, for RUSTSEC-2026-0436.** The advisory (panic and unbounded allocation in the
+  CFB/OLE2 parser on malformed input, CVSS 7.5 HIGH) is denial of service only: a directory stream
+  whose length is not a multiple of 128 trips a bounds-checked panic in `Directory::from_slice`, and
+  a crafted self-referential DIFAT chain grows an allocation without bound, so a 512-byte file can
+  crash the reader thread or exhaust memory. RantaiClaw reaches the parser through the `kb-office`
+  feature's spreadsheet reader, which opens `calamine::Xls` on `.xls` ingested through the knowledge
+  base (`src/kb/file/office.rs`); the impact lands only when that opt-in feature is enabled and a
+  crafted spreadsheet is ingested. The `Cargo.toml` requirement moves `0.36` → `0.38`, because
+  0.38.0 is outside the existing `0.36` requirement, and the lockfile takes `calamine` 0.36.1 →
+  0.38.0. A patched release exists, so no advisory waiver was added to `deny.toml` or the Security
+  Audit job's ignore list; the bump clears the finding instead of waiving it.
+
+- **pulldown-cmark 0.13.6, for RUSTSEC-2026-0414 and RUSTSEC-2026-0433.** RUSTSEC-2026-0414
+  (exponential event growth with `ENABLE_WIKILINKS`, CVSS 7.5 HIGH) and RUSTSEC-2026-0433
+  (quadratic parsing of nested image wikilinks) are denial-of-service advisories: parsing untrusted
+  Markdown with that option exhausts memory or CPU. The lockfile takes `pulldown-cmark` from 0.13.4
+  to 0.13.6, which fixes both. RantaiClaw never enables the option: `src/channels/format/ast.rs`
+  sets `Options::empty()` plus `ENABLE_TABLES` and `ENABLE_STRIKETHROUGH`, so neither path was
+  reachable. A patched release exists, so neither advisory is waived in `deny.toml` or the
+  Security Audit job's ignore list. `Cargo.toml` is unchanged, because 0.13.6 stays inside the
+  existing `0.13` requirement. `Cargo.lock` only.
+
+- **rustls-webpki 0.103.16 and webpki-roots 1.0.10, for RUSTSEC-2026-0381, RUSTSEC-2026-0382 and
+  RUSTSEC-2026-0383.** The lockfile takes `rustls-webpki` 0.103.15 to 0.103.16, `webpki-roots`
+  1.0.9 to 1.0.10 and `webpki-root-certs` 1.0.7 to 1.0.10. That clears RUSTSEC-2026-0382,
+  RUSTSEC-2026-0383 and the 1.x instance of RUSTSEC-2026-0381 (the emSign root, removed from the
+  bundled list in 1.0.10). The `Cargo.toml` floor for `webpki-roots` rises to 1.0.10, so the
+  lockfile cannot fall back to 1.0.9. RUSTSEC-2026-0381 is still waived for `webpki-roots`
+  0.26.11, which matches the advisory by version number only: 0.26.x is a wrapper that depends on
+  `webpki-roots` 1.x, the crate that ships the root list, and no patched 0.26.x exists. The
+  wrapper stays because `tokio-tungstenite` still requests `^0.26`. The waiver in `deny.toml` and
+  the Security Audit job's ignore list goes when `tokio-tungstenite` or `axum` moves to
+  `webpki-roots` 1.x.
+
+- **quinn-proto 0.11.18, for RUSTSEC-2026-0338, RUSTSEC-2026-0339, RUSTSEC-2026-0340,
+  RUSTSEC-2026-0341 and RUSTSEC-2026-0342.** The lockfile still carried `quinn-proto` 0.11.15, and
+  the five advisories are fixed in 0.11.17 and 0.11.18. Nothing compiles it: `cargo tree -i
+  quinn-proto` reports no dependency path from the manifest with `--all-features --target all`,
+  so the entry was a leftover and the shipped binary does not change. The bump moves `getrandom`
+  0.3.4 to 0.4.3 and `rand` 0.9.4 to 0.10.3 and adds `rand_pcg` 0.10.2, all inside the same
+  unreachable subgraph. `Cargo.lock` only.
+
+- **zip: 9.3.0 on the calamine path, 8.6.0 still waived on the docx-rs path.** The lockfile holds
+  two versions. `calamine` 0.38.0 uses `zip` 9.3.0, which none of the advisories below affect.
+  `docx-rs` 0.4.22 pins `zip ^8.6` and stays on 8.6.0, which upstream yanked together with every
+  7.x and 8.x release, so no in-range release exists to move to. `deny.toml` therefore allows the
+  yanked `zip@8.6.0` (the allowance covers the yanked status only, not advisories) and waives
+  RUSTSEC-2026-0367, RUSTSEC-2026-0368, RUSTSEC-2026-0369 and RUSTSEC-2026-0429 by id. All four
+  concern `ZipArchive::extract()` and `ZipStreamReader::extract()`, which unpack archive entries
+  to disk, and 0429 aborts the process on a symlink entry with a large declared size. They are
+  patched only in `zip` 9.0.0 or later. Nothing in `src/` calls the zip crate, and `docx-rs`
+  reads entries into memory through `ZipArchive<Cursor<&[u8]>>` with no `extract(` call. The
+  crate is reached only through the opt-in `kb-office` feature, so a default build contains no
+  zip at all. The waivers and the yanked allowance go when `docx-rs` accepts `zip` 9.
+
+- **RUSTSEC-2026-0387 fixed: the `ssh` transport runs on the patched crypto stack.** The advisory
+  (timing variability in operations intended to be constant-time) is fixed only in
+  `crypto-bigint` >= 0.7.6, which `russh` 0.60.3 could never select: it pins
+  `crypto-bigint = "=0.7.0-rc.28"` exactly, so `cargo update` refuses the bump. The transport
+  now uses `russh` 0.63.3, whose `crypto-bigint ^0.7.3` requirement resolves to the patched
+  0.7.10, and the advisory is no longer waived in `deny.toml` or the Security Audit job's ignore
+  list. Host keys already pinned in `ssh_known_hosts.json` keep the same fingerprints and the
+  same accept-or-refuse outcomes, and the offered key-exchange and host-key algorithm lists are
+  unchanged. One refusal is explicit now: a server that presents an OpenSSH certificate host
+  key is refused with a message that says so, and nothing is pinned — certificates were never
+  accepted, so the behaviour does not change, only the clarity of the error. No config key
+  changed.
+
+- **A scheduled shell job ran with the daemon's whole environment.** The cron
+  scheduler spawned the job's command with no `env_clear()`, so the child inherited
+  every variable the daemon holds — a provider API key, a channel token. The model
+  could schedule such a job itself through the `cron_add` tool and read the output
+  back through `cron_runs` or the job's `last_output`, so every daemon-held secret
+  was readable by the model. A shell job now runs with the same cleared environment
+  the agent's `shell` tool gives a command: an empty environment, then only the
+  allowlisted functional variables in `SAFE_ENV_VARS`, then the
+  `[skills.entries.<n>]` env overlay, then the loaded skills' own tools directories
+  appended to the child's `PATH`. `SAFE_ENV_VARS` is unchanged and the agent's
+  `shell` tool behaves exactly as before. This holds for every shell job,
+  operator-created ones included — `created_by` cannot separate them reliably, so
+  it is not used — and for every way a job is run (the scheduler, `cron run`, the
+  `cron_run` tool, the gateway route, the TUI), because all of them dispatch
+  through the same function. An operator job that needs a secret reads it itself:
+  `sh -c '. ~/.config/myjob.env && mycmd'`. No config key changed and nothing
+  migrates, so rolling back means reverting this change. One limit remains: the
+  job runs through `sh -lc`, a login shell, so it still sources the operator's own
+  `/etc/profile` and `~/.profile`; the agent's `shell` tool runs a non-login shell
+  and does not source profiles. Those files are readable by the agent's shell
+  anyway, so this does not widen what the model can reach, but the two are not
+  byte-identical.
+
+- **ctutils 0.4.4, for RUSTSEC-2026-0385.** The lockfile takes `ctutils` 0.4.2 → 0.4.4. The
+  `ctutils::Choice` mask generators are `const fn`, so before 0.4.4 the generated code could
+  branch on the secret value on common platforms, and the `u128` comparisons could branch on
+  32-bit targets; 0.4.4 removes those branches and checks the generated code with BINSEC.
+  Reached via `crypto-bigint` ← `elliptic-curve` / `rsa` ← `russh`, so the default build (the
+  `ssh` tool) is affected. No config key and no behaviour of RantaiClaw itself changed.
+  `Cargo.lock` only.
+
+- **tokio 1.53.3, for RUSTSEC-2026-0386.** The lockfile takes `tokio` 1.53.1 → 1.53.3.
+  `tokio::io::unix::AsyncFd` offers safe constructors (`new`, `with_interest`, `try_new`,
+  `try_with_interest`) that take any `T: AsRawFd`, so safe code could build an `AsyncFd` from an
+  arbitrary or already-closed file descriptor, and closing a duplicated descriptor whose number
+  the runtime then reused could free an allocation the I/O driver still points at — a
+  use-after-free when a readiness event fired. From 1.53.3 the constructors are deprecated in
+  favour of the unsafe `AsyncFd::register`, which asks the caller to prove the descriptor stays
+  valid and unchanged. RantaiClaw's own code never constructs an `AsyncFd`, so the unsound path
+  was not reachable here, but the advisory fails the License & Supply Chain check on every
+  branch. No config key and no behaviour of RantaiClaw itself changed. `Cargo.lock` only.
+
+- An approval reply that names a request handle typed for an expired or unknown request approved the unrelated pending request when exactly one was still pending in the same chat. The relay now refuses that path and answers the reply itself: nothing pending matches the token, and the reply lists what is still answerable in this chat — whichever verb carries the handle (`approve`, `allow`, `y`, `n`, with or without a `--persist` tail). A `/approve` or `/deny` reply that names no pending request is also answered by the relay instead of being forwarded to the model. A reply that names a command (`/approve kubectl`) no longer resolves anything — the request handle or the exact tool name does; 0.33.0-alpha resolved such a reply when one request was pending.
+
+- On the prompt (XML) tool protocol, a tool's output could close its `<tool_result>` frame and inject text the model read as a separate result; the output and the frame's attribute values are now escaped so each result stays one frame. MCP tool output had no size limit; it is now capped at 1 MiB with a marker saying how many bytes were dropped.
+
+- The shell, `pty`, `ssh exec`, skill tools and cron jobs refuse a command that names a credential
+  directory (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.kube`, `~/.netrc`,
+  `~/.azure`, `~/.config/gcloud`, or a profile `secrets` directory), at every autonomy
+  level, with no approval prompt that can lift it. The check is best effort: a command
+  reaches a credential directory without naming it through `cd`, a variable other than
+  `HOME`, a glob, command substitution or an interpreter. Operating-system containment is
+  `[runtime].kind`. A redirect glued to its target (`echo x >~/.ssh/authorized_keys`) is
+  refused the same as the bare path.
+
+- Under `readonly` (the Strict preset), MCP tools and skill tools no longer run. The agent loop
+  refuses every tool call that the tool has not declared read-only, before the tool body starts.
+  The same gate refuses any future tool that does not declare its read calls. Read tools keep
+  running: `file_read`, `glob_search`, `memory_recall`, `cron_list`, `cron_runs`, `web_search_tool`,
+  `pdf_read`, `image_info`, `session_search`, the task reads `get_task`, `list_tasks` and
+  `read_comments`, the skill reads `skills_list`, `skill_view` and `skills_search`,
+  `git_operations` status, diff, log and branch, `proxy_config` `get` and `list_services`, the
+  composio `list`, `list_accounts` and `connected_accounts` actions, and the `pty` `screen`, `wait`
+  and `stop` actions. Under `supervised` and `full` nothing changes.
+
+- `[[model_routes]].api_key` and `[[embedding_routes]].api_key` are encrypted at rest like every
+  other provider key when `[secrets] encrypt` is on (the default). Before this, a route key was the
+  one provider credential written to `config.toml` as plaintext. The config API already withholds
+  it. Downgrade hazard: a config saved by this build holds `enc2:` route keys, and a binary from
+  before this change sends the literal `enc2:…` string as the route's key, so the route fails to
+  authenticate. Rolling back means reverting, then re-entering any route key saved in between.
+  Channel and tunnel tokens are still plaintext and are not part of this change.
+
+- A ClawHub skill file listed in the version manifest without a `sha256` (for example a script or `SKILL.toml`) was installed unverified: only the literal `SKILL.md` had to carry a hash, and every other entry was verified only when one happened to be present. Installs and updates now validate the whole manifest before fetching anything and refuse a version that lists any file without a valid 64-hex hash, naming the file; `skills update` keeps the installed version. Skills already installed are not re-verified, changed or removed.
+
+- The `ssh` tool checked the server key against `ssh_known_hosts.json` and failed open: a store that
+  could not be read or parsed was treated as an empty store, so the connection ran with the server
+  key unverified, and the store was then rewritten with that one entry, dropping every host pinned
+  before; a write that failed was ignored, so the host stayed unpinned while the connection ran.
+  The check now fails closed: an unreadable, unparseable or unwritable store refuses the
+  connection, and the store is written atomically through a temporary file that is renamed over the
+  target, so it can no longer be left half-written. A changed server key is now reported as a
+  changed key with the stored and the presented fingerprint, where the connection used to fail with
+  `Unknown server key`. A host already on record with the same key is unaffected: the store is not
+  rewritten and its permissions are not changed. Operator cost: a store that is already corrupt or
+  unwritable is now refused where the connection previously went through, and the message names
+  the file and how to repair it.
+
+- **An MCP OAuth login could be completed by the wrong callback.** The loopback listener the
+  flow binds on `127.0.0.1:11500` accepted the first request that arrived with a `code`,
+  whatever page it came from, and the authorization URL carried neither a `state` nor a PKCE
+  challenge — so any local process that hit the port first (a preconnect, a preview, a
+  malicious page) could hand the login a code of its choosing and have it exchanged. A
+  callback is now bound to its session: the authorization URL carries a one-time `state` and
+  an S256 `code_challenge`, the token exchange sends the matching `code_verifier`, and the
+  listener keeps the login alive across stray traffic — a wrong redirect slug, a missing
+  `state`, or a `state` that does not match this login is answered with a plain error page
+  and ignored, compared in constant time so a local prober cannot time its way to the
+  expected value. An `error=` parameter carrying the right `state` still ends the flow with
+  the provider's error. The bind stays `127.0.0.1:11500` and the authorization and token
+  endpoints stay constants; no environment variable or config key can redirect the exchange,
+  and the test-only seam that can is compiled out of production paths. No config key changed.
+
+- **A medium-risk grant made in one channel conversation answered the risk gate in every
+  conversation.** The shell risk gate's "Session" answer recorded the basename on the one
+  process-wide policy that every channel shares, so an owner's answer in chat A let the same
+  medium-risk command run unasked in chat B — and chat B is a chat a guest chose. The grants are
+  now filed per conversation: a grant answers the risk gate only in the channel and reply
+  target that made it, and never for a guest's turn, which asks again — the risk gate is the
+  owner's only check on a guest, and the guest's own `guest_allowed_commands` ceiling says
+  which commands a guest may run, not that a medium-risk one may run unasked. The TUI, the CLI
+  and the gateway's own operator paths have no chat, so their grants stay process-wide (one
+  operator). The console keeps its per-session grants: they are re-seeded under the console
+  turn's own scope, so a session answer still holds for the next message of that conversation
+  and for no other. No config key changed; rolling back means reverting this change.
 
 ## [0.33.0-alpha] — 2026-10-08
 
