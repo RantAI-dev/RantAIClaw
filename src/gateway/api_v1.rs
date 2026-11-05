@@ -9305,6 +9305,67 @@ mod tests {
         assert_eq!(channel_rows, vec![channel_id]);
     }
 
+    /// Deleting a session that has forks succeeds, and the forks stay: they
+    /// keep their messages and become top-level sessions.
+    ///
+    /// The delete used to answer 500 "FOREIGN KEY constraint failed" —
+    /// `sessions.parent_session_id` referenced `sessions(id)` without an
+    /// `ON DELETE` action, so the fork's reference blocked the delete.
+    #[tokio::test]
+    async fn sessions_delete_of_a_parent_session_keeps_its_forks() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+
+        let profile = crate::profile::ProfileManager::active().expect("active profile");
+        let session_db = profile.sessions_db_path();
+        let workspace_dir = profile.workspace_dir();
+
+        // A parent session with two forks of it.
+        let (parent_id, fork_a, fork_b) = {
+            let store = crate::sessions::SessionStore::open(&session_db).expect("open");
+            let parent = store.new_session("m", "tui").expect("parent");
+            let fork_a = store.fork_session(&parent.id, "fork a").expect("fork a");
+            let fork_b = store.fork_session(&parent.id, "fork b").expect("fork b");
+            (parent.id, fork_a.id, fork_b.id)
+        };
+
+        let state = test_state();
+        *state.config.lock() = {
+            let mut cfg = crate::config::Config::default();
+            cfg.workspace_dir = workspace_dir.clone();
+            cfg
+        };
+
+        let resp = sessions_delete(State(state), HeaderMap::new(), Path(parent_id.clone()))
+            .await
+            .expect("delete of a parent session must succeed")
+            .0;
+        assert_eq!(resp["deleted"], true);
+        assert_eq!(resp["id"], parent_id);
+
+        let session_store = crate::sessions::SessionStore::open(&session_db).expect("open");
+        assert!(session_store
+            .get_session(&parent_id)
+            .expect("get")
+            .is_none());
+        for fork_id in [&fork_a, &fork_b] {
+            let fork = session_store
+                .get_session(fork_id)
+                .expect("get")
+                .unwrap_or_else(|| panic!("the fork {fork_id} survives the delete"));
+            assert!(
+                fork.parent_session_id.is_none(),
+                "the fork becomes a top-level session: {fork:?}"
+            );
+            assert_eq!(
+                session_store.get_messages(fork_id).expect("messages").len(),
+                1,
+                "the fork keeps its message"
+            );
+        }
+    }
+
     /// A `/new`-ended session for the same `conversation_key` is removed
     /// by the whole-conversation delete. `close_channel_session` writes the
     /// `ended_at` and parks the row alongside the open one; both go.

@@ -1440,6 +1440,17 @@ mod tests {
         SessionStore::in_memory().expect("in-memory store")
     }
 
+    /// A file-backed store with `PRAGMA foreign_keys=ON`, plus the tempdir
+    /// that keeps the file alive for the test's lifetime.
+    ///
+    /// The in-memory store never enables foreign keys, so a test that needs
+    /// the constraint enforced has to use a file.
+    fn file_store() -> (tempfile::TempDir, SessionStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::open(&dir.path().join("sessions.db")).expect("open store");
+        (dir, store)
+    }
+
     #[test]
     fn open_sets_busy_timeout() {
         // File-backed stores must retry on lock contention instead of erroring,
@@ -2198,6 +2209,115 @@ mod tests {
         let mut s = store();
         let removed = s.delete_session("no-such-id").unwrap();
         assert!(!removed);
+    }
+
+    /// A fork outlives the session it was branched from: deleting the parent
+    /// succeeds, the fork keeps every message it had and becomes a top-level
+    /// session.
+    ///
+    /// The store is file-backed on purpose: only a file-backed store turns
+    /// `PRAGMA foreign_keys` on, and the foreign key on `parent_session_id`
+    /// is what used to make the delete fail with "FOREIGN KEY constraint
+    /// failed".
+    #[test]
+    fn delete_session_keeps_the_forks_of_the_deleted_session() {
+        let (_dir, mut s) = file_store();
+
+        let parent = s.new_session("m", "tui").unwrap();
+        s.record_api_turn("m", Some(&parent.id), "question", "answer")
+            .unwrap();
+        let fork_a = s.fork_session(&parent.id, "fork a").unwrap();
+        let fork_b = s.fork_session(&parent.id, "fork b").unwrap();
+
+        let removed = s.delete_session(&parent.id).unwrap();
+        assert!(removed, "the parent row is removed");
+
+        for (fork, note) in [(&fork_a, "fork a"), (&fork_b, "fork b")] {
+            let session = s
+                .get_session(&fork.id)
+                .unwrap()
+                .unwrap_or_else(|| panic!("the fork survives the delete"));
+            assert!(
+                session.parent_session_id.is_none(),
+                "the fork becomes a top-level session: {session:?}"
+            );
+            let messages = s.get_messages(&fork.id).unwrap();
+            assert_eq!(messages.len(), 1, "the fork keeps its message");
+            assert_eq!(messages[0].content, note);
+        }
+
+        // The parent's own messages go with it.
+        assert!(s.get_messages(&parent.id).unwrap().is_empty());
+    }
+
+    /// Deleting a whole conversation must still work when one of its
+    /// sessions has a fork: the fork is not part of the conversation, so it
+    /// survives and becomes top-level instead of blocking the delete.
+    #[test]
+    fn delete_conversation_keeps_a_fork_that_is_not_in_the_conversation() {
+        let (_dir, mut s) = file_store();
+
+        let parent = s
+            .record_channel_turn("m", "telegram:chat-1", "u", "r", None)
+            .unwrap();
+        let fork = s.fork_session(&parent, "fork").unwrap();
+
+        let removed = s.delete_conversation("telegram:chat-1").unwrap();
+        assert_eq!(removed, 1, "the channel session is removed");
+
+        assert!(s.get_session(&parent).unwrap().is_none());
+        let session = s
+            .get_session(&fork.id)
+            .unwrap()
+            .unwrap_or_else(|| panic!("the fork survives the delete"));
+        assert!(
+            session.parent_session_id.is_none(),
+            "the fork becomes a top-level session: {session:?}"
+        );
+        assert_eq!(s.get_messages(&fork.id).unwrap().len(), 1);
+    }
+
+    /// The retention sweep removes a channel session once it has no message
+    /// left. A session with a fork must not block that sweep — the fork
+    /// outlives the parent and becomes top-level.
+    #[test]
+    fn prune_channel_sessions_removes_an_aged_parent_that_has_a_fork() {
+        let (_dir, mut s) = file_store();
+
+        let parent = s
+            .record_channel_turn("m", "telegram:chat-old", "u", "r", None)
+            .unwrap();
+        let fork = s.fork_session(&parent, "fork").unwrap();
+
+        // Age the parent past the retention window: its messages are old, so
+        // the sweep drops them and the now-empty parent goes with them. The
+        // fork keeps its recent message and stays.
+        s.conn
+            .execute(
+                "UPDATE sessions SET started_at = 1 WHERE id = ?1",
+                params![&parent],
+            )
+            .unwrap();
+        s.conn
+            .execute(
+                "UPDATE messages SET timestamp = 1 WHERE session_id = ?1",
+                params![&parent],
+            )
+            .unwrap();
+
+        let removed = s.prune_channel_sessions(31_i64 * 24 * 60 * 60).unwrap();
+        assert_eq!(removed, 1, "the aged parent is removed");
+
+        assert!(s.get_session(&parent).unwrap().is_none());
+        let session = s
+            .get_session(&fork.id)
+            .unwrap()
+            .unwrap_or_else(|| panic!("the fork survives the sweep"));
+        assert!(
+            session.parent_session_id.is_none(),
+            "the fork becomes a top-level session: {session:?}"
+        );
+        assert_eq!(s.get_messages(&fork.id).unwrap().len(), 1);
     }
 
     // ── Channel recording ──────────────────────────────────────────────────

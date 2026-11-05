@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timeout gives in their place, now ends the turn on the console, the TUI and every channel. A
   refusal nobody gave (no approver available) still only fails the call, and the turn continues.
 
+- **Deleting a session that has forks no longer fails with a foreign-key error.** The `sessions`
+  table gave `parent_session_id` no `ON DELETE` action, so removing a session a fork pointed at
+  was refused. On the first start with this build, `sessions.db` migrates once to version **3**,
+  rebuilding the table with `ON DELETE SET NULL`: the delete now succeeds and each fork keeps all
+  its messages and stays as a standalone top-level session with `parent_session_id` NULL.
+  Messages, full-text search and every other table are untouched.
+
 ## [0.34.0-alpha] — 2026-11-05
 
 The hardening release. A caller can no longer borrow a stored credential for a host the
