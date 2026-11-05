@@ -194,6 +194,20 @@ ignore = [
     # webpki-roots 1.x (checked 2026-10-20: tokio-tungstenite 0.30.0 still
     # requests ^0.26), and remove the 0.26.11 entry from Cargo.lock with it.
     "RUSTSEC-2026-0381",
+    # pin-utils v0.1.0 — RUSTSEC-2026-0441, unmaintained (INFO — notice only,
+    # no vulnerability): the upstream repository was archived on 2026-10-01 and
+    # the advisory lists no patched version, so no lockfile bump clears it.
+    # Reached transitively by every build: async-imap 0.11 pulls it directly
+    # and hyper 1.8 (via axum 0.8 and reqwest 0.12/0.13) pulls it for its
+    # futures integration — verified with `cargo tree -i pin-utils`. The crate
+    # is a compile-time pinning helper (a handful of macros) consumed by
+    # futures-macro; it ships no runtime service, I/O or untrusted-input
+    # surface of its own.
+    #
+    # Revisit when a futures-util or hyper release drops the dependency, or on
+    # the async-imap upgrade already queued upstream (checked 2026-11-05: the
+    # hyper 1.8 chain keeps it either way).
+    "RUSTSEC-2026-0441",
 ]
 
 [licenses]
