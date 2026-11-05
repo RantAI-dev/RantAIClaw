@@ -438,6 +438,51 @@ mod tests {
         assert!(refusal.is_some(), "a refused call must not proceed");
     }
 
+    /// A human's Deny on the `ssh` tool's own prompt ends the turn: the model
+    /// is not asked again, so it cannot try the same command — or an
+    /// alternative one — behind the human's back. The tool still returns its
+    /// failed result; the model just never gets to act on that.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_denied_ssh_prompt_ends_the_turn() {
+        use crate::agent::deny_test_support::{answer_first, turn_agent, CountingToolProvider};
+        use std::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let policy = Arc::new(
+            SecurityPolicy::default().with_autonomy(crate::security::AutonomyLevel::Supervised),
+        );
+        let approvals = Arc::new(crate::security::PendingApprovals::new(Some(
+            std::time::Duration::from_secs(5),
+        )));
+        policy.set_pending(approvals.clone());
+
+        let (provider, requests) = CountingToolProvider::new(
+            "ssh",
+            r#"{"action":"exec","session":"probe","command":"id"}"#,
+        );
+        let mut agent = turn_agent(
+            Box::new(provider),
+            vec![Box::new(SshTool::new(Arc::clone(&policy)))],
+            Arc::clone(&policy),
+            dir.path(),
+        );
+        // The pane answers the request the tool registered.
+        let responder = answer_first(approvals, crate::security::Decision::Deny);
+
+        let token = tokio_util::sync::CancellationToken::new();
+        agent
+            .turn_streaming("go", None, Some(token))
+            .await
+            .expect("the turn ends");
+
+        responder.await.expect("the prompt was answered");
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "a Deny must end the turn: the model was asked again"
+        );
+    }
+
     fn tool(level: AutonomyLevel) -> SshTool {
         SshTool::new(Arc::new(SecurityPolicy::default().with_autonomy(level)))
     }
