@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A Deny on the shell, `pty` and `ssh` approval prompts now ends the turn on every surface.** The
+  console's modal already cancelled the turn when a person answered no there; a Deny at the prompt a
+  tool raises itself — the shell tool's two command gates, `pty` and `ssh` — only failed the call,
+  so the model could retry it and the prompt came back. A person's Deny, or the Deny the approval
+  timeout gives in their place, now ends the turn on the console, the TUI and every channel. A
+  refusal nobody gave (no approver available) still only fails the call, and the turn continues.
+
 ## [0.34.0-alpha] — 2026-11-05
 
 The hardening release. A caller can no longer borrow a stored credential for a host the

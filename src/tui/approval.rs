@@ -388,6 +388,50 @@ mod tests {
         );
     }
 
+    /// A human's Deny in the pane ends the turn: the model is not asked again,
+    /// so it cannot try the same command — or an alternative one — behind the
+    /// human's back. The shell's own gate (Layer B) is the prompt the pane
+    /// shows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_denied_pane_prompt_ends_the_turn() {
+        use crate::agent::deny_test_support::{answer_first, turn_agent, CountingToolProvider};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let security = Arc::new(SecurityPolicy::from_config(
+            &autonomy(AutonomyLevel::Supervised, &[]),
+            dir.path(),
+        ));
+        let approvals = Arc::new(PendingApprovals::new(Some(Duration::from_secs(5))));
+        security.set_pending(approvals.clone());
+
+        let (provider, requests) = CountingToolProvider::new("shell", r#"{"command":"probe"}"#);
+        let mut agent = turn_agent(
+            Box::new(provider),
+            vec![Box::new(crate::tools::ShellTool::new(
+                Arc::clone(&security),
+                Arc::new(crate::runtime::NativeRuntime::new()),
+            ))],
+            Arc::clone(&security),
+            dir.path(),
+        );
+        agent.set_surface("tui");
+        // The pane answers the request the shell registered.
+        let responder = answer_first(approvals, Decision::Deny);
+
+        let token = tokio_util::sync::CancellationToken::new();
+        agent
+            .turn_streaming("go", None, Some(token))
+            .await
+            .expect("the turn ends");
+
+        responder.await.expect("the pane answered");
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "a Deny must end the turn: the model was asked again"
+        );
+    }
+
     /// Under `Supervised` the `pty` and `ssh` tools also ask for themselves.
     /// The user must see one prompt for the call, not two.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

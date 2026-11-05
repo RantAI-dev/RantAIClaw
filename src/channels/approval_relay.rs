@@ -2962,6 +2962,281 @@ mod tests {
         let _ = second.await;
     }
 
+    // ── A human's Deny ends the turn ───────────────────────────────────
+
+    /// A tool that does nothing. The Layer-A test is about the gate, not about
+    /// what the tool would have done.
+    struct NoopTool;
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for NoopTool {
+        fn name(&self) -> &str {
+            "probe_tool"
+        }
+
+        fn description(&self) -> &str {
+            "A tool that does nothing, for the approval-gate tests."
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "done".to_string(),
+                error: None,
+            })
+        }
+    }
+
+    /// The policy a channel turn runs under: every tool asks, and the shell
+    /// has an allowlist that does not name the probe command, so the shell's
+    /// own gate asks too.
+    fn supervised_policy(dir: &std::path::Path) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy::from_config(
+            &crate::config::AutonomyConfig {
+                level: crate::security::AutonomyLevel::Supervised,
+                always_ask: vec![],
+                auto_approve: vec![],
+                ..crate::config::AutonomyConfig::default()
+            },
+            dir,
+        ))
+    }
+
+    /// The manager a channel turn gates its tools with.
+    fn supervised_manager() -> ApprovalManager {
+        ApprovalManager::from_config(&crate::config::AutonomyConfig {
+            level: crate::security::AutonomyLevel::Supervised,
+            always_ask: vec![],
+            auto_approve: vec![],
+            ..crate::config::AutonomyConfig::default()
+        })
+    }
+
+    /// Wait for the registry to hold a request, then answer it from the chat.
+    /// The answer comes from another task because the tool is waiting on it.
+    async fn answer_from_the_chat(
+        relay: Arc<PendingApprovals>,
+        reply: impl FnOnce(&Arc<PendingApprovals>) -> Option<String> + Send + 'static,
+    ) -> Option<String> {
+        for _ in 0..300 {
+            if !relay.list().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        reply(&relay)
+    }
+
+    /// A human's Deny in the chat on the shell's own gate (Layer B) ends the
+    /// turn: the model is not asked again, so it cannot try the same command —
+    /// or an alternative one — behind the human's back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_channel_deny_on_the_shell_prompt_ends_the_turn() {
+        use crate::agent::deny_test_support::{turn_agent, CountingToolProvider};
+        use std::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let security = supervised_policy(dir.path());
+        let approvals = Arc::new(PendingApprovals::new(Some(Duration::from_secs(5))));
+        security.set_pending(approvals.clone());
+
+        let (provider, requests) = CountingToolProvider::new("shell", r#"{"command":"probe"}"#);
+        let mut agent = turn_agent(
+            Box::new(provider),
+            vec![Box::new(crate::tools::ShellTool::new(
+                Arc::clone(&security),
+                Arc::new(crate::runtime::NativeRuntime::new()),
+            ))],
+            Arc::clone(&security),
+            dir.path(),
+        );
+        agent.set_surface("telegram");
+
+        // The chat answers the request the shell registered.
+        let chat = {
+            let security = Arc::clone(&security);
+            let approvals = Arc::clone(&approvals);
+            tokio::spawn(async move {
+                answer_from_the_chat(approvals, move |_approvals| {
+                    let owners = vec!["owner1".to_string()];
+                    try_handle_reply(
+                        "/deny probe",
+                        &security,
+                        "owner1",
+                        &owners,
+                        "telegram",
+                        "chat-1",
+                    )
+                })
+                .await
+            })
+        };
+
+        let token = tokio_util::sync::CancellationToken::new();
+        agent
+            .turn_streaming("go", None, Some(token))
+            .await
+            .expect("the turn ends");
+
+        let ack = chat.await.expect("the chat answered");
+        assert!(ack.is_some(), "the deny must be recognised: {ack:?}");
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "a Deny must end the turn: the model was asked again"
+        );
+    }
+
+    /// A human's Deny in the chat on the tool-approval gate (Layer A) ends the
+    /// turn too: the owner said no, so the model must not get to try the call
+    /// again — or an alternative one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_channel_deny_on_the_tool_prompt_ends_the_turn() {
+        use crate::agent::deny_test_support::{turn_agent, CountingToolProvider};
+        use std::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let security = supervised_policy(dir.path());
+        let relay = Arc::new(PendingApprovals::new(Some(Duration::from_secs(5))));
+        let channel: Arc<dyn Channel> = Arc::new(CapturingChannel::default());
+        let backend = ChatRelayApprovalBackend::new(relay.clone(), channel, &relay_origin());
+
+        let (provider, requests) = CountingToolProvider::new("probe_tool", "{}");
+        let mut agent = turn_agent(
+            Box::new(provider),
+            vec![Box::new(NoopTool)],
+            Arc::clone(&security),
+            dir.path(),
+        );
+        agent.set_surface("telegram");
+        agent.set_approval(
+            Some(Arc::new(supervised_manager())),
+            Some(Arc::new(backend)),
+        );
+
+        // The chat answers the request the gate raised.
+        let chat = {
+            let relay = Arc::clone(&relay);
+            tokio::spawn(async move {
+                answer_from_the_chat(relay, |relay| {
+                    let owners = vec!["owner1".to_string()];
+                    try_handle_tool_reply(
+                        "/deny probe_tool",
+                        relay,
+                        "owner1",
+                        &owners,
+                        "telegram",
+                        "chat-1",
+                    )
+                })
+                .await
+            })
+        };
+
+        let token = tokio_util::sync::CancellationToken::new();
+        agent
+            .turn_streaming("go", None, Some(token))
+            .await
+            .expect("the turn ends");
+
+        let ack = chat.await.expect("the chat answered");
+        assert!(ack.is_some(), "the deny must be recognised: {ack:?}");
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "a Deny must end the turn: the model was asked again"
+        );
+    }
+
+    /// The deadline gave the no in the human's place (Layer A, basis
+    /// `NoAnswer`): the turn ends as well. Nobody refused — the prompt simply
+    /// went unanswered — but the model must not get to ask again, or the
+    /// unanswered prompt comes back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_channel_deny_on_a_timed_out_tool_prompt_ends_the_turn() {
+        use crate::agent::deny_test_support::{turn_agent, CountingToolProvider};
+        use std::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let security = supervised_policy(dir.path());
+        // The deadline the prompt carries: nobody answers it.
+        let relay = Arc::new(PendingApprovals::new(Some(Duration::from_millis(50))));
+        let channel: Arc<dyn Channel> = Arc::new(CapturingChannel::default());
+        let backend = ChatRelayApprovalBackend::new(relay.clone(), channel, &relay_origin());
+
+        let (provider, requests) = CountingToolProvider::new("probe_tool", "{}");
+        let mut agent = turn_agent(
+            Box::new(provider),
+            vec![Box::new(NoopTool)],
+            Arc::clone(&security),
+            dir.path(),
+        );
+        agent.set_surface("telegram");
+        agent.set_approval(
+            Some(Arc::new(supervised_manager())),
+            Some(Arc::new(backend)),
+        );
+
+        let token = tokio_util::sync::CancellationToken::new();
+        agent
+            .turn_streaming("go", None, Some(token))
+            .await
+            .expect("the turn ends");
+
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "an unanswered prompt must end the turn: the model was asked again"
+        );
+    }
+
+    /// The shell's own prompt goes unanswered and the deadline gives the no in
+    /// the human's place: the turn ends as well. Nobody refused — the prompt
+    /// simply timed out — but the model must not get to ask again, or the
+    /// unanswered prompt comes straight back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_channel_deny_on_a_timed_out_shell_prompt_ends_the_turn() {
+        use crate::agent::deny_test_support::{turn_agent, CountingToolProvider};
+        use std::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let security = supervised_policy(dir.path());
+        // The deadline the shell's prompt carries: nobody answers it.
+        let approvals = Arc::new(PendingApprovals::new(Some(Duration::from_millis(50))));
+        security.set_pending(approvals);
+
+        let (provider, requests) = CountingToolProvider::new("shell", r#"{"command":"probe"}"#);
+        let mut agent = turn_agent(
+            Box::new(provider),
+            vec![Box::new(crate::tools::ShellTool::new(
+                Arc::clone(&security),
+                Arc::new(crate::runtime::NativeRuntime::new()),
+            ))],
+            Arc::clone(&security),
+            dir.path(),
+        );
+        agent.set_surface("telegram");
+
+        let token = tokio_util::sync::CancellationToken::new();
+        agent
+            .turn_streaming("go", None, Some(token))
+            .await
+            .expect("the turn ends");
+
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "an unanswered prompt must end the turn: the model was asked again"
+        );
+    }
+
     /// Negative path for the full chain: with nothing pending anywhere along it
     /// (Layer A empty, Layer B registry empty), ordinary chat stays chat. A bare
     /// `ok` does not get claimed by Layer A's bare-verb path (it returns `None`

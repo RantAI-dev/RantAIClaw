@@ -3305,6 +3305,11 @@ mod tests {
             format!("custom:http://{}", self.addr)
         }
 
+        /// How many provider requests the turn made.
+        fn request_count(&self) -> usize {
+            *self.requests.lock()
+        }
+
         fn ask_for(&self, command: &str) {
             *self.commands.lock() = vec![command.to_string()];
         }
@@ -5072,6 +5077,38 @@ mod tests {
             approval_request_count(&events),
             1,
             "Smart's one shell request must be one event: {events:?}"
+        );
+    }
+
+    /// A human Deny on the shell's own gate (Layer B) ends the turn: the model
+    /// must not be asked again, so it cannot try the same command — or an
+    /// alternative one — behind the human's back.
+    #[tokio::test]
+    async fn console_deny_on_the_shell_prompt_ends_the_turn() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+        let state = scripted_state();
+        let script = ShellToolScript::start().await;
+
+        script.ask_for("hostname");
+        let (events, prompt) = drive_console_turn(
+            &state,
+            &script.provider(),
+            None,
+            "run it",
+            // Deny: the answer the browser's modal gets.
+            Some((false, false)),
+        )
+        .await;
+        assert!(
+            prompt.is_some(),
+            "the unallowed command must prompt before it is denied: {events:?}"
+        );
+        assert_eq!(
+            script.request_count(),
+            1,
+            "a Deny must end the turn: the model was asked again: {events:?}"
         );
     }
 

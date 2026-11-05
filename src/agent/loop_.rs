@@ -1409,7 +1409,13 @@ pub(crate) async fn execute_one_tool_structured(
                 }
                 return Err(ToolLoopCancelled.into());
             }
-            r = crate::security::TOOL_APPROVAL.scope(cell, tool_future) => r,
+            // The turn's token rides along with the tool: a tool that asks a
+            // human itself (shell's two gates, `pty`, `ssh`) ends the turn when
+            // the human says no, without the `Tool` trait carrying a token.
+            r = crate::security::TURN_CANCEL.scope(
+                CancellationToken::clone(token),
+                crate::security::TOOL_APPROVAL.scope(cell, tool_future),
+            ) => r,
         }
     } else {
         crate::security::TOOL_APPROVAL
@@ -1668,6 +1674,16 @@ pub(crate) async fn execute_tool_calls_collecting(
                 let decision = verdict.response;
                 mgr.record_decision(&call.name, &call.arguments, decision, channel_name);
                 if decision == ApprovalResponse::No {
+                    // A human said no, or the deadline gave the no in the human's
+                    // place (`NoAnswer`). Either way the turn ends here: the
+                    // model must not get to try the same call again. A refusal
+                    // nobody gave (`NoApprover`) is not a human's no and leaves
+                    // the turn alone — the model may pick another approach.
+                    if verdict.basis != crate::approval::DecisionBasis::NoApprover {
+                        if let Some(token) = cancellation_token {
+                            token.cancel();
+                        }
+                    }
                     if let Some(tx) = events {
                         let denial_id = Uuid::new_v4().to_string();
                         let _ = tx
@@ -6247,6 +6263,45 @@ done
         assert!(output.contains("no answer came in time"), "{output}");
         assert!(!output.contains("did not approve"), "{output}");
         assert!(!output.contains("no approver"), "{output}");
+    }
+
+    /// A refusal nobody gave is not a Deny. The tool does not run, the model
+    /// is told that no approver was available, and the turn goes on: the model
+    /// may pick another approach. Only a human's no — or the deadline's — ends
+    /// a turn.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refusal_nobody_gave_leaves_the_turn_running() {
+        use crate::agent::deny_test_support::{turn_agent, CountingToolProvider};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (provider, requests) = CountingToolProvider::new("do_thing", "{}");
+        let mut agent = turn_agent(
+            Box::new(provider),
+            vec![Box::new(RanFlagTool {
+                ran: Arc::clone(&ran),
+            })],
+            Arc::new(SecurityPolicy::default()),
+            dir.path(),
+        );
+        // Nobody is there to answer: the surface's own backend refuses.
+        agent.set_approval(
+            Some(Arc::new(supervised_manager())),
+            Some(Arc::new(crate::approval::AutoDenyBackend)),
+        );
+
+        let token = CancellationToken::new();
+        agent
+            .turn_streaming("go", None, Some(token))
+            .await
+            .expect("the turn ends");
+
+        assert!(!ran.load(Ordering::SeqCst), "a refused call must not run");
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "a refusal nobody gave must not end the turn: the model was not asked again"
+        );
     }
 
     /// `auto_approve` takes an exact tool name, so one MCP tool can run

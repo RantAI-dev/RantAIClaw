@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, oneshot};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::audit::ApprovalOutcome;
@@ -180,6 +181,32 @@ tokio::task_local! {
     /// `false` outside a turn is the safe answer: the TUI, the CLI and the
     /// gateway's own operator paths are the operator's own turns.
     pub static TURN_IS_GUEST: bool;
+
+    /// The turn's cancellation token, while a tool runs.
+    ///
+    /// A tool that asks a human itself (shell's two gates, `pty`, `ssh`) has to
+    /// end the turn when the human says no — the model must not get to try the
+    /// same call, or an alternative one, behind their back. A `Tool` carries no
+    /// cancellation token, and widening that trait for one tool's benefit is
+    /// worse than ambient context the shared decision path reads.
+    ///
+    /// The agent loop installs one of these around every tool's `execute`, next
+    /// to [`TOOL_APPROVAL`], so a tool that asks inherits the behaviour without
+    /// knowing about it. Absent outside a turn (a unit test, a cron path), and
+    /// the shared path then does nothing.
+    pub static TURN_CANCEL: CancellationToken;
+}
+
+/// End the turn after a human refused the request.
+///
+/// A person said no, or the deadline gave the no in their place: both end the
+/// turn. A refusal nobody gave — the registry shut down under the request —
+/// is not a human's no and leaves the turn alone.
+///
+/// A no-op when no turn is in scope: a prompt raised outside a turn has no
+/// turn to end.
+pub fn cancel_turn_on_human_deny() {
+    let _ = TURN_CANCEL.try_with(CancellationToken::cancel);
 }
 
 /// Shared handle to the human answer one tool call received.
@@ -562,17 +589,28 @@ impl PendingApprovals {
         let _ = self.inner.notify_tx.send(request);
 
         // `_cleanup` drops after this value is produced, removing both entries.
-        match self.inner.timeout {
+        //
+        // `human_deny` says who produced a no: a person answered, or the
+        // deadline gave the no in a person's place. A no the registry produced
+        // on its own (it shut down under the request) is nobody's no — it
+        // leaves the turn alone.
+        let (outcome, human_deny) = match self.inner.timeout {
             Some(d) => match tokio::time::timeout(d, rx).await {
-                Ok(Ok(decision)) => PendingOutcome {
-                    decision,
-                    timed_out: false,
-                },
+                Ok(Ok(decision)) => (
+                    PendingOutcome {
+                        decision,
+                        timed_out: false,
+                    },
+                    decision == Decision::Deny,
+                ),
                 // Sender dropped (registry shut down) — deny, no broadcast.
-                Ok(Err(_)) => PendingOutcome {
-                    decision: Decision::Deny,
-                    timed_out: false,
-                },
+                Ok(Err(_)) => (
+                    PendingOutcome {
+                        decision: Decision::Deny,
+                        timed_out: false,
+                    },
+                    false,
+                ),
                 // Deadline elapsed — auto-deny AND tell resolved-subscribers so a
                 // web modal can close instead of leaving dead buttons.
                 Err(_elapsed) => {
@@ -582,24 +620,41 @@ impl PendingApprovals {
                         reply_target: reply_target_for_resolve.clone(),
                         timed_out: true,
                     });
-                    PendingOutcome {
-                        decision: Decision::Deny,
-                        timed_out: true,
-                    }
+                    (
+                        PendingOutcome {
+                            decision: Decision::Deny,
+                            timed_out: true,
+                        },
+                        true,
+                    )
                 }
             },
             None => match rx.await {
-                Ok(decision) => PendingOutcome {
-                    decision,
-                    timed_out: false,
-                },
+                Ok(decision) => (
+                    PendingOutcome {
+                        decision,
+                        timed_out: false,
+                    },
+                    decision == Decision::Deny,
+                ),
                 // Oneshot sender dropped (registry shut down) — deny.
-                Err(_) => PendingOutcome {
-                    decision: Decision::Deny,
-                    timed_out: false,
-                },
+                Err(_) => (
+                    PendingOutcome {
+                        decision: Decision::Deny,
+                        timed_out: false,
+                    },
+                    false,
+                ),
             },
+        };
+        if human_deny {
+            // A person said no, or the deadline gave the no in their place:
+            // end the turn, so the model does not get to try the same call
+            // again. The tool still returns its failed result — the model sees
+            // the call as denied, it just never gets to act on that.
+            cancel_turn_on_human_deny();
         }
+        outcome
     }
 
     /// Resolve a pending request. Returns `true` if a sender was
