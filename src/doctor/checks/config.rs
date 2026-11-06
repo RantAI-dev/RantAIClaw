@@ -126,18 +126,26 @@ impl DoctorCheck for ProviderKeyCheck {
 
         // Ask the ONE question the send path asks. `resolve_key_for_provider`
         // answers a narrower one — "is a key in config?" — so an install
-        // authenticated by environment, by an auth profile, by AWS variables or
-        // by the Gemini CLI was told the agent could not send while it sent
-        // fine. `has_usable_credential` covers local providers too, so the
-        // separate keyless branch that used to sit here is gone.
-        let state_dir = crate::auth::state_dir_from_config(&ctx.config);
+        // authenticated by environment or by AWS variables was told the agent
+        // could not send while it sent fine. `has_usable_credential` covers
+        // local providers too, so the separate keyless branch that used to sit
+        // here is gone.
         let resolved = ctx.config.resolve_key_for_provider(provider);
+
+        // A setup-token is refused when the request is sent, so the credential
+        // RESOLVES and the provider BUILDS: the failure is invisible until a
+        // turn is attempted. It is a breakage, not a setup gap, so it fails.
+        if let Some(problem) = provider_credential_problem(provider, resolved.as_deref()) {
+            return CheckResult::fail(
+                self.name(),
+                problem.message(&format!("credential for {provider}"), "is refused"),
+            )
+            .with_category(self.category())
+            .with_hint("run: rantaiclaw setup provider");
+        }
+
         match (
-            crate::providers::has_usable_credential(
-                provider,
-                resolved.as_deref(),
-                Some(&state_dir),
-            ),
+            crate::providers::has_usable_credential(provider, resolved.as_deref()),
             resolved,
         ) {
             (true, _) => {
@@ -154,7 +162,7 @@ impl DoctorCheck for ProviderKeyCheck {
                 self.name(),
                 format!(
                     "no credential for {provider} — tried config, its environment variables, \
-                     and the provider's own auth (OAuth profile / cached token / AWS env). \
+                     and the provider's own auth (AWS env). \
                      The agent cannot send a message yet"
                 ),
             )
@@ -267,6 +275,52 @@ fn writable_probe(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Are the login files an earlier RantaiClaw wrote still on disk?
+///
+/// The startup sweep removes them, so a file that is still there means the
+/// sweep could NOT remove it: a read-only directory, a file owned by someone
+/// else, a mount the operator put there. The credential is still on disk, so
+/// it is worth saying so — with the paths, which are not secrets, and never
+/// with the contents, which are.
+pub struct LegacyLoginFilesCheck;
+
+#[async_trait]
+impl DoctorCheck for LegacyLoginFilesCheck {
+    fn name(&self) -> &'static str {
+        "config.legacy_logins"
+    }
+    fn category(&self) -> &'static str {
+        "config"
+    }
+    async fn run(&self, ctx: &DoctorContext) -> CheckResult {
+        let present: Vec<String> =
+            crate::config::legacy_logins::legacy_login_file_paths(&ctx.config)
+                .into_iter()
+                .filter(|path| path.exists())
+                .map(|path| path.display().to_string())
+                .collect();
+
+        if present.is_empty() {
+            return CheckResult::ok(self.name(), "no legacy login files on disk")
+                .with_category(self.category());
+        }
+
+        // Warn, not Fail: the files are harmless to the agent — nothing reads
+        // them any more — but a credential left on disk is a credential the
+        // operator did not ask to keep. The fix is the operator's to make.
+        CheckResult::warn(
+            self.name(),
+            format!(
+                "{} legacy login file(s) could not be removed: {}",
+                present.len(),
+                present.join(", ")
+            ),
+        )
+        .with_category(self.category())
+        .with_hint("delete them by hand, or check the directory's permissions")
+    }
+}
+
 fn provider_validation_error(name: &str) -> Option<String> {
     // Validate the provider spec's SHAPE (name / custom URL), not credential
     // presence: pass a placeholder key so providers that now require one at
@@ -298,6 +352,9 @@ enum ProviderProblem {
     RemovedLogin(&'static str),
     /// The name is not one the factory knows.
     Invalid(String),
+    /// The credential the provider would send is a Claude subscription
+    /// setup-token, which this build refuses.
+    SetupToken(&'static str),
 }
 
 impl ProviderProblem {
@@ -312,6 +369,7 @@ impl ProviderProblem {
                 format!("{subject} names a removed login: {sentence}")
             }
             Self::Invalid(reason) => format!("{subject} {invalid}: {reason}"),
+            Self::SetupToken(sentence) => format!("{subject}: {sentence}"),
         }
     }
 }
@@ -326,6 +384,15 @@ fn provider_problem(name: &str) -> Option<ProviderProblem> {
         return Some(ProviderProblem::RemovedLogin(sentence));
     }
     provider_validation_error(name).map(ProviderProblem::Invalid)
+}
+
+/// The problem with the CREDENTIAL `name` would send, if it has one.
+///
+/// A setup-token authenticates a Claude subscription, and this build refuses
+/// one: the provider still builds (so the gateway binds), and every request is
+/// refused. The report names the API key that replaces it.
+fn provider_credential_problem(name: &str, config_key: Option<&str>) -> Option<ProviderProblem> {
+    crate::providers::refused_credential(name, config_key).map(ProviderProblem::SetupToken)
 }
 
 #[cfg(test)]
@@ -473,10 +540,9 @@ mod tests {
     }
 
     /// `doctor` used to ask a NARROWER question than the send path: "is a key
-    /// in config?". An install authenticated by AWS environment variables, an
-    /// auth profile or a cached OAuth token was told the agent could not send,
-    /// while it sent fine. Both checks now ask `has_usable_credential`, so all
-    /// three surfaces give one answer.
+    /// in config?". An install authenticated by AWS environment variables was
+    /// told the agent could not send, while it sent fine. Both checks now ask
+    /// `has_usable_credential`, so all three surfaces give one answer.
     #[tokio::test]
     async fn provider_key_check_sees_a_credential_that_is_not_a_config_key() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
@@ -521,6 +587,138 @@ mod tests {
             let result = ProviderKeyCheck.run(&ctx).await;
             assert_eq!(result.severity, Severity::Ok, "{name}: {}", result.message);
         }
+    }
+
+    /// A setup-token is a Claude subscription credential this build refuses.
+    /// The provider still builds — so the gateway binds and the daemon stays
+    /// up — and every request is refused. The check must FAIL: the agent
+    /// cannot send, and a Warn would let a broken install look like a setup
+    /// gap.
+    ///
+    /// The message names the API key that replaces it and never the token.
+    #[tokio::test]
+    async fn provider_key_check_fails_on_a_setup_token_credential() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+
+        let mut cfg = Config::default();
+        cfg.default_provider = Some("anthropic".into());
+        cfg.api_key = None;
+        cfg.provider_api_keys.insert(
+            "anthropic".into(),
+            "sk-ant-oat01-doctor-marker-token".into(),
+        );
+        let (ctx, _tmp) = ctx_with_config(cfg);
+        let result = ProviderKeyCheck.run(&ctx).await;
+        assert_eq!(result.severity, Severity::Fail, "msg: {}", result.message);
+        assert!(
+            result.message.contains("ANTHROPIC_API_KEY"),
+            "msg: {}",
+            result.message
+        );
+        assert!(
+            !result.message.contains("doctor-marker-token"),
+            "the report must not echo the credential: {}",
+            result.message
+        );
+    }
+
+    /// The startup sweep removes the legacy login files, so a file that is
+    /// still there means the sweep could NOT remove it: a read-only directory,
+    /// a file owned by someone else. The check says so, naming the path —
+    /// and never the contents, which are a credential.
+    #[tokio::test]
+    async fn legacy_login_files_check_warns_when_a_legacy_file_is_still_there() {
+        let (ctx, tmp) = ctx_with_config(Config::default());
+        let mut config = ctx.config.clone();
+        // The state dir is the directory the config file lives in, so the
+        // check must read this test's directory, never the operator's own.
+        config.config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            tmp.path().join("auth-profiles.json"),
+            "sk-ant-oat01-doctor-marker-token",
+        )
+        .expect("write the legacy file");
+        let ctx = DoctorContext {
+            profile: ctx.profile,
+            config,
+            offline: false,
+        };
+
+        let result = LegacyLoginFilesCheck.run(&ctx).await;
+        assert_eq!(result.severity, Severity::Warn, "msg: {}", result.message);
+        assert!(
+            result.message.contains("auth-profiles.json"),
+            "msg: {}",
+            result.message
+        );
+        assert!(
+            !result.message.contains("doctor-marker-token"),
+            "the report must not echo the credential: {}",
+            result.message
+        );
+    }
+
+    /// The Copilot token pair lives in the PLATFORM config directory, not
+    /// beside the config file, so the check must look there too.
+    #[tokio::test]
+    async fn legacy_login_files_check_sees_the_copilot_files_in_the_platform_config_directory() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let xdg = scratch.path().join("xdg");
+        let copilot = xdg.join("rantaiclaw").join("copilot");
+        std::fs::create_dir_all(&copilot).expect("the copilot dir");
+        std::fs::write(copilot.join("access-token"), "copilot-marker-token")
+            .expect("write the copilot token");
+        let _xdg = crate::test_env::EnvGuard::set("XDG_CONFIG_HOME", &xdg);
+
+        let (ctx, tmp) = ctx_with_config(Config::default());
+        let mut config = ctx.config.clone();
+        config.config_path = tmp.path().join("config.toml");
+        let ctx = DoctorContext {
+            profile: ctx.profile,
+            config,
+            offline: false,
+        };
+
+        let result = LegacyLoginFilesCheck.run(&ctx).await;
+        assert_eq!(result.severity, Severity::Warn, "msg: {}", result.message);
+        assert!(
+            result.message.contains("access-token"),
+            "msg: {}",
+            result.message
+        );
+        assert!(
+            !result.message.contains("copilot-marker-token"),
+            "the report must not echo the credential: {}",
+            result.message
+        );
+    }
+
+    /// Nothing left on disk is the normal case, and the check must say so
+    /// rather than stay quiet.
+    ///
+    /// The platform config directory is pointed at an empty one, so the
+    /// operator's own files cannot decide the verdict.
+    #[tokio::test]
+    async fn legacy_login_files_check_passes_when_there_is_nothing_to_sweep() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let xdg = scratch.path().join("xdg");
+        std::fs::create_dir_all(&xdg).expect("the config home");
+        let _xdg = crate::test_env::EnvGuard::set("XDG_CONFIG_HOME", &xdg);
+
+        let (ctx, tmp) = ctx_with_config(Config::default());
+        let mut config = ctx.config.clone();
+        config.config_path = tmp.path().join("config.toml");
+        let ctx = DoctorContext {
+            profile: ctx.profile,
+            config,
+            offline: false,
+        };
+
+        let result = LegacyLoginFilesCheck.run(&ctx).await;
+        assert_eq!(result.severity, Severity::Ok, "msg: {}", result.message);
     }
 
     #[tokio::test]

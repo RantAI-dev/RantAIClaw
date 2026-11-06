@@ -77,10 +77,36 @@ By default the runtime keeps its data under the profile directory, `~/.rantaicla
 The runtime sets a mode on several files and directories. These include:
 
 - `config.toml` is written with mode 0600.
-- `auth-profiles.json`, `pairing_codes.json` and `~/.rantaiclaw/.secret_key` are written with mode 0600.
+- `pairing_codes.json` and `~/.rantaiclaw/.secret_key` are written with mode 0600.
 - `cron/jobs.db` and its WAL and SHM files get mode 0600, on a best-effort basis.
 - The profile's `secrets/` directory gets mode 0700, on a best-effort basis.
 - The WhatsApp Web session database, which holds the account's keys, gets mode 0600, as does each snapshot file and `.extra` file written beside it. Its parent directory gets mode 0700. All of these are best effort.
+
+### Login files an earlier build left on disk
+
+RantaiClaw used to keep subscription logins on disk. It keeps none now, and the first
+start with this build removes what an earlier build left behind:
+
+- `auth-profiles.json`, `auth-profiles.lock` and `auth-openai-pending.json` in the
+  active profile's config directory — the directory that holds `config.toml`.
+- `access-token` and `api-key.json` in the `copilot` subdirectory of the OS platform
+  config directory: `$XDG_CONFIG_HOME/rantaiclaw/copilot/` on Linux,
+  `~/Library/Application Support/rantaiclaw/copilot/` on macOS,
+  `%APPDATA%\rantaiclaw\copilot\` on Windows. That is not the profile directory, and
+  those two files are the only things read from it.
+
+The sweep runs on every start and is idempotent, so only the first start after an
+upgrade has anything to remove. Each removed file gets one log line naming the path and
+nothing else — the file held a credential, and a log is the wrong place for one:
+
+```text
+removed legacy login file: ~/.rantaiclaw/profiles/default/auth-profiles.json
+```
+
+A file that cannot be removed is left in place and reported by `rantaiclaw doctor` as
+`config.legacy_logins`, with the paths and the hint to delete them by hand. Nothing
+outside the list above is touched: `~/.gemini/` and `~/.qwen/` belong to other CLIs and
+are left alone.
 
 ### Credentials in `config.toml`
 
@@ -90,7 +116,7 @@ The channel and tunnel tokens are not encrypted. They are stored as plaintext in
 
 A gateway client that holds a paired token has operator rights over provider config, so a config write (for example `PUT /api/v1/config/model` or the console) may point the agent at any endpoint. What a caller cannot do without writing config is borrow a stored credential for a host the operator never configured: a caller-chosen `custom:<url>` or `anthropic-custom:<url>` id is refused until the operator configures it.
 
-The runtime sets no mode on the profile directories, `brain.db` or `sessions.db`, and the list above is not exhaustive for other files. For every path without a mode, the operator's umask decides. The `systemd --user` installer writes the unit file with no mode. The OpenRC installer, which runs as root and uses `/etc/rantaiclaw`, sets 0750 on the workspace and the log directory, and 0600 on `config.toml`, `.secret_key` and `auth-profiles.json`.
+The runtime sets no mode on the profile directories, `brain.db` or `sessions.db`, and the list above is not exhaustive for other files. For every path without a mode, the operator's umask decides. The `systemd --user` installer writes the unit file with no mode. The OpenRC installer, which runs as root and uses `/etc/rantaiclaw`, sets 0750 on the workspace and the log directory, and 0600 on `config.toml` and `.secret_key`.
 
 ## Groups
 

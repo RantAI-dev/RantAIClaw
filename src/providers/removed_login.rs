@@ -163,7 +163,7 @@ mod tests {
 
         for (name, _) in REMOVED_NAMES {
             assert!(
-                !has_usable_credential(name, None, None),
+                !has_usable_credential(name, None),
                 "{name} must not report a usable credential"
             );
         }
@@ -200,7 +200,7 @@ mod tests {
             assert!(is_local_refusal(&error), "{provider_name}: {error}");
 
             assert!(
-                !has_usable_credential(provider_name, Some(placeholder), None),
+                !has_usable_credential(provider_name, Some(placeholder)),
                 "{provider_name} must not report a usable credential"
             );
         }

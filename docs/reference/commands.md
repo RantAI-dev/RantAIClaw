@@ -43,7 +43,7 @@ This reference is derived from the current CLI surface (`rantaiclaw --help`).
 | `ui` | Install/run/stop the optional web console (claw-ui) |
 | `memory` | Agent memory: list, get, add, recall, reindex, stats, clear |
 | `update` | Self-replace the binary against a published GitHub release |
-| `auth` | Manage the Anthropic subscription auth profile (setup token) |
+| `auth` | Removed — prints why and exits non-zero; use an API key instead |
 | `permissions` | Owners and the non-owner (guest) capability ceiling, shared by all multi-user channels |
 | `personality` | Show, list, or set the active persona preset, name and timezone |
 | `profile` | Create, clone, switch, and delete profiles |
@@ -738,27 +738,19 @@ from the list.
 
 ### `auth`
 
-Provider **subscription** authentication — the Anthropic setup token — as opposed to the
-API keys `setup provider` writes into config. Both can be present; credential precedence is
-documented in [`providers.md`](providers.md).
+Removed. RantaiClaw stores no provider subscription login, so there is no profile to
+manage, paste or list. The command survives only as a stub: it prints the removal
+message on stderr and exits with status `1`, so a script that still calls it fails
+loudly instead of appearing to succeed.
 
-| Subcommand | Description |
-|---|---|
-| `paste-token` | Paste a setup/auth token (Anthropic subscription auth) |
-| `setup-token` | Alias for `paste-token`, interactive by default |
-| `logout` | Remove an auth profile |
-| `use` | Set the active auth profile for a provider |
-| `list` | List auth profiles |
-| `status` | Active profile and token expiry |
+```text
+The `auth` command was removed: RantaiClaw no longer stores provider subscription logins. Use an API key instead — set ANTHROPIC_API_KEY, store the provider's key in config.toml, or run `rantaiclaw setup provider`.
+```
 
-The OAuth login commands are gone. `login`, `paste-redirect` and `refresh` existed for the
-ChatGPT (OpenAI Codex) login only, and RantaiClaw uses API keys only — that login was
-removed with them. The Anthropic setup-token path is unchanged.
-
-A stored **anthropic** profile is used for inference: `agent -p anthropic` and an
-`anthropic-custom:<url>` provider send it when no config key is set and before any
-`ANTHROPIC_*` env var. Profiles stored for other providers are not used for inference.
-Order and header rules are in [`providers.md`](providers.md#anthropic-family-credential-order).
+Use an API key instead: export the provider's own variable (`ANTHROPIC_API_KEY` for
+Anthropic), store the key in `config.toml`, or run `rantaiclaw setup provider`. A Claude
+subscription setup token is refused rather than sent. Credential order and the header
+rule are in [`providers.md`](providers.md#anthropic-family-credential-order).
 
 ### `permissions`
 

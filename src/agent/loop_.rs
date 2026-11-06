@@ -2652,6 +2652,11 @@ pub async fn run_with_scope(
     // futures require it.
     reader: &mut (dyn tokio::io::AsyncBufRead + Unpin + Send),
 ) -> Result<String> {
+    // The subscription logins are gone, so the files an earlier RantaiClaw
+    // wrote for them are swept on every start. The sweep is idempotent and
+    // logs one line per file it actually removed.
+    crate::config::legacy_logins::remove_legacy_login_files(&config);
+
     // ── Wire up agnostic subsystems ──────────────────────────────
     let observer: Arc<dyn Observer> = observer
         .unwrap_or_else(|| Arc::from(observability::create_observer(&config.observability)));
@@ -2749,7 +2754,6 @@ pub async fn run_with_scope(
         })?;
 
     let provider_runtime_options = providers::ProviderRuntimeOptions {
-        auth_profile_override: None,
         rantaiclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
