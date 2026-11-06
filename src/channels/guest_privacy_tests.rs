@@ -2724,7 +2724,7 @@ impl Deployment {
         let mut config = Config {
             workspace_dir: workspace.path().to_path_buf(),
             config_path: config_dir.path().join("config.toml"),
-            default_provider: Some("openai-codex".to_string()),
+            default_provider: Some("test-non-native".to_string()),
             channels_config: crate::config::schema::ChannelsConfig {
                 telegram: Some(crate::config::TelegramConfig {
                     bot_token: "111111111:not-a-real-token".into(),
@@ -2755,7 +2755,7 @@ impl Deployment {
             config.agents.insert(
                 "helper".to_string(),
                 crate::config::DelegateAgentConfig {
-                    provider: "openai-codex".to_string(),
+                    provider: "test-non-native".to_string(),
                     model: "helper-model".to_string(),
                     system_prompt: None,
                     api_key: None,

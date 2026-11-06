@@ -2,7 +2,7 @@
 
 This is a high-signal reference for common config sections and defaults.
 
-Last verified: **May 9, 2026**.
+Last verified: **November 6, 2026**.
 
 Config path resolution at startup:
 
@@ -271,7 +271,7 @@ Notes:
 - Usage is appended to `<workspace>/state/costs.jsonl`. The day rolls over at
   UTC midnight.
 - The ceiling counts a turn only when the provider reports token counts. The
-  OpenAI-compatible, Anthropic, OpenRouter, Ollama, Copilot and Bedrock providers
+  OpenAI-compatible, Anthropic, OpenRouter, Ollama and Bedrock providers
   report them; a provider that does not report them adds nothing to the day's total.
 - `enabled = false` turns off the ceiling **and** the usage record together.
 - `rantaiclaw usage` prints today's total against this ceiling. See

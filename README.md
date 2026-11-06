@@ -295,10 +295,15 @@ checklist that promotes a row from this table to the one above.
 
 ## Providers
 
-Around 16 adapters — OpenAI, Anthropic, Gemini, Bedrock, GLM/Z.AI, Ollama, Copilot,
-OpenAI Codex, Gemini CLI, OpenRouter and more — behind one `Provider` trait, with a
-resilient wrapper (`providers/reliable.rs`) handling retry, fallback and timeouts
-uniformly, and a router for `provider:model` resolution.
+Provider adapters — OpenAI, Anthropic, Gemini, Bedrock, GLM/Z.AI, Ollama, OpenRouter and
+more — sit behind one `Provider` trait, with a resilient wrapper (`providers/reliable.rs`)
+handling retry, fallback and timeouts uniformly, and a router for `provider:model`
+resolution.
+
+Providers use API keys. The subscription logins for GitHub Copilot, ChatGPT (OpenAI
+Codex), Gemini CLI, Qwen Code OAuth and MiniMax OAuth were removed; a config that still
+names one loads, and the request that reaches it is refused with the API-key replacement
+named.
 
 Anthropic, OpenAI and Gemini route through [`rig-core`](https://github.com/0xPlaygrounds/rig)
 for streaming and tool calling. The hand-rolled implementations remain available behind

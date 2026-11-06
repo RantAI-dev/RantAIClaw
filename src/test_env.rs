@@ -59,11 +59,15 @@ impl CredentialEnvScrub {
                 "GEMINI_API_KEY",
                 "GOOGLE_API_KEY",
                 "DASHSCOPE_API_KEY",
+                "MINIMAX_API_KEY",
                 "AWS_ACCESS_KEY_ID",
                 "AWS_SECRET_ACCESS_KEY",
                 "AWS_SESSION_TOKEN",
                 "QWEN_OAUTH_TOKEN",
                 "QWEN_OAUTH_REFRESH_TOKEN",
+                "QWEN_OAUTH_RESOURCE_URL",
+                "MINIMAX_OAUTH_TOKEN",
+                "MINIMAX_OAUTH_REFRESH_TOKEN",
                 "XDG_CONFIG_HOME",
             ]
             .into_iter()

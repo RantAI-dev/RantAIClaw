@@ -44,6 +44,16 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
 const SUPPORTED_PROXY_SERVICE_SELECTORS: &[&str] =
     &["provider.*", "channel.*", "tool.*", "memory.*", "tunnel.*"];
 
+/// The proxy service keys whose provider is gone.
+///
+/// Copilot had no API-key path, so the key is inert. The key stays in
+/// [`SUPPORTED_PROXY_SERVICE_KEYS`] so a config written before the removal
+/// still loads; the operator is told why the key does nothing.
+const REMOVED_PROXY_SERVICE_KEYS: &[(&str, &str)] = &[(
+    "provider.copilot",
+    "the GitHub Copilot login was removed, and Copilot has no API-key path in RantaiClaw",
+)];
+
 static RUNTIME_PROXY_CONFIG: OnceLock<RwLock<ProxyConfig>> = OnceLock::new();
 /// Proxy env vars THIS process authored via `apply_to_process_env`. On a config
 /// reload, `apply_env_overrides` must not mistake a var it wrote itself for a
@@ -1318,6 +1328,19 @@ impl ProxyConfig {
                     "Unsupported proxy service selector '{selector}'. Use tool `proxy_config` action `list_services` for valid values"
                 );
             }
+
+            // A key whose provider was removed still loads, so the config is
+            // not rejected for a service that no longer exists. It does
+            // nothing, and the operator has to be told why.
+            if let Some((key, why)) = REMOVED_PROXY_SERVICE_KEYS
+                .iter()
+                .find(|(known, _)| known.eq_ignore_ascii_case(&selector))
+            {
+                tracing::warn!(
+                    service = *key,
+                    "The proxy service key `{key}` is ignored: {why} — choose another provider."
+                );
+            }
         }
 
         if self.enabled && !self.has_any_proxy_url() {
@@ -1744,7 +1767,7 @@ pub fn apply_runtime_proxy_to_blocking_builder(
 
 /// Default per-request timeout (seconds) for the unparameterised
 /// [`build_runtime_proxy_client`]. 120 matches the provider HTTP clients
-/// (`openai`, `anthropic`, `copilot`, `openrouter`, `bedrock`, `glm`,
+/// (`openai`, `anthropic`, `openrouter`, `bedrock`, `glm`,
 /// `gemini`, `compatible`) — the channel callers below (`telegram`,
 /// `discord`, `slack`, `mattermost`, `lark`, `dingtalk`, `qq`, `whatsapp`,
 /// `whatsapp_http`, `tunnel.custom`, `tool.browser`, `memory.embeddings`)
@@ -11145,6 +11168,32 @@ default_model = "legacy-model"
 
         let error = proxy.validate().unwrap_err().to_string();
         assert!(error.contains("proxy.scope='services'"));
+    }
+
+    /// A config written before the Copilot login was removed still names
+    /// `provider.copilot` under `[proxy]`. It must keep loading — the key is
+    /// still a supported one — and the operator must be told the key is inert
+    /// and why.
+    #[tokio::test]
+    async fn a_removed_provider_proxy_key_still_loads_with_a_warning() {
+        let (buffer, _guard) = capture_logs();
+        let proxy = ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://127.0.0.1:7890".into()),
+            https_proxy: None,
+            all_proxy: None,
+            no_proxy: Vec::new(),
+            scope: ProxyScope::Services,
+            services: vec!["provider.copilot".into()],
+        };
+
+        proxy
+            .validate()
+            .expect("a config written before the removal must still load");
+
+        let logs = buffer.contents();
+        assert!(logs.contains("provider.copilot"), "{logs}");
+        assert!(logs.contains("removed"), "{logs}");
     }
 
     #[test]

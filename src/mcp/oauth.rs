@@ -32,10 +32,40 @@ use serde::Deserialize;
 use tokio::sync::{oneshot, Mutex};
 
 use super::curated::OAuthProvider;
-use crate::auth::openai_oauth::{generate_pkce_state, PkceState};
 
-#[cfg(test)]
+use base64::Engine;
 use sha2::{Digest, Sha256};
+
+/// The PKCE pair of a login, plus the one-time `state` that binds the
+/// callback to it.
+#[derive(Debug, Clone)]
+pub(crate) struct PkceState {
+    pub(crate) code_verifier: String,
+    pub(crate) code_challenge: String,
+    pub(crate) state: String,
+}
+
+/// A fresh PKCE pair: a verifier, its S256 challenge, and a `state`.
+pub(crate) fn generate_pkce_state() -> PkceState {
+    let code_verifier = random_base64url(64);
+    let digest = Sha256::digest(code_verifier.as_bytes());
+    let code_challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
+
+    PkceState {
+        code_verifier,
+        code_challenge,
+        state: random_base64url(24),
+    }
+}
+
+/// Random bytes, base64url-encoded without padding.
+fn random_base64url(byte_len: usize) -> String {
+    use chacha20poly1305::aead::{rand_core::RngCore, OsRng};
+
+    let mut bytes = vec![0_u8; byte_len];
+    OsRng.fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
 
 /// Fixed listener port. Must match what's registered in upstream OAuth
 /// app config (`http://localhost:11500/oauth/<provider-slug>`).
@@ -434,7 +464,6 @@ mod tests {
     use super::*;
     use axum::routing::post;
     use axum::Json;
-    use base64::Engine as _;
     use serde_json::json;
 
     /// Every form body POSTed to the fake token endpoint, in order.
@@ -557,6 +586,31 @@ mod tests {
             assert!(!slug.contains('_'), "{slug} should not contain underscore");
             assert!(slug.chars().all(|c| c.is_ascii_lowercase() || c == '-'));
         }
+    }
+
+    /// The PKCE pair is the security property of every MCP login: the
+    /// challenge is the S256 digest of the verifier, the verifier is long
+    /// enough to matter, and neither the verifier nor the `state` is ever
+    /// reused. A reused verifier or state would defeat PKCE and CSRF
+    /// together.
+    #[test]
+    fn pkce_generation_is_valid() {
+        let pkce = generate_pkce_state();
+        let digest = Sha256::digest(pkce.code_verifier.as_bytes());
+        let expected = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
+        assert_eq!(
+            pkce.code_challenge, expected,
+            "code_challenge must be the S256 hash of the verifier"
+        );
+        assert!(
+            pkce.code_verifier.len() >= 43,
+            "verifier too short for PKCE"
+        );
+
+        // Distinct per call — a reused verifier/state would defeat PKCE + CSRF.
+        let other = generate_pkce_state();
+        assert_ne!(pkce.code_verifier, other.code_verifier);
+        assert_ne!(pkce.state, other.state);
     }
 
     /// The authorization URL must bind the login to its session: a one-time

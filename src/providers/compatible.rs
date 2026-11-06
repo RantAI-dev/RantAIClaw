@@ -1082,6 +1082,39 @@ fn parse_responses_response_body(
 }
 
 impl OpenAiCompatibleProvider {
+    /// The request one user turn would produce, without sending it.
+    ///
+    /// The seam for "what would go on the wire": the credential the provider
+    /// holds is the one that goes out, in the header its auth style names.
+    /// Building a request does not send it, so a test that uses this seam
+    /// cannot reach the provider's host.
+    #[cfg(test)]
+    pub(crate) async fn build_request_for_test(
+        &self,
+        model: &str,
+    ) -> anyhow::Result<reqwest::Request> {
+        let credential = self.current_credential().await?;
+        let request = ApiChatRequest {
+            model: model.to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            temperature: 0.0,
+            stream: Some(false),
+            tools: None,
+            tool_choice: None,
+        };
+        self.apply_auth_header(
+            self.http_client()
+                .post(self.chat_completions_url())
+                .json(&request),
+            &credential,
+        )
+        .build()
+        .map_err(anyhow::Error::from)
+    }
+
     fn apply_auth_header(
         &self,
         req: reqwest::RequestBuilder,
@@ -1373,6 +1406,14 @@ impl OpenAiCompatibleProvider {
 
 #[async_trait]
 impl Provider for OpenAiCompatibleProvider {
+    /// The provider itself: the factory builds this type for the
+    /// OpenAI-compatible names (Qwen, MiniMax, Groq, ...), so a test that
+    /// reaches it through the wrappers has reached the factory's build.
+    #[cfg(test)]
+    fn test_as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
     fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
         crate::providers::traits::ProviderCapabilities {
             native_tool_calling: true,

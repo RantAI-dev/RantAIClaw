@@ -29,6 +29,14 @@ pub enum ProviderConfigError {
     /// functional one (CLAUDE.md §10). The trade-off buys a diff that only
     /// touches the code it has to touch; the `Display` text is unchanged
     /// either way.
+    ///
+    /// `name` is the ONE caller-controlled part of this message, so it is
+    /// bounded where it enters the type: the factory holds it to 64
+    /// characters and marks the cut, so one request cannot put an unbounded
+    /// amount of caller text into a 400 body. `guidance` is static text and
+    /// is never shortened, and the `CustomUrl*` variants below carry only
+    /// static strings, so this bound is the only length limit any variant of
+    /// this type has.
     #[error("Unknown provider: {name}. {guidance}")]
     UnknownProvider { name: String, guidance: String },
 

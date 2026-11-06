@@ -17,24 +17,22 @@
 //! in [`create_provider_with_url`]. See `AGENTS.md` §7.1 for the full change playbook.
 
 // Legacy hand-rolled Anthropic/Gemini providers are kept compiled in the default
-// build: they serve auth modes rig-core cannot (Anthropic setup-tokens, Gemini
-// CLI OAuth / cloudcode-pa) and are the routed backend for those modes — not dead
-// code. 016 Stage-2 deletion is cancelled; see plans/025-rigprovider-auth-parity.md.
+// build: they serve auth modes rig-core cannot (Anthropic setup-tokens) and are
+// the routed backend for those modes — not dead code. 016 Stage-2 deletion is
+// cancelled; see plans/025-rigprovider-auth-parity.md.
 pub mod anthropic;
 pub mod bedrock;
 pub mod compatible;
 pub mod config_error;
-pub mod copilot;
 pub mod gemini;
-pub mod gemini_cli;
 pub(crate) mod gemini_error;
 pub(crate) mod local_refusal;
 pub mod ollama;
 #[cfg(feature = "legacy-providers")]
 pub mod openai;
-pub mod openai_codex;
 pub mod openrouter;
 pub mod reliable;
+pub(crate) mod removed_login;
 mod renewing_credential;
 pub mod rig_native;
 pub mod router;
@@ -51,24 +49,37 @@ pub use traits::{
 use crate::auth::anthropic_token::{detect_auth_kind, AnthropicAuthKind};
 use compatible::{AuthStyle, OpenAiCompatibleProvider};
 use reliable::ReliableProvider;
-use renewing_credential::{RenewedToken, RenewingCredential};
-use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 const MAX_API_ERROR_CHARS: usize = 200;
+
+/// How many characters of a caller-supplied provider name are echoed back in
+/// an unknown-provider refusal.
+///
+/// WHY: the name is the ONE caller-controlled part of that message, and a
+/// request body may carry a great deal of it. 64 characters is generous for a
+/// real provider name: the longest one the factory knows is
+/// `anthropic-custom:https://your-api.com`, 35 characters.
+const MAX_UNKNOWN_PROVIDER_NAME_CHARS: usize = 64;
+
+/// The marker that shows a name was cut to the bound.
+///
+/// WHY: a silent cut leaves the caller reading a short name as if it were the
+/// name it sent. The marker says the name was shortened.
+const TRUNCATION_MARKER: &str = "...[truncated]";
+
+/// How many characters of a caller-supplied model name are echoed back in a
+/// provider refusal.
+///
+/// WHY: like the provider name above, the model name is the ONE
+/// caller-controlled part of the message and a request body may carry a great
+/// deal of it. 64 characters is generous for a real model id: the longest one
+/// the Ollama provider sees is far shorter. The bound applies to the echoed
+/// text only, never to the model that is sent.
+const MAX_MODEL_NAME_CHARS: usize = 64;
 const MINIMAX_INTL_BASE_URL: &str = "https://api.minimax.io/v1";
 const MINIMAX_CN_BASE_URL: &str = "https://api.minimaxi.com/v1";
-const MINIMAX_OAUTH_GLOBAL_TOKEN_ENDPOINT: &str = "https://api.minimax.io/oauth/token";
-const MINIMAX_OAUTH_CN_TOKEN_ENDPOINT: &str = "https://api.minimaxi.com/oauth/token";
-const MINIMAX_OAUTH_PLACEHOLDER: &str = "minimax-oauth";
-const MINIMAX_OAUTH_CN_PLACEHOLDER: &str = "minimax-oauth-cn";
-const MINIMAX_OAUTH_TOKEN_ENV: &str = "MINIMAX_OAUTH_TOKEN";
 const MINIMAX_API_KEY_ENV: &str = "MINIMAX_API_KEY";
-const MINIMAX_OAUTH_REFRESH_TOKEN_ENV: &str = "MINIMAX_OAUTH_REFRESH_TOKEN";
-const MINIMAX_OAUTH_REGION_ENV: &str = "MINIMAX_OAUTH_REGION";
-const MINIMAX_OAUTH_CLIENT_ID_ENV: &str = "MINIMAX_OAUTH_CLIENT_ID";
-const MINIMAX_OAUTH_DEFAULT_CLIENT_ID: &str = "78257093-7e40-4613-99e0-527b14b39113";
 const GLM_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
 const GLM_CN_BASE_URL: &str = "https://open.bigmodel.cn/api/paas/v4";
 const MOONSHOT_INTL_BASE_URL: &str = "https://api.moonshot.ai/v1";
@@ -76,15 +87,6 @@ const MOONSHOT_CN_BASE_URL: &str = "https://api.moonshot.cn/v1";
 const QWEN_CN_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 const QWEN_INTL_BASE_URL: &str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1";
 const QWEN_US_BASE_URL: &str = "https://dashscope-us.aliyuncs.com/compatible-mode/v1";
-const QWEN_OAUTH_BASE_FALLBACK_URL: &str = QWEN_CN_BASE_URL;
-const QWEN_OAUTH_TOKEN_ENDPOINT: &str = "https://chat.qwen.ai/api/v1/oauth2/token";
-const QWEN_OAUTH_PLACEHOLDER: &str = "qwen-oauth";
-const QWEN_OAUTH_TOKEN_ENV: &str = "QWEN_OAUTH_TOKEN";
-const QWEN_OAUTH_REFRESH_TOKEN_ENV: &str = "QWEN_OAUTH_REFRESH_TOKEN";
-const QWEN_OAUTH_RESOURCE_URL_ENV: &str = "QWEN_OAUTH_RESOURCE_URL";
-const QWEN_OAUTH_CLIENT_ID_ENV: &str = "QWEN_OAUTH_CLIENT_ID";
-const QWEN_OAUTH_DEFAULT_CLIENT_ID: &str = "f0304373b74a44d2b584a3fb70ca9e56";
-const QWEN_OAUTH_CREDENTIAL_FILE: &str = ".qwen/oauth_creds.json";
 const ZAI_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 const ZAI_CN_BASE_URL: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
 
@@ -109,18 +111,13 @@ pub(crate) fn is_minimax_intl_alias(name: &str) -> bool {
             | "minimax-intl"
             | "minimax-io"
             | "minimax-global"
-            | "minimax-oauth"
             | "minimax-portal"
-            | "minimax-oauth-global"
             | "minimax-portal-global"
     )
 }
 
 pub(crate) fn is_minimax_cn_alias(name: &str) -> bool {
-    matches!(
-        name,
-        "minimax-cn" | "minimaxi" | "minimax-oauth-cn" | "minimax-portal-cn"
-    )
+    matches!(name, "minimax-cn" | "minimaxi" | "minimax-portal-cn")
 }
 
 pub(crate) fn is_minimax_alias(name: &str) -> bool {
@@ -169,15 +166,13 @@ pub(crate) fn is_qwen_us_alias(name: &str) -> bool {
     matches!(name, "qwen-us" | "dashscope-us")
 }
 
-pub(crate) fn is_qwen_oauth_alias(name: &str) -> bool {
-    matches!(name, "qwen-code" | "qwen-oauth" | "qwen_oauth")
-}
-
+/// The Qwen names that work with a DashScope API key.
+///
+/// The OAuth-only names (`qwen-code` and friends) are not aliases: a config
+/// that names one is refused with the DashScope-key replacement (see
+/// [`removed_login`](crate::providers::removed_login)).
 pub(crate) fn is_qwen_alias(name: &str) -> bool {
-    is_qwen_cn_alias(name)
-        || is_qwen_intl_alias(name)
-        || is_qwen_us_alias(name)
-        || is_qwen_oauth_alias(name)
+    is_qwen_cn_alias(name) || is_qwen_intl_alias(name) || is_qwen_us_alias(name)
 }
 
 pub(crate) fn is_zai_global_alias(name: &str) -> bool {
@@ -200,561 +195,11 @@ pub(crate) fn is_doubao_alias(name: &str) -> bool {
     matches!(name, "doubao" | "volcengine" | "ark" | "doubao-cn")
 }
 
-/// Where an OAuth refresh request goes. Unit tests point it at a local
-/// listener so a refresh never reaches the network.
-#[cfg(test)]
-static TEST_TOKEN_ENDPOINT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-
-fn oauth_token_endpoint(production: &'static str) -> String {
-    #[cfg(test)]
-    if let Some(url) = TEST_TOKEN_ENDPOINT
-        .lock()
-        .expect("test endpoint lock")
-        .clone()
-    {
-        return url;
-    }
-    production.to_string()
-}
-
-#[derive(Clone, Copy, Debug)]
-enum MinimaxOauthRegion {
-    Global,
-    Cn,
-}
-
-impl MinimaxOauthRegion {
-    fn token_endpoint(self) -> String {
-        oauth_token_endpoint(match self {
-            Self::Global => MINIMAX_OAUTH_GLOBAL_TOKEN_ENDPOINT,
-            Self::Cn => MINIMAX_OAUTH_CN_TOKEN_ENDPOINT,
-        })
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct MinimaxOauthRefreshResponse {
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    access_token: Option<String>,
-    #[serde(default)]
-    base_resp: Option<MinimaxOauthBaseResponse>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MinimaxOauthBaseResponse {
-    #[serde(default)]
-    status_msg: Option<String>,
-}
-
-#[derive(Clone, Deserialize, Default)]
-struct QwenOauthCredentials {
-    #[serde(default)]
-    access_token: Option<String>,
-    #[serde(default)]
-    refresh_token: Option<String>,
-    #[serde(default)]
-    resource_url: Option<String>,
-    #[serde(default)]
-    expiry_date: Option<i64>,
-}
-
-impl std::fmt::Debug for QwenOauthCredentials {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("QwenOauthCredentials")
-            .field(
-                "access_token",
-                &self.access_token.as_ref().map(|_| "[REDACTED]"),
-            )
-            .field(
-                "refresh_token",
-                &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
-            )
-            .field("resource_url", &self.resource_url)
-            .field("expiry_date", &self.expiry_date)
-            .finish()
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct QwenOauthTokenResponse {
-    #[serde(default)]
-    access_token: Option<String>,
-    #[serde(default)]
-    refresh_token: Option<String>,
-    #[serde(default)]
-    expires_in: Option<i64>,
-    #[serde(default)]
-    resource_url: Option<String>,
-    #[serde(default)]
-    error: Option<String>,
-    #[serde(default)]
-    error_description: Option<String>,
-}
-
-#[derive(Clone, Default)]
-struct QwenOauthProviderContext {
-    /// A token that can be sent as it is: an explicit key, the env token, or a
-    /// login token that still has life left when the provider is built.
-    credential: Option<String>,
-    /// Present when the credential comes from the Qwen login. It re-reads the
-    /// login file and refreshes at request time, and replaces `credential`.
-    login: Option<Arc<RenewingCredential>>,
-    base_url: Option<String>,
-}
-
-impl std::fmt::Debug for QwenOauthProviderContext {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("QwenOauthProviderContext")
-            .field(
-                "credential",
-                &self.credential.as_ref().map(|_| "[REDACTED]"),
-            )
-            .field("login", &self.login.as_ref().map(|_| "[renewing]"))
-            .field("base_url", &self.base_url)
-            .finish()
-    }
-}
-
 fn read_non_empty_env(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-}
-
-fn is_minimax_oauth_placeholder(value: &str) -> bool {
-    value.eq_ignore_ascii_case(MINIMAX_OAUTH_PLACEHOLDER)
-        || value.eq_ignore_ascii_case(MINIMAX_OAUTH_CN_PLACEHOLDER)
-}
-
-fn minimax_oauth_region(name: &str) -> MinimaxOauthRegion {
-    if let Some(region) = read_non_empty_env(MINIMAX_OAUTH_REGION_ENV) {
-        let normalized = region.to_ascii_lowercase();
-        if matches!(normalized.as_str(), "cn" | "china") {
-            return MinimaxOauthRegion::Cn;
-        }
-        if matches!(normalized.as_str(), "global" | "intl" | "international") {
-            return MinimaxOauthRegion::Global;
-        }
-    }
-
-    if is_minimax_cn_alias(name) {
-        MinimaxOauthRegion::Cn
-    } else {
-        MinimaxOauthRegion::Global
-    }
-}
-
-fn minimax_oauth_client_id() -> String {
-    read_non_empty_env(MINIMAX_OAUTH_CLIENT_ID_ENV)
-        .unwrap_or_else(|| MINIMAX_OAUTH_DEFAULT_CLIENT_ID.to_string())
-}
-
-fn qwen_oauth_client_id() -> String {
-    read_non_empty_env(QWEN_OAUTH_CLIENT_ID_ENV)
-        .unwrap_or_else(|| QWEN_OAUTH_DEFAULT_CLIENT_ID.to_string())
-}
-
-fn qwen_oauth_credentials_file_path() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
-        .map(|home| home.join(QWEN_OAUTH_CREDENTIAL_FILE))
-}
-
-fn normalize_qwen_oauth_base_url(raw: &str) -> Option<String> {
-    let trimmed = raw.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        trimmed.to_string()
-    } else {
-        format!("https://{trimmed}")
-    };
-
-    let normalized = with_scheme.trim_end_matches('/').to_string();
-    if normalized.ends_with("/v1") {
-        Some(normalized)
-    } else {
-        Some(format!("{normalized}/v1"))
-    }
-}
-
-fn read_qwen_oauth_cached_credentials() -> Option<QwenOauthCredentials> {
-    let path = qwen_oauth_credentials_file_path()?;
-    let content = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str::<QwenOauthCredentials>(&content).ok()
-}
-
-fn normalized_qwen_expiry_millis(raw: i64) -> i64 {
-    if raw < 10_000_000_000 {
-        raw.saturating_mul(1000)
-    } else {
-        raw
-    }
-}
-
-fn qwen_oauth_expiry(credentials: &QwenOauthCredentials) -> Option<std::time::SystemTime> {
-    let millis =
-        u64::try_from(normalized_qwen_expiry_millis(credentials.expiry_date?)).unwrap_or(0);
-    Some(std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis))
-}
-
-/// The access token in a login, with its expiry. `None` when the login holds
-/// no usable token.
-fn qwen_oauth_login_token(credentials: &QwenOauthCredentials) -> Option<RenewedToken> {
-    let token = credentials
-        .access_token
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
-    Some(RenewedToken {
-        token: token.to_string(),
-        expires_at: qwen_oauth_expiry(credentials),
-    })
-}
-
-fn refresh_qwen_oauth_access_token(refresh_token: &str) -> anyhow::Result<QwenOauthCredentials> {
-    let client_id = qwen_oauth_client_id();
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .build()
-        .unwrap_or_else(|_| reqwest::blocking::Client::new());
-
-    let response = client
-        .post(oauth_token_endpoint(QWEN_OAUTH_TOKEN_ENDPOINT))
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Accept", "application/json")
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token),
-            ("client_id", client_id.as_str()),
-        ])
-        .send()
-        .map_err(|error| anyhow::anyhow!("Qwen OAuth refresh request failed: {error}"))?;
-
-    let status = response.status();
-    let body = response
-        .text()
-        .unwrap_or_else(|_| "<failed to read Qwen OAuth response body>".to_string());
-
-    let parsed = serde_json::from_str::<QwenOauthTokenResponse>(&body).ok();
-
-    if !status.is_success() {
-        let detail = parsed
-            .as_ref()
-            .and_then(|payload| payload.error_description.as_deref())
-            .or_else(|| parsed.as_ref().and_then(|payload| payload.error.as_deref()))
-            .filter(|msg| !msg.trim().is_empty())
-            .unwrap_or(body.as_str());
-        anyhow::bail!(
-            "Qwen OAuth refresh failed (HTTP {status}): {}",
-            sanitize_api_error(detail)
-        );
-    }
-
-    let payload =
-        parsed.ok_or_else(|| anyhow::anyhow!("Qwen OAuth refresh response is not JSON"))?;
-
-    if let Some(error_code) = payload
-        .error
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        let detail = payload.error_description.as_deref().unwrap_or(error_code);
-        anyhow::bail!("Qwen OAuth refresh failed: {}", sanitize_api_error(detail));
-    }
-
-    let access_token = payload
-        .access_token
-        .as_deref()
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("Qwen OAuth refresh response missing access_token"))?
-        .to_string();
-
-    let expiry_date = payload.expires_in.and_then(|seconds| {
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .and_then(|duration| i64::try_from(duration.as_secs()).ok())?;
-        now_secs
-            .checked_add(seconds)
-            .and_then(|unix_secs| unix_secs.checked_mul(1000))
-    });
-
-    Ok(QwenOauthCredentials {
-        access_token: Some(access_token),
-        refresh_token: payload
-            .refresh_token
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string),
-        resource_url: payload
-            .resource_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string),
-        expiry_date,
-    })
-}
-
-/// A refresh token the server issued in place of `replaced`. Kept in memory
-/// only: the login file belongs to the Qwen CLI and is never written.
-struct QwenRotatedRefreshToken {
-    replaced: String,
-    rotated: String,
-}
-
-type QwenRefreshRotation = std::sync::Mutex<Option<QwenRotatedRefreshToken>>;
-
-/// A new access token for the Qwen login, called when the held one is gone or
-/// has little life left.
-///
-/// The login file is read again first: a login made with the Qwen CLI since
-/// the last renewal is used as it is. Only when it holds nothing better is the
-/// refresh token exchanged. The file is never written, since it belongs to the
-/// Qwen CLI.
-fn renew_qwen_oauth_login(rotation: &QwenRefreshRotation) -> anyhow::Result<RenewedToken> {
-    const FIX: &str = "Log in again with the `qwen` CLI, or set QWEN_OAUTH_TOKEN.";
-
-    let cached = read_qwen_oauth_cached_credentials();
-    if let Some(token) = cached.as_ref().and_then(qwen_oauth_login_token) {
-        if token.has_life_beyond_margin() {
-            return Ok(token);
-        }
-    }
-
-    let source_refresh_token = read_non_empty_env(QWEN_OAUTH_REFRESH_TOKEN_ENV).or_else(|| {
-        cached
-            .as_ref()
-            .and_then(|credentials| credentials.refresh_token.clone())
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-    });
-    let Some(source_refresh_token) = source_refresh_token else {
-        if cached.is_none() {
-            anyhow::bail!("No Qwen Code login was found. {FIX}");
-        }
-        anyhow::bail!("The Qwen Code login has expired and holds no refresh token. {FIX}");
-    };
-
-    // A refresh token the server rotated is newer than the one in the file,
-    // but only while the file still holds the token it replaced. A different
-    // token in the file is a new login and wins.
-    let mut rotation = rotation
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let refresh_token = match rotation.as_ref() {
-        Some(rotated) if rotated.replaced == source_refresh_token => rotated.rotated.clone(),
-        _ => source_refresh_token.clone(),
-    };
-
-    let refreshed = refresh_qwen_oauth_access_token(&refresh_token).map_err(|error| {
-        anyhow::anyhow!("The Qwen Code login could not be renewed ({error}). {FIX}")
-    })?;
-    if let Some(rotated) = refreshed
-        .refresh_token
-        .clone()
-        .filter(|token| *token != refresh_token)
-    {
-        *rotation = Some(QwenRotatedRefreshToken {
-            replaced: source_refresh_token,
-            rotated,
-        });
-    }
-    let mut token = qwen_oauth_login_token(&refreshed)
-        .ok_or_else(|| anyhow::anyhow!("The Qwen Code login could not be renewed. {FIX}"))?;
-    token.expires_at.get_or_insert_with(|| {
-        std::time::SystemTime::now() + renewing_credential::ASSUMED_LIFETIME
-    });
-    Ok(token)
-}
-
-fn resolve_qwen_oauth_context(credential_override: Option<&str>) -> QwenOauthProviderContext {
-    let override_value = credential_override
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let placeholder_requested = override_value
-        .map(|value| value.eq_ignore_ascii_case(QWEN_OAUTH_PLACEHOLDER))
-        .unwrap_or(false);
-
-    if let Some(explicit) = override_value {
-        if !placeholder_requested {
-            return QwenOauthProviderContext {
-                credential: Some(explicit.to_string()),
-                login: None,
-                base_url: None,
-            };
-        }
-    }
-
-    let cached = read_qwen_oauth_cached_credentials();
-
-    let env_token = read_non_empty_env(QWEN_OAUTH_TOKEN_ENV);
-    let env_refresh_token = read_non_empty_env(QWEN_OAUTH_REFRESH_TOKEN_ENV);
-    let env_resource_url = read_non_empty_env(QWEN_OAUTH_RESOURCE_URL_ENV);
-
-    // The login is used when no env token is set and either something to log
-    // in with exists or the placeholder asks for the login. Building never
-    // calls the network: an expired token is renewed by the first request.
-    let held = cached.as_ref().and_then(qwen_oauth_login_token);
-    let has_login_source = held.is_some()
-        || env_refresh_token.is_some()
-        || cached
-            .as_ref()
-            .and_then(|credentials| credentials.refresh_token.as_deref())
-            .is_some_and(|value| !value.trim().is_empty());
-    let login = (env_token.is_none() && (has_login_source || placeholder_requested)).then(|| {
-        let rotation = QwenRefreshRotation::default();
-        Arc::new(RenewingCredential::new(held.clone(), move || {
-            renew_qwen_oauth_login(&rotation)
-        }))
-    });
-
-    let login_token = held
-        .filter(RenewedToken::has_life_beyond_margin)
-        .map(|token| token.token);
-    let mut credential = env_token.or(login_token);
-    credential = credential
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string);
-
-    if credential.is_none() && login.is_none() && !placeholder_requested {
-        credential = read_non_empty_env("DASHSCOPE_API_KEY");
-    }
-
-    let base_url = env_resource_url
-        .as_deref()
-        .and_then(normalize_qwen_oauth_base_url)
-        .or_else(|| {
-            cached
-                .as_ref()
-                .and_then(|credentials| credentials.resource_url.as_deref())
-                .and_then(normalize_qwen_oauth_base_url)
-        });
-
-    QwenOauthProviderContext {
-        credential,
-        login,
-        base_url,
-    }
-}
-
-fn resolve_minimax_static_credential() -> Option<String> {
-    read_non_empty_env(MINIMAX_OAUTH_TOKEN_ENV).or_else(|| read_non_empty_env(MINIMAX_API_KEY_ENV))
-}
-
-fn refresh_minimax_oauth_access_token(name: &str, refresh_token: &str) -> anyhow::Result<String> {
-    let region = minimax_oauth_region(name);
-    let endpoint = region.token_endpoint();
-    let client_id = minimax_oauth_client_id();
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .build()
-        .unwrap_or_else(|_| reqwest::blocking::Client::new());
-
-    let response = client
-        .post(&endpoint)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Accept", "application/json")
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token),
-            ("client_id", client_id.as_str()),
-        ])
-        .send()
-        .map_err(|error| anyhow::anyhow!("MiniMax OAuth refresh request failed: {error}"))?;
-
-    let status = response.status();
-    let body = response
-        .text()
-        .unwrap_or_else(|_| "<failed to read MiniMax OAuth response body>".to_string());
-
-    let parsed = serde_json::from_str::<MinimaxOauthRefreshResponse>(&body).ok();
-
-    if !status.is_success() {
-        let detail = parsed
-            .as_ref()
-            .and_then(|payload| payload.base_resp.as_ref())
-            .and_then(|base| base.status_msg.as_deref())
-            .filter(|msg| !msg.trim().is_empty())
-            .unwrap_or(body.as_str());
-        anyhow::bail!(
-            "MiniMax OAuth refresh failed (HTTP {status}): {}",
-            sanitize_api_error(detail)
-        );
-    }
-
-    if let Some(payload) = parsed {
-        if let Some(status_text) = payload.status.as_deref() {
-            if !status_text.eq_ignore_ascii_case("success") {
-                let detail = payload
-                    .base_resp
-                    .as_ref()
-                    .and_then(|base| base.status_msg.as_deref())
-                    .unwrap_or(status_text);
-                anyhow::bail!(
-                    "MiniMax OAuth refresh failed: {}",
-                    sanitize_api_error(detail)
-                );
-            }
-        }
-
-        if let Some(token) = payload
-            .access_token
-            .as_deref()
-            .map(str::trim)
-            .filter(|token| !token.is_empty())
-        {
-            return Ok(token.to_string());
-        }
-    }
-
-    anyhow::bail!("MiniMax OAuth refresh response missing access_token");
-}
-
-/// A new MiniMax access token from the refresh token in the environment.
-/// Called by the renewing credential when the held token is gone or about to
-/// expire; the refresh response names no expiry, so the token is assumed to
-/// last `ASSUMED_LIFETIME`.
-fn renew_minimax_oauth_token(name: &str) -> anyhow::Result<RenewedToken> {
-    const FIX: &str =
-        "Set a fresh MINIMAX_OAUTH_REFRESH_TOKEN, or set MINIMAX_OAUTH_TOKEN or MINIMAX_API_KEY.";
-
-    let refresh_token = read_non_empty_env(MINIMAX_OAUTH_REFRESH_TOKEN_ENV)
-        .ok_or_else(|| anyhow::anyhow!("No MiniMax refresh token is set. {FIX}"))?;
-    let token = refresh_minimax_oauth_access_token(name, &refresh_token).map_err(|error| {
-        anyhow::anyhow!("The MiniMax login could not be renewed ({error}). {FIX}")
-    })?;
-    Ok(RenewedToken {
-        token,
-        expires_at: Some(std::time::SystemTime::now() + renewing_credential::ASSUMED_LIFETIME),
-    })
-}
-
-/// Whether MiniMax authenticates by renewing an access token from
-/// `MINIMAX_OAUTH_REFRESH_TOKEN`. An explicit key and the static env tokens
-/// outrank it, and the generic fallback keys do not. Reads the environment
-/// only, never the network.
-fn minimax_refresh_token_in_use(name: &str, credential_override: Option<&str>) -> bool {
-    let override_value = credential_override
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    is_minimax_alias(name)
-        && override_value.is_none_or(is_minimax_oauth_placeholder)
-        && resolve_minimax_static_credential().is_none()
-        && read_non_empty_env(MINIMAX_OAUTH_REFRESH_TOKEN_ENV).is_some()
 }
 
 /// Normalize a provider name/alias to a stable canonical form for keying
@@ -798,29 +243,15 @@ fn minimax_base_url(name: &str) -> Option<&'static str> {
     }
 }
 
-/// The MiniMax provider for `name` at `base_url`. `api_key` is the configured
-/// key, `key` the credential resolved from it. When a refresh token is the
-/// credential, the provider renews its access token at request time.
-fn build_minimax_provider(
-    name: &str,
-    base_url: &str,
-    api_key: Option<&str>,
-    key: Option<&str>,
-) -> OpenAiCompatibleProvider {
-    let provider = OpenAiCompatibleProvider::new_merge_system_into_user(
+/// The MiniMax provider for `name` at `base_url`. `key` is the credential
+/// resolved from the config or the environment.
+fn build_minimax_provider(base_url: &str, key: Option<&str>) -> OpenAiCompatibleProvider {
+    OpenAiCompatibleProvider::new_merge_system_into_user(
         "MiniMax",
         base_url,
         key,
         AuthStyle::Bearer,
-    );
-    if minimax_refresh_token_in_use(name, api_key) {
-        let name = name.to_string();
-        provider.with_renewing_credential(Arc::new(RenewingCredential::new(None, move || {
-            renew_minimax_oauth_token(&name)
-        })))
-    } else {
-        provider
-    }
+    )
 }
 
 fn glm_base_url(name: &str) -> Option<&'static str> {
@@ -844,7 +275,7 @@ fn moonshot_base_url(name: &str) -> Option<&'static str> {
 }
 
 fn qwen_base_url(name: &str) -> Option<&'static str> {
-    if is_qwen_cn_alias(name) || is_qwen_oauth_alias(name) {
+    if is_qwen_cn_alias(name) {
         Some(QWEN_CN_BASE_URL)
     } else if is_qwen_intl_alias(name) {
         Some(QWEN_INTL_BASE_URL)
@@ -1041,6 +472,24 @@ pub fn has_usable_credential(
     config_key: Option<&str>,
     state_dir: Option<&Path>,
 ) -> bool {
+    // A login that was removed has no credential to find: the API-key
+    // replacement is a different provider, and this one refuses every
+    // request. The check comes first, so neither the local-provider
+    // shortcut nor the generic fallback keys below can make a removed
+    // login look configured.
+    if removed_login::is_removed_login_name(name) {
+        return false;
+    }
+
+    // A credential that asks for a removed login is a placeholder, not a key.
+    if config_key
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|value| removed_login::removed_credential_refusal(value).is_some())
+    {
+        return false;
+    }
+
     // Nothing is missing: these run locally and `create_provider` substitutes a
     // placeholder where the OpenAI-compatible client wants a bearer at all.
     // Answering here rather than at each caller is what removes the carve-outs.
@@ -1052,22 +501,6 @@ pub fn has_usable_credential(
         return true;
     }
 
-    // A MiniMax refresh token is exchanged for an access token when a request
-    // is sent. Having one set is enough here; the exchange is not attempted.
-    if minimax_refresh_token_in_use(name, config_key) {
-        return true;
-    }
-
-    // Gemini CLI OAuth has no API key / env var but is a usable credential — it
-    // is routed to the legacy cloudcode-pa path. Report it as configured so
-    // `doctor` and the setup wizard don't tell CLI-authed users they're
-    // unconfigured (plan 025).
-    if matches!(name, "gemini" | "google" | "google-gemini")
-        && gemini_cli::gemini_cli_has_credentials()
-    {
-        return true;
-    }
-
     // `BedrockProvider::new()` ignores the `key` argument entirely and reads
     // `AwsCredentials::from_env`, so the resolver — which returns `None` for
     // bedrock by design — can never see this. Ask the provider's own check.
@@ -1075,46 +508,25 @@ pub fn has_usable_credential(
         return true;
     }
 
-    // `OpenAiCodexProvider::new(options)` ignores `key` too and reads an auth
-    // profile out of `<state_dir>/auth-profiles.json`.
-    //
-    // With no state dir the caller could not tell us where to look, so this
-    // branch answers `true` rather than inventing a missing credential — a
-    // false negative here would be produced by the CALL SITE, not the install.
-    if matches!(name, "openai-codex" | "openai_codex" | "codex") {
-        return state_dir.is_none_or(|dir| crate::auth::has_auth_profile(dir, name));
-    }
-
-    // Qwen OAuth resolves through `resolve_qwen_oauth_context`, not through the
-    // credential resolver — whose qwen arm only knows `DASHSCOPE_API_KEY`.
-    if is_qwen_oauth_alias(name) && qwen_oauth_has_credentials() {
-        return true;
-    }
-
-    // `CopilotProvider` falls back to a cached GitHub token before it would
-    // start an interactive device-code login. The cache is a credential it can
-    // send with; the device flow needs a human and is not reachable at send
-    // time, so it does not count.
-    if matches!(name, "copilot" | "github-copilot") && copilot::has_cached_token() {
-        return true;
-    }
-
     false
 }
 
-/// Whether Qwen OAuth has a credential the provider would use — the env token
-/// or refresh token, or the cached credentials file `resolve_qwen_oauth_context`
-/// reads.
-fn qwen_oauth_has_credentials() -> bool {
-    read_non_empty_env(QWEN_OAUTH_TOKEN_ENV).is_some()
-        || read_non_empty_env(QWEN_OAUTH_REFRESH_TOKEN_ENV).is_some()
-        || read_qwen_oauth_cached_credentials().is_some_and(|creds| {
-            creds
-                .access_token
-                .as_deref()
-                .or(creds.refresh_token.as_deref())
-                .is_some_and(|token| !token.trim().is_empty())
-        })
+/// The refusal for a provider name whose subscription login was removed.
+///
+/// The public door to the `removed_login` module: a caller outside this
+/// module asks here, so the sentence a removed login produces has one source.
+/// `None` for every name that is still a provider.
+pub fn removed_login_refusal(name: &str) -> Option<&'static str> {
+    removed_login::removed_login_refusal(name)
+}
+
+/// The operator-facing sentence of the refusal `error` carries, if it is one.
+///
+/// The public door to the `local_refusal` module. The gateway must say the
+/// same words on both of its routes, so it reads the sentence here instead
+/// of unwrapping the refusal type itself.
+pub fn local_refusal_text(error: &anyhow::Error) -> Option<&str> {
+    local_refusal::local_refusal_text(error)
 }
 
 /// The base provider a `<base>-custom:<url>` name is an endpoint of, e.g.
@@ -1151,11 +563,6 @@ fn is_anthropic_family(name: &str) -> bool {
 /// For Anthropic, the provider-specific env var is `ANTHROPIC_OAUTH_TOKEN` (for setup-tokens)
 /// followed by `ANTHROPIC_API_KEY` (for regular API keys).
 ///
-/// For MiniMax, OAuth mode supports `api_key = "minimax-oauth"`, resolving credentials from
-/// `MINIMAX_OAUTH_TOKEN` first, then `MINIMAX_API_KEY`. This function does not use
-/// `MINIMAX_OAUTH_REFRESH_TOKEN`: the provider exchanges it for an access token
-/// when a request is sent (see `build_minimax_provider`).
-///
 /// The anthropic family's auth profile needs a state dir, so callers that have one
 /// use [`resolve_provider_credential_with_kind`].
 fn resolve_provider_credential(name: &str, credential_override: Option<&str>) -> Option<String> {
@@ -1169,25 +576,29 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
 ///
 /// Order: the config-stored override → (anthropic family only) the active auth
 /// profile → the provider's env vars → the generic `RANTAICLAW_API_KEY`/`API_KEY`.
+///
+/// A removed login resolves to nothing: the API-key replacement is a different
+/// provider, and resolving a credential here would let a removed login look
+/// configured (see [`removed_login`](crate::providers::removed_login)).
 fn resolve_provider_credential_with_kind(
     name: &str,
     credential_override: Option<&str>,
     state_dir: Option<&Path>,
     profile_override: Option<&str>,
 ) -> Option<(String, Option<AnthropicAuthKind>)> {
-    let mut minimax_oauth_placeholder_requested = false;
+    if removed_login::is_removed_login_name(name) {
+        return None;
+    }
 
     if let Some(raw_override) = credential_override {
         let trimmed_override = raw_override.trim();
         if !trimmed_override.is_empty() {
-            if is_minimax_alias(name) && is_minimax_oauth_placeholder(trimmed_override) {
-                minimax_oauth_placeholder_requested = true;
-                if let Some(credential) = resolve_minimax_static_credential() {
-                    return Some((credential, None));
-                }
-            } else {
-                return Some((trimmed_override.to_owned(), None));
+            // A credential that asks for a removed login is a placeholder, not
+            // a key. It resolves to nothing, so no env var can stand in for it.
+            if removed_login::removed_credential_refusal(trimmed_override).is_some() {
+                return None;
             }
+            return Some((trimmed_override.to_owned(), None));
         }
     }
 
@@ -1226,7 +637,7 @@ fn resolve_provider_credential_with_kind(
             vec!["KIMI_CODE_API_KEY", "MOONSHOT_API_KEY"]
         }
         name if is_glm_alias(name) => vec!["GLM_API_KEY"],
-        name if is_minimax_alias(name) => vec![MINIMAX_OAUTH_TOKEN_ENV, MINIMAX_API_KEY_ENV],
+        name if is_minimax_alias(name) => vec![MINIMAX_API_KEY_ENV],
         // Bedrock uses AWS AKSK from env vars (AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY),
         // not a single API key. Credential resolution happens inside BedrockProvider.
         "bedrock" | "aws-bedrock" => return None,
@@ -1253,10 +664,6 @@ fn resolve_provider_credential_with_kind(
                 return Some((value.to_string(), None));
             }
         }
-    }
-
-    if minimax_oauth_placeholder_requested && is_minimax_alias(env_name) {
-        return None;
     }
 
     for env_var in ["RANTAICLAW_API_KEY", "API_KEY"] {
@@ -1395,12 +802,7 @@ pub fn create_provider_with_options(
     api_key: Option<&str>,
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
-    match name {
-        "openai-codex" | "openai_codex" | "codex" => {
-            Ok(Box::new(openai_codex::OpenAiCodexProvider::new(options)))
-        }
-        _ => create_provider_with_url_and_options(name, api_key, None, options),
-    }
+    create_provider_with_url_and_options(name, api_key, None, options)
 }
 
 /// Factory: create the right provider from config with optional custom base URL
@@ -1412,6 +814,28 @@ pub fn create_provider_with_url(
     create_provider_with_url_and_options(name, api_key, api_url, &ProviderRuntimeOptions::default())
 }
 
+/// Bound a caller-supplied name to `limit` characters, marking the cut.
+///
+/// WHY a bound: such a name is usually the ONE caller-controlled part of a
+/// refusal — the guidance beside it is static — and a request body may carry
+/// up to 64 KiB of it (the gateway's `MAX_BODY_SIZE`). Echoed whole, one
+/// request could put that much caller text into a 400 body. The cut lands on
+/// a char boundary, so a multibyte name is never split into invalid text,
+/// and a name that already fits is returned unchanged.
+fn bounded_name(name: &str, limit: usize) -> String {
+    if name.chars().count() <= limit {
+        return name.to_string();
+    }
+    // The byte index of the first char PAST the bound: a char boundary by
+    // construction, so the kept part is always valid text.
+    let end = name
+        .char_indices()
+        .nth(limit)
+        .map(|(index, _)| index)
+        .unwrap_or(name.len());
+    format!("{}{}", &name[..end], TRUNCATION_MARKER)
+}
+
 /// Factory: create provider with optional base URL and runtime options.
 #[allow(clippy::too_many_lines)]
 fn create_provider_with_url_and_options(
@@ -1420,35 +844,41 @@ fn create_provider_with_url_and_options(
     api_url: Option<&str>,
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
-    let qwen_oauth_context = is_qwen_oauth_alias(name).then(|| resolve_qwen_oauth_context(api_key));
+    // A config that names a removed subscription login still builds a
+    // provider: the gateway binds, the daemon stays up, and the refusal
+    // happens when a request is sent, with the API-key replacement named.
+    // The check comes first, so no credential source can make a removed
+    // login look configured.
+    if let Some(message) = removed_login::removed_login_refusal(name) {
+        return Ok(Box::new(removed_login::RemovedLoginProvider::new(message)));
+    }
+    if let Some(message) = api_key
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(removed_login::removed_credential_refusal)
+    {
+        return Ok(Box::new(removed_login::RemovedLoginProvider::new(message)));
+    }
 
     // Resolve credential and break static-analysis taint chain from the
     // `api_key` parameter so that downstream provider storage of the value
     // is not linked to the original sensitive-named source.
-    let (resolved_credential, profile_auth_kind) =
-        if let Some(context) = qwen_oauth_context.as_ref() {
-            (context.credential.clone(), None)
-        } else {
-            let resolved = resolve_provider_credential_with_kind(
-                name,
-                api_key,
-                options.rantaiclaw_dir.as_deref(),
-                options.auth_profile_override.as_deref(),
-            );
-            match resolved {
-                Some((value, kind)) => (Some(value), kind),
-                None => (None, None),
-            }
-        };
+    let (resolved_credential, profile_auth_kind) = {
+        let resolved = resolve_provider_credential_with_kind(
+            name,
+            api_key,
+            options.rantaiclaw_dir.as_deref(),
+            options.auth_profile_override.as_deref(),
+        );
+        match resolved {
+            Some((value, kind)) => (Some(value), kind),
+            None => (None, None),
+        }
+    };
     let resolved_credential =
         resolved_credential.map(|v| String::from_utf8(v.into_bytes()).unwrap_or_default());
     #[allow(clippy::option_as_ref_deref)]
     let key = resolved_credential.as_ref().map(String::as_str);
-
-    // The Gemini CLI login's state is not checked here: the login is read
-    // when a request is sent, so an expired login fails that request with
-    // the fix named (see `gemini::GeminiProvider`) and the build never fails
-    // because of it. The gateway and the channels start with an expired login.
 
     match name {
         #[cfg(test)]
@@ -1458,6 +888,10 @@ fn create_provider_with_url_and_options(
         // and which model and credential it carried when it did.
         #[cfg(test)]
         "test-recording" => Ok(Box::new(tests::RecordingProvider::new(key))),
+        // A provider without native tool calling, so a test can prove that a
+        // turn falls back to the text protocol.
+        #[cfg(test)]
+        "test-non-native" => Ok(Box::new(TestNonNativeProvider)),
         // ── Primary providers (custom implementations) ───────
         "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(key))),
         // Anthropic / OpenAI native / Gemini route through `RigProvider`
@@ -1508,13 +942,11 @@ fn create_provider_with_url_and_options(
         ))),
         #[cfg(not(feature = "legacy-providers"))]
         "gemini" | "google" | "google-gemini" => {
-            // rig's gemini client only speaks the public endpoint; Gemini CLI
-            // OAuth tokens are scoped for cloudcode-pa. With an API key the
-            // rig path stays the default (streaming + native tools). Without
-            // one, the CLI-login provider is used: the login file is read
-            // when a request is sent, so a login made later is used without a
-            // restart, and a missing one fails that turn with the fix named.
-            // The build never fails because of the login's state.
+            // rig's gemini client only speaks the public endpoint. With an API
+            // key the rig path stays the default (streaming + native tools).
+            // Without one the provider still builds: the request is refused
+            // when it is sent, with the fix named, so the gateway binds and the
+            // daemon stays up. The build never fails because of a missing key.
             if key.is_none() {
                 Ok(Box::new(gemini::GeminiProvider::new(key)))
             } else {
@@ -1575,34 +1007,10 @@ fn create_provider_with_url_and_options(
             )))
         }
         name if minimax_base_url(name).is_some() => Ok(Box::new(build_minimax_provider(
-            name,
             minimax_base_url(name).expect("checked in guard"),
-            api_key,
             key,
         ))),
         "bedrock" | "aws-bedrock" => Ok(Box::new(bedrock::BedrockProvider::new())),
-        name if is_qwen_oauth_alias(name) => {
-            let base_url = api_url
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToString::to_string)
-                .or_else(|| qwen_oauth_context.as_ref().and_then(|context| context.base_url.clone()))
-                .unwrap_or_else(|| QWEN_OAUTH_BASE_FALLBACK_URL.to_string());
-
-            let provider = OpenAiCompatibleProvider::new_with_user_agent(
-                "Qwen Code",
-                &base_url,
-                key,
-                AuthStyle::Bearer,
-                "QwenCode/1.0",
-            );
-            Ok(Box::new(
-                match qwen_oauth_context.as_ref().and_then(|context| context.login.clone()) {
-                    Some(login) => provider.with_renewing_credential(login),
-                    None => provider,
-                },
-            ))
-        }
         name if is_qianfan_alias(name) => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Qianfan", "https://aip.baidubce.com", key, AuthStyle::Bearer,
         ))),
@@ -1644,7 +1052,6 @@ fn create_provider_with_url_and_options(
         "cohere" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Cohere", "https://api.cohere.com/compatibility", key, AuthStyle::Bearer,
         ))),
-        "copilot" | "github-copilot" => Ok(Box::new(copilot::CopilotProvider::new(key))),
         "lmstudio" | "lm-studio" => {
             let lm_studio_key = key
                 .map(str::trim)
@@ -1733,7 +1140,7 @@ fn create_provider_with_url_and_options(
         // A name no factory knows follows from the config file alone, so it is
         // a `ProviderConfigError`: a caller may treat it as fatal.
         _ => Err(ProviderConfigError::UnknownProvider {
-            name: name.to_string(),
+            name: bounded_name(name, MAX_UNKNOWN_PROVIDER_NAME_CHARS),
             guidance: "Check README for supported providers or run `rantaiclaw onboard --interactive` to reconfigure.\n\
              Tip: Use \"custom:https://your-api.com\" for OpenAI-compatible endpoints.\n\
              Tip: Use \"anthropic-custom:https://your-api.com\" for Anthropic-compatible endpoints."
@@ -1761,6 +1168,25 @@ impl Provider for TestSseProvider {
 
     fn supports_streaming(&self) -> bool {
         true
+    }
+}
+
+/// A provider without native tool calling, for a test that needs the text
+/// protocol. It takes the trait defaults, so it never reaches the network.
+#[cfg(test)]
+struct TestNonNativeProvider;
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl Provider for TestNonNativeProvider {
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        Ok("hello".to_string())
     }
 }
 
@@ -1793,12 +1219,8 @@ pub fn create_resilient_provider_with_options(
 ) -> anyhow::Result<Box<dyn Provider>> {
     let mut providers: Vec<(String, Box<dyn Provider>)> = Vec::new();
 
-    let primary_provider = match primary_name {
-        "openai-codex" | "openai_codex" | "codex" => {
-            create_provider_with_options(primary_name, api_key, options)?
-        }
-        _ => create_provider_with_url_and_options(primary_name, api_key, api_url, options)?,
-    };
+    let primary_provider =
+        create_provider_with_url_and_options(primary_name, api_key, api_url, options)?;
     providers.push((primary_name.to_string(), primary_provider));
 
     for fallback in &reliability.fallback_providers {
@@ -2025,12 +1447,6 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             local: false,
         },
         ProviderInfo {
-            name: "openai-codex",
-            display_name: "OpenAI Codex (OAuth)",
-            aliases: &["openai_codex", "codex"],
-            local: false,
-        },
-        ProviderInfo {
             name: "ollama",
             display_name: "Ollama",
             aliases: &[],
@@ -2106,8 +1522,6 @@ pub fn list_providers() -> Vec<ProviderInfo> {
                 "minimax-global",
                 "minimax-cn",
                 "minimaxi",
-                "minimax-oauth",
-                "minimax-oauth-cn",
                 "minimax-portal",
                 "minimax-portal-cn",
             ],
@@ -2133,16 +1547,13 @@ pub fn list_providers() -> Vec<ProviderInfo> {
         },
         ProviderInfo {
             name: "qwen",
-            display_name: "Qwen (DashScope / Qwen Code OAuth)",
+            display_name: "Qwen (DashScope)",
             aliases: &[
                 "dashscope",
                 "qwen-intl",
                 "dashscope-intl",
                 "qwen-us",
                 "dashscope-us",
-                "qwen-code",
-                "qwen-oauth",
-                "qwen_oauth",
             ],
             local: false,
         },
@@ -2192,12 +1603,6 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             name: "cohere",
             display_name: "Cohere",
             aliases: &[],
-            local: false,
-        },
-        ProviderInfo {
-            name: "copilot",
-            display_name: "GitHub Copilot",
-            aliases: &["github-copilot"],
             local: false,
         },
         ProviderInfo {
@@ -2461,43 +1866,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn resolve_provider_credential_uses_minimax_oauth_env_for_placeholder() {
-        let _env_lock = env_lock();
-        let _oauth_guard = EnvGuard::set(MINIMAX_OAUTH_TOKEN_ENV, Some("oauth-token"));
-        let _api_guard = EnvGuard::set(MINIMAX_API_KEY_ENV, Some("api-key"));
-        let _refresh_guard = EnvGuard::set(MINIMAX_OAUTH_REFRESH_TOKEN_ENV, None);
-
-        let resolved = resolve_provider_credential("minimax", Some(MINIMAX_OAUTH_PLACEHOLDER));
-
-        assert_eq!(resolved.as_deref(), Some("oauth-token"));
-    }
-
-    #[test]
-    fn resolve_provider_credential_falls_back_to_minimax_api_key_for_placeholder() {
-        let _env_lock = env_lock();
-        let _oauth_guard = EnvGuard::set(MINIMAX_OAUTH_TOKEN_ENV, None);
-        let _api_guard = EnvGuard::set(MINIMAX_API_KEY_ENV, Some("api-key"));
-        let _refresh_guard = EnvGuard::set(MINIMAX_OAUTH_REFRESH_TOKEN_ENV, None);
-
-        let resolved = resolve_provider_credential("minimax", Some(MINIMAX_OAUTH_PLACEHOLDER));
-
-        assert_eq!(resolved.as_deref(), Some("api-key"));
-    }
-
-    #[test]
-    fn resolve_provider_credential_placeholder_ignores_generic_api_key_fallback() {
-        let _env_lock = env_lock();
-        let _oauth_guard = EnvGuard::set(MINIMAX_OAUTH_TOKEN_ENV, None);
-        let _api_guard = EnvGuard::set(MINIMAX_API_KEY_ENV, None);
-        let _refresh_guard = EnvGuard::set(MINIMAX_OAUTH_REFRESH_TOKEN_ENV, None);
-        let _generic_guard = EnvGuard::set("API_KEY", Some("generic-key"));
-
-        let resolved = resolve_provider_credential("minimax", Some(MINIMAX_OAUTH_PLACEHOLDER));
-
-        assert!(resolved.is_none());
-    }
-
-    #[test]
     fn resolve_provider_credential_bedrock_uses_internal_credential_path() {
         let _generic_guard = EnvGuard::set("API_KEY", Some("generic-key"));
         let _override_guard = EnvGuard::set("OPENROUTER_API_KEY", Some("openrouter-key"));
@@ -2511,94 +1879,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn resolve_qwen_oauth_context_prefers_explicit_override() {
-        let _env_lock = env_lock();
-        let fake_home = format!("/tmp/rantaiclaw-qwen-oauth-home-{}", std::process::id());
-        let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
-        let _token_guard = EnvGuard::set(QWEN_OAUTH_TOKEN_ENV, Some("oauth-token"));
-        let _resource_guard = EnvGuard::set(
-            QWEN_OAUTH_RESOURCE_URL_ENV,
-            Some("coding-intl.dashscope.aliyuncs.com"),
-        );
-
-        let context = resolve_qwen_oauth_context(Some("  explicit-qwen-token  "));
-
-        assert_eq!(context.credential.as_deref(), Some("explicit-qwen-token"));
-        assert!(context.base_url.is_none());
-    }
-
-    #[test]
-    fn resolve_qwen_oauth_context_uses_env_token_and_resource_url() {
-        let _env_lock = env_lock();
-        let fake_home = format!("/tmp/rantaiclaw-qwen-oauth-home-{}-env", std::process::id());
-        let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
-        let _token_guard = EnvGuard::set(QWEN_OAUTH_TOKEN_ENV, Some("oauth-token"));
-        let _refresh_guard = EnvGuard::set(QWEN_OAUTH_REFRESH_TOKEN_ENV, None);
-        let _resource_guard = EnvGuard::set(
-            QWEN_OAUTH_RESOURCE_URL_ENV,
-            Some("coding-intl.dashscope.aliyuncs.com"),
-        );
-        let _dashscope_guard = EnvGuard::set("DASHSCOPE_API_KEY", Some("dashscope-fallback"));
-
-        let context = resolve_qwen_oauth_context(Some(QWEN_OAUTH_PLACEHOLDER));
-
-        assert_eq!(context.credential.as_deref(), Some("oauth-token"));
-        assert_eq!(
-            context.base_url.as_deref(),
-            Some("https://coding-intl.dashscope.aliyuncs.com/v1")
-        );
-    }
-
-    #[test]
-    fn resolve_qwen_oauth_context_reads_cached_credentials_file() {
-        let _env_lock = env_lock();
-        let fake_home = format!(
-            "/tmp/rantaiclaw-qwen-oauth-home-{}-file",
-            std::process::id()
-        );
-        let creds_dir = PathBuf::from(&fake_home).join(".qwen");
-        std::fs::create_dir_all(&creds_dir).unwrap();
-        let creds_path = creds_dir.join("oauth_creds.json");
-        std::fs::write(
-            &creds_path,
-            r#"{"access_token":"cached-token","refresh_token":"cached-refresh","resource_url":"https://resource.example.com","expiry_date":4102444800000}"#,
-        )
-        .unwrap();
-
-        let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
-        let _token_guard = EnvGuard::set(QWEN_OAUTH_TOKEN_ENV, None);
-        let _refresh_guard = EnvGuard::set(QWEN_OAUTH_REFRESH_TOKEN_ENV, None);
-        let _resource_guard = EnvGuard::set(QWEN_OAUTH_RESOURCE_URL_ENV, None);
-        let _dashscope_guard = EnvGuard::set("DASHSCOPE_API_KEY", None);
-
-        let context = resolve_qwen_oauth_context(Some(QWEN_OAUTH_PLACEHOLDER));
-
-        assert_eq!(context.credential.as_deref(), Some("cached-token"));
-        assert_eq!(
-            context.base_url.as_deref(),
-            Some("https://resource.example.com/v1")
-        );
-    }
-
-    #[test]
-    fn resolve_qwen_oauth_context_placeholder_does_not_use_dashscope_fallback() {
-        let _env_lock = env_lock();
-        let fake_home = format!(
-            "/tmp/rantaiclaw-qwen-oauth-home-{}-placeholder",
-            std::process::id()
-        );
-        let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
-        let _token_guard = EnvGuard::set(QWEN_OAUTH_TOKEN_ENV, None);
-        let _refresh_guard = EnvGuard::set(QWEN_OAUTH_REFRESH_TOKEN_ENV, None);
-        let _resource_guard = EnvGuard::set(QWEN_OAUTH_RESOURCE_URL_ENV, None);
-        let _dashscope_guard = EnvGuard::set("DASHSCOPE_API_KEY", Some("dashscope-fallback"));
-
-        let context = resolve_qwen_oauth_context(Some(QWEN_OAUTH_PLACEHOLDER));
-
-        assert!(context.credential.is_none());
-    }
-
-    #[test]
     fn regional_alias_predicates_cover_expected_variants() {
         assert!(is_moonshot_alias("moonshot"));
         assert!(is_moonshot_alias("kimi-global"));
@@ -2606,13 +1886,9 @@ pub(crate) mod tests {
         assert!(is_glm_alias("bigmodel"));
         assert!(is_minimax_alias("minimax-io"));
         assert!(is_minimax_alias("minimaxi"));
-        assert!(is_minimax_alias("minimax-oauth"));
         assert!(is_minimax_alias("minimax-portal-cn"));
         assert!(is_qwen_alias("dashscope"));
         assert!(is_qwen_alias("qwen-us"));
-        assert!(is_qwen_alias("qwen-code"));
-        assert!(is_qwen_oauth_alias("qwen-code"));
-        assert!(is_qwen_oauth_alias("qwen_oauth"));
         assert!(is_zai_alias("z.ai"));
         assert!(is_zai_alias("zai-cn"));
         assert!(is_qianfan_alias("qianfan"));
@@ -2640,7 +1916,6 @@ pub(crate) mod tests {
         assert_eq!(canonical_china_provider_name("minimax-cn"), Some("minimax"));
         assert_eq!(canonical_china_provider_name("qwen"), Some("qwen"));
         assert_eq!(canonical_china_provider_name("dashscope-us"), Some("qwen"));
-        assert_eq!(canonical_china_provider_name("qwen-code"), Some("qwen"));
         assert_eq!(canonical_china_provider_name("zai"), Some("zai"));
         assert_eq!(canonical_china_provider_name("z.ai-cn"), Some("zai"));
         assert_eq!(canonical_china_provider_name("qianfan"), Some("qianfan"));
@@ -2726,7 +2001,6 @@ pub(crate) mod tests {
         assert_eq!(qwen_base_url("qwen-cn"), Some(QWEN_CN_BASE_URL));
         assert_eq!(qwen_base_url("qwen-intl"), Some(QWEN_INTL_BASE_URL));
         assert_eq!(qwen_base_url("qwen-us"), Some(QWEN_US_BASE_URL));
-        assert_eq!(qwen_base_url("qwen-code"), Some(QWEN_CN_BASE_URL));
 
         assert_eq!(zai_base_url("zai"), Some(ZAI_GLOBAL_BASE_URL));
         assert_eq!(zai_base_url("z.ai"), Some(ZAI_GLOBAL_BASE_URL));
@@ -2752,12 +2026,6 @@ pub(crate) mod tests {
     #[test]
     fn factory_openai() {
         assert!(create_provider("openai", Some("provider-test-credential")).is_ok());
-    }
-
-    #[test]
-    fn factory_openai_codex() {
-        let options = ProviderRuntimeOptions::default();
-        assert!(create_provider_with_options("openai-codex", None, &options).is_ok());
     }
 
     #[test]
@@ -2802,35 +2070,30 @@ pub(crate) mod tests {
         );
     }
 
-    /// Building a Gemini provider never fails because of the login's state:
-    /// an expired login is refused when the request is sent, with the fix
-    /// named. The gateway and the channels start with an expired login.
+    /// A Gemini provider without an API key is still built: the gateway binds
+    /// and the daemon stays up. The request is refused when it is sent, with
+    /// the key named.
     ///
     /// The refusal is asserted on the provider the FACTORY built — not on one
     /// the test builds next to it — and on the request that WOULD be built:
     /// a test must never send anything to Google, not even a request the
     /// provider refuses.
     #[tokio::test]
-    async fn an_expired_gemini_cli_login_does_not_fail_the_provider_build() {
+    async fn a_keyless_gemini_provider_is_built_and_refuses_the_request() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
         let _scrub = crate::test_env::CredentialEnvScrub::new();
-        let (home, _home_guard) = gemini_cli::gemini_home();
-
-        gemini_cli::write_gemini_creds_with_expiry(&home, "ya29.mock-token", -3_600_000);
 
         let provider = create_provider("gemini", None)
-            .expect("an expired Gemini CLI login must not fail the provider build");
+            .expect("a keyless Gemini provider must be built: the request is refused instead");
 
         let gemini = gemini_provider_inside(provider.as_ref())
-            .expect("the factory builds the Gemini CLI-login provider when there is no key");
+            .expect("the factory builds the Gemini provider when there is no key");
 
         let error = gemini
             .build_request_for_test("gemini-2.0-flash")
-            .expect_err("an expired Gemini CLI login must fail the request");
+            .expect_err("a missing API key must fail the request");
         assert!(
-            error
-                .to_string()
-                .contains(gemini_cli::EXPIRED_LOGIN_REFUSAL),
+            error.to_string().contains("Gemini API key not found"),
             "{error}"
         );
         // The refusal is a TYPE, so the retry wrapper recognises it without
@@ -2845,97 +2108,11 @@ pub(crate) mod tests {
     }
 
     /// The same through the routed factory the gateway builds its provider
-    /// with: the door stays open, and the refusal the wrapped provider
-    /// produces is a typed one.
-    #[tokio::test]
-    async fn the_routed_factory_builds_a_provider_with_an_expired_gemini_cli_login() {
-        let _env = crate::test_env::ENV_LOCK.lock().await;
-        let _scrub = crate::test_env::CredentialEnvScrub::new();
-        let (home, _home_guard) = gemini_cli::gemini_home();
-
-        gemini_cli::write_gemini_creds_with_expiry(&home, "ya29.mock-token", -3_600_000);
-
-        // One attempt: the refusal is not about retrying, and the gateway's
-        // own retry policy is not what this test is about.
-        let reliability = crate::config::ReliabilityConfig {
-            provider_retries: 0,
-            ..Default::default()
-        };
-        let provider = create_routed_provider_with_options(
-            "gemini",
-            None,
-            None,
-            &reliability,
-            &[],
-            "gemini-2.0-flash",
-            &|_: &str| -> Option<String> { None },
-            &ProviderRuntimeOptions::default(),
-        )
-        .expect("an expired Gemini CLI login must not fail the provider build");
-
-        // The provider the ROUTED factory built, reached through the retry
-        // wrapper and the hint guard it wraps the build in.
-        let gemini = gemini_provider_inside(provider.as_ref())
-            .expect("the routed factory builds the Gemini CLI-login provider when there is no key");
-
-        let error = gemini
-            .build_request_for_test("gemini-2.0-flash")
-            .expect_err("an expired Gemini CLI login must fail the request");
-        assert!(
-            error
-                .to_string()
-                .contains(gemini_cli::EXPIRED_LOGIN_REFUSAL),
-            "{error}"
-        );
-        assert!(
-            error.chain().any(|cause| cause
-                .downcast_ref::<gemini_error::GeminiAuthError>()
-                .is_some()),
-            "the refusal must reach the retry wrapper as a typed error: {error:?}"
-        );
-    }
-
-    /// With no key and no login file at all, the Gemini provider is still
-    /// built: the login file is read when a request is sent, so a login made
-    /// later is used without a restart — and the build never fails because of
-    /// the login's state.
-    #[tokio::test]
-    async fn a_keyless_gemini_provider_is_built_without_a_login_file() {
-        let _env = crate::test_env::ENV_LOCK.lock().await;
-        let _scrub = crate::test_env::CredentialEnvScrub::new();
-        let (_home, _home_guard) = gemini_cli::gemini_home();
-
-        let provider = create_provider("gemini", None).expect(
-            "a keyless Gemini provider must be built: the login is read when a request is sent",
-        );
-
-        let gemini = gemini_provider_inside(provider.as_ref())
-            .expect("the factory builds the Gemini CLI-login provider when there is no key");
-
-        // No login file yet: the request is refused with the fix named, and
-        // the refusal is a type, so the retry wrapper recognises it.
-        let error = gemini
-            .build_request_for_test("gemini-2.0-flash")
-            .expect_err("a missing login must fail the request");
-        assert!(
-            error.to_string().contains("Gemini API key not found"),
-            "{error}"
-        );
-        assert!(
-            error.chain().any(|cause| cause
-                .downcast_ref::<gemini_error::GeminiAuthError>()
-                .is_some()),
-            "the refusal must reach the retry wrapper as a typed error: {error:?}"
-        );
-    }
-
-    /// The same through the routed factory the gateway builds its provider
     /// with.
     #[tokio::test]
     async fn the_routed_factory_builds_a_keyless_gemini_provider() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
         let _scrub = crate::test_env::CredentialEnvScrub::new();
-        let (_home, _home_guard) = gemini_cli::gemini_home();
 
         let reliability = crate::config::ReliabilityConfig {
             provider_retries: 0,
@@ -2991,113 +2168,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Codex ignores `key` too: `OpenAiCodexProvider::new(options)` reads an
-    /// auth profile out of `<state_dir>/auth-profiles.json`.
-    #[test]
-    fn codex_is_usable_with_only_an_auth_profile() {
-        let _env_lock = env_lock();
-        let _clear = crate::test_env::CredentialEnvScrub::new();
-        let dir = tempfile::tempdir().expect("state dir");
-
-        for name in ["openai-codex", "codex"] {
-            assert!(
-                !has_usable_credential(name, None, Some(dir.path())),
-                "{name} with no profile is not usable"
-            );
-        }
-
-        std::fs::write(
-            dir.path().join("auth-profiles.json"),
-            r#"{"schema_version":1,"updated_at":"2026-01-01T00:00:00Z",
-                "active_profiles":{"openai-codex":"openai-codex:default"},
-                "profiles":{"openai-codex:default":{
-                    "provider":"openai-codex","profile_name":"default","kind":"oauth"}}}"#,
-        )
-        .expect("write profile store");
-
-        for name in ["openai-codex", "codex"] {
-            assert!(
-                has_usable_credential(name, None, Some(dir.path())),
-                "{name} with an auth profile must read as usable"
-            );
-        }
-    }
-
-    /// A state dir the caller could not supply must not be reported as a
-    /// missing credential — that would be a false negative invented by the
-    /// call site rather than by the install.
-    #[test]
-    fn codex_without_a_state_dir_is_not_judged() {
-        let _env_lock = env_lock();
-        let _clear = crate::test_env::CredentialEnvScrub::new();
-        assert!(
-            has_usable_credential("openai-codex", None, None),
-            "with no state dir to read, the honest answer is not `unusable`"
-        );
-    }
-
-    /// Qwen OAuth resolves through `resolve_qwen_oauth_context`, which the
-    /// credential resolver never sees: its qwen arm only knows
-    /// `DASHSCOPE_API_KEY`.
-    #[test]
-    fn qwen_oauth_is_usable_from_its_env_token() {
-        let _env_lock = env_lock();
-        let _clear = crate::test_env::CredentialEnvScrub::new();
-        let home = tempfile::tempdir().expect("home");
-        let _home = crate::test_env::HomeGuard::set(home.path());
-
-        assert!(!has_usable_credential("qwen-code", None, None));
-
-        let _token = crate::test_env::EnvGuard::set(QWEN_OAUTH_TOKEN_ENV, "neutral-qwen-token");
-        assert!(
-            has_usable_credential("qwen-code", None, None),
-            "an env OAuth token is a credential the provider will use"
-        );
-    }
-
-    #[test]
-    fn qwen_oauth_is_usable_from_its_cached_credentials_file() {
-        let _env_lock = env_lock();
-        let _clear = crate::test_env::CredentialEnvScrub::new();
-        let home = tempfile::tempdir().expect("home");
-        let _home = crate::test_env::HomeGuard::set(home.path());
-
-        assert!(!has_usable_credential("qwen-oauth", None, None));
-
-        let creds = home.path().join(QWEN_OAUTH_CREDENTIAL_FILE);
-        std::fs::create_dir_all(creds.parent().expect("parent")).expect("qwen dir");
-        std::fs::write(&creds, r#"{"access_token":"neutral-qwen-cached-token"}"#)
-            .expect("write creds");
-
-        assert!(
-            has_usable_credential("qwen-oauth", None, None),
-            "the cached OAuth credentials the provider reads must count"
-        );
-    }
-
-    /// Copilot falls back to a cached GitHub token; without one the only path
-    /// left is an interactive device-code login, which is not a credential
-    /// reachable at send time.
-    #[test]
-    fn copilot_is_usable_from_its_cached_token() {
-        let _env_lock = env_lock();
-        let _clear = crate::test_env::CredentialEnvScrub::new();
-        let config_home = tempfile::tempdir().expect("config home");
-        let _xdg = crate::test_env::EnvGuard::set("XDG_CONFIG_HOME", config_home.path());
-
-        assert!(!has_usable_credential("copilot", None, None));
-
-        let dir = config_home.path().join("rantaiclaw").join("copilot");
-        std::fs::create_dir_all(&dir).expect("copilot dir");
-        std::fs::write(dir.join("access-token"), "gho_neutral_placeholder_value")
-            .expect("write token");
-
-        assert!(
-            has_usable_credential("copilot", None, None),
-            "a cached GitHub token is what the provider sends with"
-        );
-    }
-
     /// A local provider needs no credential at all, so nothing is missing.
     #[test]
     fn local_providers_need_no_credential() {
@@ -3132,8 +2202,7 @@ pub(crate) mod tests {
     #[test]
     fn has_usable_credential_gemini_env_and_config() {
         // Plan 025 (diagnostics): doctor/setup must see gemini env + config keys
-        // as usable again (the CLI-OAuth branch is env-dependent, covered by
-        // gemini_cli's own tests).
+        // as usable again.
         let _g = crate::test_env::ENV_LOCK.blocking_lock();
         let prev_g = std::env::var_os("GEMINI_API_KEY");
         let prev_goog = std::env::var_os("GOOGLE_API_KEY");
@@ -3153,6 +2222,52 @@ pub(crate) mod tests {
         assert!(
             via_env,
             "GOOGLE_API_KEY must count as a usable gemini credential"
+        );
+    }
+
+    /// The public door to a removed login's refusal.
+    ///
+    /// The gateway and the doctor live outside this module, so they ask here
+    /// instead of reaching into a private submodule: the sentence they show
+    /// has to come from one place, and it has to be the sentence the refusal
+    /// itself carries.
+    #[test]
+    fn the_removed_login_door_answers_what_the_module_answers() {
+        assert_eq!(
+            removed_login_refusal("openai-codex"),
+            removed_login::removed_login_refusal("openai-codex"),
+            "the door must answer what the module answers"
+        );
+        let sentence =
+            removed_login_refusal("openai-codex").expect("a removed login has a refusal");
+        assert!(sentence.contains("OPENAI_API_KEY"), "{sentence}");
+        // A provider that still exists has no refusal to hand out.
+        assert_eq!(removed_login_refusal("openai"), None);
+    }
+
+    /// The public door to a refusal's sentence, read out of a real refusal:
+    /// the provider the factory built for a removed login, refusing the way
+    /// the gateway will see it.
+    #[tokio::test]
+    async fn the_local_refusal_door_reads_the_sentence_of_a_factory_refusal() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+
+        let provider =
+            create_provider("openai-codex", None).expect("a removed login still builds a provider");
+        let error = provider
+            .simple_chat("hello", "test-model", 0.0)
+            .await
+            .expect_err("a removed login refuses the request");
+        assert_eq!(
+            local_refusal_text(&error),
+            removed_login::removed_login_refusal("openai-codex"),
+            "the door must read the sentence the provider refused with"
+        );
+        // An ordinary failure carries no refusal, so the door says nothing.
+        assert_eq!(
+            local_refusal_text(&anyhow::anyhow!("an ordinary failure")),
+            None
         );
     }
 
@@ -3231,8 +2346,6 @@ pub(crate) mod tests {
         assert!(create_provider("minimax-global", Some("key")).is_ok());
         assert!(create_provider("minimax-cn", Some("key")).is_ok());
         assert!(create_provider("minimaxi", Some("key")).is_ok());
-        assert!(create_provider("minimax-oauth", Some("key")).is_ok());
-        assert!(create_provider("minimax-oauth-cn", Some("key")).is_ok());
         assert!(create_provider("minimax-portal", Some("key")).is_ok());
         assert!(create_provider("minimax-portal-cn", Some("key")).is_ok());
     }
@@ -3272,8 +2385,6 @@ pub(crate) mod tests {
         assert!(create_provider("dashscope-international", Some("key")).is_ok());
         assert!(create_provider("qwen-us", Some("key")).is_ok());
         assert!(create_provider("dashscope-us", Some("key")).is_ok());
-        assert!(create_provider("qwen-code", Some("key")).is_ok());
-        assert!(create_provider("qwen-oauth", Some("key")).is_ok());
     }
 
     #[test]
@@ -3333,12 +2444,6 @@ pub(crate) mod tests {
     #[test]
     fn factory_cohere() {
         assert!(create_provider("cohere", Some("key")).is_ok());
-    }
-
-    #[test]
-    fn factory_copilot() {
-        assert!(create_provider("copilot", Some("key")).is_ok());
-        assert!(create_provider("github-copilot", Some("key")).is_ok());
     }
 
     #[test]
@@ -3482,6 +2587,96 @@ pub(crate) mod tests {
         let msg = p.err().unwrap().to_string();
         assert!(msg.contains("Unknown provider"));
         assert!(msg.contains("nonexistent"));
+    }
+
+    /// The provider name the caller sent is echoed back in the refusal, and it
+    /// is the ONE caller-controlled part of that message: the guidance beside
+    /// it is static. So the name is bounded where it enters the error — cut to
+    /// a fixed length, with the cut visible — and the guidance still reaches
+    /// the caller whole.
+    #[test]
+    fn factory_unknown_provider_bounds_a_long_caller_supplied_name() {
+        /// The length the echoed name is held to.
+        const NAME_BOUND: usize = 64;
+
+        /// The marker that shows the name was cut.
+        const CUT_MARKER: &str = "...[truncated]";
+
+        /// The static remediation lines, which must arrive whole.
+        const GUIDANCE_LINES: [&str; 3] = [
+            "Check README for supported providers or run `rantaiclaw onboard --interactive` to reconfigure.",
+            "Tip: Use \"custom:https://your-api.com\" for OpenAI-compatible endpoints.",
+            "Tip: Use \"anthropic-custom:https://your-api.com\" for Anthropic-compatible endpoints.",
+        ];
+
+        let long_name = "unknown-provider-".repeat(20);
+        let msg = create_provider(&long_name, None)
+            .err()
+            .expect("an unknown provider must be refused")
+            .to_string();
+
+        let (echoed, _) = msg
+            .split_once(". Check README for supported providers")
+            .expect("the refusal names the provider, then gives the guidance");
+        let echoed = echoed
+            .strip_prefix("Unknown provider: ")
+            .expect("the refusal opens with the unknown provider name");
+
+        let kept = echoed
+            .strip_suffix(CUT_MARKER)
+            .expect("a cut name must say that it was cut");
+        assert!(
+            kept.chars().count() <= NAME_BOUND,
+            "the echoed name must be bounded to {NAME_BOUND} characters, got {}: {kept}",
+            kept.chars().count()
+        );
+        assert!(
+            !msg.contains(&long_name),
+            "the whole name must not be echoed back"
+        );
+
+        for line in GUIDANCE_LINES {
+            assert!(
+                msg.contains(line),
+                "the guidance must reach the caller whole: {line}"
+            );
+        }
+
+        // A multibyte name is cut on a char boundary: a cut inside a char
+        // would not be a name at all.
+        let multibyte = "é".repeat(80);
+        let msg = create_provider(&multibyte, None)
+            .err()
+            .expect("an unknown provider must be refused")
+            .to_string();
+        let (echoed, _) = msg
+            .split_once(". Check README for supported providers")
+            .expect("the refusal names the provider, then gives the guidance");
+        let echoed = echoed
+            .strip_prefix("Unknown provider: ")
+            .expect("the refusal opens with the unknown provider name");
+        let kept = echoed
+            .strip_suffix(CUT_MARKER)
+            .expect("a cut name must say that it was cut");
+        assert!(
+            kept.chars().count() <= NAME_BOUND,
+            "a multibyte name must be cut to {NAME_BOUND} characters, got {}: {kept}",
+            kept.chars().count()
+        );
+
+        // A name that fits is echoed as it was sent: no cut, no marker.
+        let short = create_provider("nonexistent", None)
+            .err()
+            .expect("an unknown provider must be refused")
+            .to_string();
+        assert!(
+            short.contains("Unknown provider: nonexistent."),
+            "a name that fits must be echoed unchanged: {short}"
+        );
+        assert!(
+            !short.contains(CUT_MARKER),
+            "a name that fits must not carry the cut marker: {short}"
+        );
     }
 
     #[test]
@@ -3648,7 +2843,6 @@ pub(crate) mod tests {
             "qwen-intl",
             "qwen-cn",
             "qwen-us",
-            "qwen-code",
             "lmstudio",
             "llamacpp",
             "groq",
@@ -3659,7 +2853,6 @@ pub(crate) mod tests {
             "fireworks",
             "perplexity",
             "cohere",
-            "copilot",
             "nvidia",
             "astrai",
             "ovhcloud",
@@ -4391,602 +3584,123 @@ pub(crate) mod tests {
         assert!(plain_err.contains("ANTHROPIC_API_KEY"), "{plain_err}");
     }
 
-    // ---- Renewal of an expiring login at request time ----------------------
+    // ── The kept API-key paths send the configured key ────
     //
-    // The token endpoint and the chat endpoint are one local listener: the
-    // refresh call goes to `<uri>/token` through `TEST_TOKEN_ENDPOINT` and the
-    // chat request to `<uri>/v1/chat/completions`, so nothing leaves the host.
+    // The subscription logins are gone; the API keys stay. These prove the
+    // key the operator configured is still the credential that reaches the
+    // host — the factory hands it to the provider, and the provider puts it
+    // in the request.
 
-    /// Points the OAuth refresh at a local URL and clears it on drop.
-    struct TokenEndpointOverride;
-
-    impl TokenEndpointOverride {
-        fn set(url: String) -> Self {
-            *TEST_TOKEN_ENDPOINT.lock().expect("test endpoint lock") = Some(url);
-            Self
-        }
+    /// The OpenAI-compatible provider the factory built, if it is one.
+    fn compatible_provider_inside(provider: &dyn Provider) -> Option<&OpenAiCompatibleProvider> {
+        provider
+            .test_as_any()
+            .and_then(|inner| inner.downcast_ref::<OpenAiCompatibleProvider>())
     }
 
-    impl Drop for TokenEndpointOverride {
-        fn drop(&mut self) {
-            *TEST_TOKEN_ENDPOINT.lock().expect("test endpoint lock") = None;
-        }
-    }
-
-    /// A local listener that answers `POST /token` with `token_response` and any
-    /// chat completion with a fixed reply.
-    async fn login_endpoint(token_response: wiremock::ResponseTemplate) -> wiremock::MockServer {
-        let server = fake_chat_endpoint().await;
+    /// The `openai` key path: the configured key is the bearer token the host
+    /// receives.
+    ///
+    /// The whole path is asserted on the wire: the factory builds the
+    /// provider with the configured key, and the request that reaches the
+    /// endpoint carries it.
+    #[tokio::test]
+    async fn the_openai_path_sends_the_configured_key_to_its_host() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::path("/token"))
-            .respond_with(token_response)
+            .and(wiremock::matchers::path("/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "c", "object": "chat.completion", "created": 1_700_000_000_u64,
+                    "model": "gpt-4o-mini",
+                    "choices": [{"index": 0, "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "ok"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                })),
+            )
             .mount(&server)
             .await;
-        server
-    }
 
-    fn renewed_token_response(access_token: &str) -> wiremock::ResponseTemplate {
-        wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "access_token": access_token,
-            "refresh_token": "refresh-rotated",
-            "expires_in": 3600,
-        }))
-    }
-
-    async fn refresh_calls(server: &wiremock::MockServer) -> usize {
-        server
-            .received_requests()
-            .await
-            .unwrap_or_default()
-            .iter()
-            .filter(|req| req.url.path() == "/token")
-            .count()
-    }
-
-    /// The `Authorization` header of each chat request, in order.
-    async fn chat_authorization(server: &wiremock::MockServer) -> Vec<String> {
-        server
-            .received_requests()
-            .await
-            .unwrap_or_default()
-            .iter()
-            .filter(|req| req.url.path() == "/v1/chat/completions")
-            .filter_map(|req| req.headers.get("authorization"))
-            .map(|value| value.to_str().unwrap_or_default().to_string())
-            .collect()
-    }
-
-    fn unix_millis_from_now(offset_secs: i64) -> i64 {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock after the epoch");
-        i64::try_from(now.as_millis()).expect("millis fit") + offset_secs * 1000
-    }
-
-    /// Writes the login file the Qwen CLI keeps under `home`.
-    fn write_qwen_login(
-        home: &Path,
-        access_token: &str,
-        refresh_token: &str,
-        expires_in_secs: i64,
-    ) {
-        let dir = home.join(".qwen");
-        std::fs::create_dir_all(&dir).expect("login dir");
-        let body = serde_json::json!({
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-            "expiry_date": unix_millis_from_now(expires_in_secs),
-        });
-        std::fs::write(dir.join("oauth_creds.json"), body.to_string()).expect("login file");
-    }
-
-    fn qwen_login_provider(server: &wiremock::MockServer, api_key: &str) -> Box<dyn Provider> {
-        create_provider_with_url(
-            "qwen-oauth",
-            Some(api_key),
-            Some(&format!("{}/v1", server.uri())),
+        let provider = create_provider_with_url(
+            "openai",
+            Some("sk-configured-openai-key"),
+            Some(&server.uri()),
         )
-        .expect("the provider builds")
-    }
-
-    /// A login with less than the renewal margin left is renewed when the next
-    /// request is sent, not when the provider is built, and that request
-    /// carries the new token.
-    #[tokio::test]
-    async fn qwen_login_near_expiry_is_renewed_on_the_next_request() {
-        let _env = crate::test_env::ENV_LOCK.lock().await;
-        let _scrub = crate::test_env::CredentialEnvScrub::new();
-        let home = tempfile::tempdir().expect("home");
-        let _home = crate::test_env::HomeGuard::set(home.path());
-        let _resource = crate::test_env::EnvGuard::unset(QWEN_OAUTH_RESOURCE_URL_ENV);
-        let server = login_endpoint(renewed_token_response("token-renewed")).await;
-        let _endpoint = TokenEndpointOverride::set(format!("{}/token", server.uri()));
-        write_qwen_login(home.path(), "token-stale", "refresh-user-a", 60);
-
-        let provider = qwen_login_provider(&server, QWEN_OAUTH_PLACEHOLDER);
-        assert_eq!(refresh_calls(&server).await, 0, "building must not refresh");
-
+        .expect("the factory builds openai with the configured key");
         provider
-            .simple_chat("hi", "mock-model", 0.0)
+            .simple_chat("hi", "gpt-4o-mini", 0.0)
             .await
-            .expect("the renewed login answers");
+            .expect("the endpoint answers");
 
-        assert_eq!(refresh_calls(&server).await, 1);
         assert_eq!(
-            chat_authorization(&server).await,
-            vec!["Bearer token-renewed".to_string()]
+            authorization_headers(&server).await,
+            vec!["Bearer sk-configured-openai-key".to_string()],
+            "the configured key must be the bearer token the host receives"
         );
     }
 
-    /// A login that is still good is sent as it is and never refreshed.
+    /// The `qwen` key path (DashScope): the factory hands the configured key
+    /// to the provider, and that key is the one the request carries.
     #[tokio::test]
-    async fn qwen_login_with_life_left_is_not_refreshed() {
+    async fn the_qwen_path_sends_the_configured_key_to_its_host() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
         let _scrub = crate::test_env::CredentialEnvScrub::new();
-        let home = tempfile::tempdir().expect("home");
-        let _home = crate::test_env::HomeGuard::set(home.path());
-        let _resource = crate::test_env::EnvGuard::unset(QWEN_OAUTH_RESOURCE_URL_ENV);
-        let server = login_endpoint(renewed_token_response("token-renewed")).await;
-        let _endpoint = TokenEndpointOverride::set(format!("{}/token", server.uri()));
-        write_qwen_login(home.path(), "token-valid", "refresh-user-a", 3600);
+        let key = "sk-configured-dashscope-key";
 
-        let provider = qwen_login_provider(&server, QWEN_OAUTH_PLACEHOLDER);
-        for _ in 0..2 {
-            provider
-                .simple_chat("hi", "mock-model", 0.0)
-                .await
-                .expect("the login answers");
-        }
-
-        assert_eq!(refresh_calls(&server).await, 0);
+        let provider =
+            create_provider("qwen", Some(key)).expect("the factory builds qwen with the key");
+        let compatible = compatible_provider_inside(provider.as_ref())
+            .expect("qwen builds an OpenAI-compatible provider");
         assert_eq!(
-            chat_authorization(&server).await,
-            vec!["Bearer token-valid".to_string(); 2]
+            compatible.credential.as_deref(),
+            Some(key),
+            "the configured key must reach the provider the factory built"
         );
-    }
 
-    /// A login made with the Qwen CLI after the provider was built is read at
-    /// renewal time and used without a refresh call.
-    #[tokio::test]
-    async fn qwen_login_written_after_build_is_read_at_renewal() {
-        let _env = crate::test_env::ENV_LOCK.lock().await;
-        let _scrub = crate::test_env::CredentialEnvScrub::new();
-        let home = tempfile::tempdir().expect("home");
-        let _home = crate::test_env::HomeGuard::set(home.path());
-        let _resource = crate::test_env::EnvGuard::unset(QWEN_OAUTH_RESOURCE_URL_ENV);
-        let server = login_endpoint(renewed_token_response("token-renewed")).await;
-        let _endpoint = TokenEndpointOverride::set(format!("{}/token", server.uri()));
-        write_qwen_login(home.path(), "token-stale", "refresh-user-a", 60);
-
-        let provider = qwen_login_provider(&server, QWEN_OAUTH_PLACEHOLDER);
-        write_qwen_login(home.path(), "token-from-new-login", "refresh-user-a", 3600);
-        provider
-            .simple_chat("hi", "mock-model", 0.0)
+        let request = compatible
+            .build_request_for_test("qwen-plus")
             .await
-            .expect("the new login answers");
-
-        assert_eq!(refresh_calls(&server).await, 0);
+            .expect("the provider builds the request");
         assert_eq!(
-            chat_authorization(&server).await,
-            vec!["Bearer token-from-new-login".to_string()]
+            request
+                .headers()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer sk-configured-dashscope-key"),
+            "the configured key must be the bearer token the host receives"
         );
     }
 
-    /// With no login at all when the provider is built, one made later is used.
+    /// The `minimax` key path: the same, for the MiniMax endpoint.
     #[tokio::test]
-    async fn qwen_provider_built_without_a_login_uses_one_made_later() {
+    async fn the_minimax_path_sends_the_configured_key_to_its_host() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
         let _scrub = crate::test_env::CredentialEnvScrub::new();
-        let home = tempfile::tempdir().expect("home");
-        let _home = crate::test_env::HomeGuard::set(home.path());
-        let _resource = crate::test_env::EnvGuard::unset(QWEN_OAUTH_RESOURCE_URL_ENV);
-        let server = login_endpoint(renewed_token_response("token-renewed")).await;
-        let _endpoint = TokenEndpointOverride::set(format!("{}/token", server.uri()));
+        let key = "sk-configured-minimax-key";
 
-        let provider = qwen_login_provider(&server, QWEN_OAUTH_PLACEHOLDER);
-        write_qwen_login(home.path(), "token-from-new-login", "refresh-user-a", 3600);
-        provider
-            .simple_chat("hi", "mock-model", 0.0)
-            .await
-            .expect("the new login answers");
-
-        assert_eq!(refresh_calls(&server).await, 0);
+        let provider =
+            create_provider("minimax", Some(key)).expect("the factory builds minimax with the key");
+        let compatible = compatible_provider_inside(provider.as_ref())
+            .expect("minimax builds an OpenAI-compatible provider");
         assert_eq!(
-            chat_authorization(&server).await,
-            vec!["Bearer token-from-new-login".to_string()]
+            compatible.credential.as_deref(),
+            Some(key),
+            "the configured key must reach the provider the factory built"
         );
-    }
 
-    /// An explicit key and an env token are sent as they are, however stale the
-    /// login file is, and never refreshed.
-    #[tokio::test]
-    async fn qwen_explicit_key_and_env_token_are_never_refreshed() {
-        let _env = crate::test_env::ENV_LOCK.lock().await;
-        let _scrub = crate::test_env::CredentialEnvScrub::new();
-        let home = tempfile::tempdir().expect("home");
-        let _home = crate::test_env::HomeGuard::set(home.path());
-        let _resource = crate::test_env::EnvGuard::unset(QWEN_OAUTH_RESOURCE_URL_ENV);
-        let server = login_endpoint(renewed_token_response("token-renewed")).await;
-        let _endpoint = TokenEndpointOverride::set(format!("{}/token", server.uri()));
-        write_qwen_login(home.path(), "token-stale", "refresh-user-a", -3600);
-
-        let explicit = qwen_login_provider(&server, "key-explicit");
-        explicit
-            .simple_chat("hi", "mock-model", 0.0)
+        let request = compatible
+            .build_request_for_test("minimax-text-01")
             .await
-            .expect("the explicit key answers");
-
-        let _token = crate::test_env::EnvGuard::set(QWEN_OAUTH_TOKEN_ENV, "token-from-env");
-        let from_env = qwen_login_provider(&server, QWEN_OAUTH_PLACEHOLDER);
-        from_env
-            .simple_chat("hi", "mock-model", 0.0)
-            .await
-            .expect("the env token answers");
-
-        assert_eq!(refresh_calls(&server).await, 0);
+            .expect("the provider builds the request");
         assert_eq!(
-            chat_authorization(&server).await,
-            vec![
-                "Bearer key-explicit".to_string(),
-                "Bearer token-from-env".to_string()
-            ]
+            request
+                .headers()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer sk-configured-minimax-key"),
+            "the configured key must be the bearer token the host receives"
         );
-    }
-
-    /// A refresh the server refuses fails that request with a sentence that
-    /// names the fix, and nothing is sent to the chat endpoint.
-    #[tokio::test]
-    async fn qwen_refresh_failure_names_the_fix_and_sends_nothing() {
-        let _env = crate::test_env::ENV_LOCK.lock().await;
-        let _scrub = crate::test_env::CredentialEnvScrub::new();
-        let home = tempfile::tempdir().expect("home");
-        let _home = crate::test_env::HomeGuard::set(home.path());
-        let _resource = crate::test_env::EnvGuard::unset(QWEN_OAUTH_RESOURCE_URL_ENV);
-        let server = login_endpoint(wiremock::ResponseTemplate::new(400).set_body_json(
-            serde_json::json!({"error": "invalid_grant", "error_description": "refresh token revoked sk-fake-secret-value-0000"}),
-        ))
-        .await;
-        let _endpoint = TokenEndpointOverride::set(format!("{}/token", server.uri()));
-        write_qwen_login(home.path(), "token-stale", "refresh-user-a", -3600);
-
-        let provider = qwen_login_provider(&server, QWEN_OAUTH_PLACEHOLDER);
-        let error = provider
-            .simple_chat("hi", "mock-model", 0.0)
-            .await
-            .expect_err("a refused refresh fails the request")
-            .to_string();
-
-        assert!(error.contains("`qwen`"), "{error}");
-        assert!(error.contains(QWEN_OAUTH_TOKEN_ENV), "{error}");
-        assert!(!error.contains("token-stale"), "{error}");
-        assert!(!error.contains("refresh-user-a"), "{error}");
-        assert!(error.contains("revoked"), "{error}");
-        assert!(
-            !error.contains("sk-fake-secret-value-0000"),
-            "a secret in the server's message must not reach the error: {error}"
-        );
-        assert!(chat_authorization(&server).await.is_empty());
-    }
-
-    /// The streaming path renews the login too.
-    #[tokio::test]
-    async fn qwen_streaming_request_carries_the_renewed_token() {
-        use futures_util::StreamExt;
-
-        let _env = crate::test_env::ENV_LOCK.lock().await;
-        let _scrub = crate::test_env::CredentialEnvScrub::new();
-        let home = tempfile::tempdir().expect("home");
-        let _home = crate::test_env::HomeGuard::set(home.path());
-        let _resource = crate::test_env::EnvGuard::unset(QWEN_OAUTH_RESOURCE_URL_ENV);
-        let server = login_endpoint(renewed_token_response("token-renewed")).await;
-        let _endpoint = TokenEndpointOverride::set(format!("{}/token", server.uri()));
-        write_qwen_login(home.path(), "token-stale", "refresh-user-a", 60);
-
-        let provider = qwen_login_provider(&server, QWEN_OAUTH_PLACEHOLDER);
-        let mut stream = provider.stream_chat_with_system(
-            None,
-            "hi",
-            "mock-model",
-            0.0,
-            traits::StreamOptions::new(true),
-        );
-        while stream.next().await.is_some() {}
-
-        assert_eq!(refresh_calls(&server).await, 1);
-        assert_eq!(
-            chat_authorization(&server).await,
-            vec!["Bearer token-renewed".to_string()]
-        );
-    }
-
-    fn minimax_refresh_response(access_token: &str) -> wiremock::ResponseTemplate {
-        wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "status": "success",
-            "access_token": access_token,
-        }))
-    }
-
-    /// The MiniMax provider the factory builds for `minimax-oauth`, pointed at
-    /// the local listener.
-    fn minimax_login_provider(
-        server: &wiremock::MockServer,
-        api_key: Option<&str>,
-    ) -> OpenAiCompatibleProvider {
-        let key = resolve_provider_credential("minimax-oauth", api_key);
-        build_minimax_provider(
-            "minimax-oauth",
-            &format!("{}/v1", server.uri()),
-            api_key,
-            key.as_deref(),
-        )
-    }
-
-    /// Environment for a MiniMax refresh-token login: nothing else configured.
-    fn minimax_refresh_env() -> Vec<crate::test_env::EnvGuard> {
-        vec![
-            crate::test_env::EnvGuard::unset(MINIMAX_OAUTH_TOKEN_ENV),
-            crate::test_env::EnvGuard::unset(MINIMAX_API_KEY_ENV),
-            crate::test_env::EnvGuard::unset(MINIMAX_OAUTH_REGION_ENV),
-            crate::test_env::EnvGuard::set(MINIMAX_OAUTH_REFRESH_TOKEN_ENV, "refresh-user-a"),
-        ]
-    }
-
-    /// A refresh token is exchanged when the first request is sent, not when
-    /// the provider is built, and that request carries the new access token.
-    #[tokio::test]
-    async fn minimax_refresh_token_is_exchanged_on_the_first_request() {
-        let _env = crate::test_env::ENV_LOCK.lock().await;
-        let _scrub = crate::test_env::CredentialEnvScrub::new();
-        let _minimax = minimax_refresh_env();
-        let _generic = crate::test_env::EnvGuard::set("RANTAICLAW_API_KEY", "key-generic");
-        let server = login_endpoint(minimax_refresh_response("minimax-renewed")).await;
-        let _endpoint = TokenEndpointOverride::set(format!("{}/token", server.uri()));
-
-        let provider = minimax_login_provider(&server, Some(MINIMAX_OAUTH_PLACEHOLDER));
-        assert_eq!(refresh_calls(&server).await, 0, "building must not refresh");
-
-        provider
-            .simple_chat("hi", "mock-model", 0.0)
-            .await
-            .expect("the renewed token answers");
-
-        assert_eq!(refresh_calls(&server).await, 1);
-        assert_eq!(
-            chat_authorization(&server).await,
-            vec!["Bearer minimax-renewed".to_string()]
-        );
-    }
-
-    /// A renewed access token is kept: later requests send it without another
-    /// refresh call.
-    #[tokio::test]
-    async fn minimax_renewed_token_is_not_refreshed_again_while_it_lasts() {
-        let _env = crate::test_env::ENV_LOCK.lock().await;
-        let _scrub = crate::test_env::CredentialEnvScrub::new();
-        let _minimax = minimax_refresh_env();
-        let _generic = crate::test_env::EnvGuard::set("RANTAICLAW_API_KEY", "key-generic");
-        let server = login_endpoint(minimax_refresh_response("minimax-renewed")).await;
-        let _endpoint = TokenEndpointOverride::set(format!("{}/token", server.uri()));
-
-        let provider = minimax_login_provider(&server, None);
-        for _ in 0..3 {
-            provider
-                .simple_chat("hi", "mock-model", 0.0)
-                .await
-                .expect("the renewed token answers");
-        }
-
-        assert_eq!(refresh_calls(&server).await, 1);
-        assert_eq!(
-            chat_authorization(&server).await,
-            vec!["Bearer minimax-renewed".to_string(); 3]
-        );
-    }
-
-    /// An explicit key and an env token are sent as they are even when a
-    /// refresh token is also set, and never refreshed.
-    #[tokio::test]
-    async fn minimax_explicit_key_and_env_token_are_never_refreshed() {
-        let _env = crate::test_env::ENV_LOCK.lock().await;
-        let _scrub = crate::test_env::CredentialEnvScrub::new();
-        let _minimax = minimax_refresh_env();
-        let server = login_endpoint(minimax_refresh_response("minimax-renewed")).await;
-        let _endpoint = TokenEndpointOverride::set(format!("{}/token", server.uri()));
-
-        let explicit = minimax_login_provider(&server, Some("key-explicit"));
-        explicit
-            .simple_chat("hi", "mock-model", 0.0)
-            .await
-            .expect("the explicit key answers");
-
-        let _token = crate::test_env::EnvGuard::set(MINIMAX_OAUTH_TOKEN_ENV, "token-from-env");
-        let from_env = minimax_login_provider(&server, Some(MINIMAX_OAUTH_PLACEHOLDER));
-        from_env
-            .simple_chat("hi", "mock-model", 0.0)
-            .await
-            .expect("the env token answers");
-
-        assert_eq!(refresh_calls(&server).await, 0);
-        assert_eq!(
-            chat_authorization(&server).await,
-            vec![
-                "Bearer key-explicit".to_string(),
-                "Bearer token-from-env".to_string()
-            ]
-        );
-    }
-
-    /// A refused refresh fails that request with a sentence that names the
-    /// fix, and nothing reaches the chat endpoint.
-    #[tokio::test]
-    async fn minimax_refresh_failure_names_the_fix_and_sends_nothing() {
-        let _env = crate::test_env::ENV_LOCK.lock().await;
-        let _scrub = crate::test_env::CredentialEnvScrub::new();
-        let _minimax = minimax_refresh_env();
-        let server = login_endpoint(wiremock::ResponseTemplate::new(401).set_body_json(
-            serde_json::json!({"base_resp": {"status_msg": "refresh token revoked sk-fake-secret-value-0000"}}),
-        ))
-        .await;
-        let _endpoint = TokenEndpointOverride::set(format!("{}/token", server.uri()));
-
-        let provider = minimax_login_provider(&server, None);
-        let error = provider
-            .simple_chat("hi", "mock-model", 0.0)
-            .await
-            .expect_err("a refused refresh fails the request")
-            .to_string();
-
-        assert!(error.contains(MINIMAX_OAUTH_REFRESH_TOKEN_ENV), "{error}");
-        assert!(error.contains(MINIMAX_OAUTH_TOKEN_ENV), "{error}");
-        assert!(!error.contains("refresh-user-a"), "{error}");
-        assert!(error.contains("revoked"), "{error}");
-        assert!(
-            !error.contains("sk-fake-secret-value-0000"),
-            "a secret in the server's message must not reach the error: {error}"
-        );
-        assert!(chat_authorization(&server).await.is_empty());
-    }
-
-    /// Asking whether MiniMax has a usable credential does not call the
-    /// network: a refresh token that is set counts.
-    #[tokio::test]
-    async fn minimax_credential_check_does_not_refresh() {
-        let _env = crate::test_env::ENV_LOCK.lock().await;
-        let _scrub = crate::test_env::CredentialEnvScrub::new();
-        let refresh_env = minimax_refresh_env();
-        let server = login_endpoint(minimax_refresh_response("minimax-renewed")).await;
-        let _endpoint = TokenEndpointOverride::set(format!("{}/token", server.uri()));
-
-        assert!(has_usable_credential(
-            "minimax-oauth",
-            Some(MINIMAX_OAUTH_PLACEHOLDER),
-            None
-        ));
-        assert!(has_usable_credential("minimax", None, None));
-        assert_eq!(refresh_calls(&server).await, 0);
-
-        drop(refresh_env);
-        let _none = crate::test_env::EnvGuard::unset(MINIMAX_OAUTH_REFRESH_TOKEN_ENV);
-        assert!(!has_usable_credential(
-            "minimax-oauth",
-            Some(MINIMAX_OAUTH_PLACEHOLDER),
-            None
-        ));
-    }
-
-    fn rotating_token_response() -> wiremock::ResponseTemplate {
-        wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "access_token": "token-renewed",
-            "refresh_token": "refresh-rotated-b",
-            "expires_in": 60,
-        }))
-    }
-
-    /// The body of each refresh request, in order.
-    async fn refresh_bodies(server: &wiremock::MockServer) -> Vec<String> {
-        server
-            .received_requests()
-            .await
-            .unwrap_or_default()
-            .iter()
-            .filter(|req| req.url.path() == "/token")
-            .map(|req| String::from_utf8_lossy(&req.body).into_owned())
-            .collect()
-    }
-
-    /// A refresh token the server rotated is kept in memory and sent at the
-    /// next renewal; the login file is not written.
-    #[tokio::test]
-    async fn qwen_rotated_refresh_token_is_used_for_the_next_renewal() {
-        let _env = crate::test_env::ENV_LOCK.lock().await;
-        let _scrub = crate::test_env::CredentialEnvScrub::new();
-        let home = tempfile::tempdir().expect("home");
-        let _home = crate::test_env::HomeGuard::set(home.path());
-        let _resource = crate::test_env::EnvGuard::unset(QWEN_OAUTH_RESOURCE_URL_ENV);
-        let server = login_endpoint(rotating_token_response()).await;
-        let _endpoint = TokenEndpointOverride::set(format!("{}/token", server.uri()));
-        write_qwen_login(home.path(), "token-stale", "refresh-file-a", 60);
-        let login_file = home.path().join(".qwen/oauth_creds.json");
-        let file_before = std::fs::read(&login_file).expect("login file");
-
-        let provider = qwen_login_provider(&server, QWEN_OAUTH_PLACEHOLDER);
-        for _ in 0..2 {
-            provider
-                .simple_chat("hi", "mock-model", 0.0)
-                .await
-                .expect("the renewed login answers");
-        }
-
-        let bodies = refresh_bodies(&server).await;
-        assert_eq!(bodies.len(), 2, "{bodies:?}");
-        assert!(
-            bodies[0].contains("refresh_token=refresh-file-a"),
-            "{bodies:?}"
-        );
-        assert!(
-            bodies[1].contains("refresh_token=refresh-rotated-b"),
-            "{bodies:?}"
-        );
-        assert_eq!(std::fs::read(&login_file).expect("login file"), file_before);
-    }
-
-    /// A login made with the Qwen CLI after a rotation has a different refresh
-    /// token in the file, and that one wins over the rotated one.
-    #[tokio::test]
-    async fn qwen_new_login_refresh_token_outranks_a_rotated_one() {
-        let _env = crate::test_env::ENV_LOCK.lock().await;
-        let _scrub = crate::test_env::CredentialEnvScrub::new();
-        let home = tempfile::tempdir().expect("home");
-        let _home = crate::test_env::HomeGuard::set(home.path());
-        let _resource = crate::test_env::EnvGuard::unset(QWEN_OAUTH_RESOURCE_URL_ENV);
-        let server = login_endpoint(rotating_token_response()).await;
-        let _endpoint = TokenEndpointOverride::set(format!("{}/token", server.uri()));
-        write_qwen_login(home.path(), "token-stale", "refresh-file-a", 60);
-
-        let provider = qwen_login_provider(&server, QWEN_OAUTH_PLACEHOLDER);
-        provider
-            .simple_chat("hi", "mock-model", 0.0)
-            .await
-            .expect("the renewed login answers");
-        write_qwen_login(home.path(), "token-stale-2", "refresh-file-c", -3600);
-        provider
-            .simple_chat("hi", "mock-model", 0.0)
-            .await
-            .expect("the renewed login answers");
-
-        let bodies = refresh_bodies(&server).await;
-        assert_eq!(bodies.len(), 2, "{bodies:?}");
-        assert!(
-            bodies[1].contains("refresh_token=refresh-file-c"),
-            "{bodies:?}"
-        );
-    }
-
-    /// A refusal whose body is not JSON is quoted without secrets.
-    #[tokio::test]
-    async fn qwen_refresh_failure_with_a_raw_body_hides_secrets() {
-        let _env = crate::test_env::ENV_LOCK.lock().await;
-        let _scrub = crate::test_env::CredentialEnvScrub::new();
-        let home = tempfile::tempdir().expect("home");
-        let _home = crate::test_env::HomeGuard::set(home.path());
-        let _resource = crate::test_env::EnvGuard::unset(QWEN_OAUTH_RESOURCE_URL_ENV);
-        let server = login_endpoint(
-            wiremock::ResponseTemplate::new(500)
-                .set_body_string("gateway error for sk-fake-secret-value-0000"),
-        )
-        .await;
-        let _endpoint = TokenEndpointOverride::set(format!("{}/token", server.uri()));
-        write_qwen_login(home.path(), "token-stale", "refresh-user-a", -3600);
-
-        let provider = qwen_login_provider(&server, QWEN_OAUTH_PLACEHOLDER);
-        let error = provider
-            .simple_chat("hi", "mock-model", 0.0)
-            .await
-            .expect_err("a failed refresh fails the request")
-            .to_string();
-
-        assert!(error.contains("gateway error"), "{error}");
-        assert!(error.contains(QWEN_OAUTH_TOKEN_ENV), "{error}");
-        assert!(!error.contains("sk-fake-secret-value-0000"), "{error}");
     }
 }

@@ -543,6 +543,15 @@ fn provider_switch_warning(cfg: &crate::config::Config, provider_changed: bool) 
         return None;
     }
     let provider = cfg.default_provider.as_deref()?;
+    // A provider whose subscription login was removed is not waiting for a
+    // key: the key belongs to a different provider, and the refusal names
+    // it. "No API key found" would send the operator after a key that cannot
+    // help.
+    if let Some(sentence) = crate::providers::removed_login_refusal(provider) {
+        return Some(format!(
+            "Channels and chat can't use '{provider}': {sentence}"
+        ));
+    }
     // Ask the same question the send path asks, with the same inputs: the
     // per-provider key (not just the top-level one) and the directory holding
     // this install's auth profiles.
@@ -2970,6 +2979,44 @@ mod tests {
         // No provider change -> never warns.
         cfg.api_key = None;
         assert!(provider_switch_warning(&cfg, false).is_none());
+    }
+
+    /// A provider whose subscription login was removed is not waiting for a
+    /// key: the key belongs to a different provider. The warning has to name
+    /// that replacement, and every provider that still exists has to keep the
+    /// wording it always had.
+    #[tokio::test]
+    async fn provider_switch_warning_names_the_replacement_for_a_removed_login() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        // An empty install directory, so no stored key can answer for the
+        // provider either.
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let mut cfg = Config::default();
+        cfg.config_path = tmp.path().join("config.toml");
+        cfg.api_key = None;
+
+        // The removed ChatGPT login: the key that replaces it belongs to
+        // another provider, and the warning has to say which one.
+        cfg.default_provider = Some("openai-codex".into());
+        let warning = provider_switch_warning(&cfg, true).expect("a removed login warns");
+        assert!(warning.contains("OPENAI_API_KEY"), "{warning}");
+
+        // Copilot has no API-key path at all, so the warning says that
+        // instead of naming a key.
+        cfg.default_provider = Some("copilot".into());
+        let warning = provider_switch_warning(&cfg, true).expect("a removed login warns");
+        assert!(warning.contains("no API-key path"), "{warning}");
+
+        // A provider that still exists keeps the wording it always had.
+        cfg.default_provider = Some("anthropic".into());
+        let warning = provider_switch_warning(&cfg, true).expect("a provider without a key warns");
+        assert_eq!(
+            warning,
+            "No API key found for 'anthropic'. If it needs one, channels and chat \
+             can't use it until you add it in Configuration."
+        );
     }
 
     #[test]

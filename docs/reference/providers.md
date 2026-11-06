@@ -2,7 +2,7 @@
 
 This document maps provider IDs, aliases, and credential environment variables.
 
-Last verified: **May 9, 2026**.
+Last verified: **November 6, 2026**.
 
 ## How to List Providers
 
@@ -88,11 +88,11 @@ ANTHROPIC_API_KEY, store a key in config, or paste an auth profile`.
 | `opencode` | `opencode-zen` | No | `OPENCODE_API_KEY` |
 | `zai` | `z.ai` | No | `ZAI_API_KEY` |
 | `glm` | `zhipu` | No | `GLM_API_KEY` |
-| `minimax` | `minimax-intl`, `minimax-io`, `minimax-global`, `minimax-cn`, `minimaxi`, `minimax-oauth`, `minimax-oauth-cn`, `minimax-portal`, `minimax-portal-cn` | No | `MINIMAX_OAUTH_TOKEN`, `MINIMAX_API_KEY` |
+| `minimax` | `minimax-intl`, `minimax-io`, `minimax-global`, `minimax-cn`, `minimaxi`, `minimax-portal`, `minimax-portal-cn` | No | `MINIMAX_API_KEY` |
 | `bedrock` | `aws-bedrock` | No | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (optional: `AWS_REGION`) |
 | `qianfan` | `baidu` | No | `QIANFAN_API_KEY` |
 | `doubao` | `volcengine`, `ark`, `doubao-cn` | No | `ARK_API_KEY`, `DOUBAO_API_KEY` |
-| `qwen` | `dashscope`, `qwen-intl`, `dashscope-intl`, `qwen-us`, `dashscope-us`, `qwen-code`, `qwen-oauth`, `qwen_oauth` | No | `QWEN_OAUTH_TOKEN`, `DASHSCOPE_API_KEY` |
+| `qwen` | `dashscope`, `qwen-intl`, `dashscope-intl`, `qwen-us`, `dashscope-us` | No | `DASHSCOPE_API_KEY` |
 | `groq` | — | No | `GROQ_API_KEY` |
 | `mistral` | — | No | `MISTRAL_API_KEY` |
 | `xai` | `grok` | No | `XAI_API_KEY` |
@@ -101,41 +101,74 @@ ANTHROPIC_API_KEY, store a key in config, or paste an auth profile`.
 | `fireworks` | `fireworks-ai` | No | `FIREWORKS_API_KEY` |
 | `perplexity` | — | No | `PERPLEXITY_API_KEY` |
 | `cohere` | — | No | `COHERE_API_KEY` |
-| `copilot` | `github-copilot` | No | (use config/`API_KEY` fallback with GitHub token) |
 | `lmstudio` | `lm-studio` | Yes | (optional; local by default) |
 | `llamacpp` | `llama.cpp` | Yes | `LLAMACPP_API_KEY` (optional; only if server auth is enabled) |
 | `nvidia` | `nvidia-nim`, `build.nvidia.com` | No | `NVIDIA_API_KEY` |
 | `astrai` | — | No | `ASTRAI_API_KEY` |
 
-The OpenAI-compatible, Anthropic, OpenRouter, Ollama, Copilot and Bedrock providers
+The OpenAI-compatible, Anthropic, OpenRouter, Ollama and Bedrock providers
 report the token counts that feed the daily token ceiling (`[cost] max_tokens_per_day`);
 a provider that does not report them adds nothing to the day's total.
 
 A request that a provider refuses before sending anything fails the turn at once, with no
 retry and no backoff wait, because a retry would end in the same sentence. These refusals
-are a missing Anthropic, AWS Bedrock or OpenAI Codex credential, an OpenAI Codex login that
-names no account, and an Ollama `:cloud` model on a local endpoint or without an API key.
+are a missing AWS Bedrock or Gemini credential, and an Ollama `:cloud` model on a local
+endpoint or without an API key.
+
+### Removed Subscription Logins
+
+RantaiClaw uses API keys only. Five subscription logins are gone, and every name that
+stood for one is refused with the API-key replacement named:
+
+| Removed login | Refusal |
+|---|---|
+| `copilot`, `github-copilot` | The GitHub Copilot login was removed. Copilot has no API-key path in RantaiClaw — choose another provider. |
+| `openai-codex`, `openai_codex`, `codex` | The ChatGPT (OpenAI Codex) login was removed. Use the "openai" provider with an OPENAI_API_KEY instead. |
+| `qwen-code`, `qwen-oauth`, `qwen_oauth` | The Qwen Code OAuth login was removed. Use the "qwen" provider with a DashScope API key (DASHSCOPE_API_KEY) instead. |
+| `minimax-oauth`, `minimax-oauth-cn`, `minimax-oauth-global` | The MiniMax OAuth login was removed. Use the "minimax" provider with a MINIMAX_API_KEY instead. |
+
+A config that still names one of them **loads**. The daemon starts, the gateway binds and
+the console serves, so there is no restart loop; the refusal comes when a request is sent.
+Nothing is sent to the vendor, the turn fails at once with the sentence above, and no retry
+follows.
+
+The same sentence answers a credential that asks for the login in the name of the key:
+`api_key = "minimax-oauth"` and `api_key = "qwen-oauth"` are placeholders, not keys, and
+the provider they sit on refuses with the sentence its own name would have produced.
+
+`rantaiclaw doctor` reports a config that names one of them:
+
+```text
+default_provider "copilot" names a removed login: The GitHub Copilot login was removed. Copilot has no API-key path in RantaiClaw — choose another provider.
+```
+
+The gateway's chat route answers the same failure with `400` and the replacement sentence
+in the error body. The streaming route answers `200` and carries the same sentence in its
+error event, so a client that reads one route and compares it with the other finds one
+message.
+
+Under `[proxy]`, a service key of `provider.copilot` still loads — it stays a supported
+key, so a config written before the removal is not rejected — but it is inert, and a
+warning says why.
 
 ### Gemini Notes
 
 - Provider ID: `gemini` (aliases: `google`, `google-gemini`)
-- Auth can come from `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or Gemini CLI OAuth cache (`~/.gemini/oauth_creds.json`)
-- The Gemini CLI login is reused while its access token is valid — about an hour after the last
-  `gemini` run. It is never refreshed. The login is read when a request is sent, so an expired one
-  fails that turn with the fix named: run `gemini` again or set `GEMINI_API_KEY`. Nothing is sent to
-  Google, so the expired login no longer comes back as a 401. No restart is needed after `gemini`:
-  the renewed login is used on the next request.
-- A refused login fails the turn at once — no retry, no backoff wait. The credential is decided
+- Auth comes from an API key: the key stored in config, `GEMINI_API_KEY`, or `GOOGLE_API_KEY`
+- The Gemini CLI login is gone. RantaiClaw uses API keys only, so `~/.gemini/oauth_creds.json` is
+  never read and a login made with the `gemini` CLI cannot be reused.
+- With no key the request is refused before anything is sent, with the fix named:
+
+  ```text
+  Gemini API key not found. Options:
+  1. Set GEMINI_API_KEY env var
+  2. Get an API key from https://aistudio.google.com/app/apikey
+  3. Run `rantaiclaw onboard` to configure
+  ```
+
+- A refused request fails the turn at once — no retry, no backoff wait. The credential is decided
   locally, before anything is sent, so a retry could only end in the same sentence.
-- A first login needs no restart: the login file is read when a request is about to be sent, so a
-  login made after the agent started is used on the next request. Building the provider never fails
-  because of the login's state — with no key and no login file the gateway and the channels still
-  start, and every turn fails with the fix named.
-- With Gemini CLI's encrypted credential storage there is no `oauth_creds.json` to reuse — the login
-  lives in the OS keychain and the file is deleted after the migration — so nothing is found and a key
-  is needed.
 - API key requests use `generativelanguage.googleapis.com/v1beta`
-- Gemini CLI OAuth requests use `cloudcode-pa.googleapis.com/v1internal` with Code Assist request envelope semantics
 
 ### Image Input By Provider
 
@@ -258,61 +291,49 @@ default_provider = "anthropic-custom:https://your-api.example.com"
 - The list is cached under the provider string as written in config, so two custom endpoints keep separate lists.
 - A failed request, a non-2xx answer, or an answer with no model IDs fails the refresh, leaves any earlier cache as it was, and ends with the `/model <id>` and `default_model` way forward.
 
-## MiniMax OAuth Setup (config.toml)
+## MiniMax API Key Setup (config.toml)
 
-Set the MiniMax provider and OAuth placeholder in config:
+Set the MiniMax provider and its key in config:
 
 ```toml
-default_provider = "minimax-oauth"
-api_key = "minimax-oauth"
+default_provider = "minimax"
+api_key = "sk-..."
 ```
 
-Then provide one of the following credentials via environment variables:
+Then provide the key through one of these:
 
-- `MINIMAX_OAUTH_TOKEN` (preferred, direct access token)
-- `MINIMAX_API_KEY` (legacy/static token)
-- `MINIMAX_OAUTH_REFRESH_TOKEN` (exchanged for an access token when a request needs one, and again when that token is about 30 minutes old; the refresh response names no expiry, so 30 minutes is assumed)
+- `MINIMAX_API_KEY` in the environment
+- the `api_key` written above, or a `[provider_api_keys]` entry for the provider name
 
-Optional:
-
-- `MINIMAX_OAUTH_REGION=global` or `cn` (defaults by provider alias)
-- `MINIMAX_OAUTH_CLIENT_ID` to override the default OAuth client id
+The MiniMax OAuth login is gone. `MINIMAX_OAUTH_TOKEN`, `MINIMAX_OAUTH_REFRESH_TOKEN`,
+`MINIMAX_OAUTH_CLIENT_ID` and `MINIMAX_OAUTH_REGION` do nothing, and a config that names
+`minimax-oauth` is refused at send time with the replacement named — see
+[Removed Subscription Logins](#removed-subscription-logins).
 
 Channel compatibility note:
 
 - For MiniMax-backed channel conversations, runtime history is normalized to keep valid `user`/`assistant` turn order.
 - Channel-specific delivery guidance (for example Telegram attachment markers) is merged into the leading system prompt instead of being appended as a trailing `system` turn.
 
-## Qwen Code OAuth Setup (config.toml)
+## Qwen API Key Setup (config.toml)
 
-Set Qwen Code OAuth mode in config:
+Set the Qwen provider and its key in config:
 
 ```toml
-default_provider = "qwen-code"
-api_key = "qwen-oauth"
+default_provider = "qwen"
+api_key = "sk-..."
 ```
 
-Credential resolution for `qwen-code`:
+Then provide the key through one of these:
 
-1. Explicit `api_key` value (if not the placeholder `qwen-oauth`)
-2. `QWEN_OAUTH_TOKEN`
-3. `~/.qwen/oauth_creds.json` (reuses Qwen Code cached OAuth credentials)
-4. Optional refresh via `QWEN_OAUTH_REFRESH_TOKEN` (or cached refresh token)
-5. If no OAuth placeholder is used and there is no Qwen login at all (no token or refresh token in
-   `~/.qwen/oauth_creds.json` and no `QWEN_OAUTH_REFRESH_TOKEN`), `DASHSCOPE_API_KEY` is used instead.
-   A login that exists but cannot be renewed does not fall back to it: the request fails with the fix.
+- `DASHSCOPE_API_KEY` in the environment
+- the `api_key` written above, or a `[provider_api_keys]` entry for the provider name
 
-The login is renewed while the daemon runs. A request made when the access token has
-under two minutes left (or has expired) first re-reads `~/.qwen/oauth_creds.json`, so a
-login made with the Qwen CLI afterwards is used, and only then exchanges the refresh token.
-RantaiClaw never writes that file. A failed renewal fails that request and names the fix:
-log in again with `qwen`, or set `QWEN_OAUTH_TOKEN`. An explicit key and `QWEN_OAUTH_TOKEN`
-are sent as they are and never refreshed.
-
-Optional endpoint override:
-
-- `QWEN_OAUTH_RESOURCE_URL` (normalized to `https://.../v1` if needed)
-- If unset, `resource_url` from cached OAuth credentials is used when available
+The Qwen Code OAuth login is gone. `QWEN_OAUTH_TOKEN`, `QWEN_OAUTH_REFRESH_TOKEN` and
+`QWEN_OAUTH_RESOURCE_URL` do nothing, and `~/.qwen/oauth_creds.json` is never read. A
+config that names `qwen-code`, or a credential placeholder such as `api_key = "qwen-oauth"`,
+is refused at send time with the replacement named — see
+[Removed Subscription Logins](#removed-subscription-logins).
 
 ## Model Routing (`hint:<name>`)
 

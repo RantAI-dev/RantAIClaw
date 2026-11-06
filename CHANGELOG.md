@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **Five subscription logins are gone; RantaiClaw uses API keys only.** The GitHub Copilot, ChatGPT
+  (OpenAI Codex), Gemini CLI, Qwen Code OAuth and MiniMax OAuth logins were removed. Every name that
+  stood for one is refused with the API-key replacement named:
+
+  - The GitHub Copilot login was removed. Copilot has no API-key path in RantaiClaw — choose another provider.
+  - The ChatGPT (OpenAI Codex) login was removed. Use the "openai" provider with an OPENAI_API_KEY instead.
+  - The Qwen Code OAuth login was removed. Use the "qwen" provider with a DashScope API key (DASHSCOPE_API_KEY) instead.
+  - The MiniMax OAuth login was removed. Use the "minimax" provider with a MINIMAX_API_KEY instead.
+
+  The Gemini CLI login is gone as well: the Gemini provider takes an API key (`GEMINI_API_KEY` or
+  `GOOGLE_API_KEY`) and never reads `~/.gemini/oauth_creds.json`. These logins were features when
+  v0.34.0-alpha shipped them — that release announced the Qwen Code and MiniMax token renewal and
+  the Gemini CLI login — so this release removes what that release added.
+- **A config that names a removed login still loads, and the refusal comes when a request is sent.**
+  The daemon starts, the gateway binds and the console serves, so there is no restart loop. Nothing is
+  sent to the vendor, the turn fails at once with the replacement named, and no retry follows. A
+  credential placeholder is refused the same way: `api_key = "minimax-oauth"` and
+  `api_key = "qwen-oauth"` are placeholders, not keys. The gateway's chat route answers the failure
+  with `400` and the replacement sentence; the streaming route answers `200` and carries the same
+  sentence in its error event. `rantaiclaw doctor` reports it as
+  `default_provider "copilot" names a removed login: The GitHub Copilot login was removed. Copilot has no API-key path in RantaiClaw — choose another provider.`
+- **The console's provider-switch warning names the removal instead of asking for a key.** Switching
+  the active provider to a name that stood for a removed subscription login now warns
+  `Channels and chat can't use 'copilot': The GitHub Copilot login was removed. Copilot has no API-key path in RantaiClaw — choose another provider.`
+  The refusal names the API-key replacement wherever there is one. Before this, the warning said
+  `No API key found for 'copilot'. If it needs one, channels and chat can't use it until you add it in Configuration.`
+  That sent the operator after a key that cannot help. Every provider that still exists keeps that
+  wording.
+- **The `auth` subcommands that belonged to the Codex login are gone.** `rantaiclaw auth login`,
+  `auth paste-redirect` and `auth refresh` are no longer commands: they served the ChatGPT (OpenAI
+  Codex) login only. `auth paste-token`, `auth setup-token`, `auth logout`, `auth use`, `auth list`
+  and `auth status` stay, and the Anthropic setup-token path is unchanged.
+- **The OAuth environment variables and the OAuth credential caches do nothing.**
+  `MINIMAX_OAUTH_TOKEN`, `MINIMAX_OAUTH_REFRESH_TOKEN`, `MINIMAX_OAUTH_CLIENT_ID`,
+  `MINIMAX_OAUTH_REGION`, `QWEN_OAUTH_TOKEN`, `QWEN_OAUTH_REFRESH_TOKEN` and
+  `QWEN_OAUTH_RESOURCE_URL` are no longer read, and neither `~/.qwen/oauth_creds.json` nor
+  `~/.gemini/oauth_creds.json` is opened. The working keys are `MINIMAX_API_KEY`,
+  `GEMINI_API_KEY` / `GOOGLE_API_KEY`, `DASHSCOPE_API_KEY` and `OPENAI_API_KEY`.
+- **A `"provider.copilot"` entry under `[proxy]` still loads and does nothing.** The key stays a
+  supported proxy service key, so a config written before the removal is not rejected. It is inert,
+  and a warning says why.
+- **No config key and no default changed, so the config schema stays at version 40.**
+
 ### Fixed
 
 - **A Deny on the shell, `pty` and `ssh` approval prompts now ends the turn on every surface.** The
@@ -22,6 +67,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rebuilding the table with `ON DELETE SET NULL`: the delete now succeeds and each fork keeps all
   its messages and stays as a standalone top-level session with `parent_session_id` NULL.
   Messages, full-text search and every other table are untouched.
+
+- **A turn the caller has to fix now answers `400` on the chat route instead of `500`.** The route
+  classifies a turn failure by whose fault it is. The caller's to fix: a provider name the factory
+  does not know, a custom endpoint URL that is empty, unparseable or not http(s), and a refusal the
+  provider decided before it sent anything — a missing Gemini or AWS Bedrock credential, an Ollama
+  `:cloud` model on a local endpoint or without an API key. Those answer `400` with the actionable
+  sentence in the body. The server's fault — a provider error, a network failure — still answers
+  `500`. The streaming route keeps its `200` and carries the same sentence in its `error` event, and
+  the removed-login refusal already described above is one of these `400` answers.
+
+- **A caller-controlled name in a refusal is cut to 64 characters and marked `...[truncated]`.** The
+  provider name in an unknown-provider refusal and the model name in an Ollama `:cloud` refusal are
+  the only caller-controlled text a refusal body carries, so each is bounded where the refusal is
+  built; the cut lands on a character boundary, so a name that already fits is echoed unchanged and
+  a multibyte name is never split. The guidance beside it — how to reconfigure, the two `custom:`
+  endpoint forms, the variable to set — is never cut. Before, the whole message was cut to 200
+  characters, which cut the guidance off mid-sentence. The bound applies to the refusal only: the
+  model that goes on the wire keeps its full name.
 
 ## [0.34.0-alpha] — 2026-11-05
 

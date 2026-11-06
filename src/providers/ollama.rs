@@ -8,6 +8,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use super::{bounded_name, MAX_MODEL_NAME_CHARS};
+
 pub struct OllamaProvider {
     base_url: String,
     api_key: Option<String>,
@@ -158,17 +160,21 @@ impl OllamaProvider {
     fn resolve_request_details(&self, model: &str) -> anyhow::Result<(String, bool)> {
         let requests_cloud = model.ends_with(":cloud");
         let normalized_model = model.strip_suffix(":cloud").unwrap_or(model).to_string();
+        // The refusal names the model the caller asked for, and the caller
+        // controls that name: a request body may carry a great deal of it.
+        // The echoed name is bounded; the model that is sent is not.
+        let bounded_model = bounded_name(model, MAX_MODEL_NAME_CHARS);
 
         if requests_cloud && self.is_local_endpoint() {
             return Err(LocalRefusal::new(format!(
-                "Model '{model}' requested cloud routing, but Ollama endpoint is local. Configure api_url with a remote Ollama endpoint."
+                "Model '{bounded_model}' requested cloud routing, but Ollama endpoint is local. Configure api_url with a remote Ollama endpoint."
             ))
             .into());
         }
 
         if requests_cloud && self.api_key.is_none() {
             return Err(LocalRefusal::new(format!(
-                "Model '{model}' requested cloud routing, but no API key is configured. Set OLLAMA_API_KEY or config api_key."
+                "Model '{bounded_model}' requested cloud routing, but no API key is configured. Set OLLAMA_API_KEY or config api_key."
             ))
             .into());
         }
@@ -961,6 +967,142 @@ mod tests {
         assert!(error
             .to_string()
             .contains("requested cloud routing, but no API key is configured"));
+    }
+
+    /// The refusal echoes the model name the caller sent, and the caller
+    /// controls that name: a request body may carry up to 64 KiB of it. The
+    /// echoed name is therefore bounded and the cut is marked.
+    #[test]
+    fn cloud_routing_refusal_bounds_a_long_model_name() {
+        let long_model = format!("{}:cloud", "a".repeat(200));
+        let error = OllamaProvider::new(None, Some("ollama-key"))
+            .resolve_request_details(&long_model)
+            .expect_err("cloud suffix should fail on local endpoint");
+
+        let text = error.to_string();
+        let bounded = format!(
+            "{}{}",
+            "a".repeat(crate::providers::MAX_MODEL_NAME_CHARS),
+            crate::providers::TRUNCATION_MARKER
+        );
+        assert!(
+            text.contains(&format!("Model '{bounded}' requested cloud routing")),
+            "refusal should echo the bounded model name: {text}"
+        );
+        assert!(
+            !text.contains(&long_model),
+            "refusal should not echo the whole model name: {text}"
+        );
+        let echoed = text
+            .strip_prefix("Model '")
+            .and_then(|rest| {
+                rest.split_once("' requested cloud routing")
+                    .map(|(name, _)| name)
+            })
+            .expect("refusal should name the model it refused");
+        assert!(
+            echoed.chars().count()
+                <= crate::providers::MAX_MODEL_NAME_CHARS
+                    + crate::providers::TRUNCATION_MARKER.chars().count(),
+            "the echoed model name should be at most the bound plus the cut marker: {text}"
+        );
+    }
+
+    /// The second cloud-routing refusal carries the same caller-controlled
+    /// model name, so it is bounded the same way.
+    #[test]
+    fn cloud_routing_refusal_without_api_key_bounds_a_long_model_name() {
+        let long_model = format!("{}:cloud", "a".repeat(200));
+        let error = OllamaProvider::new(Some("https://ollama.com"), None)
+            .resolve_request_details(&long_model)
+            .expect_err("cloud suffix should require API key");
+
+        let text = error.to_string();
+        let bounded = format!(
+            "{}{}",
+            "a".repeat(crate::providers::MAX_MODEL_NAME_CHARS),
+            crate::providers::TRUNCATION_MARKER
+        );
+        assert!(
+            text.contains(&format!("Model '{bounded}' requested cloud routing")),
+            "refusal should echo the bounded model name: {text}"
+        );
+        assert!(
+            !text.contains(&long_model),
+            "refusal should not echo the whole model name: {text}"
+        );
+    }
+
+    /// The guidance beside the model name is static, so it stays whole: a
+    /// bound belongs to the name the caller controls, not to the sentence
+    /// that tells the operator what to configure.
+    #[test]
+    fn cloud_routing_refusal_keeps_the_static_guidance_whole() {
+        let long_model = format!("{}:cloud", "a".repeat(200));
+
+        let local = OllamaProvider::new(None, Some("ollama-key"))
+            .resolve_request_details(&long_model)
+            .expect_err("cloud suffix should fail on local endpoint");
+        assert!(
+            local.to_string().contains(
+                "requested cloud routing, but Ollama endpoint is local. Configure api_url with a remote Ollama endpoint."
+            ),
+            "the local-endpoint guidance should stay whole: {local}"
+        );
+
+        let keyless = OllamaProvider::new(Some("https://ollama.com"), None)
+            .resolve_request_details(&long_model)
+            .expect_err("cloud suffix should require API key");
+        assert!(
+            keyless.to_string().contains(
+                "requested cloud routing, but no API key is configured. Set OLLAMA_API_KEY or config api_key."
+            ),
+            "the missing-key guidance should stay whole: {keyless}"
+        );
+    }
+
+    /// A model name that already fits is echoed exactly as it arrived: the
+    /// bound only cuts names that are too long.
+    #[test]
+    fn cloud_routing_refusal_echoes_a_fitting_model_name_unchanged() {
+        let error = OllamaProvider::new(None, Some("ollama-key"))
+            .resolve_request_details("qwen3:cloud")
+            .expect_err("cloud suffix should fail on local endpoint");
+
+        let text = error.to_string();
+        assert!(
+            text.contains("Model 'qwen3:cloud' requested cloud routing"),
+            "a fitting model name should be echoed unchanged: {text}"
+        );
+        assert!(
+            !text.contains(crate::providers::TRUNCATION_MARKER),
+            "a fitting model name should carry no cut marker: {text}"
+        );
+    }
+
+    /// The bound applies to the refusal message only. The model that goes on
+    /// the wire keeps its full name.
+    #[test]
+    fn cloud_routing_refusal_does_not_change_the_model_sent_to_ollama() {
+        let long_model = format!("{}:cloud", "a".repeat(200));
+        let provider = OllamaProvider::new(Some("https://ollama.com"), Some("ollama-key"));
+
+        let (model, should_auth) = provider
+            .resolve_request_details(&long_model)
+            .expect("a remote endpoint with a key should resolve");
+        assert_eq!(
+            model,
+            "a".repeat(200),
+            "the resolved model should keep its full name"
+        );
+        assert!(should_auth);
+
+        let request = provider.build_chat_request(Vec::new(), &model, 0.2, None);
+        assert_eq!(
+            request.model,
+            "a".repeat(200),
+            "the model on the wire should keep its full name"
+        );
     }
 
     /// Both cloud-routing refusals are decided before anything is sent, as a

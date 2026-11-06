@@ -81,8 +81,6 @@ The runtime sets a mode on several files and directories. These include:
 - `cron/jobs.db` and its WAL and SHM files get mode 0600, on a best-effort basis.
 - The profile's `secrets/` directory gets mode 0700, on a best-effort basis.
 - The WhatsApp Web session database, which holds the account's keys, gets mode 0600, as does each snapshot file and `.extra` file written beside it. Its parent directory gets mode 0700. All of these are best effort.
-- The Copilot token cache keeps `access-token` and `api-key.json` at mode 0600, and its directory gets mode 0700. Both are best effort. The directory is `copilot` inside the platform config directory, or `rantaiclaw-copilot-<user>` in the temp directory when no config directory is found.
-- The pending OpenAI login file `auth-openai-pending.json` is written with mode 0600.
 
 ### Credentials in `config.toml`
 

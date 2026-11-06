@@ -13305,8 +13305,9 @@ done
 }
 
 /// The owner and guest prompts of the runtime `build_channel_runtime` builds
-/// for a provider without native tool calling (`openai-codex` takes the trait
-/// default), with `guest_tools` as the operator's `guest_allowed_tools`.
+/// for a provider without native tool calling (the test-only `test-non-native`
+/// provider takes the trait default), with `guest_tools` as the operator's
+/// `guest_allowed_tools`.
 /// Returns `(owner_prompt, guest_prompt, workspace_path)`.
 ///
 /// `HOME` and the config directory point at temp directories for the whole
@@ -13322,7 +13323,7 @@ async fn non_native_runtime_prompts(guest_tools: &[&str]) -> (String, String, St
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.path().to_path_buf();
     config.config_path = config_dir.path().join("config.toml");
-    config.default_provider = Some("openai-codex".to_string());
+    config.default_provider = Some("test-non-native".to_string());
     config.channels_config.telegram = Some(crate::config::TelegramConfig {
         bot_token: "111111111:not-a-real-token".into(),
         allowed_users: vec!["*".into()],
