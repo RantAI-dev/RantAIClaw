@@ -313,16 +313,14 @@ mod tests {
     async fn ping_does_not_probe_unauthenticated_when_the_credential_is_not_a_key() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
         let _scrub = crate::test_env::CredentialEnvScrub::new();
-        let home = tempfile::tempdir().expect("config home");
-        let _xdg = crate::test_env::EnvGuard::set("XDG_CONFIG_HOME", home.path());
-
-        let dir = home.path().join("rantaiclaw").join("copilot");
-        std::fs::create_dir_all(&dir).expect("copilot dir");
-        std::fs::write(dir.join("access-token"), "gho_neutral_placeholder_value")
-            .expect("write token");
+        // Bedrock signs its requests with the AWS env vars, so the install has
+        // a credential this check cannot put in a bearer header.
+        let _id = crate::test_env::EnvGuard::set("AWS_ACCESS_KEY_ID", "AKIAEXAMPLEPLACEHOLDER");
+        let _secret =
+            crate::test_env::EnvGuard::set("AWS_SECRET_ACCESS_KEY", "neutral-aws-secret-value");
 
         let mut cfg = Config::default();
-        cfg.default_provider = Some("copilot".into());
+        cfg.default_provider = Some("bedrock".into());
         cfg.api_key = None;
         let check = ProviderPingCheck::with_endpoint("http://127.0.0.1:1/models");
         let result = check.run(&ctx(cfg)).await;
@@ -379,10 +377,10 @@ mod tests {
     fn resolve_endpoint_never_turns_a_bare_provider_name_into_a_url() {
         for provider in [
             "bedrock",
-            "copilot",
-            "openai-codex",
+            "gemini",
             "qianfan",
             "not-a-provider",
+            "unknown-provider-name",
         ] {
             let url = resolve_endpoint(provider, None);
             assert!(

@@ -13,8 +13,7 @@ use crate::memory::{
 use crate::onboard::ui;
 use crate::providers::{
     canonical_china_provider_name, is_glm_alias, is_glm_cn_alias, is_minimax_alias,
-    is_moonshot_alias, is_qianfan_alias, is_qwen_alias, is_qwen_oauth_alias, is_zai_alias,
-    is_zai_cn_alias,
+    is_moonshot_alias, is_qianfan_alias, is_qwen_alias, is_zai_alias, is_zai_cn_alias,
 };
 use anyhow::{bail, Context, Result};
 use console::style;
@@ -962,10 +961,6 @@ pub async fn run_quick_setup(
 }
 
 fn canonical_provider_name(provider_name: &str) -> &str {
-    if is_qwen_oauth_alias(provider_name) {
-        return "qwen-code";
-    }
-
     if let Some(canonical) = canonical_china_provider_name(provider_name) {
         return canonical;
     }
@@ -999,7 +994,6 @@ pub(crate) fn default_model_for_provider(provider: &str) -> String {
     match canonical_provider_name(provider) {
         "anthropic" => "claude-sonnet-4-6".into(),
         "openai" => "gpt-5.5".into(),
-        "openai-codex" => "gpt-5.3-codex".into(),
         "venice" => "zai-org-glm-5-2".into(),
         "groq" => "llama-spark".into(),
         "mistral" => "mistral-large-latest".into(),
@@ -1013,7 +1007,6 @@ pub(crate) fn default_model_for_provider(provider: &str) -> String {
         "glm" | "zai" => "glm-5.2".into(),
         "minimax" => "MiniMax-M3".into(),
         "qwen" => "qwen3.7-plus".into(),
-        "qwen-code" => "qwen3.6-coder-plus".into(),
         "ollama" => "llama3.3".into(),
         "llamacpp" => "ggml-org/gpt-oss-20b-GGUF".into(),
         "gemini" => "gemini-3-pro".into(),
@@ -1131,28 +1124,6 @@ pub fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)>
             (
                 "o4-mini".to_string(),
                 "o4-mini (reasoning, fallback)".to_string(),
-            ),
-        ],
-        "openai-codex" => vec![
-            (
-                "gpt-5.3-codex".to_string(),
-                "GPT-5.3 Codex (latest, recommended)".to_string(),
-            ),
-            (
-                "gpt-5.2-codex".to_string(),
-                "GPT-5.2 Codex (older flagship)".to_string(),
-            ),
-            (
-                "gpt-5.1-codex-mini".to_string(),
-                "GPT-5.1 Codex Mini (cheap, capable)".to_string(),
-            ),
-            (
-                "gpt-5-codex".to_string(),
-                "GPT-5 Codex (legacy, stable)".to_string(),
-            ),
-            (
-                "o4-mini".to_string(),
-                "o4-mini (reasoning fallback)".to_string(),
             ),
         ],
         "venice" => vec![
@@ -1402,24 +1373,6 @@ pub fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)>
                 "Qwen 3.6 Turbo (fast, cost-efficient)".to_string(),
             ),
         ],
-        "qwen-code" => vec![
-            (
-                "qwen3.6-coder-plus".to_string(),
-                "Qwen 3.6 Coder Plus (latest, recommended)".to_string(),
-            ),
-            (
-                "qwen3-coder-plus".to_string(),
-                "Qwen3 Coder Plus (recommended for coding workflows)".to_string(),
-            ),
-            (
-                "qwen3.5-plus".to_string(),
-                "Qwen3.5 Plus (reasoning + coding)".to_string(),
-            ),
-            (
-                "qwen3-max-2026-01-23".to_string(),
-                "Qwen3 Max (high-capability coding model)".to_string(),
-            ),
-        ],
         "nvidia" => vec![
             (
                 "meta/llama-3.3-70b-instruct".to_string(),
@@ -1533,7 +1486,7 @@ pub fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)>
         ],
         // No curated list for this provider. `list_providers()` carries more
         // entries than this table does — `synthetic`, `opencode`, `doubao`,
-        // `copilot`, `lmstudio`, `ovhcloud` all land here — and the previous
+        // `qianfan`, `lmstudio`, `ovhcloud` all land here — and the previous
         // fallback offered a single row literally named `default`, which is not
         // a model ID on any of them. An empty catalog is honest: the caller
         // renders its "no catalog, run `models refresh`" state and the operator
@@ -1843,7 +1796,7 @@ fn fetch_anthropic_models(models_url: &str, api_key: Option<&str>) -> Result<Vec
 fn fetch_gemini_models(api_key: Option<&str>) -> Result<Vec<String>> {
     let Some(api_key) = api_key else {
         bail!(
-            "Gemini model fetch requires an API key (set GEMINI_API_KEY); the Gemini CLI login cannot list models. {TYPE_MODEL_ID_HINT}"
+            "Gemini model fetch requires an API key (set GEMINI_API_KEY); without one the model list cannot be fetched. {TYPE_MODEL_ID_HINT}"
         );
     };
 
@@ -2033,8 +1986,6 @@ fn fetch_live_models_for_provider(
                     // Anthropic also accepts OAuth setup-tokens via ANTHROPIC_OAUTH_TOKEN
                     if provider_name == "anthropic" {
                         std::env::var("ANTHROPIC_OAUTH_TOKEN").ok()
-                    } else if provider_name == "minimax" {
-                        std::env::var("MINIMAX_OAUTH_TOKEN").ok()
                     } else {
                         None
                     }
@@ -2845,17 +2796,13 @@ pub(crate) const PROVIDER_SETUP_TIERS: &[ProviderTier] = &[
             ("venice", "Venice AI — privacy-first (Llama, Opus)"),
             ("anthropic", "Anthropic — Claude Sonnet & Opus (direct)"),
             ("openai", "OpenAI — GPT-4o, o1, GPT-5 (direct)"),
-            (
-                "openai-codex",
-                "OpenAI Codex (ChatGPT subscription OAuth, no API key)",
-            ),
             ("deepseek", "DeepSeek — V3 & R1 (affordable)"),
             ("mistral", "Mistral — Large & Codestral"),
             ("xai", "xAI — Grok 3 & 4"),
             ("perplexity", "Perplexity — search-augmented AI"),
             (
                 "gemini",
-                "Google Gemini — Gemini 2.0 Flash & Pro (supports CLI auth)",
+                "Google Gemini — Gemini 2.0 Flash & Pro (API key)",
             ),
         ],
     },
@@ -2886,10 +2833,6 @@ pub(crate) const PROVIDER_SETUP_TIERS: &[ProviderTier] = &[
             (
                 "kimi-code",
                 "Kimi Code — coding-optimized Kimi API (KimiCLI)",
-            ),
-            (
-                "qwen-code",
-                "Qwen Code — OAuth tokens reused from ~/.qwen/oauth_creds.json",
             ),
             ("moonshot", "Moonshot — Kimi API (China endpoint)"),
             (
@@ -3100,34 +3043,7 @@ pub(crate) fn setup_provider(
 
         key
     } else if canonical_provider_name(provider_name) == "gemini" {
-        // Special handling for Gemini: check for CLI auth first
-        if crate::providers::gemini_cli::gemini_cli_has_credentials() {
-            print_bullet(&format!(
-                "{} Gemini CLI credentials detected! You can skip the API key.",
-                style("✓").green().bold()
-            ));
-            print_bullet("RantaiClaw will reuse your existing Gemini CLI authentication.");
-            println!();
-
-            let use_cli: bool = dialoguer::Confirm::new()
-                .with_prompt("  Use existing Gemini CLI authentication?")
-                .default(true)
-                .interact()?;
-
-            if use_cli {
-                println!(
-                    "  {} Using Gemini CLI OAuth tokens",
-                    style("✓").green().bold()
-                );
-                String::new() // Empty key = will use CLI tokens
-            } else {
-                print_bullet("Get your API key at: https://aistudio.google.com/app/apikey");
-                Password::new()
-                    .with_prompt("  Paste your Gemini API key")
-                    .allow_empty_password(true)
-                    .interact()?
-            }
-        } else if env_key_present("GEMINI_API_KEY") {
+        if env_key_present("GEMINI_API_KEY") {
             print_bullet(&format!(
                 "{} GEMINI_API_KEY environment variable detected!",
                 style("✓").green().bold()
@@ -3135,7 +3051,6 @@ pub(crate) fn setup_provider(
             String::new()
         } else {
             print_bullet("Get your API key at: https://aistudio.google.com/app/apikey");
-            print_bullet("Or run `gemini` CLI to authenticate (tokens will be reused).");
             println!();
 
             Password::new()
@@ -3181,48 +3096,11 @@ pub(crate) fn setup_provider(
 
             key
         }
-    } else if canonical_provider_name(provider_name) == "qwen-code" {
-        if env_key_present("QWEN_OAUTH_TOKEN") {
-            print_bullet(&format!(
-                "{} QWEN_OAUTH_TOKEN environment variable detected!",
-                style("✓").green().bold()
-            ));
-            "qwen-oauth".to_string()
-        } else {
-            print_bullet(
-                "Qwen Code OAuth credentials are usually stored in ~/.qwen/oauth_creds.json.",
-            );
-            print_bullet(
-                "Run `qwen` once and complete OAuth login to populate cached credentials.",
-            );
-            print_bullet("You can also set QWEN_OAUTH_TOKEN directly.");
-            println!();
-
-            let key: String = Password::new()
-                .with_prompt(
-                    "  Paste your Qwen OAuth token (or press Enter to auto-detect cached OAuth)",
-                )
-                .allow_empty_password(true)
-                .interact()?;
-
-            if key.trim().is_empty() {
-                print_bullet(&format!(
-                    "Using OAuth auto-detection. Set {} and optional {} if needed.",
-                    style("QWEN_OAUTH_TOKEN").yellow(),
-                    style("QWEN_OAUTH_RESOURCE_URL").yellow()
-                ));
-                "qwen-oauth".to_string()
-            } else {
-                key
-            }
-        }
     } else {
         let key_url = if is_moonshot_alias(provider_name)
             || canonical_provider_name(provider_name) == "kimi-code"
         {
             "https://platform.moonshot.cn/console/api-keys"
-        } else if canonical_provider_name(provider_name) == "qwen-code" {
-            "https://qwen.readthedocs.io/en/latest/getting_started/installation.html"
         } else if is_glm_cn_alias(provider_name) || is_zai_cn_alias(provider_name) {
             "https://open.bigmodel.cn/usercenter/proj-mgmt/apikeys"
         } else if is_glm_alias(provider_name) || is_zai_alias(provider_name) {
@@ -3321,10 +3199,6 @@ pub(crate) fn setup_provider(
         let has_api_key = !api_key.trim().is_empty()
             || ((canonical_provider != "ollama" || ollama_remote)
                 && std::env::var(provider_env_var(provider_name))
-                    .ok()
-                    .is_some_and(|value| !value.trim().is_empty()))
-            || (provider_name == "minimax"
-                && std::env::var("MINIMAX_OAUTH_TOKEN")
                     .ok()
                     .is_some_and(|value| !value.trim().is_empty()));
 
@@ -3482,10 +3356,6 @@ pub(crate) fn setup_provider(
 
 /// Map provider name to its conventional env var
 fn provider_env_var(name: &str) -> &'static str {
-    if canonical_provider_name(name) == "qwen-code" {
-        return "QWEN_OAUTH_TOKEN";
-    }
-
     match canonical_provider_name(name) {
         "openrouter" => "OPENROUTER_API_KEY",
         "anthropic" => "ANTHROPIC_API_KEY",
@@ -5913,16 +5783,7 @@ fn print_summary(config: &Config) {
 
     let provider = config.default_provider.as_deref().unwrap_or("openrouter");
     if config.api_key.is_none() && !provider_supports_keyless_local_usage(provider) {
-        if provider == "openai-codex" {
-            println!(
-                "    {} Authenticate OpenAI Codex:",
-                style(format!("{step}.")).cyan().bold()
-            );
-            println!(
-                "       {}",
-                style("rantaiclaw auth login --provider openai-codex --device-code").yellow()
-            );
-        } else if provider == "anthropic" {
+        if provider == "anthropic" {
             println!(
                 "    {} Configure Anthropic auth:",
                 style(format!("{step}.")).cyan().bold()
@@ -6551,10 +6412,8 @@ mod tests {
             .flat_map(|t| t.providers.iter().map(|(id, _)| *id))
             .collect();
         for id in [
-            "openai-codex",
             "astrai",
             "kimi-code",
-            "qwen-code",
             "glm-cn",
             "minimax-cn",
             "qwen-intl",
@@ -7605,7 +7464,7 @@ mod tests {
             "synthetic",
             "opencode",
             "doubao",
-            "copilot",
+            "qianfan",
             "lmstudio",
             "ovhcloud",
         ] {
@@ -7685,14 +7544,9 @@ mod tests {
             "anthropic/claude-sonnet-4.6"
         );
         assert_eq!(default_model_for_provider("openai"), "gpt-5.5");
-        assert_eq!(default_model_for_provider("openai-codex"), "gpt-5.3-codex");
         assert_eq!(default_model_for_provider("anthropic"), "claude-sonnet-4-6");
         assert_eq!(default_model_for_provider("qwen"), "qwen3.7-plus");
         assert_eq!(default_model_for_provider("qwen-intl"), "qwen3.7-plus");
-        assert_eq!(
-            default_model_for_provider("qwen-code"),
-            "qwen3.6-coder-plus"
-        );
         assert_eq!(default_model_for_provider("glm-cn"), "glm-5.2");
         assert_eq!(default_model_for_provider("minimax-cn"), "MiniMax-M3");
         assert_eq!(default_model_for_provider("zai-cn"), "glm-5.2");
@@ -7728,8 +7582,6 @@ mod tests {
     fn canonical_provider_name_normalizes_regional_aliases() {
         assert_eq!(canonical_provider_name("qwen-intl"), "qwen");
         assert_eq!(canonical_provider_name("dashscope-us"), "qwen");
-        assert_eq!(canonical_provider_name("qwen-code"), "qwen-code");
-        assert_eq!(canonical_provider_name("qwen-oauth"), "qwen-code");
         assert_eq!(canonical_provider_name("moonshot-intl"), "moonshot");
         assert_eq!(canonical_provider_name("kimi-cn"), "moonshot");
         assert_eq!(canonical_provider_name("kimi_coding"), "kimi-code");
@@ -7778,21 +7630,18 @@ mod tests {
         assert!(!ids.contains(&"glm-4-flash".to_string()));
     }
 
+    /// The codex model family is an OpenAI API family: it is offered by the
+    /// `openai` provider, reachable with an API key.
     #[test]
-    fn curated_models_for_openai_codex_include_codex_family() {
-        let ids: Vec<String> = curated_models_for_provider("openai-codex")
+    fn curated_models_for_openai_include_the_codex_family() {
+        let ids: Vec<String> = curated_models_for_provider("openai")
             .into_iter()
             .map(|(id, _)| id)
             .collect();
 
         // gpt-5.3-codex is the newest codex that actually exists on the OpenAI
-        // API (there is no gpt-5.5-codex / gpt-5.4-codex); previous codex models
-        // stay in the list so users on older account tiers can pick one that's
-        // actually enabled for them.
+        // API (there is no gpt-5.5-codex / gpt-5.4-codex).
         assert!(ids.contains(&"gpt-5.3-codex".to_string()));
-        assert!(ids.contains(&"gpt-5.2-codex".to_string()));
-        assert!(ids.contains(&"gpt-5.1-codex-mini".to_string()));
-        assert!(ids.contains(&"gpt-5-codex".to_string()));
         // Phantom id must never reappear.
         assert!(!ids.contains(&"gpt-5.5-codex".to_string()));
     }
@@ -7861,18 +7710,6 @@ mod tests {
 
         assert!(ids.contains(&"kimi-for-coding".to_string()));
         assert!(ids.contains(&"kimi-k2.5".to_string()));
-    }
-
-    #[test]
-    fn curated_models_for_qwen_code_include_coding_plan_models() {
-        let ids: Vec<String> = curated_models_for_provider("qwen-code")
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
-
-        assert!(ids.contains(&"qwen3-coder-plus".to_string()));
-        assert!(ids.contains(&"qwen3.5-plus".to_string()));
-        assert!(ids.contains(&"qwen3-max-2026-01-23".to_string()));
     }
 
     #[test]
@@ -8404,7 +8241,7 @@ mod tests {
         // A real provider with no model-list endpoint, so the test stays offline.
         let config = Config {
             workspace_dir: tmp.path().to_path_buf(),
-            default_provider: Some("copilot".to_string()),
+            default_provider: Some("bedrock".to_string()),
             ..Config::default()
         };
 
@@ -8440,7 +8277,7 @@ mod tests {
             ..Config::default()
         };
 
-        let err = run_models_refresh(&config, Some(" github-copilot "), true).unwrap_err();
+        let err = run_models_refresh(&config, Some(" aws-bedrock "), true).unwrap_err();
         assert!(err
             .to_string()
             .contains("does not support live model discovery"));
@@ -8484,7 +8321,7 @@ mod tests {
             ..Config::default()
         };
 
-        let err = probe_provider_catalog_quiet(&config, "copilot", true).unwrap_err();
+        let err = probe_provider_catalog_quiet(&config, "bedrock", true).unwrap_err();
         let message = err.to_string();
         assert!(message.contains("does not support live model discovery"));
         assert!(message.contains("/model"));
@@ -8492,7 +8329,7 @@ mod tests {
 
     #[test]
     fn known_provider_name_accepts_listed_names_and_custom_prefixes() {
-        assert!(is_known_provider_name("copilot"));
+        assert!(is_known_provider_name("qianfan"));
         assert!(is_known_provider_name("google"));
         assert!(is_known_provider_name("minimax-cn"));
         assert!(!is_known_provider_name("Google"));
@@ -8508,7 +8345,7 @@ mod tests {
     fn missing_key_refusals_name_a_way_forward() {
         let gemini = fetch_gemini_models(None).unwrap_err().to_string();
         assert!(gemini.contains("GEMINI_API_KEY"));
-        assert!(gemini.contains("Gemini CLI login cannot list models"));
+        assert!(gemini.contains("requires an API key"));
         assert!(gemini.contains("/model"));
 
         let anthropic = fetch_anthropic_models(ANTHROPIC_MODELS_URL, None)
@@ -9047,15 +8884,11 @@ mod tests {
         assert_eq!(provider_env_var("qwen"), "DASHSCOPE_API_KEY");
         assert_eq!(provider_env_var("qwen-intl"), "DASHSCOPE_API_KEY");
         assert_eq!(provider_env_var("dashscope-us"), "DASHSCOPE_API_KEY");
-        assert_eq!(provider_env_var("qwen-code"), "QWEN_OAUTH_TOKEN");
-        assert_eq!(provider_env_var("qwen-oauth"), "QWEN_OAUTH_TOKEN");
         assert_eq!(provider_env_var("glm-cn"), "GLM_API_KEY");
         assert_eq!(provider_env_var("minimax-cn"), "MINIMAX_API_KEY");
         assert_eq!(provider_env_var("kimi-code"), "KIMI_CODE_API_KEY");
         assert_eq!(provider_env_var("kimi_coding"), "KIMI_CODE_API_KEY");
         assert_eq!(provider_env_var("kimi_for_coding"), "KIMI_CODE_API_KEY");
-        assert_eq!(provider_env_var("minimax-oauth"), "MINIMAX_API_KEY");
-        assert_eq!(provider_env_var("minimax-oauth-cn"), "MINIMAX_API_KEY");
         assert_eq!(provider_env_var("moonshot-intl"), "MOONSHOT_API_KEY");
         assert_eq!(provider_env_var("zai-cn"), "ZAI_API_KEY");
         assert_eq!(provider_env_var("nvidia"), "NVIDIA_API_KEY");

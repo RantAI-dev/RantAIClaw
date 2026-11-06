@@ -23,8 +23,10 @@ impl DoctorCheck for ConfigSchemaCheck {
         match &cfg.default_provider {
             None => problems.push("no default_provider configured".to_string()),
             Some(name) => {
-                if let Some(reason) = provider_validation_error(name) {
-                    problems.push(format!("default_provider \"{name}\" is invalid: {reason}"));
+                if let Some(problem) = provider_problem(name) {
+                    problems.push(
+                        problem.message(&format!("default_provider \"{name}\""), "is invalid"),
+                    );
                 }
             }
         }
@@ -41,8 +43,8 @@ impl DoctorCheck for ConfigSchemaCheck {
         }
 
         for fb in &cfg.reliability.fallback_providers {
-            if let Some(reason) = provider_validation_error(fb) {
-                problems.push(format!("fallback provider \"{fb}\" invalid: {reason}"));
+            if let Some(problem) = provider_problem(fb) {
+                problems.push(problem.message(&format!("fallback provider \"{fb}\""), "invalid"));
             }
         }
 
@@ -52,10 +54,13 @@ impl DoctorCheck for ConfigSchemaCheck {
         // on the hint.
         let mut seen_hints = std::collections::HashSet::new();
         for route in &cfg.model_routes {
-            if let Some(reason) = provider_validation_error(&route.provider) {
-                problems.push(format!(
-                    "model_route \"{}\" provider \"{}\" invalid: {reason}",
-                    route.hint, route.provider
+            if let Some(problem) = provider_problem(&route.provider) {
+                problems.push(problem.message(
+                    &format!(
+                        "model_route \"{}\" provider \"{}\"",
+                        route.hint, route.provider
+                    ),
+                    "invalid",
                 ));
             }
             if !seen_hints.insert(route.hint.as_str()) {
@@ -63,10 +68,13 @@ impl DoctorCheck for ConfigSchemaCheck {
             }
         }
         for route in &cfg.embedding_routes {
-            if let Some(reason) = provider_validation_error(&route.provider) {
-                problems.push(format!(
-                    "embedding_route \"{}\" provider \"{}\" invalid: {reason}",
-                    route.hint, route.provider
+            if let Some(problem) = provider_problem(&route.provider) {
+                problems.push(problem.message(
+                    &format!(
+                        "embedding_route \"{}\" provider \"{}\"",
+                        route.hint, route.provider
+                    ),
+                    "invalid",
                 ));
             }
         }
@@ -275,6 +283,49 @@ fn provider_validation_error(name: &str) -> Option<String> {
                 .to_string(),
         ),
     }
+}
+
+/// What is wrong with a provider name in the config.
+///
+/// Two kinds, and the difference matters to the operator. A name whose
+/// subscription login was REMOVED is still a provider the factory knows, and
+/// what it needs is an API key under a different name — so the report names
+/// the replacement. A name that never existed is simply wrong, and keeps the
+/// wording it always had.
+enum ProviderProblem {
+    /// The name is one whose subscription login was removed. The sentence
+    /// names the API-key replacement.
+    RemovedLogin(&'static str),
+    /// The name is not one the factory knows.
+    Invalid(String),
+}
+
+impl ProviderProblem {
+    /// The message for this problem, in the wording of its slot.
+    ///
+    /// `subject` is the whole subject of the sentence — `default_provider "x"`,
+    /// `model_route "hint" provider "x"` — and `invalid` is how that slot has
+    /// always worded a provider it does not know.
+    fn message(&self, subject: &str, invalid: &str) -> String {
+        match self {
+            Self::RemovedLogin(sentence) => {
+                format!("{subject} names a removed login: {sentence}")
+            }
+            Self::Invalid(reason) => format!("{subject} {invalid}: {reason}"),
+        }
+    }
+}
+
+/// The problem with `name`, if it has one.
+///
+/// A removed login is classified BEFORE the factory is asked: the factory
+/// still builds a provider for those names (so the daemon stays up), and
+/// asking it would report them as valid.
+fn provider_problem(name: &str) -> Option<ProviderProblem> {
+    if let Some(sentence) = crate::providers::removed_login_refusal(name) {
+        return Some(ProviderProblem::RemovedLogin(sentence));
+    }
+    provider_validation_error(name).map(ProviderProblem::Invalid)
 }
 
 #[cfg(test)]
@@ -490,6 +541,118 @@ mod tests {
         let result = ConfigSchemaCheck.run(&ctx).await;
         assert_eq!(result.severity, Severity::Fail);
         assert!(result.hint.is_some());
+    }
+
+    /// A config that still names a removed subscription login must be
+    /// reported with the API-key replacement, not as an invalid provider:
+    /// the name is still a provider, and what it needs is a key.
+    #[tokio::test]
+    async fn config_schema_check_reports_a_removed_login_with_its_replacement() {
+        // This check reads the environment; own it, or the verdict depends on
+        // the developer's shell.
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+
+        let mut cfg = Config::default();
+        cfg.default_provider = Some("openai-codex".into());
+        let (ctx, _tmp) = ctx_with_config(cfg);
+        let result = ConfigSchemaCheck.run(&ctx).await;
+        assert_eq!(result.severity, Severity::Fail, "{}", result.message);
+        assert!(
+            result.message.contains("names a removed login"),
+            "{}",
+            result.message
+        );
+        assert!(
+            result.message.contains("OPENAI_API_KEY"),
+            "the replacement must be named: {}",
+            result.message
+        );
+    }
+
+    /// Every slot a provider name can sit in reports a removed login the same
+    /// way, with the replacement named.
+    #[tokio::test]
+    async fn config_schema_check_reports_a_removed_login_in_every_slot() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+
+        let mut cfg = Config::default();
+        cfg.default_provider = Some("openrouter".into());
+        cfg.reliability.fallback_providers = vec!["copilot".into()];
+        cfg.model_routes = vec![crate::config::schema::ModelRouteConfig {
+            hint: "code".into(),
+            provider: "qwen-code".into(),
+            model: "x".into(),
+            api_key: None,
+        }];
+        cfg.embedding_routes = vec![crate::config::schema::EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            provider: "minimax-oauth".into(),
+            model: "x".into(),
+            dimensions: None,
+            api_key: None,
+        }];
+        let (ctx, _tmp) = ctx_with_config(cfg);
+        let result = ConfigSchemaCheck.run(&ctx).await;
+        assert_eq!(result.severity, Severity::Fail, "{}", result.message);
+        for slot in [
+            "fallback provider \"copilot\"",
+            "model_route \"code\" provider \"qwen-code\"",
+            "embedding_route \"semantic\" provider \"minimax-oauth\"",
+        ] {
+            assert!(
+                result
+                    .message
+                    .contains(&format!("{slot} names a removed login")),
+                "{}",
+                result.message
+            );
+        }
+        // The replacement is named for the slot that has one.
+        assert!(
+            result.message.contains("DASHSCOPE_API_KEY"),
+            "the Qwen replacement must be named: {}",
+            result.message
+        );
+        assert!(
+            result.message.contains("MINIMAX_API_KEY"),
+            "the MiniMax replacement must be named: {}",
+            result.message
+        );
+    }
+
+    /// A name that never was a provider is still reported as invalid, in the
+    /// wording each slot has always used.
+    #[tokio::test]
+    async fn config_schema_check_keeps_the_invalid_wording_for_an_unknown_provider() {
+        let mut cfg = Config::default();
+        cfg.default_provider = Some("totally-fake".into());
+        cfg.reliability.fallback_providers = vec!["totally-fake".into()];
+        cfg.model_routes = vec![crate::config::schema::ModelRouteConfig {
+            hint: "code".into(),
+            provider: "totally-fake".into(),
+            model: "x".into(),
+            api_key: None,
+        }];
+        cfg.embedding_routes = vec![crate::config::schema::EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            provider: "totally-fake".into(),
+            model: "x".into(),
+            dimensions: None,
+            api_key: None,
+        }];
+        let (ctx, _tmp) = ctx_with_config(cfg);
+        let result = ConfigSchemaCheck.run(&ctx).await;
+        assert_eq!(result.severity, Severity::Fail, "{}", result.message);
+        for slot in [
+            "default_provider \"totally-fake\" is invalid:",
+            "fallback provider \"totally-fake\" invalid:",
+            "model_route \"code\" provider \"totally-fake\" invalid:",
+            "embedding_route \"semantic\" provider \"totally-fake\" invalid:",
+        ] {
+            assert!(result.message.contains(slot), "{}", result.message);
+        }
     }
 
     #[tokio::test]

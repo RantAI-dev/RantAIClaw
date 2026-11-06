@@ -2,7 +2,7 @@
 
 This runbook is for operators who maintain availability, security posture, and incident response.
 
-Last verified: **May 9, 2026**.
+Last verified: **November 6, 2026**.
 
 ## Scope
 
@@ -182,10 +182,10 @@ stop message names what to fix. The fatal set is:
 - a `schema_version` that is negative, malformed or newer than the binary supports
 
 A missing API key, a missing auth profile and a DNS lookup failure are NOT in that set: they are
-retried, because `rantaiclaw auth login`, an environment variable, a key stored in the config later
-or a resolver that comes back can supply them without the config file changing. A secret that is
-present but that the key on disk cannot decrypt is a different case — the files on disk have to
-change before the daemon can start.
+retried, because an environment variable, a key stored in the config later or a resolver that
+comes back can supply them without the config file changing. A secret that is present but that
+the key on disk cannot decrypt is a different case — the files on disk have to change before
+the daemon can start.
 
 The profile-door refusal is NOT retried either: it names the profile it could not select, and the
 daemon exits before it starts, so the operator has to fix the selection. The config-load refusals

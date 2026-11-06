@@ -67,9 +67,7 @@ impl TuiProvisioner for ProviderProvisioner {
 
         // ── Tier selection ─────────────────────────────────────────
         // One table shared with the CLI wizard. This used to be a
-        // hand-copy that drifted 11 providers behind (openai-codex,
-        // astrai, kimi-code, qwen-code, glm-cn, minimax-cn, qwen-intl,
-        // qwen-us, zai-cn, synthetic, opencode).
+        // hand-copy that drifted eleven providers behind.
         let tiers: Vec<String> = crate::onboard::wizard::PROVIDER_SETUP_TIERS
             .iter()
             .map(|t| t.label.to_string())
@@ -356,9 +354,9 @@ impl TuiProvisioner for ProviderProvisioner {
                     // fallback (OPENAI_API_KEY etc.) — so what passes here is
                     // exactly what will start later. Keyless-capable flows
                     // (ollama, exported env key) sail through, and so does
-                    // Gemini: its CLI login is read when a request is sent,
-                    // so the build succeeds with no key and no login file
-                    // yet. A provider that cannot build without a key
+                    // Gemini: its key is read when a request is sent,
+                    // so the build succeeds with no key yet. A provider that
+                    // cannot build without a key
                     // (openai/anthropic route through rig and fail at
                     // construction) must not be saved silently: that config
                     // used to abort every later launch — including
@@ -366,8 +364,8 @@ impl TuiProvisioner for ProviderProvisioner {
                     // existed.
                     if crate::providers::create_provider(provider_name, None).is_ok() {
                         // A keyless Gemini builds, so the check above cannot
-                        // tell a working login from none. Ask for the
-                        // credential itself: config key, env key or CLI login.
+                        // tell a working key from none. Ask for the
+                        // credential itself: the config key or the env key.
                         if matches!(provider_name, "gemini" | "google" | "google-gemini")
                             && !crate::providers::has_usable_credential(provider_name, None, None)
                         {
@@ -375,10 +373,10 @@ impl TuiProvisioner for ProviderProvisioner {
                                 &events,
                                 ProvisionEvent::Message {
                                     severity: Severity::Warn,
-                                    text: "Gemini has no API key and no Gemini CLI login yet. \
+                                    text: "The `gemini` provider has no API key yet. \
                                            The agent will start, but every turn fails until you \
-                                           run `gemini` to log in or set GEMINI_API_KEY. \
-                                           No restart is needed after either."
+                                           set GEMINI_API_KEY. \
+                                           No restart is needed after that."
                                         .into(),
                                 },
                             )
@@ -846,14 +844,13 @@ mod tests {
         (config, t)
     }
 
-    /// A keyless Gemini builds, so the factory check passes it. With no Gemini
-    /// CLI login either, every turn would fail; the operator hears that once,
-    /// and saving stays allowed because a later login needs no restart.
+    /// A keyless Gemini builds, so the factory check passes it. Every turn
+    /// would fail; the operator hears that once, and saving stays allowed
+    /// because a key needs no restart.
     #[tokio::test]
-    async fn gemini_with_no_key_and_no_login_saves_with_one_warning() {
+    async fn gemini_with_no_key_saves_with_one_warning() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
         let _scrub = crate::test_env::CredentialEnvScrub::new();
-        let (_home, _home_guard) = crate::providers::gemini_cli::gemini_home();
 
         let (config, t) = gemini_setup_with_empty_key().await;
 
@@ -868,27 +865,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gemini_with_a_valid_cli_login_saves_without_a_warning() {
-        let _env = crate::test_env::ENV_LOCK.lock().await;
-        let _scrub = crate::test_env::CredentialEnvScrub::new();
-        let (home, _home_guard) = crate::providers::gemini_cli::gemini_home();
-        crate::providers::gemini_cli::write_gemini_creds_with_expiry(
-            &home,
-            "ya29.mock-token",
-            3_600_000,
-        );
-
-        let (_config, t) = gemini_setup_with_empty_key().await;
-
-        assert!(t.configured(), "got {:?}", t.outcome);
-        assert!(warnings(&t).is_empty(), "got {:?}", warnings(&t));
-    }
-
-    #[tokio::test]
     async fn gemini_with_an_exported_key_saves_without_a_warning() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
         let _scrub = crate::test_env::CredentialEnvScrub::new();
-        let (_home, _home_guard) = crate::providers::gemini_cli::gemini_home();
         let _key = VarGuard::set("GEMINI_API_KEY", "AIzaSy-example-key");
 
         let (_config, t) = gemini_setup_with_empty_key().await;

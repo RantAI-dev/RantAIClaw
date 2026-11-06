@@ -263,9 +263,17 @@ tokens, session ids, or paths.
   A completed, non-empty turn is persisted to `sessions.db` with
   `source = "api"`; a failed or empty-answer turn is not persisted (no
   session is created/appended).
-- **Status codes**: `200`, `400` (empty `message`), `401`,
-  `500` (provider/agent error — the body is sanitized of secret-looking
+- **Status codes**: `200`, `400` (empty `message`, no model configured, a provider
+  name that does not exist, or a refusal the provider decided locally — a missing
+  Gemini or AWS Bedrock credential, an Ollama `:cloud` model, a removed
+  subscription login — with the fix named in the body), `401`,
+  `500` (any other provider/agent error — the body is sanitized of secret-looking
   tokens before being returned).
+- **One failure, one sentence, both modes.** A turn the provider refuses before it
+  sends anything — a missing credential, a provider name whose subscription login
+  was removed — fails with the same words on both modes: the sync form answers
+  `400` with the sentence in the body, and the streaming form answers `200` and
+  carries the same sentence in its `error` event.
 
 **Tool approvals on the non-streaming form.** A turn requested without the SSE
 `Accept` header has no stream for an approval modal to be raised on and no

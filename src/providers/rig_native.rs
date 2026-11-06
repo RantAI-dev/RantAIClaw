@@ -34,9 +34,9 @@
 //! - Doesn't touch OpenRouter or the OpenAI-compatible shim. Those
 //!   already stream correctly via our hand-rolled SSE; replacing
 //!   them is v0.6.x cleanup, not v0.6.0 sprint scope.
-//! - Doesn't touch Bedrock, Copilot, Ollama, OpenAI-Codex. Those
-//!   use specialized paths (AWS SDK shape, GitHub Copilot OAuth,
-//!   local NDJSON, OpenAI responses API) that are out of scope for
+//! - Doesn't touch Bedrock, Ollama. Those
+//!   use specialized paths (AWS SDK shape,
+//!   local NDJSON) that are out of scope for
 //!   this PR.
 //! - Doesn't expose every rig knob — we wire the fields the agent
 //!   loop actually uses (messages, tools, model, temperature) and

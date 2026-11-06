@@ -2,7 +2,7 @@
 
 This guide focuses on common setup/runtime failures and fast resolution paths.
 
-Last verified: **July 12, 2026**.
+Last verified: **November 6, 2026**.
 
 ## Installation / Bootstrap
 
@@ -192,15 +192,19 @@ OPENAI_API_KEY=sk-... rantaiclaw setup provider
    `default_provider` to a provider that runs keyless (for example
    `"openrouter"` or `"ollama"`), save, and relaunch.
 
-### The Gemini CLI login has expired
+### `Gemini API key not found`
 
-Cause: the only Gemini credential is the login `~/.gemini/oauth_creds.json` holds, and its access
-token has expired. The token is valid for about an hour after the last `gemini` run, and it is never
-refreshed. The login is read when a request is sent, so the turn that uses an expired login is
-refused before anything is sent, with the fix in the message:
+Cause: the Gemini provider has no API key. RantaiClaw uses API keys only, so the Gemini CLI
+login is not an option any more: `~/.gemini/oauth_creds.json` is never read, and logging in
+with the `gemini` CLI does not help.
+
+The request is refused before anything is sent, with the fix in the message:
 
 ```
-the Gemini CLI login has expired — run `gemini` to renew it, or set `GEMINI_API_KEY`
+Gemini API key not found. Options:
+1. Set GEMINI_API_KEY env var
+2. Get an API key from https://aistudio.google.com/app/apikey
+3. Run `rantaiclaw onboard` to configure
 ```
 
 The turn fails at once: the credential is decided locally, before anything is sent, so the refusal
@@ -209,19 +213,49 @@ is not retried and no backoff wait sits in front of the message.
 Fix it with either one:
 
 ```bash
-gemini          # renew the login, then retry
+export GEMINI_API_KEY=...   # use a key
 ```
 
 ```bash
-export GEMINI_API_KEY=...   # use a key instead
+rantaiclaw onboard          # or configure a key through the wizard
 ```
 
-No restart is needed after `gemini`: the renewed login is used on the next request. The same holds
-for a first login — the login file is read when a request is about to be sent, so logging in after
-the agent started is enough.
+`GOOGLE_API_KEY` works as well, and a key stored in config for `gemini` is used too.
 
-With Gemini CLI's encrypted credential storage the login lives in the OS keychain and the file is
-deleted after the migration, so there is nothing to reuse and a key is the only way in.
+### A provider names a removed subscription login
+
+Cause: the config names a subscription login RantaiClaw no longer has. RantaiClaw uses API
+keys only, so the GitHub Copilot, ChatGPT (OpenAI Codex), Gemini CLI, Qwen Code OAuth and
+MiniMax OAuth logins were removed.
+
+The daemon starts anyway: the config still loads, the gateway binds and the console serves,
+so there is no restart loop. The refusal comes when a request is sent — nothing is sent, the
+turn fails at once with the replacement named, and no retry follows:
+
+```
+The ChatGPT (OpenAI Codex) login was removed. Use the "openai" provider with an OPENAI_API_KEY instead.
+```
+
+`rantaiclaw doctor` names it too:
+
+```
+default_provider "openai-codex" names a removed login: The ChatGPT (OpenAI Codex) login was removed. Use the "openai" provider with an OPENAI_API_KEY instead.
+```
+
+Fix it by pointing the config at the provider that takes an API key, and setting that key:
+
+| Removed login | Use instead |
+|---|---|
+| `copilot`, `github-copilot` | another provider — Copilot has no API-key path in RantaiClaw |
+| `openai-codex`, `openai_codex`, `codex` | `openai` with `OPENAI_API_KEY` |
+| `qwen-code`, `qwen-oauth`, `qwen_oauth` | `qwen` with `DASHSCOPE_API_KEY` |
+| `minimax-oauth`, `minimax-oauth-cn`, `minimax-oauth-global` | `minimax` with `MINIMAX_API_KEY` |
+
+A credential placeholder is refused the same way: `api_key = "minimax-oauth"` and
+`api_key = "qwen-oauth"` are placeholders, not keys.
+
+The Gemini CLI login is gone as well, and it has no refusal of its own: the Gemini provider
+needs an API key — see `Gemini API key not found` above.
 
 ### `anthropic: ANTHROPIC_API_KEY required` or `<name>: no credential found`
 

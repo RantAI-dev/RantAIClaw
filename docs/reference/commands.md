@@ -43,7 +43,7 @@ This reference is derived from the current CLI surface (`rantaiclaw --help`).
 | `ui` | Install/run/stop the optional web console (claw-ui) |
 | `memory` | Agent memory: list, get, add, recall, reindex, stats, clear |
 | `update` | Self-replace the binary against a published GitHub release |
-| `auth` | Manage provider subscription auth profiles (OAuth / setup tokens) |
+| `auth` | Manage the Anthropic subscription auth profile (setup token) |
 | `permissions` | Owners and the non-owner (guest) capability ceiling, shared by all multi-user channels |
 | `personality` | Show, list, or set the active persona preset, name and timezone |
 | `profile` | Create, clone, switch, and delete profiles |
@@ -290,7 +290,7 @@ Behavior:
 
 - A cached list younger than 12 hours is served as is. `--force` fetches again.
 - Every provider except local Ollama and llama.cpp needs a key. The key is the one the provider uses for chat requests: the config key first, then the provider's environment variable. A key goes only to the provider's own endpoint.
-- Gemini needs an API key (`GEMINI_API_KEY` or a key in config). A Gemini CLI login cannot list models.
+- Gemini needs an API key (`GEMINI_API_KEY` or a key in config).
 - When a fetch fails and an older list is cached, the older list is served and the failure is printed. With no cached list the command fails.
 - A provider that has no model-list endpoint is refused with "does not support live model discovery yet". A name that is not a provider is refused with "Unknown provider" and a pointer to `rantaiclaw providers`.
 
@@ -738,21 +738,22 @@ from the list.
 
 ### `auth`
 
-Provider **subscription** authentication — OAuth logins and setup tokens — as opposed to the
+Provider **subscription** authentication — the Anthropic setup token — as opposed to the
 API keys `setup provider` writes into config. Both can be present; credential precedence is
 documented in [`providers.md`](providers.md).
 
 | Subcommand | Description |
 |---|---|
-| `login` | Log in with OpenAI Codex OAuth |
-| `paste-redirect` | Finish OAuth by pasting the redirect URL or auth code |
 | `paste-token` | Paste a setup/auth token (Anthropic subscription auth) |
 | `setup-token` | Alias for `paste-token`, interactive by default |
-| `refresh` | Refresh an OpenAI Codex access token from its refresh token |
 | `logout` | Remove an auth profile |
 | `use` | Set the active auth profile for a provider |
 | `list` | List auth profiles |
 | `status` | Active profile and token expiry |
+
+The OAuth login commands are gone. `login`, `paste-redirect` and `refresh` existed for the
+ChatGPT (OpenAI Codex) login only, and RantaiClaw uses API keys only — that login was
+removed with them. The Anthropic setup-token path is unchanged.
 
 A stored **anthropic** profile is used for inference: `agent -p anthropic` and an
 `anthropic-custom:<url>` provider send it when no config key is set and before any

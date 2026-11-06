@@ -222,6 +222,28 @@ fn push_failure(
     ));
 }
 
+/// Keep the FIRST local refusal the chain produced.
+///
+/// A refusal is decided before anything is sent: a credential is not set, or
+/// the request names a route the configuration cannot serve. No retry, no
+/// fallback and no model change can change it, so the turn must fail with the
+/// sentence the provider wrote — not with this wrapper's aggregate, which
+/// buries that sentence under every other attempt. The typed cause stays in
+/// the chain, so a caller can still recognise the refusal by type.
+///
+/// An ordinary failure leaves the slot empty, and the aggregate stays the
+/// top-level error it always was.
+fn keep_first_refusal(slot: &mut Option<(anyhow::Error, String)>, error: anyhow::Error) {
+    if slot.is_some() {
+        return;
+    }
+    let Some(detail) = super::local_refusal::local_refusal_text(&error) else {
+        return;
+    };
+    let detail = detail.to_string();
+    *slot = Some((error, detail));
+}
+
 // ── Resilient Provider Wrapper ────────────────────────────────────────────
 // Three-level failover strategy: model chain → provider chain → retry loop.
 //   Outer loop:  iterate model fallback chain (original model first, then
@@ -343,6 +365,9 @@ impl Provider for ReliableProvider {
     ) -> anyhow::Result<String> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
+        // The first local refusal the chain produced, kept aside so the turn
+        // fails with it instead of with the aggregate below.
+        let mut refusal: Option<(anyhow::Error, String)> = None;
 
         // Outer: model fallback chain. Middle: provider priority. Inner: retries.
         // Each iteration: attempt one (provider, model) call. On success, return
@@ -376,6 +401,9 @@ impl Provider for ReliableProvider {
                             let rate_limited = is_rate_limited(&e);
                             let failure_reason = failure_reason(rate_limited, non_retryable);
                             let error_detail = compact_error_detail(&e);
+                            // Read before the error is moved into the refusal
+                            // slot below.
+                            let context_window_exceeded = is_context_window_exceeded(&e);
 
                             push_failure(
                                 &mut failures,
@@ -395,13 +423,14 @@ impl Provider for ReliableProvider {
                                     "Non-retryable error, moving on"
                                 );
 
-                                if is_context_window_exceeded(&e) {
+                                if context_window_exceeded {
                                     anyhow::bail!(
                                         "Request exceeds model context window; retries and fallbacks were skipped. Attempts:\n{}",
                                         failures.join("\n")
                                     );
                                 }
 
+                                keep_first_refusal(&mut refusal, e);
                                 break;
                             }
 
@@ -439,6 +468,13 @@ impl Provider for ReliableProvider {
             }
         }
 
+        // A local refusal is the answer, not the aggregate: the sentence the
+        // provider wrote names what to configure, and the aggregate would bury
+        // it under every other attempt. The typed cause stays in the chain.
+        if let Some((cause, detail)) = refusal {
+            return Err(cause.context(detail));
+        }
+
         anyhow::bail!(
             "All providers/models failed. Attempts:\n{}",
             failures.join("\n")
@@ -453,6 +489,9 @@ impl Provider for ReliableProvider {
     ) -> anyhow::Result<String> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
+        // The first local refusal the chain produced, kept aside so the turn
+        // fails with it instead of with the aggregate below.
+        let mut refusal: Option<(anyhow::Error, String)> = None;
 
         for current_model in &models {
             for (provider_index, (provider_name, provider)) in self.providers.iter().enumerate() {
@@ -482,6 +521,9 @@ impl Provider for ReliableProvider {
                             let rate_limited = is_rate_limited(&e);
                             let failure_reason = failure_reason(rate_limited, non_retryable);
                             let error_detail = compact_error_detail(&e);
+                            // Read before the error is moved into the refusal
+                            // slot below.
+                            let context_window_exceeded = is_context_window_exceeded(&e);
 
                             push_failure(
                                 &mut failures,
@@ -501,13 +543,14 @@ impl Provider for ReliableProvider {
                                     "Non-retryable error, moving on"
                                 );
 
-                                if is_context_window_exceeded(&e) {
+                                if context_window_exceeded {
                                     anyhow::bail!(
                                         "Request exceeds model context window; retries and fallbacks were skipped. Attempts:\n{}",
                                         failures.join("\n")
                                     );
                                 }
 
+                                keep_first_refusal(&mut refusal, e);
                                 break;
                             }
 
@@ -537,6 +580,13 @@ impl Provider for ReliableProvider {
             }
         }
 
+        // A local refusal is the answer, not the aggregate: the sentence the
+        // provider wrote names what to configure, and the aggregate would bury
+        // it under every other attempt. The typed cause stays in the chain.
+        if let Some((cause, detail)) = refusal {
+            return Err(cause.context(detail));
+        }
+
         anyhow::bail!(
             "All providers/models failed. Attempts:\n{}",
             failures.join("\n")
@@ -551,6 +601,9 @@ impl Provider for ReliableProvider {
     ) -> anyhow::Result<ChatResponse> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
+        // The first local refusal the chain produced, kept aside so the turn
+        // fails with it instead of with the aggregate below.
+        let mut refusal: Option<(anyhow::Error, String)> = None;
 
         for current_model in &models {
             for (provider_index, (provider_name, provider)) in self.providers.iter().enumerate() {
@@ -581,6 +634,9 @@ impl Provider for ReliableProvider {
                             let rate_limited = is_rate_limited(&e);
                             let failure_reason = failure_reason(rate_limited, non_retryable);
                             let error_detail = compact_error_detail(&e);
+                            // Read before the error is moved into the refusal
+                            // slot below.
+                            let context_window_exceeded = is_context_window_exceeded(&e);
 
                             push_failure(
                                 &mut failures,
@@ -600,13 +656,14 @@ impl Provider for ReliableProvider {
                                     "Non-retryable error, moving on"
                                 );
 
-                                if is_context_window_exceeded(&e) {
+                                if context_window_exceeded {
                                     anyhow::bail!(
                                         "Request exceeds model context window; retries and fallbacks were skipped. Attempts:\n{}",
                                         failures.join("\n")
                                     );
                                 }
 
+                                keep_first_refusal(&mut refusal, e);
                                 break;
                             }
 
@@ -634,6 +691,13 @@ impl Provider for ReliableProvider {
                     "Exhausted retries, trying next provider/model"
                 );
             }
+        }
+
+        // A local refusal is the answer, not the aggregate: the sentence the
+        // provider wrote names what to configure, and the aggregate would bury
+        // it under every other attempt. The typed cause stays in the chain.
+        if let Some((cause, detail)) = refusal {
+            return Err(cause.context(detail));
         }
 
         anyhow::bail!(
@@ -747,6 +811,9 @@ impl Provider for ReliableProvider {
     ) -> anyhow::Result<ChatResponse> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
+        // The first local refusal the chain produced, kept aside so the turn
+        // fails with it instead of with the aggregate below.
+        let mut refusal: Option<(anyhow::Error, String)> = None;
 
         for current_model in &models {
             for (provider_index, (provider_name, provider)) in self.providers.iter().enumerate() {
@@ -776,6 +843,9 @@ impl Provider for ReliableProvider {
                             let rate_limited = is_rate_limited(&e);
                             let failure_reason = failure_reason(rate_limited, non_retryable);
                             let error_detail = compact_error_detail(&e);
+                            // Read before the error is moved into the refusal
+                            // slot below.
+                            let context_window_exceeded = is_context_window_exceeded(&e);
 
                             push_failure(
                                 &mut failures,
@@ -795,13 +865,14 @@ impl Provider for ReliableProvider {
                                     "Non-retryable error, moving on"
                                 );
 
-                                if is_context_window_exceeded(&e) {
+                                if context_window_exceeded {
                                     anyhow::bail!(
                                         "Request exceeds model context window; retries and fallbacks were skipped. Attempts:\n{}",
                                         failures.join("\n")
                                     );
                                 }
 
+                                keep_first_refusal(&mut refusal, e);
                                 break;
                             }
 
@@ -829,6 +900,13 @@ impl Provider for ReliableProvider {
                     "Exhausted retries, trying next provider/model"
                 );
             }
+        }
+
+        // A local refusal is the answer, not the aggregate: the sentence the
+        // provider wrote names what to configure, and the aggregate would bury
+        // it under every other attempt. The typed cause stays in the chain.
+        if let Some((cause, detail)) = refusal {
+            return Err(cause.context(detail));
         }
 
         anyhow::bail!(
@@ -1271,7 +1349,7 @@ mod tests {
             "model overloaded, try again later"
         )));
         assert!(is_non_retryable(&anyhow::anyhow!(
-            "OpenAI Codex stream error: Your input exceeds the context window of this model."
+            "Your input exceeds the context window of this model."
         )));
     }
 
@@ -1286,12 +1364,12 @@ mod tests {
 
         let provider = ReliableProvider::new(
             vec![(
-                "openai-codex".into(),
+                "openai".into(),
                 Box::new(MockProvider {
                     calls: Arc::clone(&calls),
                     fail_until_attempt: usize::MAX,
                     response: "never",
-                    error: "OpenAI Codex stream error: Your input exceeds the context window of this model. Please adjust your input and try again.",
+                    error: "Your input exceeds the context window of this model. Please adjust your input and try again.",
                 }),
             )],
             4,
@@ -1376,60 +1454,6 @@ mod tests {
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
     }
 
-    /// A refused Gemini CLI login fails the turn at once. The credential is
-    /// decided locally, before anything is sent, so a retry can only end in
-    /// the same sentence — it can only spend the operator's time waiting out
-    /// a backoff.
-    ///
-    /// The provider is the one the FACTORY builds and the refusal is the one
-    /// it produces: the type has to survive the provider boundary, or the
-    /// retry wrapper cannot recognise it.
-    #[tokio::test]
-    async fn a_refused_expired_gemini_cli_login_is_not_retried() {
-        let _env = crate::test_env::ENV_LOCK.lock().await;
-        let _scrub = crate::test_env::CredentialEnvScrub::new();
-        let (home, _home_guard) = crate::providers::gemini_cli::gemini_home();
-
-        crate::providers::gemini_cli::write_gemini_creds_with_expiry(
-            &home,
-            "ya29.mock-token",
-            -3_600_000,
-        );
-
-        let built = crate::providers::create_provider("gemini", None)
-            .expect("a keyless Gemini provider must be built");
-        let gemini = crate::providers::tests::gemini_provider_inside(built.as_ref())
-            .expect("the factory builds the Gemini CLI-login provider when there is no key");
-
-        let refusal = factory_built_gemini_refusal(gemini)
-            .expect("an expired Gemini CLI login must be refused with a typed error");
-        assert!(matches!(refusal, GeminiAuthError::ExpiredCliLogin));
-
-        let calls = Arc::new(AtomicUsize::new(0));
-        let provider = ReliableProvider::new(
-            vec![(
-                "gemini".into(),
-                Box::new(CallCounter {
-                    calls: Arc::clone(&calls),
-                    refusal,
-                }) as Box<dyn Provider>,
-            )],
-            3,
-            1,
-        );
-
-        let error = provider
-            .simple_chat("hello", "gemini-2.0-flash", 0.0)
-            .await
-            .expect_err("a refused login must fail the turn");
-        assert!(error.to_string().contains("has expired"), "{error}");
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "a refused Gemini CLI login must not be retried"
-        );
-    }
-
     /// Every refusal a provider decides locally, with the sentence it shows
     /// the operator. A retry cannot change any of them, so each fails the turn
     /// after one call even though the retry budget allows four.
@@ -1451,14 +1475,6 @@ mod tests {
             (
                 "bedrock",
                 "AWS Bedrock credentials not set. Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables.",
-            ),
-            (
-                "openai codex profile",
-                "OpenAI Codex auth profile not found. Run `rantaiclaw auth login --provider openai-codex`.",
-            ),
-            (
-                "openai codex account",
-                "OpenAI Codex account id not found in auth profile/token. Run `rantaiclaw auth login --provider openai-codex` again.",
             ),
         ];
 
@@ -1489,6 +1505,75 @@ mod tests {
         }
     }
 
+    /// A chain of one provider that refuses every request with `sentence`.
+    fn refusing_provider(sentence: &str) -> ReliableProvider {
+        ReliableProvider::new(
+            vec![(
+                "refusing".into(),
+                Box::new(LocalRefusalCounter {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    refusal: LocalRefusal::new(sentence),
+                }) as Box<dyn Provider>,
+            )],
+            3,
+            1,
+        )
+    }
+
+    /// The refusal must be the TOP of the failure — the sentence the provider
+    /// wrote is the actionable part — and its type must still ride along in
+    /// the chain, so the gateway can recognise it by type.
+    fn assert_refusal(error: &anyhow::Error, sentence: &str, method: &str) {
+        assert_eq!(error.to_string(), sentence, "{method}");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref::<LocalRefusal>().is_some()),
+            "{method}: the typed cause must stay in the chain"
+        );
+    }
+
+    /// Every aggregate the wrapper offers must fail with the refusal itself,
+    /// not with the wrapper's own aggregate ("All providers/models failed.
+    /// Attempts: …"), which buries the sentence the operator needs under every
+    /// other attempt.
+    #[tokio::test]
+    async fn a_local_refusal_is_the_top_level_failure_of_every_aggregate() {
+        let sentence = crate::providers::removed_login::MINIMAX_REFUSAL;
+        let messages = vec![ChatMessage::user("hello")];
+
+        let error = refusing_provider(sentence)
+            .chat_with_system(None, "hello", "example-model", 0.0)
+            .await
+            .expect_err("a local refusal must fail the turn");
+        assert_refusal(&error, sentence, "chat_with_system");
+
+        let error = refusing_provider(sentence)
+            .chat_with_history(&messages, "example-model", 0.0)
+            .await
+            .expect_err("a local refusal must fail the turn");
+        assert_refusal(&error, sentence, "chat_with_history");
+
+        let error = refusing_provider(sentence)
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "example-model",
+                0.0,
+            )
+            .await
+            .expect_err("a local refusal must fail the turn");
+        assert_refusal(&error, sentence, "chat");
+
+        let error = refusing_provider(sentence)
+            .chat_with_tools(&messages, &[], "example-model", 0.0)
+            .await
+            .expect_err("a local refusal must fail the turn");
+        assert_refusal(&error, sentence, "chat_with_tools");
+    }
+
     /// The type decides, not the wording: a refusal whose sentence looks like
     /// a transient failure is still final, and a plain error with the same
     /// sentence is still retried. A context layer added by a caller does not
@@ -1515,12 +1600,11 @@ mod tests {
     async fn a_refused_missing_gemini_credential_is_not_retried() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
         let _scrub = crate::test_env::CredentialEnvScrub::new();
-        let (_home, _home_guard) = crate::providers::gemini_cli::gemini_home();
 
         let built = crate::providers::create_provider("gemini", None)
             .expect("a keyless Gemini provider must be built");
         let gemini = crate::providers::tests::gemini_provider_inside(built.as_ref())
-            .expect("the factory builds the Gemini CLI-login provider when there is no key");
+            .expect("the factory builds the Gemini provider when there is no key");
 
         let refusal = factory_built_gemini_refusal(gemini)
             .expect("a missing Gemini credential must be refused with a typed error");

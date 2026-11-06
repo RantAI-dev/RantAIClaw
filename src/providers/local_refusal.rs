@@ -21,6 +21,11 @@ impl LocalRefusal {
     pub(crate) fn new(message: impl Into<String>) -> Self {
         Self(message.into())
     }
+
+    /// The operator-facing sentence this refusal carries.
+    pub(crate) fn message(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Whether `error`, or any error it wraps, is a refusal decided locally.
@@ -30,5 +35,23 @@ pub(crate) fn is_local_refusal(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause.downcast_ref::<LocalRefusal>().is_some()
             || cause.downcast_ref::<GeminiAuthError>().is_some()
+    })
+}
+
+/// The operator-facing sentence of the refusal `error` carries, if it is one.
+///
+/// The refusal is decided before anything is sent, so its sentence IS the
+/// answer: it names what to configure. A caller that only wants the text —
+/// the gateway, which must say the same words on both routes — reads it here
+/// instead of unwrapping the type itself.
+pub(crate) fn local_refusal_text(error: &anyhow::Error) -> Option<&str> {
+    error.chain().find_map(|cause| {
+        if let Some(refusal) = cause.downcast_ref::<LocalRefusal>() {
+            Some(refusal.message())
+        } else {
+            cause
+                .downcast_ref::<GeminiAuthError>()
+                .map(GeminiAuthError::refusal_text)
+        }
     })
 }

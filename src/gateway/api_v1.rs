@@ -236,18 +236,80 @@ fn err_400(msg: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
     )
 }
 
-/// Map an agent build/run failure to a response. A missing-model configuration
-/// error is the caller's to fix (400 with the actionable hint), not a server
-/// fault; everything else is a 500. Both paths scrub any secret-looking token.
-fn map_agent_error(e: anyhow::Error) -> (StatusCode, Json<ErrorBody>) {
-    let sanitized = crate::providers::sanitize_api_error(&format!("{e:#}"));
-    if e.chain().any(|c| {
-        c.downcast_ref::<crate::agent::NoModelConfigured>()
+/// A turn failure, classified by whose fault it is.
+enum TurnFailure {
+    /// The caller's to fix: a 400 carrying the actionable text.
+    Client(String),
+    /// The server's fault: a 500.
+    Server(String),
+}
+
+impl TurnFailure {
+    /// The text both chat routes report for this failure.
+    fn text(&self) -> &str {
+        match self {
+            Self::Client(text) | Self::Server(text) => text,
+        }
+    }
+
+    /// Whether the caller must change something before the request can work.
+    fn is_client_fault(&self) -> bool {
+        matches!(self, Self::Client(_))
+    }
+}
+
+/// The text and the classification of a turn failure.
+///
+/// ONE helper, so the sync route's 400 detail and the streaming route's error
+/// event say the SAME words about the same failure. Two places that each
+/// formatted their own message would drift, and a client that reads one and
+/// compares it with the other would find two different sentences.
+///
+/// The client text is the actionable part of the failure — the
+/// `ProviderConfigError`'s own message, or the refusal the provider wrote —
+/// scrubbed but NOT truncated as a whole: the guidance it carries (the
+/// API-key replacement, the name of the missing field) is what the operator
+/// needs, and cutting it off would leave the request just as unfixable. The
+/// ONE caller-controlled part of that text — the provider name in an
+/// unknown-provider refusal — is bounded where the error is built, so the
+/// bound has already been applied before the text reaches here.
+fn classify_turn_failure(error: &anyhow::Error) -> TurnFailure {
+    // A missing model is the caller's to fix, and its hint says what to set.
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::agent::NoModelConfigured>()
             .is_some()
     }) {
-        return err_400(sanitized);
+        return TurnFailure::Client(crate::providers::sanitize_api_error(&format!("{error:#}")));
     }
-    err_500(anyhow::anyhow!("{sanitized}"))
+    // A provider name the factory does not know follows from the config
+    // alone: the caller has to name a provider that exists.
+    if let Some(config_error) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::providers::ProviderConfigError>())
+    {
+        return TurnFailure::Client(crate::providers::scrub_secret_patterns(
+            &config_error.to_string(),
+        ));
+    }
+    // A refusal decided before anything was sent: the sentence names what to
+    // configure.
+    if let Some(refusal) = crate::providers::local_refusal_text(error) {
+        return TurnFailure::Client(crate::providers::scrub_secret_patterns(refusal));
+    }
+    TurnFailure::Server(crate::providers::sanitize_api_error(&format!("{error:#}")))
+}
+
+/// Map an agent build/run failure to a response. A failure the caller has to
+/// fix — a missing model, a provider name that does not exist, a refusal the
+/// provider decided locally — is a 400 with the actionable text; everything
+/// else is a 500. Both paths scrub any secret-looking token.
+fn map_agent_error(e: anyhow::Error) -> (StatusCode, Json<ErrorBody>) {
+    let failure = classify_turn_failure(&e);
+    if failure.is_client_fault() {
+        return err_400(failure.text());
+    }
+    err_500(anyhow::anyhow!("{}", failure.text()))
 }
 
 /// The caller may see this resource but not act on it. Used by the skill
@@ -1175,10 +1237,11 @@ async fn agent_chat_stream(
                 }
             }
             Err(err) => {
+                // The same helper the sync route uses, so both routes say the
+                // same words about the same failure.
+                let message = classify_turn_failure(&err).text().to_string();
                 let _ = events_tx
-                    .send(crate::agent::AgentEvent::Error(
-                        crate::providers::sanitize_api_error(&format!("{err:#}")),
-                    ))
+                    .send(crate::agent::AgentEvent::Error(message))
                     .await;
                 let _ = events_tx
                     .send(crate::agent::AgentEvent::Done {
@@ -1236,7 +1299,12 @@ async fn agent_chat_stream(
                 crate::agent::AgentEvent::Error(message)
                 | crate::agent::AgentEvent::ImageRefused { message } => {
                     errored = true;
-                    serde_json::json!({"type": "error", "message": message})
+                    // The same scrub the sync route's 400 detail gets, so the
+                    // two routes carry the same words about the same failure.
+                    serde_json::json!({
+                        "type": "error",
+                        "message": crate::providers::scrub_secret_patterns(&message)
+                    })
                 }
                 crate::agent::AgentEvent::Done { final_text, cancelled } => {
                     let persisted_text = if final_text.is_empty() {
@@ -5659,6 +5727,182 @@ mod tests {
             .expect("refusal detail")
             .contains("not configured"));
         mock.assert();
+    }
+
+    /// A chat body that asks a question and names no provider.
+    fn chat_body(message: &str) -> Json<ChatRequestBody> {
+        Json(ChatRequestBody {
+            message: message.to_string(),
+            model: None,
+            provider: None,
+            temperature: None,
+            session_id: None,
+            context: None,
+            render_mode: None,
+        })
+    }
+
+    /// Every provider name whose subscription login was removed, with the
+    /// marker of the API-key replacement its refusal must name.
+    ///
+    /// The marker is written out here rather than read from the provider
+    /// module: the point of the test is that the GATEWAY names the
+    /// replacement, so the expectation must not come from the code under test.
+    const REMOVED_LOGIN_NAMES: &[(&str, &str)] = &[
+        ("copilot", "no API-key path"),
+        ("github-copilot", "no API-key path"),
+        ("openai-codex", "OPENAI_API_KEY"),
+        ("openai_codex", "OPENAI_API_KEY"),
+        ("codex", "OPENAI_API_KEY"),
+        ("qwen-code", "DASHSCOPE_API_KEY"),
+        ("qwen-oauth", "DASHSCOPE_API_KEY"),
+        ("qwen_oauth", "DASHSCOPE_API_KEY"),
+        ("minimax-oauth", "MINIMAX_API_KEY"),
+        ("minimax-oauth-cn", "MINIMAX_API_KEY"),
+        ("minimax-oauth-global", "MINIMAX_API_KEY"),
+    ];
+
+    /// A config that still names a removed subscription login must not stop
+    /// the daemon, and must not leave the machine: the request is refused
+    /// with the API-key replacement, and nothing is sent.
+    #[tokio::test]
+    async fn agent_chat_sync_refuses_a_removed_login_with_its_replacement() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _proxy = loopback_no_proxy();
+        let home = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(home.path());
+        // The endpoint the config points at. A provider that was built for
+        // real would send here, so a request on this server means something
+        // left the machine.
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"choices":[]}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        for (name, replacement) in REMOVED_LOGIN_NAMES {
+            let state = test_state();
+            {
+                let mut config = state.config.lock();
+                config.default_provider = Some((*name).to_string());
+                config.default_model = Some("test-model".to_string());
+                config.api_key = Some("sk-configured-key-for-test-0000".to_string());
+                config.api_url = Some(server.url());
+            }
+
+            let Err((status, Json(body))) =
+                agent_chat_sync(State(state), HeaderMap::new(), chat_body("hi")).await
+            else {
+                panic!("{name} must be refused");
+            };
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{name}");
+            let detail = body.detail.unwrap_or_default();
+            assert!(
+                detail.contains(replacement),
+                "{name}: the refusal must name the replacement: {detail}"
+            );
+        }
+
+        mock.assert();
+    }
+
+    /// The two routes must say the same words. A client that reads the SSE
+    /// error event must get the text the sync route puts in its 400 detail,
+    /// byte for byte — otherwise the console shows one sentence and a curl
+    /// shows another.
+    ///
+    /// Both shapes are covered: a failure the TURN hits (the provider refuses
+    /// before it sends) and a failure the BUILD hits (the config names a
+    /// provider that does not exist).
+    #[tokio::test]
+    async fn agent_chat_stream_reports_the_same_text_as_the_sync_refusal() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let home = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(home.path());
+
+        for provider in ["openai-codex", "totally-unknown-provider-xyz"] {
+            let state = test_state();
+            {
+                let mut config = state.config.lock();
+                config.default_provider = Some(provider.to_string());
+                config.default_model = Some("test-model".to_string());
+            }
+
+            let Err((status, Json(body))) =
+                agent_chat_sync(State(state.clone()), HeaderMap::new(), chat_body("hi")).await
+            else {
+                panic!("{provider} must be refused");
+            };
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{provider}");
+            let sync_detail = body.detail.expect("refusal detail");
+
+            let mut headers = HeaderMap::new();
+            headers.insert("accept", "text/event-stream".parse().expect("header value"));
+            let response = agent_chat_dispatch(
+                State(state),
+                headers,
+                Query(ChatQuery::default()),
+                chat_body("hi"),
+            )
+            .await
+            .expect("the stream answers with HTTP 200");
+            assert_eq!(response.status(), StatusCode::OK, "{provider}");
+            let body = response_text(response).await;
+            let message = sse_values(&body)
+                .into_iter()
+                .find(|value| value["type"] == "error")
+                .and_then(|value| value["message"].as_str().map(str::to_string))
+                .expect("the stream must carry an error event");
+            assert_eq!(message, sync_detail, "{provider}");
+        }
+    }
+
+    /// A provider name the factory never knew is the caller's to fix: the
+    /// config names a provider that does not exist, and no retry or
+    /// credential changes that.
+    #[tokio::test]
+    async fn agent_chat_sync_refuses_an_unknown_provider_with_a_bad_request() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let home = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(home.path());
+
+        let state = test_state();
+        {
+            let mut config = state.config.lock();
+            config.default_provider = Some("totally-unknown-provider-xyz".to_string());
+            config.default_model = Some("test-model".to_string());
+        }
+
+        let Err((status, Json(body))) =
+            agent_chat_sync(State(state), HeaderMap::new(), chat_body("hi")).await
+        else {
+            panic!("an unknown provider must be refused");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let detail = body.detail.unwrap_or_default();
+        assert!(
+            detail.contains("Unknown provider"),
+            "the refusal must say what is wrong: {detail}"
+        );
+        // The guidance is the part the operator acts on, and it must reach the
+        // caller whole: a 400 that names the problem but cuts the fix off
+        // leaves the request just as unfixable.
+        for line in [
+            "Check README for supported providers or run `rantaiclaw onboard --interactive` to reconfigure.",
+            "Tip: Use \"custom:https://your-api.com\" for OpenAI-compatible endpoints.",
+            "Tip: Use \"anthropic-custom:https://your-api.com\" for Anthropic-compatible endpoints.",
+        ] {
+            assert!(
+                detail.contains(line),
+                "the refusal must carry the guidance line whole: {line} — {detail}"
+            );
+        }
     }
 
     /// The top-level `api_key` is the ACTIVE default provider's key. When the

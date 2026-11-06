@@ -279,7 +279,7 @@ mod tests {
     #[test]
     fn classify_model_probe_error_marks_unsupported_as_skipped() {
         let outcome = classify_model_probe_error(
-            "Provider 'copilot' does not support live model discovery yet",
+            "Provider 'bedrock' does not support live model discovery yet",
         );
         assert_eq!(outcome, ModelProbeOutcome::Skipped);
     }
