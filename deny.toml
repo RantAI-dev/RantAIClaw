@@ -157,6 +157,34 @@ ignore = [
     #
     # REVIEW BY 2026-11-15 with the other matrix-sdk-family entries above.
     "RUSTSEC-2026-0319",
+    # vodozemac v0.10.0 — RUSTSEC-2026-0451, "Degraded secret zeroization
+    # capabilities" (memory-exposure; announced 2026-11-06; affects 0.11.1
+    # and every earlier release, patched in >= 0.11.2). The Olm root key
+    # ratchet did not zeroize its HKDF output after use, so each ratchet
+    # step left a copy of the new root key and chain key in freed heap
+    # memory; an attacker who can read the process memory — a separate
+    # memory-disclosure bug, a core dump, or swapped-out pages — may
+    # recover them, which weakens Olm's forward secrecy for affected
+    # sessions. Chain: vodozemac 0.10.0 ← matrix-sdk-crypto 0.18.0 ←
+    # matrix-sdk-base 0.18.0 ← matrix-sdk 0.18.0 ← rantaiclaw, so it is
+    # only reachable through the opt-in `channel-matrix` feature;
+    # `cargo tree -i vodozemac` matches no package with default features, so
+    # no default or released build contains it — `pub-release.yml` builds with
+    # `cargo build --profile release-fast --locked` and no `--features`, and
+    # `channel-matrix` is not in the default feature set. A `channel-matrix`
+    # build DOES run the Olm ratchet (matrix-sdk is pulled with the
+    # `e2e-encryption` feature and `src/channels/matrix.rs` decrypts encrypted
+    # rooms), so this is not unreachable code — the exposure additionally
+    # needs a way to read the process memory, which this repo does
+    # not ship. The upgrade is blocked: matrix-sdk-crypto 0.18.0 pins
+    # `vodozemac "0.10.0"`, so 0.11.2 needs matrix-sdk 0.19 (which requires
+    # `vodozemac ^0.11.0`), and matrix-sdk 0.19's sqlite store needs
+    # `rusqlite ^0.40.2` while `Cargo.toml` pins `rusqlite = "0.37"` with
+    # `bundled` — both link the native `sqlite3` library, so the two cannot
+    # resolve together. Same block as the RUSTSEC-2026-0318 entry above.
+    #
+    # REVIEW BY 2026-11-15 with the other matrix-sdk-family entries above.
+    "RUSTSEC-2026-0451",
     # ttf-parser v0.25 via lopdf 0.42 → pdf-extract (KB PDF text extraction) —
     # font parser flagged unmaintained; parse-only path over operator-supplied
     # documents, no fixed release (lopdf 0.42 is current). Revisit on a lopdf bump.
