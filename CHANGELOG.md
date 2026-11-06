@@ -134,6 +134,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can no longer be sent to a host the operator never configured, and the login files that held it
   are deleted on the first start.
 
+- **A build with the opt-in `channel-matrix` feature keeps Olm root keys in freed heap memory.**
+  `vodozemac` 0.10.0 does not zeroize its HKDF output after an Olm root key ratchet step
+  (`RUSTSEC-2026-0451`, memory-exposure, affects 0.11.1 and earlier, patched in 0.11.2), so a copy
+  of the root key and the chain key can survive in freed memory. Recovering an affected key also
+  needs a way to read the process memory. The crate is pulled in only by the opt-in `channel-matrix`
+  feature, so no default build and no released binary contains it; a `channel-matrix` build does run
+  the Olm ratchet, so the path is real there. The fix needs matrix-sdk 0.19, whose sqlite store
+  needs `rusqlite` 0.40.2 while the crate pins 0.37, and both link the native `sqlite3` library, so
+  the upgrade cannot resolve today.
+
 ## [0.34.0-alpha] — 2026-11-05
 
 The hardening release. A caller can no longer borrow a stored credential for a host the
