@@ -9,9 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
-- **Five subscription logins are gone; RantaiClaw uses API keys only.** The GitHub Copilot, ChatGPT
-  (OpenAI Codex), Gemini CLI, Qwen Code OAuth and MiniMax OAuth logins were removed. Every name that
-  stood for one is refused with the API-key replacement named:
+- **Six subscription logins are gone; RantaiClaw uses API keys only.** The GitHub Copilot, ChatGPT
+  (OpenAI Codex), Gemini CLI, Qwen Code OAuth, MiniMax OAuth and Anthropic Claude subscription
+  logins were removed. Every name that stood for one is refused with the API-key replacement
+  named:
 
   - The GitHub Copilot login was removed. Copilot has no API-key path in RantaiClaw — choose another provider.
   - The ChatGPT (OpenAI Codex) login was removed. Use the "openai" provider with an OPENAI_API_KEY instead.
@@ -19,9 +20,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The MiniMax OAuth login was removed. Use the "minimax" provider with a MINIMAX_API_KEY instead.
 
   The Gemini CLI login is gone as well: the Gemini provider takes an API key (`GEMINI_API_KEY` or
-  `GOOGLE_API_KEY`) and never reads `~/.gemini/oauth_creds.json`. These logins were features when
-  v0.34.0-alpha shipped them — that release announced the Qwen Code and MiniMax token renewal and
-  the Gemini CLI login — so this release removes what that release added.
+  `GOOGLE_API_KEY`) and never reads `~/.gemini/oauth_creds.json`. The Anthropic Claude
+  subscription is gone as well, and it is refused on the credential rather than on a name: the
+  `anthropic` provider stays, and it takes an API key from the Claude Console. These logins were
+  features when v0.34.0-alpha shipped them — that release announced the Qwen Code and MiniMax
+  token renewal and the Gemini CLI login — so this release removes what that release added.
+- **A Claude subscription setup token is refused, and never sent.** The prefix is the whole rule:
+  an Anthropic API key starts with `sk-ant-api` and a setup token with `sk-ant-oat`. A configured
+  or exported credential that starts with `sk-ant-oat` is refused at use time, with this
+  sentence, and the value is never printed:
+
+  ```
+  Anthropic setup-tokens are no longer accepted. Use an API key from the Claude Console: set ANTHROPIC_API_KEY or store the key in config.
+  ```
+
+  The provider still builds, so the gateway binds and the daemon stays up; the refusal comes when
+  a request is sent. `rantaiclaw doctor` reports it as a failed credential check rather than as a
+  missing key, and the gateway's chat route answers the turn with `400` and the same sentence in
+  the body.
 - **A config that names a removed login still loads, and the refusal comes when a request is sent.**
   The daemon starts, the gateway binds and the console serves, so there is no restart loop. Nothing is
   sent to the vendor, the turn fails at once with the replacement named, and no retry follows. A
@@ -37,16 +53,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `No API key found for 'copilot'. If it needs one, channels and chat can't use it until you add it in Configuration.`
   That sent the operator after a key that cannot help. Every provider that still exists keeps that
   wording.
-- **The `auth` subcommands that belonged to the Codex login are gone.** `rantaiclaw auth login`,
-  `auth paste-redirect` and `auth refresh` are no longer commands: they served the ChatGPT (OpenAI
-  Codex) login only. `auth paste-token`, `auth setup-token`, `auth logout`, `auth use`, `auth list`
-  and `auth status` stay, and the Anthropic setup-token path is unchanged.
+- **`rantaiclaw auth` is gone, all of it.** The command was the subscription login's own
+  surface — `paste-token`, `setup-token`, `logout`, `use`, `list` and `status` — and the
+  subscription it managed is gone with it. It survives as a hidden stub that prints this on
+  stderr and exits with status `1`, so a script that still calls it fails loudly instead of
+  appearing to succeed:
+
+  ```
+  The `auth` command was removed: RantaiClaw no longer stores provider subscription logins. Use an API key instead — set ANTHROPIC_API_KEY, store the provider's key in config.toml, or run `rantaiclaw setup provider`.
+  ```
+
+  The Codex subcommands that went earlier — `login`, `paste-redirect` and `refresh` — stay gone.
+  An API key is the way in: export `ANTHROPIC_API_KEY`, store the provider's key in
+  `config.toml`, or run `rantaiclaw setup provider`.
 - **The OAuth environment variables and the OAuth credential caches do nothing.**
-  `MINIMAX_OAUTH_TOKEN`, `MINIMAX_OAUTH_REFRESH_TOKEN`, `MINIMAX_OAUTH_CLIENT_ID`,
-  `MINIMAX_OAUTH_REGION`, `QWEN_OAUTH_TOKEN`, `QWEN_OAUTH_REFRESH_TOKEN` and
-  `QWEN_OAUTH_RESOURCE_URL` are no longer read, and neither `~/.qwen/oauth_creds.json` nor
-  `~/.gemini/oauth_creds.json` is opened. The working keys are `MINIMAX_API_KEY`,
-  `GEMINI_API_KEY` / `GOOGLE_API_KEY`, `DASHSCOPE_API_KEY` and `OPENAI_API_KEY`.
+  `ANTHROPIC_OAUTH_TOKEN`, `MINIMAX_OAUTH_TOKEN`, `MINIMAX_OAUTH_REFRESH_TOKEN`,
+  `MINIMAX_OAUTH_CLIENT_ID`, `MINIMAX_OAUTH_REGION`, `QWEN_OAUTH_TOKEN`,
+  `QWEN_OAUTH_REFRESH_TOKEN` and `QWEN_OAUTH_RESOURCE_URL` are no longer read, and neither
+  `~/.qwen/oauth_creds.json` nor `~/.gemini/oauth_creds.json` is opened. The working keys are
+  `ANTHROPIC_API_KEY`, `MINIMAX_API_KEY`, `GEMINI_API_KEY` / `GOOGLE_API_KEY`,
+  `DASHSCOPE_API_KEY` and `OPENAI_API_KEY`.
+- **The doctor's provider-key warning no longer names a credential source that is gone.** It used to
+  say the check "tried config, its environment variables, and the provider's own auth (OAuth
+  profile / cached token / AWS env)". The auth profile, the cached token and the Gemini CLI login
+  are gone, so the warning now names only the sources that still exist.
+- **The first start with this build deletes the login files an earlier one wrote.** The sweep
+  runs on every start and is idempotent, so only the first start after an upgrade has anything
+  to remove: `auth-profiles.json`, `auth-profiles.lock` and `auth-openai-pending.json` in the
+  active profile's config directory, and `access-token` and `api-key.json` in the `copilot`
+  subdirectory of the OS platform config directory. Each removed file gets one log line naming
+  the path and nothing else — the file held a credential, and a log is the wrong place for one.
+  A file that cannot be removed is left in place and reported by `rantaiclaw doctor` as
+  `config.legacy_logins`. `~/.gemini/` and `~/.qwen/` belong to other CLIs and are left alone.
 - **A `"provider.copilot"` entry under `[proxy]` still loads and does nothing.** The key stays a
   supported proxy service key, so a config written before the removal is not rejected. It is inert,
   and a warning says why.
@@ -87,6 +125,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   model that goes on the wire keeps its full name.
 
 ### Security
+
+- **A stored Claude subscription login no longer reaches any host.** The Anthropic auth profile,
+  a setup token and `ANTHROPIC_OAUTH_TOKEN` are not read, refreshed or sent by any code path:
+  `anthropic` and `anthropic-custom:<url>` send only an API key the operator stored in the
+  config or exported for that provider. A configured `anthropic-custom:<url>` endpoint does not
+  change that — the credential is decided before a request is built — so the stored Claude login
+  can no longer be sent to a host the operator never configured, and the login files that held it
+  are deleted on the first start.
 
 - **A build with the opt-in `channel-matrix` feature keeps Olm root keys in freed heap memory.**
   `vodozemac` 0.10.0 does not zeroize its HKDF output after an Olm root key ratchet step

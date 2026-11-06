@@ -1462,7 +1462,7 @@ mod tests {
         let refusals = [
             (
                 "anthropic",
-                "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token).",
+                "Anthropic credentials not set. Set ANTHROPIC_API_KEY or store an API key in config.",
             ),
             (
                 "ollama endpoint",

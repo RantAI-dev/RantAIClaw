@@ -74,24 +74,35 @@ impl DoctorCheck for ProviderPingCheck {
         // the web console writes — and reported a spurious 401 for it.
         let api_key = ctx.config.resolve_key_for_provider(provider);
 
+        // A credential this build refuses must not go on the wire. The ping
+        // sends the key to the endpoint, and a refused credential — a Claude
+        // subscription setup-token — is one the agent can never use, so
+        // proving it would put a subscription credential on the wire for
+        // nothing. The refusal is reported here instead, with the API key
+        // that replaces it.
+        if let Some(sentence) = crate::providers::refused_credential(provider, api_key.as_deref()) {
+            return CheckResult::fail(
+                self.name(),
+                format!("the credential for {provider} is refused: {sentence}"),
+            )
+            .with_category(self.category())
+            .with_hint("set ANTHROPIC_API_KEY, or store an API key in config.toml");
+        }
+
         // Never probe unauthenticated. Several providers serve `/models`
         // publicly (openrouter among them), so a keyless install got a 200 and
         // this check reported "provider responded 200 OK" for a config that
         // cannot send a single message. Local providers legitimately need no
         // key; everyone else without one is a hard fail, not a probe.
         // Same question as `config.provider_key`, so the two agree: an install
-        // authenticated by an OAuth profile, a cached token or AWS env vars is
-        // usable even with no key to send in a probe header.
-        let usable = crate::providers::has_usable_credential(
-            provider,
-            api_key.as_deref(),
-            Some(&crate::auth::state_dir_from_config(&ctx.config)),
-        );
+        // authenticated by AWS env vars is usable even with no key to send in
+        // a probe header.
+        let usable = crate::providers::has_usable_credential(provider, api_key.as_deref());
 
-        // Usable, but not by a bearer this check could put in a header — an
-        // auth profile, a cached OAuth token, AWS request signing. Probing
-        // unauthenticated would draw a 401 and report a working install as
-        // broken, which is the same false verdict in the other direction.
+        // Usable, but not by a bearer this check could put in a header — AWS
+        // request signing. Probing unauthenticated would draw a 401 and report
+        // a working install as broken, which is the same false verdict in the
+        // other direction.
         if usable && api_key.is_none() && !crate::providers::provider_is_local(provider) {
             return CheckResult::ok(
                 self.name(),
@@ -136,15 +147,28 @@ impl DoctorCheck for ProviderPingCheck {
 }
 
 /// Auth headers for a provider validation/probe request. Anthropic needs
-/// `x-api-key` + `anthropic-version` (Bearer is only for its OAuth/setup
-/// tokens); every other provider uses `Authorization: Bearer <key>`. Shared by
-/// the doctor provider check and the setup provider provisioner so they agree.
+/// `x-api-key` + `anthropic-version`; every other provider uses
+/// `Authorization: Bearer <key>`. Shared by the doctor provider check and the
+/// setup provider provisioner so they agree.
 pub fn probe_auth_headers(provider: &str, api_key: &str) -> Vec<(String, String)> {
     if provider == "anthropic" {
-        crate::auth::anthropic_token::anthropic_probe_headers(api_key)
+        anthropic_probe_headers(api_key)
     } else {
         vec![("Authorization".to_string(), format!("Bearer {api_key}"))]
     }
+}
+
+/// The headers an Anthropic probe request carries.
+///
+/// `x-api-key` and `anthropic-version`, and nothing else: Anthropic rejects
+/// `Authorization: Bearer <api-key>`, and this build does not accept a
+/// subscription setup-token, so there is no second header shape to choose
+/// between. A setup-token is refused before a request is built.
+fn anthropic_probe_headers(api_key: &str) -> Vec<(String, String)> {
+    vec![
+        ("x-api-key".to_string(), api_key.to_string()),
+        ("anthropic-version".to_string(), "2023-06-01".to_string()),
+    ]
 }
 
 fn classify_response(
@@ -304,11 +328,10 @@ mod tests {
         );
     }
 
-    /// A provider authenticated by something that is not a bearer — an auth
-    /// profile, a cached OAuth token, AWS request signing — must not be probed
-    /// unauthenticated. The endpoint would answer 401 and this check would
-    /// report a working install as broken: the same false verdict as the bug
-    /// it replaced, pointing the other way.
+    /// A provider authenticated by something that is not a bearer — AWS
+    /// request signing — must not be probed unauthenticated. The endpoint would
+    /// answer 401 and this check would report a working install as broken: the
+    /// same false verdict as the bug it replaced, pointing the other way.
     #[tokio::test]
     async fn ping_does_not_probe_unauthenticated_when_the_credential_is_not_a_key() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
@@ -346,6 +369,38 @@ mod tests {
         assert!(
             !result.message.contains("no API key"),
             "should have probed: {}",
+            result.message
+        );
+    }
+
+    /// A credential this build refuses must not go out. A Claude subscription
+    /// setup-token is refused by the provider, so the agent can never use it —
+    /// and a ping would put it on the wire to prove something the agent cannot
+    /// do. The check reports the refusal instead, naming the API key that
+    /// replaces it, and never echoes the credential.
+    ///
+    /// The endpoint is unreachable on purpose: if the guard regresses, the
+    /// check probes it and fails on the message, not on the network.
+    #[tokio::test]
+    async fn ping_refuses_to_send_a_setup_token() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+
+        let mut cfg = Config::default();
+        cfg.default_provider = Some("anthropic".into());
+        cfg.api_key = Some("sk-ant-oat01-ping-marker-token".into());
+        let check = ProviderPingCheck::with_endpoint("http://127.0.0.1:1/models");
+        let result = check.run(&ctx(cfg)).await;
+
+        assert_eq!(result.severity, Severity::Fail, "msg: {}", result.message);
+        assert!(
+            result.message.contains("ANTHROPIC_API_KEY"),
+            "the report must name the replacement: {}",
+            result.message
+        );
+        assert!(
+            !result.message.contains("ping-marker-token"),
+            "the report must not echo the credential: {}",
             result.message
         );
     }

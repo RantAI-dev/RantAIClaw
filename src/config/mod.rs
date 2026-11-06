@@ -1,9 +1,12 @@
 pub mod api_url;
 pub mod fingerprint;
+pub mod legacy_logins;
 pub mod migrations;
 pub mod persistent;
 pub mod schema;
 pub mod watcher;
+
+use std::path::PathBuf;
 
 #[allow(unused_imports)]
 pub use persistent::PersistentConfigError;
@@ -25,9 +28,45 @@ pub use schema::{
     UiConfig, WebSearchConfig, WebhookConfig, WhatsAppWebConfig,
 };
 
+/// The directory this install keeps its per-profile state in.
+///
+/// It is the directory the config file lives in, so the secret store, the
+/// model cache and the session database sit beside it. It used to live in the
+/// auth module, which no longer exists: it is a config-dir helper, not a
+/// login helper.
+pub fn state_dir_from_config(config: &Config) -> PathBuf {
+    config
+        .config_path
+        .parent()
+        .map_or_else(|| PathBuf::from("."), PathBuf::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The state dir is the directory the config file lives in: every
+    /// per-profile file sits beside it.
+    #[test]
+    fn state_dir_is_the_config_file_directory() {
+        let mut config = Config::default();
+        config.config_path = std::path::PathBuf::from("/tmp/rantaiclaw-profile/config.toml");
+        assert_eq!(
+            state_dir_from_config(&config),
+            std::path::PathBuf::from("/tmp/rantaiclaw-profile")
+        );
+    }
+
+    /// A config path with no directory part has no parent directory to name:
+    /// the helper returns the empty path, which is what it returned when it
+    /// lived in the auth module. The behaviour is unchanged — the helper only
+    /// MOVED.
+    #[test]
+    fn state_dir_of_a_bare_config_path_is_empty() {
+        let mut config = Config::default();
+        config.config_path = std::path::PathBuf::from("config.toml");
+        assert_eq!(state_dir_from_config(&config), std::path::PathBuf::new());
+    }
 
     #[test]
     fn reexported_config_default_is_constructible() {

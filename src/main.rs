@@ -34,7 +34,6 @@
 
 use anyhow::{bail, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
-use dialoguer::Password;
 use std::io::{IsTerminal, Write};
 use tracing::info;
 use tracing_subscriber::fmt;
@@ -75,7 +74,6 @@ fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
 
 mod agent;
 mod approval;
-mod auth;
 mod channels;
 mod cli_style;
 mod config;
@@ -561,10 +559,17 @@ Targets: owner | tool | command (aliases: owners, tools, commands, cmd).")]
         skill_command: SkillCommands,
     },
 
-    /// Manage provider subscription authentication profiles
+    /// (removed) Manage provider subscription authentication profiles
+    ///
+    /// The subscription logins are gone; the command stays as a hidden stub
+    /// that says so and exits non-zero. The arguments are swallowed, so
+    /// `rantaiclaw auth login` explains the removal instead of printing
+    /// "unrecognized subcommand".
+    #[command(hide = true)]
     Auth {
-        #[command(subcommand)]
-        auth_command: AuthCommands,
+        /// Ignored: the `auth` command was removed.
+        #[arg(trailing_var_arg = true, num_args = 0.., hide = true)]
+        auth_args: Vec<String>,
     },
 
     /// Start interactive chat (default when no subcommand given)
@@ -843,56 +848,6 @@ enum ConfigCommands {
     Schema,
     /// Show the active configuration as JSON, with all secrets redacted
     Show,
-}
-
-#[derive(Subcommand, Debug)]
-enum AuthCommands {
-    /// Paste setup token / auth token (for Anthropic subscription auth)
-    PasteToken {
-        /// Provider (`anthropic`)
-        #[arg(long)]
-        provider: String,
-        /// Profile name (default: default)
-        #[arg(long, default_value = "default")]
-        profile: String,
-        /// Token value (if omitted, read interactively)
-        #[arg(long)]
-        token: Option<String>,
-        /// Auth kind override (`authorization` or `api-key`)
-        #[arg(long)]
-        auth_kind: Option<String>,
-    },
-    /// Alias for `paste-token` (interactive by default)
-    SetupToken {
-        /// Provider (`anthropic`)
-        #[arg(long)]
-        provider: String,
-        /// Profile name (default: default)
-        #[arg(long, default_value = "default")]
-        profile: String,
-    },
-    /// Remove auth profile
-    Logout {
-        /// Provider
-        #[arg(long)]
-        provider: String,
-        /// Profile name (default: default)
-        #[arg(long, default_value = "default")]
-        profile: String,
-    },
-    /// Set active profile for a provider
-    Use {
-        /// Provider
-        #[arg(long)]
-        provider: String,
-        /// Profile name or full profile id
-        #[arg(long)]
-        profile: String,
-    },
-    /// List auth profiles
-    List,
-    /// Show auth status with active profile and token expiry info
-    Status,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1902,6 +1857,11 @@ async fn main() -> Result<()> {
     };
     config.apply_env_overrides();
 
+    // The subscription logins are gone, so the files an earlier RantaiClaw
+    // wrote for them are swept on every start. The sweep is idempotent and
+    // logs one line per file it actually removed.
+    crate::config::legacy_logins::remove_legacy_login_files(&config);
+
     match cli.command {
         None
         | Some(
@@ -1967,7 +1927,7 @@ async fn main() -> Result<()> {
                 // unknown `default_provider`, a custom provider URL that is
                 // missing, unparseable or not http(s), an unknown `[memory]
                 // backend, and an unknown `[runtime] kind. A missing API key,
-                // a missing auth profile and a DNS lookup failure are NOT
+                // a missing credential and a DNS lookup failure are NOT
                 // fatal: they are retried.
                 Err(e) if gateway::startup_exit_code(&e) == gateway::EX_CONFIG_EXIT_CODE => {
                     eprintln!("Error: {e:#}");
@@ -1997,7 +1957,7 @@ async fn main() -> Result<()> {
                 // unknown `default_provider`, a custom provider URL that is
                 // missing, unparseable or not http(s), an unknown `[memory]
                 // backend, and an unknown `[runtime] kind. A missing API key,
-                // a missing auth profile and a DNS lookup failure are NOT
+                // a missing credential and a DNS lookup failure are NOT
                 // fatal: the supervisor retries them. AddrInUse after the
                 // retry budget stays exit 1, so systemd keeps retrying a port
                 // conflict.
@@ -2441,7 +2401,7 @@ async fn main() -> Result<()> {
             memory::cli::handle_command(memory_command, &config).await
         }
 
-        Some(Commands::Auth { auth_command }) => handle_auth_command(auth_command, &config).await,
+        Some(Commands::Auth { auth_args }) => handle_auth_command_removed(&auth_args),
 
         Some(Commands::Config { config_command }) => match config_command {
             ConfigCommands::Schema => {
@@ -2521,33 +2481,6 @@ fn write_shell_completion<W: Write>(shell: CompletionShell, writer: &mut W) -> R
     Ok(())
 }
 
-fn read_auth_input(prompt: &str) -> Result<String> {
-    let input = Password::new()
-        .with_prompt(prompt)
-        .allow_empty_password(false)
-        .interact()?;
-    Ok(input.trim().to_string())
-}
-
-fn format_expiry(profile: &auth::profiles::AuthProfile) -> String {
-    match profile
-        .token_set
-        .as_ref()
-        .and_then(|token_set| token_set.expires_at)
-    {
-        Some(ts) => {
-            let now = chrono::Utc::now();
-            if ts <= now {
-                format!("expired at {}", ts.to_rfc3339())
-            } else {
-                let mins = (ts - now).num_minutes();
-                format!("expires in {mins}m ({})", ts.to_rfc3339())
-            }
-        }
-        None => "n/a".to_string(),
-    }
-}
-
 #[allow(clippy::too_many_lines)]
 /// Run the channel runtime until a shutdown signal, then let it drain.
 ///
@@ -2622,131 +2555,18 @@ async fn handle_permissions_command(
     Ok(())
 }
 
-async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Result<()> {
-    let auth_service = auth::AuthService::from_config(config);
-
-    match auth_command {
-        AuthCommands::PasteToken {
-            provider,
-            profile,
-            token,
-            auth_kind,
-        } => {
-            let provider = auth::normalize_provider(&provider)?;
-            let token = match token {
-                Some(token) => token.trim().to_string(),
-                None => read_auth_input("Paste token")?,
-            };
-            if token.is_empty() {
-                bail!("Token cannot be empty");
-            }
-
-            let kind = auth::anthropic_token::detect_auth_kind(&token, auth_kind.as_deref());
-            let mut metadata = std::collections::HashMap::new();
-            metadata.insert(
-                "auth_kind".to_string(),
-                kind.as_metadata_value().to_string(),
-            );
-
-            auth_service
-                .store_provider_token(&provider, &profile, &token, metadata, true)
-                .await?;
-            println!("Saved profile {profile}");
-            println!("Active profile for {provider}: {profile}");
-            Ok(())
-        }
-
-        AuthCommands::SetupToken { provider, profile } => {
-            let provider = auth::normalize_provider(&provider)?;
-            let token = read_auth_input("Paste token")?;
-            if token.is_empty() {
-                bail!("Token cannot be empty");
-            }
-
-            let kind = auth::anthropic_token::detect_auth_kind(&token, Some("authorization"));
-            let mut metadata = std::collections::HashMap::new();
-            metadata.insert(
-                "auth_kind".to_string(),
-                kind.as_metadata_value().to_string(),
-            );
-
-            auth_service
-                .store_provider_token(&provider, &profile, &token, metadata, true)
-                .await?;
-            println!("Saved profile {profile}");
-            println!("Active profile for {provider}: {profile}");
-            Ok(())
-        }
-
-        AuthCommands::Logout { provider, profile } => {
-            let provider = auth::normalize_provider(&provider)?;
-            let removed = auth_service.remove_profile(&provider, &profile).await?;
-            if removed {
-                println!("Removed auth profile {provider}:{profile}");
-            } else {
-                println!("Auth profile not found: {provider}:{profile}");
-            }
-            Ok(())
-        }
-
-        AuthCommands::Use { provider, profile } => {
-            let provider = auth::normalize_provider(&provider)?;
-            auth_service.set_active_profile(&provider, &profile).await?;
-            println!("Active profile for {provider}: {profile}");
-            Ok(())
-        }
-
-        AuthCommands::List => {
-            let data = auth_service.load_profiles().await?;
-            if data.profiles.is_empty() {
-                println!("No auth profiles configured.");
-                return Ok(());
-            }
-
-            for (id, profile) in &data.profiles {
-                let active = data
-                    .active_profiles
-                    .get(&profile.provider)
-                    .is_some_and(|active_id| active_id == id);
-                let marker = if active { "*" } else { " " };
-                println!("{marker} {id}");
-            }
-
-            Ok(())
-        }
-
-        AuthCommands::Status => {
-            let data = auth_service.load_profiles().await?;
-            if data.profiles.is_empty() {
-                println!("No auth profiles configured.");
-                return Ok(());
-            }
-
-            for (id, profile) in &data.profiles {
-                let active = data
-                    .active_profiles
-                    .get(&profile.provider)
-                    .is_some_and(|active_id| active_id == id);
-                let marker = if active { "*" } else { " " };
-                println!(
-                    "{} {} kind={:?} account={} expires={}",
-                    marker,
-                    id,
-                    profile.kind,
-                    crate::security::redact(profile.account_id.as_deref().unwrap_or("unknown")),
-                    format_expiry(profile)
-                );
-            }
-
-            println!();
-            println!("Active profiles:");
-            for (provider, profile_id) in &data.active_profiles {
-                println!("  {provider}: {profile_id}");
-            }
-
-            Ok(())
-        }
-    }
+/// The removed `auth` command.
+///
+/// The subscription logins are gone, so there is nothing to store and nothing
+/// to list. The command stays as a hidden stub: it prints what replaced the
+/// login and exits non-zero, because the operator asked for a login and no
+/// login happened.
+///
+/// The arguments are ignored on purpose — `rantaiclaw auth login` must reach
+/// this stub rather than clap's "unrecognized subcommand".
+fn handle_auth_command_removed(_args: &[String]) -> Result<()> {
+    eprintln!("{}", rantaiclaw::AUTH_COMMAND_REMOVED_MESSAGE);
+    std::process::exit(rantaiclaw::AUTH_COMMAND_REMOVED_EXIT_CODE);
 }
 
 #[cfg(test)]
@@ -3098,7 +2918,7 @@ fn headless_choice(multi: bool, asked_before: bool) -> HeadlessChoice {
 ///
 /// There are no exclusions here any more. `has_usable_credential` answers for
 /// every auth mode the factory actually uses — local providers, AWS env vars,
-/// auth profiles, cached OAuth tokens — so this call site does not need to know
+/// API keys — so this call site does not need to know
 /// which providers are special. The Bedrock carve-out this function used to
 /// carry is gone with it (plan 301).
 fn unusable_provider_after_headless_setup(
@@ -3112,7 +2932,6 @@ fn unusable_provider_after_headless_setup(
     if rantaiclaw::providers::has_usable_credential(
         name,
         config.resolve_key_for_provider(name).as_deref(),
-        Some(&crate::auth::state_dir_from_config(config)),
     ) {
         return None;
     }

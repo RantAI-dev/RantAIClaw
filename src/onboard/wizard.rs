@@ -1755,8 +1755,16 @@ const ANTHROPIC_MODELS_URL: &str = "https://api.anthropic.com/v1/models";
 
 fn fetch_anthropic_models(models_url: &str, api_key: Option<&str>) -> Result<Vec<String>> {
     let Some(api_key) = api_key else {
-        bail!("Anthropic model fetch requires API key or OAuth token. {TYPE_MODEL_ID_HINT}");
+        bail!("Anthropic model fetch requires an API key. {TYPE_MODEL_ID_HINT}");
     };
+
+    // A Claude subscription setup-token is not an API key, and this build
+    // never puts one on the wire. The fetch refuses it before a request is
+    // built, and the sentence names what to enter instead. The value itself
+    // is never echoed.
+    if let Some(sentence) = crate::providers::setup_token_refusal("anthropic", Some(api_key)) {
+        return Err(crate::providers::local_refusal::LocalRefusal::new(sentence).into());
+    }
 
     let Ok(parsed) = reqwest::Url::parse(models_url) else {
         bail!("model fetch endpoint is not a valid URL ({REDACTED_ENDPOINT})");
@@ -1764,15 +1772,12 @@ fn fetch_anthropic_models(models_url: &str, api_key: Option<&str>) -> Result<Vec
     let safe_endpoint = redact_endpoint_for_display(models_url);
 
     let client = build_model_fetch_client()?;
-    let mut request = client.get(parsed).header("anthropic-version", "2023-06-01");
-
-    if api_key.starts_with("sk-ant-oat01-") {
-        request = request
-            .header("Authorization", format!("Bearer {api_key}"))
-            .header("anthropic-beta", "oauth-2025-04-20");
-    } else {
-        request = request.header("x-api-key", api_key);
-    }
+    // The credential always goes out as `x-api-key`: an API key and nothing
+    // else reaches this endpoint.
+    let request = client
+        .get(parsed)
+        .header("anthropic-version", "2023-06-01")
+        .header("x-api-key", api_key);
 
     let response = request
         .send()
@@ -1960,18 +1965,13 @@ fn fetch_live_models_for_provider(
     provider_name: &str,
     api_key: &str,
     provider_api_url: Option<&str>,
-    state_dir: Option<&Path>,
 ) -> Result<Vec<String>> {
     let requested_provider_name = provider_name;
     if let Some(parsed) = crate::providers::parse_custom_endpoint(requested_provider_name) {
         let (kind, base_url) = parsed?;
         // The key the chat path sends to this URL, which for these two forms
         // is not the wizard's per-provider env var.
-        let key = crate::providers::resolve_chat_credential(
-            requested_provider_name,
-            Some(api_key),
-            state_dir,
-        );
+        let key = crate::providers::resolve_chat_credential(requested_provider_name, Some(api_key));
         return fetch_custom_endpoint_models(kind, &base_url, key.as_deref());
     }
     let provider_name = canonical_provider_name(provider_name);
@@ -1982,14 +1982,6 @@ fn fetch_live_models_for_provider(
         } else {
             std::env::var(provider_env_var(provider_name))
                 .ok()
-                .or_else(|| {
-                    // Anthropic also accepts OAuth setup-tokens via ANTHROPIC_OAUTH_TOKEN
-                    if provider_name == "anthropic" {
-                        std::env::var("ANTHROPIC_OAUTH_TOKEN").ok()
-                    } else {
-                        None
-                    }
-                })
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
         }
@@ -2504,12 +2496,7 @@ pub fn run_models_refresh(
         .unwrap_or_default();
     let provider_api_url = active_provider_api_url(config, &provider_name);
 
-    match fetch_live_models_for_provider(
-        &provider_name,
-        &api_key,
-        provider_api_url,
-        config.config_path.parent(),
-    ) {
+    match fetch_live_models_for_provider(&provider_name, &api_key, provider_api_url) {
         Ok(models) if !models.is_empty() => {
             cache_live_models_for_provider(&config.workspace_dir, &provider_name, &models)?;
             println!(
@@ -2600,12 +2587,7 @@ pub(crate) fn probe_provider_catalog_quiet(
         .unwrap_or_default();
     let provider_api_url = active_provider_api_url(config, provider_name);
 
-    match fetch_live_models_for_provider(
-        provider_name,
-        &api_key,
-        provider_api_url,
-        config.config_path.parent(),
-    ) {
+    match fetch_live_models_for_provider(provider_name, &api_key, provider_api_url) {
         Ok(models) if !models.is_empty() => {
             let count = models.len();
             cache_live_models_for_provider(&config.workspace_dir, provider_name, &models)?;
@@ -3059,13 +3041,7 @@ pub(crate) fn setup_provider(
                 .interact()?
         }
     } else if canonical_provider_name(provider_name) == "anthropic" {
-        if env_key_present("ANTHROPIC_OAUTH_TOKEN") {
-            print_bullet(&format!(
-                "{} ANTHROPIC_OAUTH_TOKEN environment variable detected!",
-                style("✓").green().bold()
-            ));
-            String::new()
-        } else if env_key_present("ANTHROPIC_API_KEY") {
+        if env_key_present("ANTHROPIC_API_KEY") {
             print_bullet(&format!(
                 "{} ANTHROPIC_API_KEY environment variable detected!",
                 style("✓").green().bold()
@@ -3078,19 +3054,17 @@ pub(crate) fn setup_provider(
                     .cyan()
                     .underlined()
             ));
-            print_bullet("Or run `claude setup-token` to get an OAuth setup-token.");
             println!();
 
             let key: String = Password::new()
-                .with_prompt("  Paste your API key or setup-token (or press Enter to skip)")
+                .with_prompt("  Paste your API key (or press Enter to skip)")
                 .allow_empty_password(true)
                 .interact()?;
 
             if key.trim().is_empty() {
                 print_bullet(&format!(
-                    "Skipped. Set {} or {} or edit config.toml later.",
-                    style("ANTHROPIC_API_KEY").yellow(),
-                    style("ANTHROPIC_OAUTH_TOKEN").yellow()
+                    "Skipped. Set {} or edit config.toml later.",
+                    style("ANTHROPIC_API_KEY").yellow()
                 ));
             }
 
@@ -3236,7 +3210,6 @@ pub(crate) fn setup_provider(
                     provider_name,
                     &api_key,
                     provider_api_url.as_deref(),
-                    None,
                 ) {
                     Ok(live_model_ids) if !live_model_ids.is_empty() => {
                         cache_live_models_for_provider(
@@ -8508,6 +8481,76 @@ mod tests {
                 "claude-test-a".to_string(),
                 "claude-test-b".to_string()
             ])
+        );
+    }
+
+    /// A Claude subscription setup-token is not an API key, and this build
+    /// never puts one on the wire: the Anthropic model fetch refuses it
+    /// before a request is built. The mock expects zero hits, so a
+    /// regression that sends the token fails the test.
+    #[test]
+    fn fetch_anthropic_models_refuses_a_setup_token_without_a_request() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _proxy = loopback_no_proxy();
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"model-a"}]}"#)
+            .expect(0)
+            .create();
+        let url = format!("{}/v1/models", server.url());
+
+        let err =
+            fetch_anthropic_models(&url, Some("sk-ant-oat01-wizard-marker-token")).unwrap_err();
+
+        mock.assert();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("ANTHROPIC_API_KEY"),
+            "the operator must be told what to enter: {message}"
+        );
+        assert!(
+            !message.contains("sk-ant-oat01-wizard-marker-token"),
+            "the token must never be echoed: {message}"
+        );
+    }
+
+    /// The model refresh the CLI and the gateway both call refuses a
+    /// setup-token too: it asks the model list with the same credential the
+    /// chat path sends, so that credential must not go out here either.
+    #[test]
+    fn run_models_refresh_refuses_a_setup_token_without_a_request() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _proxy = loopback_no_proxy();
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"model-a"}]}"#)
+            .expect(0)
+            .create();
+        let provider = format!("anthropic-custom:{}", server.url());
+        let tmp = TempDir::new().unwrap();
+        let config = custom_endpoint_config(
+            tmp.path(),
+            &provider,
+            Some("sk-ant-oat01-wizard-marker-token"),
+        );
+
+        let err = run_models_refresh(&config, None, true).unwrap_err();
+
+        mock.assert();
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("ANTHROPIC_API_KEY"),
+            "the operator must be told what to enter: {chain}"
+        );
+        assert!(
+            !chain.contains("sk-ant-oat01-wizard-marker-token"),
+            "the token must never be echoed: {chain}"
         );
     }
 

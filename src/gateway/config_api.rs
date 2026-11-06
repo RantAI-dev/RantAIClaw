@@ -553,12 +553,11 @@ fn provider_switch_warning(cfg: &crate::config::Config, provider_changed: bool) 
         ));
     }
     // Ask the same question the send path asks, with the same inputs: the
-    // per-provider key (not just the top-level one) and the directory holding
-    // this install's auth profiles.
+    // per-provider key (not just the top-level one) and the environment the
+    // provider itself reads.
     if crate::providers::has_usable_credential(
         provider,
         cfg.resolve_key_for_provider(provider).as_deref(),
-        Some(&crate::auth::state_dir_from_config(cfg)),
     ) {
         return None;
     }

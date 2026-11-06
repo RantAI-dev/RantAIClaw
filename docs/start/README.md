@@ -16,7 +16,7 @@ For first-time setup and quick orientation.
 | I want guided prompts | `rantaiclaw onboard --interactive` |
 | Config exists, just fix channels | `rantaiclaw onboard --channels-only` |
 | Config exists, I intentionally want full overwrite | `rantaiclaw onboard --force` |
-| Using Anthropic subscription auth | See [Anthropic family credential order](../reference/providers.md#anthropic-family-credential-order) |
+| Using an Anthropic API key | See [Anthropic family credential order](../reference/providers.md#anthropic-family-credential-order) |
 
 ## Onboarding and Validation
 

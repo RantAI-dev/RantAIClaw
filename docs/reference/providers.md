@@ -53,29 +53,41 @@ this order:
 1. The key stored in config for the name you typed: its `[provider_api_keys]` entry,
    under the canonical name or the name as written, and the top-level `api_key` only
    when that name is the default provider.
-2. The active auth profile for `anthropic`, written by `auth paste-token` or
-   `auth setup-token`. Its `auth_kind` decides the header: `authorization` goes out as
-   `Authorization: Bearer`, `api-key` as `x-api-key`.
-3. The env vars `ANTHROPIC_OAUTH_TOKEN`, then `ANTHROPIC_API_KEY`.
-4. The generic `RANTAICLAW_API_KEY`, then `API_KEY`.
+2. The env var `ANTHROPIC_API_KEY`.
+3. The generic `RANTAICLAW_API_KEY`, then `API_KEY`.
 
-`anthropic-custom:<url>` inherits the `anthropic` env vars, so `ANTHROPIC_API_KEY`
-works for a custom Anthropic-format endpoint without a second key. Config is read under
-the custom name as typed only: the `anthropic` entry in `[provider_api_keys]` and the
-top-level `api_key` are not read for it. The auth profile is used for inference for
-`anthropic` only. A stored profile for any other provider is not used for inference;
-their keys come from config or env.
+There is no fourth source. RantaiClaw stores no subscription login, so no auth profile
+is read, and `ANTHROPIC_OAUTH_TOKEN` is not read either. Whatever the source, the key
+goes out as `x-api-key`.
+
+`anthropic-custom:<url>` inherits the `ANTHROPIC_API_KEY` env var, so it works for a
+custom Anthropic-format endpoint without a second key. Config is read under the custom
+name as typed only: the `anthropic` entry in `[provider_api_keys]` and the top-level
+`api_key` are not read for it. Every provider reads its own config entry; a key stored
+for one provider is not sent to another, apart from the generic `RANTAICLAW_API_KEY` /
+`API_KEY` fallback.
 
 With no credential in any source, the run refuses and names the string you typed and
 the variable to set, for example `anthropic-custom:<url>: no credential found — set
-ANTHROPIC_API_KEY, store a key in config, or paste an auth profile`.
+ANTHROPIC_API_KEY or store a key in config`.
+
+A Claude subscription setup token is refused, and never sent. The prefix is the whole
+rule: an Anthropic API key starts with `sk-ant-api` and a setup token with `sk-ant-oat`.
+The refusal names the replacement:
+
+```text
+Anthropic setup-tokens are no longer accepted. Use an API key from the Claude Console: set ANTHROPIC_API_KEY or store the key in config.
+```
+
+The provider still builds, so the gateway binds and the daemon stays up; the refusal
+comes when a request is sent.
 
 ## Provider Catalog
 
 | Canonical ID | Aliases | Local | Provider-specific env var(s) |
 |---|---|---:|---|
 | `openrouter` | — | No | `OPENROUTER_API_KEY` |
-| `anthropic` | — | No | `ANTHROPIC_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` |
+| `anthropic` | — | No | `ANTHROPIC_API_KEY` |
 | `openai` | — | No | `OPENAI_API_KEY` |
 | `ollama` | — | Yes | `OLLAMA_API_KEY` (optional) |
 | `gemini` | `google`, `google-gemini` | No | `GEMINI_API_KEY`, `GOOGLE_API_KEY` |
@@ -117,7 +129,7 @@ endpoint or without an API key.
 
 ### Removed Subscription Logins
 
-RantaiClaw uses API keys only. Five subscription logins are gone, and every name that
+RantaiClaw uses API keys only. Six subscription logins are gone, and every name that
 stood for one is refused with the API-key replacement named:
 
 | Removed login | Refusal |
@@ -150,6 +162,22 @@ message.
 Under `[proxy]`, a service key of `provider.copilot` still loads — it stays a supported
 key, so a config written before the removal is not rejected — but it is inert, and a
 warning says why.
+
+The sixth removed login is the Anthropic Claude subscription, and it is refused on the
+credential rather than on a name: the `anthropic` provider stays, and it takes an API key
+from the Claude Console. A setup token — a credential that starts with `sk-ant-oat` — is
+refused with this sentence wherever it is found:
+
+```text
+Anthropic setup-tokens are no longer accepted. Use an API key from the Claude Console: set ANTHROPIC_API_KEY or store the key in config.
+```
+
+Nothing reaches Anthropic with such a credential, and a configured
+`anthropic-custom:<url>` endpoint does not change that: the refusal is decided locally,
+before a request is built. `rantaiclaw doctor` reports it as a failed credential check
+rather than as a missing key, and the gateway's chat route answers the turn with `400`
+and the same sentence in the error body. See
+[Anthropic family credential order](#anthropic-family-credential-order).
 
 ### Gemini Notes
 

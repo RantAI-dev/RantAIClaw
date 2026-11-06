@@ -3747,11 +3747,14 @@ mod tests {
         )
     }
 
-    /// `anthropic-custom:` ids make the refresh hand the stored Anthropic
-    /// profile token (`config_path.parent()` is the state dir) to the host the
-    /// id names. An id the operator never configured must be refused with 400
-    /// before any request — the loopback listener stays at zero hits and the
-    /// refusal must not echo the credential.
+    /// `anthropic-custom:` ids make the refresh hand the credential it finds
+    /// for that provider to the host the id names. An id the operator never
+    /// configured must be refused with 400 before any request — the loopback
+    /// listener stays at zero hits and the refusal must not echo a credential.
+    ///
+    /// The legacy auth-profile store is on disk, holding a marker token: the
+    /// store is gone, so nothing reads it, and the marker must not reach the
+    /// host the id names.
     #[tokio::test]
     async fn provider_models_refresh_refuses_an_unconfigured_anthropic_custom_endpoint_without_a_request(
     ) {
@@ -3767,33 +3770,36 @@ mod tests {
             .create_async()
             .await;
         let state_dir = tempfile::tempdir().expect("temp state dir");
-        let store = crate::auth::profiles::AuthProfilesStore::new(state_dir.path(), true);
-        store
-            .upsert_profile(
-                crate::auth::profiles::AuthProfile {
-                    id: crate::auth::default_profile_id("anthropic"),
-                    provider: "anthropic".into(),
-                    profile_name: "default".into(),
-                    kind: crate::auth::profiles::AuthProfileKind::Token,
-                    account_id: None,
-                    workspace_id: None,
-                    token_set: None,
-                    token: Some("sk-ant-oat01-MARKER_TOKEN".into()),
-                    metadata: std::collections::BTreeMap::new(),
-                    created_at: chrono::Utc::now(),
-                    updated_at: chrono::Utc::now(),
-                },
-                true,
-            )
-            .await
-            .expect("store anthropic profile");
+        // The file an earlier RantaiClaw wrote, in the shape it wrote it: a
+        // map of profiles, each with a token.
+        std::fs::write(
+            state_dir.path().join("auth-profiles.json"),
+            serde_json::json!({
+                "schema_version": 1,
+                "updated_at": "2026-01-01T00:00:00Z",
+                "active_profiles": {"anthropic": "anthropic:default"},
+                "profiles": {
+                    "anthropic:default": {
+                        "provider": "anthropic",
+                        "profile_name": "default",
+                        "kind": "token",
+                        "token": "sk-ant-oat01-MARKER_TOKEN",
+                        "metadata": {"auth_kind": "authorization"},
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "updated_at": "2026-01-01T00:00:00Z"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write the legacy auth-profile file");
         let workspace = tempfile::tempdir().expect("temp workspace");
         let state = test_state();
         {
             let mut config = state.config.lock();
             config.workspace_dir = workspace.path().to_path_buf();
-            // The refresh resolves the stored profile from `config_path.parent()`,
-            // so it must point at the temp state dir.
+            // The legacy store sat beside the config file, so it must point at
+            // the temp state dir.
             config.config_path = state_dir.path().join("config.toml");
         }
         let provider_id = format!("anthropic-custom:{}", server.url());

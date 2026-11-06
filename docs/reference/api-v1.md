@@ -266,7 +266,8 @@ tokens, session ids, or paths.
 - **Status codes**: `200`, `400` (empty `message`, no model configured, a provider
   name that does not exist, or a refusal the provider decided locally — a missing
   Gemini or AWS Bedrock credential, an Ollama `:cloud` model, a removed
-  subscription login — with the fix named in the body), `401`,
+  subscription login, an Anthropic setup-token — with the fix named in the body),
+  `401`,
   `500` (any other provider/agent error — the body is sanitized of secret-looking
   tokens before being returned).
 - **One failure, one sentence, both modes.** A turn the provider refuses before it

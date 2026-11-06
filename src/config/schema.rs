@@ -4459,7 +4459,7 @@ impl Config {
     ///
     /// Deliberately narrow: it answers "is a key in this config?", not "can
     /// this install send a message?". The wider question — which also accepts
-    /// environment variables, auth profiles and keyless local providers — is
+    /// environment variables and keyless local providers — is
     /// what `doctor`'s `config.provider_key` check asks. The two answers
     /// differ on purpose.
     ///
