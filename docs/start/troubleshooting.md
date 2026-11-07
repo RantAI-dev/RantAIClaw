@@ -225,8 +225,8 @@ rantaiclaw onboard          # or configure a key through the wizard
 ### A provider names a removed subscription login
 
 Cause: the config names a subscription login RantaiClaw no longer has. RantaiClaw uses API
-keys only, so the GitHub Copilot, ChatGPT (OpenAI Codex), Gemini CLI, Qwen Code OAuth and
-MiniMax OAuth logins were removed.
+keys only, so the GitHub Copilot, ChatGPT (OpenAI Codex), Gemini CLI, Qwen Code OAuth,
+MiniMax OAuth and Anthropic Claude subscription logins were removed.
 
 The daemon starts anyway: the config still loads, the gateway binds and the console serves,
 so there is no restart loop. The refusal comes when a request is sent — nothing is sent, the
@@ -263,14 +263,29 @@ The Anthropic family found no credential. It checks these sources in order, and
 the first one present is used:
 
 1. A key stored in config for the provider name you typed (`[provider_api_keys]`).
-2. The active auth profile for `anthropic` (`rantaiclaw auth status` shows it).
-3. `ANTHROPIC_OAUTH_TOKEN`, then `ANTHROPIC_API_KEY`.
-4. `RANTAICLAW_API_KEY`, then `API_KEY`.
+2. `ANTHROPIC_API_KEY`.
+3. `RANTAICLAW_API_KEY`, then `API_KEY`.
+
+There is no fourth source. RantaiClaw stores no subscription login, so no auth
+profile is read, and `ANTHROPIC_OAUTH_TOKEN` is not read either.
 
 The refusal names the provider string you typed. For `anthropic-custom:<url>` it
-reads `anthropic-custom:<url>: no credential found`, not `anthropic`. Fix it with
-any one source: export `ANTHROPIC_API_KEY`, run `rantaiclaw setup provider`, or
-`rantaiclaw auth paste-token --provider anthropic`.
+reads `anthropic-custom:<url>: no credential found — set ANTHROPIC_API_KEY or store
+a key in config`, not `anthropic`. Fix it with any one source: export
+`ANTHROPIC_API_KEY` or run `rantaiclaw setup provider`.
+
+### `Anthropic setup-tokens are no longer accepted`
+
+Cause: the credential is a Claude subscription setup token, not an API key. The
+prefix is the whole rule — an Anthropic API key starts with `sk-ant-api`, a setup
+token with `sk-ant-oat` — and the token is never sent.
+
+Fix it with an API key from the Claude Console instead: export
+`ANTHROPIC_API_KEY`, or store the key in `config.toml` with
+`rantaiclaw setup provider`. The refusal is decided locally, before a request is
+built, so it holds on every surface — an `anthropic-custom:<url>` endpoint included.
+`rantaiclaw doctor` reports it as a failed credential check rather than as a
+missing key.
 
 ### `Custom API key not set` from a fallback provider
 

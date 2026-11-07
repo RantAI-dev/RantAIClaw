@@ -367,7 +367,7 @@ impl TuiProvisioner for ProviderProvisioner {
                         // tell a working key from none. Ask for the
                         // credential itself: the config key or the env key.
                         if matches!(provider_name, "gemini" | "google" | "google-gemini")
-                            && !crate::providers::has_usable_credential(provider_name, None, None)
+                            && !crate::providers::has_usable_credential(provider_name, None)
                         {
                             send(
                                 &events,
@@ -428,6 +428,59 @@ impl TuiProvisioner for ProviderProvisioner {
                         // Some(0) = re-enter; an unknown index re-prompts
                         // too, the safest reading of a malformed selection.
                         _ => continue,
+                    }
+                }
+
+                // A Claude subscription setup-token is refused by this build:
+                // it is not an API key, and the agent can never use it. It is
+                // NOT sent to the validation endpoint — a subscription
+                // credential must not reach any host, not even the one that
+                // issued it — and the operator is told what to enter instead.
+                if let Some(sentence) =
+                    crate::providers::setup_token_refusal(provider_name, Some(api_key.trim()))
+                {
+                    send(
+                        &events,
+                        ProvisionEvent::Message {
+                            severity: Severity::Warn,
+                            text: format!("{sentence} It was not sent anywhere."),
+                        },
+                    )
+                    .await?;
+                    send(
+                        &events,
+                        ProvisionEvent::Choose {
+                            id: "api_key_retry".into(),
+                            label: "What would you like to do?".into(),
+                            options: vec!["Re-enter the API key".into(), "Abort setup".into()],
+                            multi: false,
+                            filterable: false,
+                        },
+                    )
+                    .await?;
+                    let choice = recv_selection(&mut responses).await?;
+                    match choice.first().copied() {
+                        // Abort setup — or a selection this flow does not know,
+                        // which is treated as an abort rather than as consent
+                        // to store a credential the build refuses.
+                        Some(1) | None => {
+                            send(
+                                &events,
+                                ProvisionEvent::Failed {
+                                    error: format!(
+                                        "{provider_name} needs an API key; setup aborted."
+                                    ),
+                                },
+                            )
+                            .await?;
+                            return Ok(ProvisionOutcome::Aborted(format!(
+                                "{provider_name} needs an API key."
+                            )));
+                        }
+                        // Re-enter: the loop asks for the key again. An unknown
+                        // index re-prompts too, the safest reading of a
+                        // malformed selection.
+                        Some(_) => continue,
                     }
                 }
 
@@ -1192,6 +1245,55 @@ mod tests {
         );
         assert!(t.configured(), "flow must configure, got {:?}", t.outcome);
         assert_eq!(config.default_model.as_deref(), Some("typed-x"));
+    }
+
+    /// A Claude subscription setup-token is refused: it is not an API key, and
+    /// this build never sends one. The provisioner must not put it on the
+    /// wire — not to Anthropic, and not to a host the operator configured —
+    /// and the operator must be told what to enter instead.
+    ///
+    /// The proxy points at a closed port, so a regression sends the token
+    /// nowhere: the request fails at the proxy, and the test fails on what the
+    /// operator was told.
+    #[tokio::test]
+    async fn a_setup_token_is_refused_and_never_sent() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _key = VarGuard::unset("ANTHROPIC_API_KEY");
+        let _http_proxy = VarGuard::set("HTTP_PROXY", "http://127.0.0.1:1");
+        let _https_proxy = VarGuard::set("HTTPS_PROXY", "http://127.0.0.1:1");
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let profile = scratch_profile(tmp.path());
+        let mut config = Config::default();
+
+        let t = drive(
+            &ProviderProvisioner::new(),
+            &mut config,
+            &profile,
+            vec![
+                Answer::Pick(PICK_TIER_RECOMMENDED),
+                Answer::Pick(pick_provider("anthropic")),
+                Answer::Text("sk-ant-oat01-provision-marker"),
+                Answer::Pick(1), // Abort setup
+            ],
+        )
+        .await;
+
+        assert!(
+            t.aborted(),
+            "a refused key must abort the setup, got {:?}",
+            t.outcome
+        );
+        assert!(
+            t.messages().iter().any(|m| m.contains("ANTHROPIC_API_KEY")),
+            "the operator must be told what to enter: {:?}",
+            t.messages()
+        );
+        assert!(
+            config.api_key.is_none(),
+            "the refused key must not be written: {:?}",
+            config.api_key
+        );
     }
 
     /// The gate consults the same oracle boot uses — including the

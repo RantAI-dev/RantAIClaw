@@ -766,7 +766,6 @@ pub fn build_gateway_router(
             &model,
             &|name| config.resolve_key_for_provider(name),
             &providers::ProviderRuntimeOptions {
-                auth_profile_override: None,
                 rantaiclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
                 secrets_encrypt: config.secrets.encrypt,
                 reasoning_enabled: config.runtime.reasoning_enabled,
@@ -778,10 +777,9 @@ pub fn build_gateway_router(
         // http(s). The same config file fails the same way on every retry, and
         // nothing outside it can change that.
         //
-        // A missing credential is NOT fatal: `rantaiclaw auth login`, an
-        // environment variable, or a key stored in the config later can supply
-        // it without the config file changing, so the supervisor must retry
-        // until one of them does.
+        // A missing credential is NOT fatal: an environment variable, or a
+        // key stored in the config later can supply it without the config file
+        // changing, so the supervisor must retry until one of them does.
         //
         // The split is decided HERE, at the call site, and not in the
         // supervisor: the supervisor must not learn about provider errors.
@@ -1410,6 +1408,11 @@ pub async fn run_gateway(
     // drains the bus, because otherwise nothing would.
     channel_bus: Option<Arc<crate::channels::ChannelBus>>,
 ) -> Result<()> {
+    // The subscription logins are gone, so the files an earlier RantaiClaw
+    // wrote for them are swept on every start. The sweep is idempotent and
+    // logs one line per file it actually removed.
+    crate::config::legacy_logins::remove_legacy_login_files(&config);
+
     // ── Security: refuse public bind without an explicit opt-in ──
     //
     // A configured tunnel is deliberately NOT a pass. Every provider proxies
@@ -4145,16 +4148,15 @@ mod tests {
         );
     }
 
-    /// A missing credential is NOT a config error: `rantaiclaw auth login`, an
-    /// environment variable, or a key stored in the config later can supply it
-    /// without the config file changing, so the supervisor must retry instead
-    /// of stopping the daemon for good.
+    /// A missing credential is NOT a config error: an environment variable, or
+    /// a key stored in the config later can supply it without the config file
+    /// changing, so the supervisor must retry instead of stopping the daemon
+    /// for good.
     ///
     /// The credential is withheld from every source: no `api_key`, no stored
-    /// per-provider key, no auth profile (the profile is read from the config's
-    /// own directory, which is a fresh temp dir here), and the credential
-    /// environment variables are scrubbed while the crate-wide env lock is
-    /// held, so a sibling test's `ANTHROPIC_API_KEY` cannot supply it.
+    /// per-provider key, and the credential environment variables are scrubbed
+    /// while the crate-wide env lock is held, so a sibling test's
+    /// `ANTHROPIC_API_KEY` cannot supply it.
     #[tokio::test]
     async fn run_gateway_with_missing_anthropic_credential_is_not_fatal() {
         use crate::daemon::{classify_gateway_failure, GatewayFailure};
@@ -4165,8 +4167,8 @@ mod tests {
         let workspace = tempfile::tempdir().expect("temp workspace");
         let mut config = crate::config::Config::default();
         config.workspace_dir = workspace.path().to_path_buf();
-        // The Anthropic auth profile is read from the config's own directory:
-        // a fresh temp dir holds no profile, so no credential comes from disk.
+        // No credential comes from disk: the config names no key, and the
+        // login store that used to sit in the config's own directory is gone.
         config.config_path = workspace.path().join("config.toml");
         config.default_provider = Some("anthropic".into());
         config.api_key = None;

@@ -11,10 +11,23 @@ use serde::{Deserialize, Serialize};
 pub struct AnthropicProvider {
     credential: Option<String>,
     base_url: String,
-    /// Send the credential as `Authorization: Bearer` regardless of its prefix.
-    /// Set by [`AnthropicProvider::with_bearer`] for a stored profile whose
-    /// `auth_kind` says `authorization`; otherwise the `sk-ant-oat01-` prefix decides.
-    force_bearer: bool,
+}
+
+/// The refusal for an Anthropic credential that is a subscription setup-token.
+///
+/// A setup-token (`sk-ant-oat…`) authenticates a Claude subscription through
+/// `Authorization: Bearer` plus the `anthropic-beta` header. RantaiClaw uses
+/// API keys only, so such a credential is refused rather than sent: the
+/// provider still builds — the gateway binds and the daemon stays up — and
+/// every request is refused with this sentence, which names the replacement.
+pub(crate) const SETUP_TOKEN_REFUSAL: &str = "Anthropic setup-tokens are no longer accepted. Use an API key from the Claude Console: set ANTHROPIC_API_KEY or store the key in config.";
+
+/// Whether `credential` is an Anthropic subscription setup-token.
+///
+/// The prefix is the whole rule: an Anthropic API key starts with `sk-ant-api`
+/// and a setup-token with `sk-ant-oat`. The value is never echoed.
+pub(crate) fn is_setup_token(credential: &str) -> bool {
+    credential.trim().starts_with("sk-ant-oat")
 }
 
 #[derive(Debug, Serialize)]
@@ -187,36 +200,20 @@ impl AnthropicProvider {
                 .filter(|k| !k.is_empty())
                 .map(ToString::to_string),
             base_url,
-            force_bearer: false,
         }
     }
 
-    /// Like [`AnthropicProvider::with_base_url`], but the credential is sent as
-    /// `Authorization: Bearer` whatever its prefix — for a stored profile whose
-    /// `auth_kind` is `authorization`. Rig's Anthropic client cannot send Bearer.
-    pub fn with_bearer(credential: Option<&str>, base_url: Option<&str>) -> Self {
-        Self {
-            force_bearer: true,
-            ..Self::with_base_url(credential, base_url)
-        }
-    }
-
-    fn is_setup_token(token: &str) -> bool {
-        token.starts_with("sk-ant-oat01-")
-    }
-
+    /// The credential goes out as `x-api-key`, always.
+    ///
+    /// Anthropic rejects `Authorization: Bearer` for an API key, and this build
+    /// no longer accepts a subscription setup-token, so there is no second
+    /// header shape to choose between.
     fn apply_auth(
         &self,
         request: reqwest::RequestBuilder,
         credential: &str,
     ) -> reqwest::RequestBuilder {
-        if self.force_bearer || Self::is_setup_token(credential) {
-            request
-                .header("Authorization", format!("Bearer {credential}"))
-                .header("anthropic-beta", "oauth-2025-04-20")
-        } else {
-            request.header("x-api-key", credential)
-        }
+        request.header("x-api-key", credential)
     }
 
     /// Cache system prompts larger than ~1024 tokens (3KB of text)
@@ -447,10 +444,37 @@ impl AnthropicProvider {
     fn require_credential(&self) -> anyhow::Result<&String> {
         self.credential.as_ref().ok_or_else(|| {
             LocalRefusal::new(
-                "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token).",
+                "Anthropic credentials not set. Set ANTHROPIC_API_KEY or store an API key in config.",
             )
             .into()
         })
+    }
+}
+
+/// The provider that refuses every request with [`SETUP_TOKEN_REFUSAL`].
+///
+/// It exists so a config that still holds a setup-token does not stop the
+/// daemon: the gateway binds, the console stays up, and the refusal happens
+/// when a request is sent — with the API-key replacement named.
+pub(crate) struct SetupTokenProvider;
+
+#[async_trait]
+impl Provider for SetupTokenProvider {
+    /// The concrete provider behind this one, for a test that needs to reach
+    /// the implementation a factory built.
+    #[cfg(test)]
+    fn test_as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        Err(LocalRefusal::new(SETUP_TOKEN_REFUSAL).into())
     }
 }
 
@@ -604,7 +628,43 @@ impl Provider for AnthropicProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::anthropic_token::{detect_auth_kind, AnthropicAuthKind};
+
+    /// A setup-token is recognised by its prefix and nothing else, and the
+    /// value is never part of the answer.
+    #[test]
+    fn setup_token_detection_works() {
+        assert!(is_setup_token("sk-ant-oat01-abcdef"));
+        assert!(is_setup_token("  sk-ant-oat01-abcdef  "));
+        assert!(!is_setup_token("sk-ant-api03-abcdef"));
+        assert!(!is_setup_token(""));
+    }
+
+    /// The credential always goes out as `x-api-key`. There is no Bearer path
+    /// left: a setup-token never reaches a request, because the provider
+    /// refuses it before one is built.
+    #[test]
+    fn apply_auth_uses_x_api_key_and_never_bearer() {
+        let provider = AnthropicProvider::new(None);
+        let request = provider
+            .apply_auth(
+                provider
+                    .http_client()
+                    .get("https://api.anthropic.com/v1/models"),
+                "sk-ant-api-key",
+            )
+            .build()
+            .expect("request should build");
+
+        assert_eq!(
+            request
+                .headers()
+                .get("x-api-key")
+                .and_then(|v| v.to_str().ok()),
+            Some("sk-ant-api-key")
+        );
+        assert!(request.headers().get("authorization").is_none());
+        assert!(request.headers().get("anthropic-beta").is_none());
+    }
 
     #[test]
     fn messages_usage_maps_to_provider_counts() {
@@ -713,7 +773,7 @@ mod tests {
     async fn missing_credential_is_refused_as_a_local_refusal() {
         let provider = AnthropicProvider::new(None);
         let sentence =
-            "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token).";
+            "Anthropic credentials not set. Set ANTHROPIC_API_KEY or store an API key in config.";
 
         let error = provider
             .chat_with_system(None, "hello", "claude-3-opus", 0.7)
@@ -735,42 +795,6 @@ mod tests {
             .expect_err("a provider with no credential must refuse");
         assert!(crate::providers::local_refusal::is_local_refusal(&error));
         assert_eq!(error.to_string(), sentence);
-    }
-
-    #[test]
-    fn setup_token_detection_works() {
-        assert!(AnthropicProvider::is_setup_token("sk-ant-oat01-abcdef"));
-        assert!(!AnthropicProvider::is_setup_token("sk-ant-api-key"));
-    }
-
-    #[test]
-    fn apply_auth_uses_bearer_and_beta_for_setup_tokens() {
-        let provider = AnthropicProvider::new(None);
-        let request = provider
-            .apply_auth(
-                provider
-                    .http_client()
-                    .get("https://api.anthropic.com/v1/models"),
-                "sk-ant-oat01-test-token",
-            )
-            .build()
-            .expect("request should build");
-
-        assert_eq!(
-            request
-                .headers()
-                .get("authorization")
-                .and_then(|v| v.to_str().ok()),
-            Some("Bearer sk-ant-oat01-test-token")
-        );
-        assert_eq!(
-            request
-                .headers()
-                .get("anthropic-beta")
-                .and_then(|v| v.to_str().ok()),
-            Some("oauth-2025-04-20")
-        );
-        assert!(request.headers().get("x-api-key").is_none());
     }
 
     #[test]
@@ -882,12 +906,6 @@ mod tests {
             let json = serde_json::to_string(&req).unwrap();
             assert!(json.contains(&format!("{temp}")));
         }
-    }
-
-    #[test]
-    fn detects_auth_from_jwt_shape() {
-        let kind = detect_auth_kind("a.b.c", None);
-        assert_eq!(kind, AnthropicAuthKind::Authorization);
     }
 
     #[test]
@@ -1337,7 +1355,6 @@ mod tests {
         let provider = AnthropicProvider {
             credential: Some("test-key".to_string()),
             base_url: format!("http://{addr}"),
-            force_bearer: false,
         };
 
         // Multi-turn conversation: system → user (Go code) → assistant (code response) → user (follow-up)

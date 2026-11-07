@@ -1463,7 +1463,6 @@ pub(crate) async fn build_channel_runtime(
     let config = config.clone();
     let provider_name = routing::resolved_default_provider(&config);
     let provider_runtime_options = providers::ProviderRuntimeOptions {
-        auth_profile_override: None,
         rantaiclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,

@@ -729,7 +729,6 @@ pub fn all_tools_with_runtime(
             delegate_fallback_credential,
             security.clone(),
             crate::providers::ProviderRuntimeOptions {
-                auth_profile_override: None,
                 rantaiclaw_dir: root_config
                     .config_path
                     .parent()

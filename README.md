@@ -301,9 +301,11 @@ handling retry, fallback and timeouts uniformly, and a router for `provider:mode
 resolution.
 
 Providers use API keys. The subscription logins for GitHub Copilot, ChatGPT (OpenAI
-Codex), Gemini CLI, Qwen Code OAuth and MiniMax OAuth were removed; a config that still
-names one loads, and the request that reaches it is refused with the API-key replacement
-named.
+Codex), Gemini CLI, Qwen Code OAuth, MiniMax OAuth and the Anthropic Claude subscription
+were removed; a config that still names one loads, and the request that reaches it is
+refused with the API-key replacement named. Anthropic keeps its provider and takes an
+API key from the Claude Console — `ANTHROPIC_API_KEY` — and a stored setup token is
+refused rather than sent.
 
 Anthropic, OpenAI and Gemini route through [`rig-core`](https://github.com/0xPlaygrounds/rig)
 for streaming and tool calling. The hand-rolled implementations remain available behind

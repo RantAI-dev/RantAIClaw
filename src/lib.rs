@@ -40,7 +40,6 @@ use serde::{Deserialize, Serialize};
 
 pub mod agent;
 pub mod approval;
-pub(crate) mod auth;
 pub mod channels;
 pub(crate) mod cli_style;
 pub mod config;
@@ -83,6 +82,16 @@ pub(crate) mod tunnel;
 pub(crate) mod util;
 
 pub use config::Config;
+
+/// What the removed `auth` command prints, and the code it exits with.
+///
+/// The command survives as a hidden stub, so `rantaiclaw auth login` explains
+/// what happened instead of printing "unrecognized subcommand". It exits
+/// non-zero: the operator asked for a login, and no login happened.
+pub const AUTH_COMMAND_REMOVED_MESSAGE: &str = "The `auth` command was removed: RantaiClaw no longer stores provider subscription logins. Use an API key instead — set ANTHROPIC_API_KEY, store the provider's key in config.toml, or run `rantaiclaw setup provider`.";
+
+/// The exit code the removed `auth` command exits with.
+pub const AUTH_COMMAND_REMOVED_EXIT_CODE: i32 = 1;
 
 /// Service management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

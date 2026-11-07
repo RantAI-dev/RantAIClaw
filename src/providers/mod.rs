@@ -46,10 +46,9 @@ pub use traits::{
     ProviderUsage, ToolCall, ToolResultMessage,
 };
 
-use crate::auth::anthropic_token::{detect_auth_kind, AnthropicAuthKind};
 use compatible::{AuthStyle, OpenAiCompatibleProvider};
 use reliable::ReliableProvider;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 const MAX_API_ERROR_CHARS: usize = 200;
 
@@ -319,7 +318,6 @@ pub(crate) fn region_base_url(name: &str) -> Option<&'static str> {
 
 #[derive(Debug, Clone)]
 pub struct ProviderRuntimeOptions {
-    pub auth_profile_override: Option<String>,
     pub rantaiclaw_dir: Option<PathBuf>,
     pub secrets_encrypt: bool,
     pub reasoning_enabled: Option<bool>,
@@ -347,7 +345,6 @@ impl std::fmt::Debug for FailoverAnnounce {
 impl Default for ProviderRuntimeOptions {
     fn default() -> Self {
         Self {
-            auth_profile_override: None,
             rantaiclaw_dir: None,
             secrets_encrypt: true,
             reasoning_enabled: None,
@@ -467,11 +464,7 @@ pub async fn api_error(provider: &str, response: reqwest::Response) -> anyhow::E
 /// explicit config/api_key value) or a provider-specific env var. Providers that
 /// need no key (or none is configured/env-set) return `false`; the gateway uses
 /// this to warn when a switched provider likely can't be used.
-pub fn has_usable_credential(
-    name: &str,
-    config_key: Option<&str>,
-    state_dir: Option<&Path>,
-) -> bool {
+pub fn has_usable_credential(name: &str, config_key: Option<&str>) -> bool {
     // A login that was removed has no credential to find: the API-key
     // replacement is a different provider, and this one refuses every
     // request. The check comes first, so neither the local-provider
@@ -497,7 +490,7 @@ pub fn has_usable_credential(
         return true;
     }
 
-    if resolve_provider_credential_with_kind(name, config_key, state_dir, None).is_some() {
+    if resolve_provider_credential(name, config_key).is_some() {
         return true;
     }
 
@@ -552,40 +545,23 @@ fn is_anthropic_family(name: &str) -> bool {
     credential_base_name(name) == "anthropic"
 }
 
-/// Resolve API key for a provider from config and environment variables, with
-/// no state dir.
+/// Resolve the API key a provider sends, from the config value and the
+/// environment.
 ///
 /// Resolution order:
-/// 1. Explicitly provided `api_key` parameter (trimmed, filtered if empty)
-/// 2. Provider-specific environment variable (e.g., `ANTHROPIC_OAUTH_TOKEN`, `OPENROUTER_API_KEY`)
-/// 3. Generic fallback variables (`RANTAICLAW_API_KEY`, `API_KEY`)
+/// 1. The config-stored key for that provider (trimmed, ignored if empty)
+/// 2. The provider's own environment variable (e.g. `ANTHROPIC_API_KEY`,
+///    `OPENROUTER_API_KEY`)
+/// 3. The generic fallback variables (`RANTAICLAW_API_KEY`, `API_KEY`)
 ///
-/// For Anthropic, the provider-specific env var is `ANTHROPIC_OAUTH_TOKEN` (for setup-tokens)
-/// followed by `ANTHROPIC_API_KEY` (for regular API keys).
-///
-/// The anthropic family's auth profile needs a state dir, so callers that have one
-/// use [`resolve_provider_credential_with_kind`].
-fn resolve_provider_credential(name: &str, credential_override: Option<&str>) -> Option<String> {
-    resolve_provider_credential_with_kind(name, credential_override, None, None)
-        .map(|(credential, _kind)| credential)
-}
-
-/// [`resolve_provider_credential`], also reporting the Anthropic header kind when
-/// the credential came from a stored auth profile. The kind is what the transport
-/// needs: a profile token classified `authorization` goes out as Bearer.
-///
-/// Order: the config-stored override → (anthropic family only) the active auth
-/// profile → the provider's env vars → the generic `RANTAICLAW_API_KEY`/`API_KEY`.
+/// Nothing is read from disk: a stored login profile is gone, so the only
+/// credentials left are the ones the operator stored in the config or
+/// exported for this provider.
 ///
 /// A removed login resolves to nothing: the API-key replacement is a different
 /// provider, and resolving a credential here would let a removed login look
 /// configured (see [`removed_login`](crate::providers::removed_login)).
-fn resolve_provider_credential_with_kind(
-    name: &str,
-    credential_override: Option<&str>,
-    state_dir: Option<&Path>,
-    profile_override: Option<&str>,
-) -> Option<(String, Option<AnthropicAuthKind>)> {
+fn resolve_provider_credential(name: &str, credential_override: Option<&str>) -> Option<String> {
     if removed_login::is_removed_login_name(name) {
         return None;
     }
@@ -598,28 +574,14 @@ fn resolve_provider_credential_with_kind(
             if removed_login::removed_credential_refusal(trimmed_override).is_some() {
                 return None;
             }
-            return Some((trimmed_override.to_owned(), None));
-        }
-    }
-
-    if is_anthropic_family(name) {
-        if let Some(state_dir) = state_dir {
-            if let Some((token, kind)) =
-                crate::auth::anthropic_profile_token(state_dir, profile_override)
-            {
-                let kind = kind
-                    .as_deref()
-                    .and_then(AnthropicAuthKind::from_metadata_value)
-                    .unwrap_or_else(|| detect_auth_kind(&token, None));
-                return Some((token, Some(kind)));
-            }
+            return Some(trimmed_override.to_owned());
         }
     }
 
     // A `<base>-custom:<url>` endpoint takes its base's env candidates.
     let env_name = credential_base_name(name);
     let provider_env_candidates: Vec<&str> = match env_name {
-        "anthropic" => vec!["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
+        "anthropic" => vec!["ANTHROPIC_API_KEY"],
         "openrouter" => vec!["OPENROUTER_API_KEY"],
         "openai" => vec!["OPENAI_API_KEY"],
         "ollama" => vec!["OLLAMA_API_KEY"],
@@ -661,7 +623,7 @@ fn resolve_provider_credential_with_kind(
         if let Ok(value) = std::env::var(env_var) {
             let value = value.trim();
             if !value.is_empty() {
-                return Some((value.to_string(), None));
+                return Some(value.to_string());
             }
         }
     }
@@ -670,7 +632,7 @@ fn resolve_provider_credential_with_kind(
         if let Ok(value) = std::env::var(env_var) {
             let value = value.trim();
             if !value.is_empty() {
-                return Some((value.to_string(), None));
+                return Some(value.to_string());
             }
         }
     }
@@ -747,48 +709,54 @@ pub(crate) fn parse_custom_endpoint(
 }
 
 /// The credential the chat path sends to the endpoint named `name`, for a
-/// caller that sends its own request there: `config_key` first, then (for the
-/// anthropic family, when `state_dir` is given) the stored auth profile, then
-/// the provider's env vars, then `RANTAICLAW_API_KEY` / `API_KEY`.
-pub(crate) fn resolve_chat_credential(
-    name: &str,
-    config_key: Option<&str>,
-    state_dir: Option<&Path>,
-) -> Option<String> {
-    resolve_provider_credential_with_kind(name, config_key, state_dir, None)
-        .map(|(credential, _kind)| credential)
+/// caller that sends its own request there: `config_key` first, then the
+/// provider's env vars, then `RANTAICLAW_API_KEY` / `API_KEY`.
+pub(crate) fn resolve_chat_credential(name: &str, config_key: Option<&str>) -> Option<String> {
+    resolve_provider_credential(name, config_key)
 }
 
-/// Anthropic OAuth "setup-tokens" (`sk-ant-oat01-…`) authenticate via
-/// `Authorization: Bearer` + the `anthropic-beta` header — which rig-core's
-/// Anthropic client does not send (it uses `x-api-key`). Detect them so the
-/// factory can route to the legacy provider, which speaks that auth flow.
-fn is_anthropic_setup_token(key: Option<&str>) -> bool {
-    key.map(|k| k.trim().starts_with("sk-ant-oat01-"))
-        .unwrap_or(false)
+/// The refusal for an Anthropic-family credential that is a subscription
+/// setup-token, if `credential` is one.
+///
+/// `None` for every other credential and for every provider outside the
+/// anthropic family. The value is never echoed.
+pub fn setup_token_refusal(name: &str, credential: Option<&str>) -> Option<&'static str> {
+    if !is_anthropic_family(name) {
+        return None;
+    }
+    credential
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|value| anthropic::is_setup_token(value))
+        .map(|_| anthropic::SETUP_TOKEN_REFUSAL)
+}
+
+/// The refusal for the credential the provider would send, if that credential is
+/// one this build refuses.
+///
+/// It asks the resolver the send path uses, so the answer is the credential
+/// that would actually go out — the config key, else the provider's own
+/// environment variable, else the generic fallback.
+pub fn refused_credential(name: &str, config_key: Option<&str>) -> Option<&'static str> {
+    let resolved = resolve_provider_credential(name, config_key);
+    setup_token_refusal(name, resolved.as_deref())
 }
 
 /// The refusal for an Anthropic-family name with no credential from any source.
 /// It names the provider string the operator typed and the variable that fixes
 /// it, so an `anthropic-custom:<url>` is not reported as `anthropic`.
 fn anthropic_missing_credential_error(name: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "{name}: no credential found — set ANTHROPIC_API_KEY, store a key in config, \
-         or paste an auth profile"
-    )
+    anyhow::anyhow!("{name}: no credential found — set ANTHROPIC_API_KEY or store a key in config")
 }
 
-/// The legacy Anthropic provider for a credential that must go out as
-/// `Authorization: Bearer`: a stored profile whose `auth_kind` is `authorization`.
-/// `None` for every other source, which keeps the rig path.
-fn anthropic_bearer_provider(
-    key: Option<&str>,
-    profile_auth_kind: Option<AnthropicAuthKind>,
-    base_url: Option<&str>,
-) -> Option<Box<dyn Provider>> {
-    (profile_auth_kind == Some(AnthropicAuthKind::Authorization)).then(|| {
-        Box::new(anthropic::AnthropicProvider::with_bearer(key, base_url)) as Box<dyn Provider>
-    })
+/// The provider that refuses every request, for an Anthropic-family credential
+/// that is a subscription setup-token.
+///
+/// The factory still returns a provider, so the gateway binds and the daemon
+/// stays up; the refusal happens when a request is sent.
+fn anthropic_setup_token_provider(key: Option<&str>) -> Option<Box<dyn Provider>> {
+    key.filter(|value| anthropic::is_setup_token(value))
+        .map(|_| Box::new(anthropic::SetupTokenProvider) as Box<dyn Provider>)
 }
 
 /// Factory: create the right provider from config (without custom URL)
@@ -796,7 +764,7 @@ pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<
     create_provider_with_options(name, api_key, &ProviderRuntimeOptions::default())
 }
 
-/// Factory: create provider with runtime options (auth profile override, state dir).
+/// Factory: create provider with runtime options.
 pub fn create_provider_with_options(
     name: &str,
     api_key: Option<&str>,
@@ -863,18 +831,7 @@ fn create_provider_with_url_and_options(
     // Resolve credential and break static-analysis taint chain from the
     // `api_key` parameter so that downstream provider storage of the value
     // is not linked to the original sensitive-named source.
-    let (resolved_credential, profile_auth_kind) = {
-        let resolved = resolve_provider_credential_with_kind(
-            name,
-            api_key,
-            options.rantaiclaw_dir.as_deref(),
-            options.auth_profile_override.as_deref(),
-        );
-        match resolved {
-            Some((value, kind)) => (Some(value), kind),
-            None => (None, None),
-        }
-    };
+    let resolved_credential = resolve_provider_credential(name, api_key);
     let resolved_credential =
         resolved_credential.map(|v| String::from_utf8(v.into_bytes()).unwrap_or_default());
     #[allow(clippy::option_as_ref_deref)]
@@ -901,32 +858,25 @@ fn create_provider_with_url_and_options(
         // approval — see plans/016-legacy-providers-sunset.md).
         #[cfg(not(feature = "legacy-providers"))]
         "anthropic" => {
-            // A stored profile that says `authorization`, and setup-tokens, need
-            // Bearer + anthropic-beta (rig can't send them): the legacy provider
-            // (which also gives prompt caching). Plain API keys keep the rig path
-            // (streaming + native tools).
-            if let Some(provider) = anthropic_bearer_provider(key, profile_auth_kind, None) {
-                Ok(provider)
-            } else if is_anthropic_setup_token(key) {
-                Ok(Box::new(anthropic::AnthropicProvider::new(key)))
-            } else {
-                Ok(Box::new(
-                    rig_native::RigProvider::for_provider("anthropic", key)
-                        .map_err(|_| anthropic_missing_credential_error(name))?,
-                ))
+            // A setup-token is refused when the request is sent, so the
+            // gateway binds and the daemon stays up. A plain API key keeps the
+            // rig path (streaming + native tools).
+            if let Some(provider) = anthropic_setup_token_provider(key) {
+                return Ok(provider);
             }
+            Ok(Box::new(
+                rig_native::RigProvider::for_provider("anthropic", key)
+                    .map_err(|_| anthropic_missing_credential_error(name))?,
+            ))
         }
-        // A stored profile that says `authorization` still goes out as Bearer in
-        // this build, by the same helper the default build's first branch uses.
-        // A setup-token needs no branch here: the legacy provider sends one as
-        // Bearer itself.
+        // A setup-token is refused here too, by the same helper the default
+        // build's first branch uses.
         #[cfg(feature = "legacy-providers")]
         "anthropic" => {
-            if let Some(provider) = anthropic_bearer_provider(key, profile_auth_kind, None) {
-                Ok(provider)
-            } else {
-                Ok(Box::new(anthropic::AnthropicProvider::new(key)))
+            if let Some(provider) = anthropic_setup_token_provider(key) {
+                return Ok(provider);
             }
+            Ok(Box::new(anthropic::AnthropicProvider::new(key)))
         }
         #[cfg(not(feature = "legacy-providers"))]
         "openai" => Ok(Box::new(rig_native::RigProvider::for_provider_with_url(
@@ -1126,9 +1076,7 @@ fn create_provider_with_url_and_options(
                 "Anthropic-custom provider",
                 "anthropic-custom:https://your-api.com",
             )?;
-            if let Some(provider) =
-                anthropic_bearer_provider(key, profile_auth_kind, Some(&base_url))
-            {
+            if let Some(provider) = anthropic_setup_token_provider(key) {
                 return Ok(provider);
             }
             Ok(Box::new(
@@ -1235,8 +1183,7 @@ pub fn create_resilient_provider_with_options(
         // another is a credential leak.
         //
         // Keep using `create_provider_with_options` so fallback entries that
-        // require runtime options (for example Codex auth profile overrides)
-        // continue to work.
+        // require runtime options continue to work.
         let fallback_key = (fallback_keys)(fallback);
         match create_provider_with_options(fallback, fallback_key.as_deref(), options) {
             Ok(provider) => providers.push((fallback.clone(), provider)),
@@ -2131,13 +2078,24 @@ pub(crate) mod tests {
         .expect("a keyless Gemini provider must be built");
     }
 
+    /// A setup-token is refused for the anthropic family, and the refusal
+    /// names the API key that replaces it. The value itself never appears in
+    /// the sentence, and a provider outside the family is not touched.
     #[test]
-    fn anthropic_setup_token_detected_for_routing() {
-        // Plan 025: setup-tokens route to the legacy provider (Bearer+beta).
-        assert!(is_anthropic_setup_token(Some("sk-ant-oat01-abc")));
-        assert!(is_anthropic_setup_token(Some("  sk-ant-oat01-abc  ")));
-        assert!(!is_anthropic_setup_token(Some("sk-ant-api03-abc")));
-        assert!(!is_anthropic_setup_token(None));
+    fn a_setup_token_is_refused_for_the_anthropic_family_only() {
+        let sentence = setup_token_refusal("anthropic", Some("sk-ant-oat01-abc"))
+            .expect("a setup-token is refused");
+        assert!(sentence.contains("ANTHROPIC_API_KEY"), "{sentence}");
+        assert!(!sentence.contains("sk-ant-oat01-abc"), "{sentence}");
+
+        assert_eq!(
+            setup_token_refusal("anthropic", Some("  sk-ant-oat01-abc  ")),
+            Some(sentence),
+            "the prefix rule ignores surrounding whitespace"
+        );
+        assert!(setup_token_refusal("anthropic", Some("sk-ant-api03-abc")).is_none());
+        assert!(setup_token_refusal("anthropic", None).is_none());
+        assert!(setup_token_refusal("openai", Some("sk-ant-oat01-abc")).is_none());
     }
 
     /// Bedrock is the case that must not regress: `BedrockProvider::new()`
@@ -2151,7 +2109,7 @@ pub(crate) mod tests {
 
         for name in ["bedrock", "aws-bedrock"] {
             assert!(
-                !has_usable_credential(name, None, None),
+                !has_usable_credential(name, None),
                 "{name} with no AWS credentials is not usable"
             );
         }
@@ -2162,7 +2120,7 @@ pub(crate) mod tests {
 
         for name in ["bedrock", "aws-bedrock"] {
             assert!(
-                has_usable_credential(name, None, None),
+                has_usable_credential(name, None),
                 "{name} authenticated by AWS env vars must read as usable"
             );
         }
@@ -2176,7 +2134,7 @@ pub(crate) mod tests {
 
         for name in ["ollama", "lmstudio", "llamacpp"] {
             assert!(
-                has_usable_credential(name, None, None),
+                has_usable_credential(name, None),
                 "{name} runs locally and needs no key"
             );
         }
@@ -2193,7 +2151,7 @@ pub(crate) mod tests {
 
         for name in ["openai", "anthropic", "openrouter", "groq"] {
             assert!(
-                !has_usable_credential(name, None, None),
+                !has_usable_credential(name, None),
                 "{name} has no credential and must not read as configured"
             );
         }
@@ -2208,9 +2166,9 @@ pub(crate) mod tests {
         let prev_goog = std::env::var_os("GOOGLE_API_KEY");
         std::env::remove_var("GEMINI_API_KEY");
         std::env::remove_var("GOOGLE_API_KEY");
-        assert!(has_usable_credential("gemini", Some("cfg-key"), None));
+        assert!(has_usable_credential("gemini", Some("cfg-key")));
         std::env::set_var("GOOGLE_API_KEY", "AIzaSy-goog");
-        let via_env = has_usable_credential("gemini", None, None);
+        let via_env = has_usable_credential("gemini", None);
         match prev_g {
             Some(v) => std::env::set_var("GEMINI_API_KEY", v),
             None => std::env::remove_var("GEMINI_API_KEY"),
@@ -3293,12 +3251,18 @@ pub(crate) mod tests {
     // ── Anthropic family: one credential order ──────────
     //
     // Order for `anthropic` and `anthropic-custom:<url>`: config-stored key
-    // → active auth profile → provider env vars → generic RANTAICLAW_API_KEY.
+    // → the provider's own env var → generic RANTAICLAW_API_KEY / API_KEY.
+    // There is no stored login profile any more: nothing reads one, so
+    // nothing can send one.
 
     const FAKE_ENV_KEY: &str = "sk-ant-api-fake-env-0001";
     const FAKE_CONFIG_KEY: &str = "sk-ant-api-fake-config-0002";
-    const FAKE_PROFILE_API_KEY: &str = "sk-ant-api-fake-profile-0003";
-    const FAKE_PROFILE_BEARER: &str = "sk-ant-oat01-fake-profile-bearer-0004";
+    const FAKE_GENERIC_KEY: &str = "sk-ant-api-fake-generic-0003";
+    /// The token the legacy auth-profile store held. It must never reach a
+    /// request: the store is gone, and nothing reads it.
+    const FAKE_LEGACY_PROFILE_TOKEN: &str = "sk-ant-oat01-legacy-profile-marker-0004";
+    /// A subscription setup-token, which this build refuses.
+    const FAKE_SETUP_TOKEN: &str = "sk-ant-oat01-setup-token-marker-0005";
 
     /// Serve one Anthropic messages reply on 127.0.0.1 and return the server.
     async fn fake_anthropic_endpoint() -> wiremock::MockServer {
@@ -3356,31 +3320,38 @@ pub(crate) mod tests {
     fn anthropic_only_env(env_key: &str) -> Vec<crate::test_env::EnvGuard> {
         vec![
             crate::test_env::EnvGuard::set("ANTHROPIC_API_KEY", env_key),
-            crate::test_env::EnvGuard::unset("ANTHROPIC_OAUTH_TOKEN"),
             crate::test_env::EnvGuard::unset("RANTAICLAW_API_KEY"),
             crate::test_env::EnvGuard::unset("API_KEY"),
         ]
     }
 
-    /// Scratch state dir holding one anthropic token profile written by the
-    /// same store `auth paste-token` uses. `kind` is the `auth_kind` metadata.
-    async fn anthropic_profile_dir(token: &str, kind: &str) -> tempfile::TempDir {
-        let dir = tempfile::tempdir().expect("state dir");
-        let service = crate::auth::AuthService::new(dir.path(), false);
-        let metadata =
-            std::collections::HashMap::from([("auth_kind".to_string(), kind.to_string())]);
-        service
-            .store_provider_token("anthropic", "default", token, metadata, true)
-            .await
-            .expect("store the anthropic profile");
-        dir
-    }
-
-    fn runtime_options(state_dir: Option<&Path>) -> ProviderRuntimeOptions {
-        ProviderRuntimeOptions {
-            rantaiclaw_dir: state_dir.map(Path::to_path_buf),
-            ..ProviderRuntimeOptions::default()
-        }
+    /// The legacy auth-profile store, in the shape an earlier RantaiClaw
+    /// wrote it: a map of profiles, each with a token.
+    ///
+    /// It sits in the directory the provider's runtime options name, which is
+    /// where the store used to live. Nothing reads it any more.
+    fn write_legacy_profile_store(dir: &std::path::Path, token: &str) {
+        std::fs::write(
+            dir.join("auth-profiles.json"),
+            serde_json::json!({
+                "schema_version": 1,
+                "updated_at": "2026-01-01T00:00:00Z",
+                "active_profiles": {"anthropic": "anthropic:default"},
+                "profiles": {
+                    "anthropic:default": {
+                        "provider": "anthropic",
+                        "profile_name": "default",
+                        "kind": "token",
+                        "token": token,
+                        "metadata": {},
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "updated_at": "2026-01-01T00:00:00Z"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write the legacy auth-profile store");
     }
 
     /// 52: `anthropic-custom:<url>` inherits the base provider's env var.
@@ -3419,62 +3390,194 @@ pub(crate) mod tests {
         assert_eq!(x_api_key, vec![FAKE_CONFIG_KEY.to_string()]);
     }
 
-    /// 55: a stored auth profile is used with no env var at all, and the header
-    /// is the kind its `auth_kind` metadata names. Both kinds are tested.
+    /// The legacy auth-profile store is on disk, holding a marker token: the
+    /// marker NEVER reaches the request. The store is gone, and the only
+    /// credential left is the one the operator configured.
     #[tokio::test]
-    async fn stored_profile_sends_with_no_env_for_api_key_kind() {
+    async fn the_legacy_profile_marker_never_reaches_a_request() {
         let _env_lock = crate::test_env::ENV_LOCK.lock().await;
         let _scrub = crate::test_env::CredentialEnvScrub::new();
-        let dir = anthropic_profile_dir(FAKE_PROFILE_API_KEY, "api-key").await;
+        let _env = anthropic_only_env(FAKE_ENV_KEY);
+        let state_dir = tempfile::tempdir().expect("state dir");
+        write_legacy_profile_store(state_dir.path(), FAKE_LEGACY_PROFILE_TOKEN);
         let endpoint = fake_anthropic_endpoint().await;
         let name = format!("anthropic-custom:{}", endpoint.uri());
+        let options = ProviderRuntimeOptions {
+            rantaiclaw_dir: Some(state_dir.path().to_path_buf()),
+            ..ProviderRuntimeOptions::default()
+        };
 
         let (x_api_key, authorization) =
-            send_one_anthropic_turn(&name, None, &runtime_options(Some(dir.path())), &endpoint)
-                .await;
-
-        assert_eq!(x_api_key, vec![FAKE_PROFILE_API_KEY.to_string()]);
-        assert!(authorization.is_empty(), "{authorization:?}");
-    }
-
-    #[tokio::test]
-    async fn stored_profile_sends_bearer_for_authorization_kind() {
-        let _env_lock = crate::test_env::ENV_LOCK.lock().await;
-        let _scrub = crate::test_env::CredentialEnvScrub::new();
-        let dir = anthropic_profile_dir(FAKE_PROFILE_BEARER, "authorization").await;
-        let endpoint = fake_anthropic_endpoint().await;
-        let name = format!("anthropic-custom:{}", endpoint.uri());
-
-        let (x_api_key, authorization) =
-            send_one_anthropic_turn(&name, None, &runtime_options(Some(dir.path())), &endpoint)
-                .await;
+            send_one_anthropic_turn(&name, None, &options, &endpoint).await;
 
         assert_eq!(
-            authorization,
-            vec![format!("Bearer {FAKE_PROFILE_BEARER}")],
-            "an authorization-kind profile must go out as Bearer"
+            x_api_key,
+            vec![FAKE_ENV_KEY.to_string()],
+            "the configured key is the credential that goes out"
         );
-        assert!(x_api_key.is_empty(), "{x_api_key:?}");
+        assert!(authorization.is_empty(), "{authorization:?}");
+        assert!(
+            !x_api_key
+                .iter()
+                .any(|value| value.contains("legacy-profile-marker")),
+            "the legacy profile token must never be sent: {x_api_key:?}"
+        );
     }
 
-    /// The config key wins over a stored profile (§3.6), pinned by name.
+    /// The same for the plain `anthropic` name: the legacy store is on disk,
+    /// and the credential the provider would send is the configured one — the
+    /// marker is not read at all, so it is not the credential and the
+    /// provider is not the one that refuses setup-tokens.
     #[tokio::test]
-    async fn config_key_beats_stored_profile() {
+    async fn the_legacy_profile_marker_is_not_the_credential_for_anthropic() {
         let _env_lock = crate::test_env::ENV_LOCK.lock().await;
         let _scrub = crate::test_env::CredentialEnvScrub::new();
-        let dir = anthropic_profile_dir(FAKE_PROFILE_API_KEY, "api-key").await;
+        let _env = anthropic_only_env(FAKE_ENV_KEY);
+        let state_dir = tempfile::tempdir().expect("state dir");
+        write_legacy_profile_store(state_dir.path(), FAKE_LEGACY_PROFILE_TOKEN);
+        let options = ProviderRuntimeOptions {
+            rantaiclaw_dir: Some(state_dir.path().to_path_buf()),
+            ..ProviderRuntimeOptions::default()
+        };
+
+        assert_eq!(
+            resolve_provider_credential("anthropic", None),
+            Some(FAKE_ENV_KEY.to_string()),
+            "the legacy store must not be a credential source"
+        );
+        assert_eq!(
+            refused_credential("anthropic", None),
+            None,
+            "the legacy token must not be read as the credential to refuse"
+        );
+
+        let provider = create_provider_with_options("anthropic", None, &options)
+            .expect("the anthropic provider builds");
+        let is_refuser = provider
+            .test_as_any()
+            .and_then(|inner| inner.downcast_ref::<anthropic::SetupTokenProvider>())
+            .is_some();
+        assert!(
+            !is_refuser,
+            "the legacy token must not make the provider refuse every request"
+        );
+    }
+
+    /// A setup-token is refused when the request is sent, not when the
+    /// provider is built: the factory still returns a provider, so the gateway
+    /// binds and the daemon stays up.
+    #[tokio::test]
+    async fn a_setup_token_is_refused_at_request_time_and_no_request_is_sent() {
+        let _env_lock = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
         let endpoint = fake_anthropic_endpoint().await;
         let name = format!("anthropic-custom:{}", endpoint.uri());
 
-        let (x_api_key, _) = send_one_anthropic_turn(
+        // The config key case.
+        let provider = create_provider_with_options(
             &name,
-            Some(FAKE_CONFIG_KEY),
-            &runtime_options(Some(dir.path())),
-            &endpoint,
+            Some(FAKE_SETUP_TOKEN),
+            &ProviderRuntimeOptions::default(),
         )
-        .await;
+        .expect("a setup-token must not stop the provider from building");
+        let error = provider
+            .chat_with_system(None, "hello", "claude-fake", 0.0)
+            .await
+            .expect_err("a setup-token must be refused");
+        let sentence =
+            crate::providers::local_refusal_text(&error).expect("the refusal is a local refusal");
+        assert!(
+            sentence.contains("ANTHROPIC_API_KEY"),
+            "the refusal names the replacement: {sentence}"
+        );
+        assert!(
+            !sentence.contains(FAKE_SETUP_TOKEN),
+            "the refusal must not echo the token: {sentence}"
+        );
+        assert_eq!(
+            endpoint.received_requests().await.unwrap_or_default().len(),
+            0,
+            "a refused request must not reach the endpoint"
+        );
 
-        assert_eq!(x_api_key, vec![FAKE_CONFIG_KEY.to_string()]);
+        // The environment-variable case.
+        let _env = anthropic_only_env(FAKE_SETUP_TOKEN);
+        let provider =
+            create_provider_with_options(&name, None, &ProviderRuntimeOptions::default())
+                .expect("a setup-token must not stop the provider from building");
+        let error = provider
+            .chat_with_system(None, "hello", "claude-fake", 0.0)
+            .await
+            .expect_err("a setup-token must be refused");
+        assert!(
+            crate::providers::local_refusal_text(&error).is_some(),
+            "the refusal is a local refusal: {error}"
+        );
+        assert_eq!(
+            endpoint.received_requests().await.unwrap_or_default().len(),
+            0,
+            "a refused request must not reach the endpoint"
+        );
+    }
+
+    /// The plain `anthropic` name refuses a setup-token the same way, and the
+    /// refusal names the replacement.
+    #[tokio::test]
+    async fn a_setup_token_is_refused_for_the_plain_anthropic_name() {
+        let _env_lock = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+
+        let provider = create_provider_with_options(
+            "anthropic",
+            Some(FAKE_SETUP_TOKEN),
+            &ProviderRuntimeOptions::default(),
+        )
+        .expect("a setup-token must not stop the provider from building");
+        let error = provider
+            .chat_with_system(None, "hello", "claude-fake", 0.0)
+            .await
+            .expect_err("a setup-token must be refused");
+        let sentence =
+            crate::providers::local_refusal_text(&error).expect("the refusal is a local refusal");
+        assert!(
+            sentence.contains("ANTHROPIC_API_KEY"),
+            "the refusal names the replacement: {sentence}"
+        );
+        assert!(
+            !sentence.contains(FAKE_SETUP_TOKEN),
+            "the refusal must not echo the token: {sentence}"
+        );
+    }
+
+    /// The anthropic family's credential order: the config key wins over the
+    /// provider's own environment variable, which wins over the generic
+    /// fallbacks.
+    #[test]
+    fn the_anthropic_credential_order_is_config_then_env_then_generic() {
+        let _env_lock = env_lock();
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+
+        assert_eq!(resolve_provider_credential("anthropic", None), None);
+
+        let _generic = crate::test_env::EnvGuard::set("RANTAICLAW_API_KEY", FAKE_GENERIC_KEY);
+        assert_eq!(
+            resolve_provider_credential("anthropic", None),
+            Some(FAKE_GENERIC_KEY.to_string()),
+            "the generic fallback is the last source"
+        );
+
+        let _provider_env = crate::test_env::EnvGuard::set("ANTHROPIC_API_KEY", FAKE_ENV_KEY);
+        assert_eq!(
+            resolve_provider_credential("anthropic", None),
+            Some(FAKE_ENV_KEY.to_string()),
+            "the provider's own variable beats the generic one"
+        );
+
+        assert_eq!(
+            resolve_provider_credential("anthropic", Some(FAKE_CONFIG_KEY)),
+            Some(FAKE_CONFIG_KEY.to_string()),
+            "the config key beats every environment variable"
+        );
     }
 
     /// `has_usable_credential` and the constructor answer the same for each
@@ -3485,57 +3588,34 @@ pub(crate) mod tests {
         let _scrub = crate::test_env::CredentialEnvScrub::new();
         let endpoint = fake_anthropic_endpoint().await;
         let custom = format!("anthropic-custom:{}", endpoint.uri());
-        let profile_dir = anthropic_profile_dir(FAKE_PROFILE_API_KEY, "api-key").await;
-        let empty_dir = tempfile::tempdir().expect("empty state dir");
 
-        // One row per case: which name, config key, state dir and env key, and
-        // the answer both entry points must give.
+        // One row per case: which name, config key, env key, and the answer
+        // both entry points must give.
         struct Case<'a> {
             name: &'a str,
             config_key: Option<&'a str>,
-            state_dir: Option<&'a Path>,
             env_key: Option<&'a str>,
             expected: bool,
         }
-        let row = |name, config_key, state_dir, env_key, expected| Case {
+        let row = |name, config_key, env_key, expected| Case {
             name,
             config_key,
-            state_dir,
             env_key,
             expected,
         };
         let cases = [
-            row("anthropic", None, Some(empty_dir.path()), None, false),
-            row(
-                "anthropic",
-                None,
-                Some(empty_dir.path()),
-                Some(FAKE_ENV_KEY),
-                true,
-            ),
-            row("anthropic", None, Some(profile_dir.path()), None, true),
-            row(&custom, None, Some(empty_dir.path()), None, false),
-            row(
-                &custom,
-                None,
-                Some(empty_dir.path()),
-                Some(FAKE_ENV_KEY),
-                true,
-            ),
-            row(
-                &custom,
-                Some(FAKE_CONFIG_KEY),
-                Some(empty_dir.path()),
-                None,
-                true,
-            ),
+            row("anthropic", None, None, false),
+            row("anthropic", None, Some(FAKE_ENV_KEY), true),
+            row("anthropic", Some(FAKE_CONFIG_KEY), None, true),
+            row(&custom, None, None, false),
+            row(&custom, None, Some(FAKE_ENV_KEY), true),
+            row(&custom, Some(FAKE_CONFIG_KEY), None, true),
         ];
 
         for case in cases {
             let Case {
                 name,
                 config_key,
-                state_dir,
                 env_key,
                 expected,
             } = case;
@@ -3543,14 +3623,14 @@ pub(crate) mod tests {
                 Some(key) => anthropic_only_env(key),
                 None => vec![
                     crate::test_env::EnvGuard::unset("ANTHROPIC_API_KEY"),
-                    crate::test_env::EnvGuard::unset("ANTHROPIC_OAUTH_TOKEN"),
                     crate::test_env::EnvGuard::unset("RANTAICLAW_API_KEY"),
                     crate::test_env::EnvGuard::unset("API_KEY"),
                 ],
             };
-            let usable = has_usable_credential(name, config_key, state_dir);
+            let usable = has_usable_credential(name, config_key);
             let constructed =
-                create_provider_with_options(name, config_key, &runtime_options(state_dir)).is_ok();
+                create_provider_with_options(name, config_key, &ProviderRuntimeOptions::default())
+                    .is_ok();
             assert_eq!(usable, expected, "has_usable_credential({name})");
             assert_eq!(
                 constructed, usable,
@@ -3565,8 +3645,7 @@ pub(crate) mod tests {
     async fn anthropic_refusal_names_the_typed_provider_and_env_var() {
         let _env_lock = crate::test_env::ENV_LOCK.lock().await;
         let _scrub = crate::test_env::CredentialEnvScrub::new();
-        let empty_dir = tempfile::tempdir().expect("empty state dir");
-        let options = runtime_options(Some(empty_dir.path()));
+        let options = ProviderRuntimeOptions::default();
 
         let custom = "anthropic-custom:http://127.0.0.1:18432";
         let custom_err = create_provider_with_options(custom, None, &options)

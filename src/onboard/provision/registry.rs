@@ -567,7 +567,7 @@ mod tests {
         assert!(key.is_none(), "the fresh profile stored no key");
 
         assert!(
-            !crate::providers::has_usable_credential("openrouter", key.as_deref(), None),
+            !crate::providers::has_usable_credential("openrouter", key.as_deref()),
             "a provider with no stored key and no key in the environment cannot send, \
              so the headless setup must not report it as configured"
         );
