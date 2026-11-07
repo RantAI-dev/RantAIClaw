@@ -33,12 +33,13 @@ ignore = [
     # in range, but moving the lockfile to it is deliberately deferred as a
     # separate concern; REMOVE this entry when that bump lands.
     "chacha20@0.10.0",
-    # zip 8.6.0 was YANKED upstream together with EVERY 7.x/8.x release
-    # (checked 2026-10-16; only 9.0.3 remains, and that is a major bump).
-    # Reached via calamine 0.36.1 and docx-rs 0.4.22 (opt-in `kb-office`),
-    # which pin zip ^8.6, so no in-range non-yanked release exists.
-    # crates.io bytes are immutable, so the yanked version is byte-identical to
-    # when it was published.
+    # zip 8.6.0 is reached only through docx-rs 0.4.22 (latest release,
+    # 2026-07-21), which requires zip ^8.6.0, behind the opt-in `kb-office`
+    # feature. calamine 0.38.0 requires zip ^9 and is not on this path.
+    # On 2026-11-07 the crates.io index does not flag 8.6.0 as yanked, so
+    # cargo-deny reports this entry as unused. The entry stays in the list
+    # because the yanked status was real when it was written, and it is cheap
+    # to keep until docx-rs moves to zip 9.
     #
     # A crate spec here suppresses ONLY the yanked status. Verified on
     # cargo-deny 0.20.2 with a synthetic zip 8.6.0 advisory injected into the
@@ -46,15 +47,12 @@ ignore = [
     # so advisories are NOT suppressed (they are matched by RUSTSEC id, which
     # this entry does not list). RUSTSEC-2025-0168 / CVE-2025-29787, the
     # advisory this entry was written against, is patched in >= 2.3.0 and so
-    # does not affect 8.6.0. Since 2026-10-17 three further advisories do
-    # affect 8.6.0: RUSTSEC-2026-0367, -0368 and -0369. Since 2026-10-22 a
-    # fourth, RUSTSEC-2026-0429, does too. All four are about `extract()`
-    # unpacking archive entries to disk, and all four are waived by id in the
-    # advisory ignore list below, not by this entry.
+    # does not affect 8.6.0. RUSTSEC-2026-0367, -0368, -0369 and -0429 do
+    # affect 8.6.0; they are waived by id in the advisory ignore list below.
     #
-    # REMOVE once calamine and docx-rs both accept zip 9 and the lockfile picks
-    # it up (or 8.6.0 is un-yanked).
-    { crate = "zip@8.6.0", reason = "no in-range non-yanked zip exists: yanked with every 7.x/8.x release (checked 2026-10-16, only 9.0.3 remains); calamine 0.36.1 and docx-rs 0.4.22 pin ^8.6; the four extract() advisories (RUSTSEC-2026-0367, -0368, -0369 and -0429) are waived by RUSTSEC id in the advisory ignore; remove once both accept zip 9" },
+    # REVIEW BY 2026-12-15: remove once docx-rs accepts zip 9 and the lockfile
+    # picks it up.
+    { crate = "zip@8.6.0", reason = "reached only through docx-rs 0.4.22 (opt-in kb-office, requires zip ^8.6.0); the crates.io index does not flag 8.6.0 yanked (checked 2026-11-07), so cargo-deny reports this entry unused; the four extract() advisories (RUSTSEC-2026-0367, -0368, -0369, -0429) are waived by RUSTSEC id below; fixed when docx-rs accepts zip 9 (latest zip 9.4.1, latest docx-rs 0.4.22, checked 2026-11-07); REVIEW BY 2026-12-15" },
     # rsa 0.10.0-rc.18 (Marvin timing sidechannel), pulled by russh 0.65.1 in the
     # default-on `remote-install` ssh/pty tools, so every default build carries it.
     # It is a client-side advisory against hosts the operator explicitly targets
@@ -62,54 +60,61 @@ ignore = [
     # lists no patched version, and the newest rsa (0.10.0-rc.18) is still affected.
     # Revisit when rsa publishes a fix.
     "RUSTSEC-2023-0071",
-    # proc-macro-error2 v2.0.1 via defmt-macros 1.1.0 (a proc macro) —
-    # build-time only, no runtime surface, no safe upgrade published upstream.
+    # proc-macro-error2 v2.0.1, pulled by defmt-macros 1.1.0 (a proc macro,
+    # build-time only, no runtime surface) through defmt 1.1.0. cargo-deny does
+    # not match this id because its graph has no path to the dependent, but
+    # cargo audit reads the whole Cargo.lock and still reports it, so the id
+    # stays in this list and in sec-audit.yml. Fixed by defmt 1.2.0, whose
+    # defmt-macros 1.2.0 no longer depends on proc-macro-error2 (latest defmt
+    # and defmt-macros are 1.2.0, checked 2026-11-07; the lock keeps 1.1.0).
     #
-    # REVIEW BY 2026-11-15, same decision. See docs/project/2026-08-14-dependency-decisions.md §5.1.
+    # REVIEW BY 2026-12-15: the defmt bump clears it; re-check the release list then.
     "RUSTSEC-2026-0173",
-    # derivative v2.2.0 — unmaintained, no maintained replacement; 2.2.0 is the
-    # final release. Reaches Cargo.lock only through the matrix-sdk →
-    # matrix_indexed_db_futures → wasm_evt_listener → derivative chain, which
-    # only resolves when matrix-sdk builds its IndexedDB store; with our
-    # `channel-matrix` features (`e2e-encryption`, `markdown`) the indexeddb
-    # half is off, and `cargo tree -i derivative --all-features` prints nothing
-    # on native targets — so no default or native build contains it. Dropping
-    # it needs an upstream matrix-sdk ecosystem change, not a lockfile bump.
+    # derivative v2.2.0, unmaintained; 2.2.0 is the final release. Path in the
+    # lock: matrix-sdk 0.19.1 → matrix-sdk-indexeddb → matrix_indexed_db_futures
+    # 0.7.0 → wasm_evt_listener 0.1.0 → derivative. That path exists only for
+    # the IndexedDB store, which the native `channel-matrix` features
+    # (`e2e-encryption`, `markdown`) leave off, and `cargo tree -i derivative
+    # --all-features` prints nothing on native targets, so no default or native
+    # build contains it. cargo-deny does not match this id for the same reason
+    # as RUSTSEC-2026-0173; cargo audit still reports it. Fixed when
+    # wasm_evt_listener and matrix_indexed_db_futures drop derivative. No fixed
+    # release yet (both are the latest releases, checked 2026-11-07).
     #
-    # REVIEW BY 2026-11-15 with RUSTSEC-2026-0319 below, the other matrix-sdk-family entry.
+    # REVIEW BY 2026-12-15 with RUSTSEC-2026-0319 below, the other matrix-sdk-family entry.
     "RUSTSEC-2024-0388",
-    # anymap2 v0.13.0 — RUSTSEC-2026-0319, flagged unmaintained, not a
+    # anymap2 v0.13.0, RUSTSEC-2026-0319, flagged unmaintained, not a
     # vulnerability; there is no patched version, and the recommended
-    # replacement is `anymap3`. Chain: anymap2 0.13.0 ← matrix-sdk 0.19.1 ←
-    # rantaiclaw, so it is only reachable through the opt-in `channel-matrix`
-    # feature; `cargo tree -i anymap2` matches no package with default
-    # features, so no default or released build contains it. An unmaintained
-    # type-map crate has no known flaw to trigger, and switching to `anymap3`
-    # is matrix-sdk's choice, not ours. Dropping it needs a matrix-sdk release
-    # that no longer depends on anymap2.
+    # replacement is `anymap3`. Path: anymap2 0.13.0 ← matrix-sdk 0.19.1 ←
+    # rantaiclaw, reachable only through the opt-in `channel-matrix` feature;
+    # `cargo tree -i anymap2` matches no package with default features, so no
+    # default or released build contains it. An unmaintained type-map crate has
+    # no known flaw to trigger, and switching to `anymap3` is matrix-sdk's
+    # choice, not ours. Fixed by a matrix-sdk release that no longer depends on
+    # anymap2. No such release yet: matrix-sdk 0.19.1 is the latest and still
+    # depends on it (checked 2026-11-07).
     #
-    # REVIEW BY 2026-11-15 with the other matrix-sdk-family entries above.
+    # REVIEW BY 2026-12-15 with the other matrix-sdk-family entries above.
     "RUSTSEC-2026-0319",
     # ttf-parser v0.25 via lopdf 0.42 → pdf-extract (KB PDF text extraction) —
     # font parser flagged unmaintained; parse-only path over operator-supplied
     # documents, no fixed release (lopdf 0.42 is current). Revisit on a lopdf bump.
     "RUSTSEC-2026-0192",
-    # zip 8.6.0 — RUSTSEC-2026-0367, RUSTSEC-2026-0368, RUSTSEC-2026-0369 and
-    # RUSTSEC-2026-0429 (four 2026-10 advisories, patched only in >= 9.0.0).
-    # All four concern `ZipArchive::extract()` / `ZipStreamReader::extract()`,
-    # which unpack archive entries to disk.
-    # RUSTSEC-2026-0429 is the one where `ZipArchive::extract()` aborts the
-    # process on a symlink entry with a large declared size. Nothing in `src/`
-    # calls into the zip crate directly, and the only reach is `kb-office`'s
-    # calamine 0.36.1 and docx-rs 0.4.22, which both read entries into memory
-    # (calamine never calls `extract`; docx-rs reads through
-    # `ZipArchive<Cursor<&[u8]>>`). Neither crate contains an `extract(` call.
-    # No default build contains zip at all. No in-range zip release exists to
-    # move to: every 7.x/8.x was yanked (see the yanked entry above) and both
-    # dependers still pin ^8.6.
+    # zip 8.6.0: RUSTSEC-2026-0367, RUSTSEC-2026-0368, RUSTSEC-2026-0369 and
+    # RUSTSEC-2026-0429 (patched only in >= 9.0.0). All four concern
+    # `ZipArchive::extract()` / `ZipStreamReader::extract()`, which unpack
+    # archive entries to disk. RUSTSEC-2026-0429 is the one where
+    # `ZipArchive::extract()` aborts the process on a symlink entry with a large
+    # declared size. Nothing in `src/` calls the zip crate directly. The only
+    # path to zip 8.6.0 is docx-rs 0.4.22 behind the opt-in `kb-office` feature,
+    # which reads entries into memory through `ZipArchive<Cursor<&[u8]>>` and
+    # never calls `extract`. calamine 0.38.0 uses zip 9.3.0, which is patched,
+    # so it is not on this path. No default build contains zip at all. Fixed
+    # when docx-rs accepts zip >= 9; latest docx-rs is still 0.4.22, which
+    # requires ^8.6.0 (checked 2026-11-07).
     #
-    # REVIEW BY 2026-11-15: drop these four ids once calamine and docx-rs
-    # accept zip 9 and the lockfile picks it up.
+    # REVIEW BY 2026-12-15: drop these four ids once docx-rs accepts zip 9 and
+    # the lockfile picks it up.
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
@@ -117,9 +122,10 @@ ignore = [
     # pin-utils v0.1.0 — RUSTSEC-2026-0441, unmaintained (INFO — notice only,
     # no vulnerability): the upstream repository was archived on 2026-10-01 and
     # the advisory lists no patched version, so no lockfile bump clears it.
-    # Reached transitively by every build: async-imap 0.11 pulls it directly
-    # and hyper 1.8 (via axum 0.8 and reqwest 0.12/0.13) pulls it for its
-    # futures integration — verified with `cargo tree -i pin-utils`. The crate
+    # Reached transitively by every build: async-imap 0.12.0 pulls it directly,
+    # and hyper 1.8.1 pulls it for its futures integration. axum 0.8.9 and
+    # reqwest 0.12.28 / 0.13.5 reach it through hyper (`cargo tree -i pin-utils`
+    # confirms this). The crate
     # is a compile-time pinning helper (a handful of macros) consumed by
     # futures-macro; it ships no runtime service, I/O or untrusted-input
     # surface of its own.
