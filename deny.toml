@@ -55,65 +55,18 @@ ignore = [
     # REMOVE once calamine and docx-rs both accept zip 9 and the lockfile picks
     # it up (or 8.6.0 is un-yanked).
     { crate = "zip@8.6.0", reason = "no in-range non-yanked zip exists: yanked with every 7.x/8.x release (checked 2026-10-16, only 9.0.3 remains); calamine 0.36.1 and docx-rs 0.4.22 pin ^8.6; the four extract() advisories (RUSTSEC-2026-0367, -0368, -0369 and -0429) are waived by RUSTSEC id in the advisory ignore; remove once both accept zip 9" },
-    # bitmaps v3.2.1 — unsound `Bitmap::try_from(&[u8])`, no patched version.
-    # Reached only through the opt-in `channel-matrix` feature via matrix-sdk 0.18
-    # → imbl 6.1.0 → bitmaps (verified: `cargo tree -i bitmaps` with default
-    # features matches nothing); no patched upstream exists.
-    #
-    # REVIEW BY 2026-11-15 with the RUSTSEC-2026-0247 / imbl-sized-chunks block
-    # below — same root (bitmaps via imbl via matrix-sdk), same decision.
-    "RUSTSEC-2025-0167",
-    # bitmaps v3.2.1 via matrix-sdk 0.16 → imbl / imbl-sized-chunks — the
-    # crate is declared unmaintained (notice only, no vulnerability). It
-    # implements fixed-size bitmap ops with no I/O and no untrusted-input
-    # surface in our usage. Unblocks when matrix-sdk moves off imbl.
-    #
-    # REVIEW BY 2026-11-15. Reached only through `channel-matrix`, which ships in
-    # no release binary — so this suppresses an advisory for code no default
-    # build contains. It DOES compile again as of the `matrix-sdk` 0.18 pin
-    # (plan 304), which removes the "code no user runs" half of the old
-    # justification: an operator who builds `--features channel-matrix` now runs
-    # it. The path is unchanged — bitmaps via imbl via eyeball-im via matrix-sdk.
-    # The 2026-08-14 write-up (§5.1) recorded a fork/pin/drop choice that the
-    # 0.18 bump answered differently; on the review date, re-make it against the
-    # current graph rather than re-defer.
-    "RUSTSEC-2026-0247",
-    # quick-xml v0.36 via docx-rs 0.4 (opt-in `kb-office` DOCX ingestion only).
-    # Both are DoS-class (quadratic duplicate-attribute check; unbounded
-    # namespace-declaration allocation), patched in quick-xml >= 0.41 — but the
-    # latest docx-rs (0.4.20) still requires ^0.36, so no fixed upstream exists.
-    # The calamine (xlsx) path is really fixed: calamine 0.36 uses quick-xml
-    # 0.41. Input is operator-provided documents, not a network surface.
-    # Revisit on a docx-rs release that moves to quick-xml >= 0.41.
-    "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
-    # rsa 0.10.0-rc.16 (Marvin timing sidechannel), pulled only by russh 0.60 in the
+    # rsa 0.10.0-rc.18 (Marvin timing sidechannel), pulled by russh 0.65.1 in the
     # default-on `remote-install` ssh/pty tools, so every default build carries it.
     # It is a client-side advisory against hosts the operator explicitly targets
     # (TOFU known-hosts), not a multi-tenant key-extraction surface. The advisory
     # lists no patched version, and the newest rsa (0.10.0-rc.18) is still affected.
     # Revisit when rsa publishes a fix.
     "RUSTSEC-2023-0071",
-    # proc-macro-error2 v2.0.1 via matrix-sdk → aquamarine (doc-comment macro) —
+    # proc-macro-error2 v2.0.1 via defmt-macros 1.1.0 (a proc macro) —
     # build-time only, no runtime surface, no safe upgrade published upstream.
     #
-    # REVIEW BY 2026-11-15, with RUSTSEC-2026-0247 above — same root, same
-    # decision. See docs/project/2026-08-14-dependency-decisions.md §5.1.
+    # REVIEW BY 2026-11-15, same decision. See docs/project/2026-08-14-dependency-decisions.md §5.1.
     "RUSTSEC-2026-0173",
-    # imbl-sized-chunks 0.1.3 via matrix-sdk 0.18 → imbl 6.1.0 — same root as
-    # RUSTSEC-2026-0247 above (bitmaps/unmaintained). This is the new
-    # use-after-free / double-free advisory against `Chunk::{clear, drop_left,
-    # drop_right}` and `InlineArray::{clear, truncate}` reachable from safe Rust
-    # when an element's `Drop` panics during the drop. The trigger is a
-    # panicking Drop impl, which is not a pattern our code or matrix-sdk's
-    # internal types exhibit; the fix is upstream imbl-sized-chunks >=0.2.0,
-    # but matrix-sdk 0.18 pins imbl 6.1.0 (which pulls 0.1.3) and has not
-    # released a version with the fix. Same opt-in surface as RUSTSEC-2026-0247:
-    # only reachable through `channel-matrix`, not in default builds.
-    #
-    # REVIEW BY 2026-11-15 with the other imbl/matrix-sdk entries. Revisit on a
-    # matrix-sdk release that updates imbl past 6.1.0.
-    "RUSTSEC-2026-0292",
     # derivative v2.2.0 — unmaintained, no maintained replacement; 2.2.0 is the
     # final release. Reaches Cargo.lock only through the matrix-sdk →
     # matrix_indexed_db_futures → wasm_evt_listener → derivative chain, which
@@ -123,68 +76,20 @@ ignore = [
     # on native targets — so no default or native build contains it. Dropping
     # it needs an upstream matrix-sdk ecosystem change, not a lockfile bump.
     #
-    # REVIEW BY 2026-11-15 with the other matrix-sdk-family entries above.
+    # REVIEW BY 2026-11-15 with RUSTSEC-2026-0319 below, the other matrix-sdk-family entry.
     "RUSTSEC-2024-0388",
-    # matrix-sdk-crypto v0.18.0 — RUSTSEC-2026-0318, "Sending custom to-device
-    # messages may panic", patched in >=0.19.0 (upstream fix
-    # matrix-org/matrix-rust-sdk#6670). Chain: matrix-sdk-crypto 0.18.0 ←
-    # matrix-sdk-base 0.18.0 ← matrix-sdk 0.18.0 ← rantaiclaw, so it is only
-    # reachable through the opt-in `channel-matrix` feature;
-    # `cargo tree -i matrix-sdk-crypto` matches no package with default
-    # features, so no default or released build contains it. The impact is a
-    # panic (availability), triggered when sending custom to-device messages.
-    # Nothing under `src/` calls `Device::encrypt_event_raw`,
-    # `OlmMachine::encrypt_content_for_devices` or `IdentityBasedStrategy`, and
-    # nothing sends a to-device message. The upgrade is blocked:
-    # matrix-sdk-sqlite 0.19 needs `rusqlite ^0.40`, while `Cargo.toml` pins
-    # `rusqlite = "0.37"` with `bundled`, and both link the native `sqlite3`
-    # library, so the two cannot resolve together. Moving rusqlite to 0.40 also
-    # pulls a RustCrypto chain (`rsa`, `pkcs8`, `russh`) that does not compile
-    # today.
-    #
-    # REVIEW BY 2026-11-15 with the other matrix-sdk-family entries above.
-    "RUSTSEC-2026-0318",
     # anymap2 v0.13.0 — RUSTSEC-2026-0319, flagged unmaintained, not a
     # vulnerability; there is no patched version, and the recommended
-    # replacement is `anymap3`. Chain: anymap2 0.13.0 ← matrix-sdk 0.18.0 ←
+    # replacement is `anymap3`. Chain: anymap2 0.13.0 ← matrix-sdk 0.19.1 ←
     # rantaiclaw, so it is only reachable through the opt-in `channel-matrix`
     # feature; `cargo tree -i anymap2` matches no package with default
     # features, so no default or released build contains it. An unmaintained
     # type-map crate has no known flaw to trigger, and switching to `anymap3`
-    # is matrix-sdk's choice, not ours. Dropping it needs a newer matrix-sdk,
-    # which is blocked for the reason given in the RUSTSEC-2026-0318 entry
-    # above (matrix-sdk 0.19 needs `rusqlite ^0.40`).
+    # is matrix-sdk's choice, not ours. Dropping it needs a matrix-sdk release
+    # that no longer depends on anymap2.
     #
     # REVIEW BY 2026-11-15 with the other matrix-sdk-family entries above.
     "RUSTSEC-2026-0319",
-    # vodozemac v0.10.0 — RUSTSEC-2026-0451, "Degraded secret zeroization
-    # capabilities" (memory-exposure; announced 2026-11-06; affects 0.11.1
-    # and every earlier release, patched in >= 0.11.2). The Olm root key
-    # ratchet did not zeroize its HKDF output after use, so each ratchet
-    # step left a copy of the new root key and chain key in freed heap
-    # memory; an attacker who can read the process memory — a separate
-    # memory-disclosure bug, a core dump, or swapped-out pages — may
-    # recover them, which weakens Olm's forward secrecy for affected
-    # sessions. Chain: vodozemac 0.10.0 ← matrix-sdk-crypto 0.18.0 ←
-    # matrix-sdk-base 0.18.0 ← matrix-sdk 0.18.0 ← rantaiclaw, so it is
-    # only reachable through the opt-in `channel-matrix` feature;
-    # `cargo tree -i vodozemac` matches no package with default features, so
-    # no default or released build contains it — `pub-release.yml` builds with
-    # `cargo build --profile release-fast --locked` and no `--features`, and
-    # `channel-matrix` is not in the default feature set. A `channel-matrix`
-    # build DOES run the Olm ratchet (matrix-sdk is pulled with the
-    # `e2e-encryption` feature and `src/channels/matrix.rs` decrypts encrypted
-    # rooms), so this is not unreachable code — the exposure additionally
-    # needs a way to read the process memory, which this repo does
-    # not ship. The upgrade is blocked: matrix-sdk-crypto 0.18.0 pins
-    # `vodozemac "0.10.0"`, so 0.11.2 needs matrix-sdk 0.19 (which requires
-    # `vodozemac ^0.11.0`), and matrix-sdk 0.19's sqlite store needs
-    # `rusqlite ^0.40.2` while `Cargo.toml` pins `rusqlite = "0.37"` with
-    # `bundled` — both link the native `sqlite3` library, so the two cannot
-    # resolve together. Same block as the RUSTSEC-2026-0318 entry above.
-    #
-    # REVIEW BY 2026-11-15 with the other matrix-sdk-family entries above.
-    "RUSTSEC-2026-0451",
     # ttf-parser v0.25 via lopdf 0.42 → pdf-extract (KB PDF text extraction) —
     # font parser flagged unmaintained; parse-only path over operator-supplied
     # documents, no fixed release (lopdf 0.42 is current). Revisit on a lopdf bump.
@@ -209,19 +114,6 @@ ignore = [
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
     "RUSTSEC-2026-0429",
-    # webpki-roots v0.26.11 — RUSTSEC-2026-0381, emSign root removed from the
-    # bundled root list. The advisory matches 0.26.11 by version number only:
-    # 0.26.x is a wrapper that depends on `webpki-roots` 1.x, the crate that
-    # actually ships the root list, and that dependency is held at >= 1.0.10 by
-    # the Cargo.toml floor and locked at 1.0.10 in Cargo.lock — so the root list
-    # every build actually embeds is the patched one with no emSign root. There
-    # is no patched 0.26.x release; the wrapper stays because tokio-tungstenite
-    # still requests ^0.26.
-    #
-    # REVIEW BY: drop this waiver when tokio-tungstenite or axum moves to
-    # webpki-roots 1.x (checked 2026-10-20: tokio-tungstenite 0.30.0 still
-    # requests ^0.26), and remove the 0.26.11 entry from Cargo.lock with it.
-    "RUSTSEC-2026-0381",
     # pin-utils v0.1.0 — RUSTSEC-2026-0441, unmaintained (INFO — notice only,
     # no vulnerability): the upstream repository was archived on 2026-10-01 and
     # the advisory lists no patched version, so no lockfile bump clears it.

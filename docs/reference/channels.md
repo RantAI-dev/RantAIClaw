@@ -184,7 +184,7 @@ Release binaries are built with **default features only**
 - every "built in" channel above ships, Lark included — `channel-lark` is now
   in the default feature set;
 - **Matrix ships in no release binary** — it needs a source build with
-  `--features channel-matrix`, on **rustc 1.93 or newer** (`matrix-sdk` declares
+  `--features channel-matrix`, on **rustc 1.96 or newer** (`matrix-sdk` declares
   that MSRV; the rest of RantaiClaw builds on 1.91). It does build there now.
 
 The README's channel table carries the same columns; the two are meant to agree.
@@ -881,13 +881,13 @@ cargo check --features channel-matrix
 ```
 
   To actually **run** it, build the binary rather than checking it, and note the
-  toolchain: `matrix-sdk` declares `rust-version = "1.93"`, while the rest of
+  toolchain: `matrix-sdk` declares `rust-version = "1.96"`, while the rest of
   RantaiClaw builds on 1.91. Matrix is the only part of this repository that
   needs a newer compiler than the crate's own declared MSRV.
 
 ```bash
-rustup toolchain install 1.93.0
-cargo +1.93.0 build --release --features channel-matrix
+rustup toolchain install 1.96.0
+cargo +1.96.0 build --release --features channel-matrix
 ```
 
 - Lark ships in the default build, no extra flag needed. To build **without**

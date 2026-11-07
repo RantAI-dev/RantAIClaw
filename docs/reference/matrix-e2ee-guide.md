@@ -2,7 +2,7 @@
 
 > **Matrix is behind a build feature and is not in the supported tier.** Release
 > binaries carry no Matrix support: it needs a source build with
-> `cargo build --features channel-matrix`, and that build needs **rustc 1.93 or
+> `cargo build --features channel-matrix`, and that build needs **rustc 1.96 or
 > newer** — `matrix-sdk` declares it, while the rest of RantaiClaw builds on
 > 1.91. Matrix is **under development** on the support axis and **not yet
 > verified** on the verification axis, for two separate reasons: the owner did
