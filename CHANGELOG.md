@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The bundled SQLite moves from 3.50.2 to 3.53.2, and matrix-sdk moves from 0.18 to 0.19.1.** The
+  `rusqlite` crate moves from 0.37 to 0.40.2, and `libsqlite3-sys` from 0.35 to 0.38.2. The
+  `matrix-sdk` crate moves from 0.18 to 0.19.1, which moves `vodozemac` from 0.10 to 0.11.2 and
+  `imbl` from 6 to 7. Only the opt-in `channel-matrix` feature pulls in matrix-sdk. A database file
+  that the previous release wrote opens unchanged, and a database file that this build writes stays
+  readable by the previous build. The move clears RUSTSEC-2025-0167, RUSTSEC-2026-0194,
+  RUSTSEC-2026-0195, RUSTSEC-2026-0247, RUSTSEC-2026-0292, RUSTSEC-2026-0318, RUSTSEC-2026-0381
+  and RUSTSEC-2026-0451.
+
 ### Removed
 
 - **Six subscription logins are gone; RantaiClaw uses API keys only.** The GitHub Copilot, ChatGPT
@@ -140,9 +151,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of the root key and the chain key can survive in freed memory. Recovering an affected key also
   needs a way to read the process memory. The crate is pulled in only by the opt-in `channel-matrix`
   feature, so no default build and no released binary contains it; a `channel-matrix` build does run
-  the Olm ratchet, so the path is real there. The fix needs matrix-sdk 0.19, whose sqlite store
-  needs `rusqlite` 0.40.2 while the crate pins 0.37, and both link the native `sqlite3` library, so
-  the upgrade cannot resolve today.
+  the Olm ratchet, so the path is real there. This release moves to vodozemac 0.11.2 through
+  matrix-sdk 0.19.1, so the fix ships in the same release. The same move clears RUSTSEC-2026-0318.
 
 ## [0.34.0-alpha] — 2026-11-05
 

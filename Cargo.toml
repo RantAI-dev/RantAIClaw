@@ -54,7 +54,7 @@ rig-core = { version = "0.37", default-features = false, features = ["reqwest", 
 # 0.18: 0.16 overflowed the rustc type-check recursion budget, so no CI job
 # could build this channel and its tests never ran. 0.18 type-checks at the
 # default limit. `rustls-tls` is gone from its feature list in this line.
-matrix-sdk = { version = "0.18", optional = true, default-features = false, features = ["e2e-encryption", "markdown"] }
+matrix-sdk = { version = "0.19", optional = true, default-features = false, features = ["e2e-encryption", "markdown"] }
 
 # Markdown parser (parser only; we render per-platform ourselves).
 # 0.13 matches the version already in Cargo.lock via ruma-events/matrix-sdk —
@@ -129,7 +129,7 @@ ring = "0.17"
 prost = { version = "0.14", default-features = false, optional = true }
 
 # Memory / persistence
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 chrono-tz = "0.10"
 cron = "0.17"
