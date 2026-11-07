@@ -171,7 +171,7 @@ unicode-width = { version = "0.2", optional = true }
 # email
 lettre = { version = "0.11.22", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
 mail-parser = "0.11.2"
-async-imap = { version = "0.11",features = ["runtime-tokio"], default-features = false }
+async-imap = { version = "0.12",features = ["runtime-tokio"], default-features = false }
 
 # HTTP server (gateway) — replaces raw TCP for proper HTTP/1.1 compliance
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws", "macros", "multipart"] }
