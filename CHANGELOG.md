@@ -12,11 +12,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The bundled SQLite moves from 3.50.2 to 3.53.2, and matrix-sdk moves from 0.18 to 0.19.1.** The
   `rusqlite` crate moves from 0.37 to 0.40.2, and `libsqlite3-sys` from 0.35 to 0.38.2. The
   `matrix-sdk` crate moves from 0.18 to 0.19.1, which moves `vodozemac` from 0.10 to 0.11.2 and
-  `imbl` from 6 to 7. Only the opt-in `channel-matrix` feature pulls in matrix-sdk. A database file
-  that the previous release wrote opens unchanged, and a database file that this build writes stays
-  readable by the previous build. The move clears RUSTSEC-2025-0167, RUSTSEC-2026-0194,
-  RUSTSEC-2026-0195, RUSTSEC-2026-0247, RUSTSEC-2026-0292, RUSTSEC-2026-0318, RUSTSEC-2026-0381
-  and RUSTSEC-2026-0451.
+  `imbl` from 6 to 7. Only the opt-in `channel-matrix` feature pulls in matrix-sdk. Building with
+  `--features channel-matrix` now needs rustc 1.96 or newer, because matrix-sdk 0.19.1 declares that
+  `rust-version`. The default build and its 1.91 MSRV are unchanged, and CI's Channel Matrix job moved
+  from 1.93.0 to 1.96.0 to match. A database file that the previous release wrote opens unchanged,
+  and a database file that this build writes stays readable by the previous build. The move clears
+  RUSTSEC-2025-0167, RUSTSEC-2026-0247, RUSTSEC-2026-0292, RUSTSEC-2026-0318 and RUSTSEC-2026-0451.
+  The waivers for RUSTSEC-2026-0194, RUSTSEC-2026-0195 and RUSTSEC-2026-0381 are removed too, but
+  this move does not cause that: the lock already holds quick-xml 0.41.0 or later, and the advisory
+  database lists webpki-roots 0.26.11 as unaffected.
 
 ### Removed
 

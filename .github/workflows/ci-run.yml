@@ -177,7 +177,7 @@ jobs:
     # in ~3m. `channel-matrix` now has its own job below for the same reason.
     # `Cargo.toml` declares `rust-version`, and until this job existed nothing
     # built at it: every other Rust job pins 1.92.0, the `channel-matrix` job
-    # 1.93.0 and the Dockerfile `rust:1.93-slim`. A declared MSRV that no build
+    # 1.96.0 and the Dockerfile `rust:1.93-slim`. A declared MSRV that no build
     # exercises is a claim, and this repository treats claims as things that get
     # checked.
     #
@@ -262,21 +262,19 @@ jobs:
         timeout-minutes: 35
         steps:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-            # 1.93, not the 1.92.0 every other job pins: matrix-sdk 0.17 and 0.18
-            # both declare `rust-version = "1.93"`, and there is no matrix-sdk
-            # release that both type-checks at the default recursion limit AND
-            # builds on 1.92. Confined to this job on purpose — moving the repo
-            # to 1.93 would touch ten workflow pins, the release build and the
-            # crate's declared MSRV (1.91), which is a product decision and not a
-            # side effect of a channel fix.
+            # 1.96, not the 1.92.0 every other job pins: matrix-sdk 0.19 declares
+            # `rust-version = "1.96"`, so this feature builds only on 1.96 or newer.
+            # The crate's own MSRV for default features stays 1.91. Confined to this
+            # job on purpose: moving the repo off 1.92.0 would touch every other
+            # workflow pin, the release build and the crate's declared MSRV (1.91),
+            # which is a product decision and not a side effect of a channel fix.
             #
-            # Nothing else is affected: `channel-matrix` is not a default feature,
-            # and `cargo +1.92.0 check --lib` passes with matrix-sdk 0.18 in
-            # Cargo.lock — an unactivated optional dependency does not impose its
-            # rust-version on the build.
+            # Nothing else is affected: `channel-matrix` is not a default feature, and
+            # an unactivated optional dependency does not impose its rust-version on
+            # the build.
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
-                  toolchain: 1.93.0
+                  toolchain: 1.96.0
             - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
               with:
                   key: channel-matrix

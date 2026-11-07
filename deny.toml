@@ -55,7 +55,7 @@ ignore = [
     # REMOVE once calamine and docx-rs both accept zip 9 and the lockfile picks
     # it up (or 8.6.0 is un-yanked).
     { crate = "zip@8.6.0", reason = "no in-range non-yanked zip exists: yanked with every 7.x/8.x release (checked 2026-10-16, only 9.0.3 remains); calamine 0.36.1 and docx-rs 0.4.22 pin ^8.6; the four extract() advisories (RUSTSEC-2026-0367, -0368, -0369 and -0429) are waived by RUSTSEC id in the advisory ignore; remove once both accept zip 9" },
-    # rsa 0.10.0-rc.16 (Marvin timing sidechannel), pulled only by russh 0.60 in the
+    # rsa 0.10.0-rc.18 (Marvin timing sidechannel), pulled by russh 0.65.1 in the
     # default-on `remote-install` ssh/pty tools, so every default build carries it.
     # It is a client-side advisory against hosts the operator explicitly targets
     # (TOFU known-hosts), not a multi-tenant key-extraction surface. The advisory
@@ -76,18 +76,17 @@ ignore = [
     # on native targets — so no default or native build contains it. Dropping
     # it needs an upstream matrix-sdk ecosystem change, not a lockfile bump.
     #
-    # REVIEW BY 2026-11-15 with the other matrix-sdk-family entries above.
+    # REVIEW BY 2026-11-15 with RUSTSEC-2026-0319 below, the other matrix-sdk-family entry.
     "RUSTSEC-2024-0388",
     # anymap2 v0.13.0 — RUSTSEC-2026-0319, flagged unmaintained, not a
     # vulnerability; there is no patched version, and the recommended
-    # replacement is `anymap3`. Chain: anymap2 0.13.0 ← matrix-sdk 0.18.0 ←
+    # replacement is `anymap3`. Chain: anymap2 0.13.0 ← matrix-sdk 0.19.1 ←
     # rantaiclaw, so it is only reachable through the opt-in `channel-matrix`
     # feature; `cargo tree -i anymap2` matches no package with default
     # features, so no default or released build contains it. An unmaintained
     # type-map crate has no known flaw to trigger, and switching to `anymap3`
-    # is matrix-sdk's choice, not ours. Dropping it needs a newer matrix-sdk,
-    # which is blocked for the reason given in the RUSTSEC-2026-0318 entry
-    # above (matrix-sdk 0.19 needs `rusqlite ^0.40`).
+    # is matrix-sdk's choice, not ours. Dropping it needs a matrix-sdk release
+    # that no longer depends on anymap2.
     #
     # REVIEW BY 2026-11-15 with the other matrix-sdk-family entries above.
     "RUSTSEC-2026-0319",

@@ -50,10 +50,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # don't use rig's #[derive(Embed)] macros in our codebase.
 rig-core = { version = "0.37", default-features = false, features = ["reqwest", "rustls"] }
 
-# Matrix client + E2EE decryption
-# 0.18: 0.16 overflowed the rustc type-check recursion budget, so no CI job
-# could build this channel and its tests never ran. 0.18 type-checks at the
-# default limit. `rustls-tls` is gone from its feature list in this line.
+# Matrix client + E2EE decryption. Optional: only the `channel-matrix` feature pulls it in,
+# and 0.19 declares rust-version 1.96, so that feature needs rustc 1.96 or newer.
 matrix-sdk = { version = "0.19", optional = true, default-features = false, features = ["e2e-encryption", "markdown"] }
 
 # Markdown parser (parser only; we render per-platform ourselves).
