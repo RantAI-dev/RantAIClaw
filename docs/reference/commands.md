@@ -68,7 +68,7 @@ The preset's *effect* is encoded in `config.toml` as a `level` + `always_ask` pa
 | Preset | `[autonomy].level` | `[autonomy].always_ask` | `[autonomy].auto_approve` | Behaviour |
 |---|---|---|---|---|
 | `manual` | `supervised` | `["*"]` (every tool) | empty | Every shell call prompts. Read-only file/memory tools not gated. |
-| `smart` | `supervised` | the operator's entries, minus `"*"` and the built-in tool names (`shell`, `file_read`, `file_write`, `web_search_tool`, `memory_store`, `memory_recall`, `browser`) | the default list (`file_read`, `memory_recall`) when empty, otherwise unchanged | Read-only and safe shell builtins pre-allowed (`ls`, `cd`, `echo`, `git status`, `which`, etc.). Writes prompt with an inline `[Y/A/N/Esc]` widget. |
+| `smart` | `supervised` | the operator's entries, minus `"*"` and the built-in tool names (`shell`, `file_read`, `file_write`, `web_search_tool`, `memory_store`, `memory_recall`, `browser`) | the default list (`file_read`, `memory_recall`) when empty, otherwise unchanged | Read-only and safe shell builtins pre-allowed (`ls`, `cd`, `echo`, `git status`, `which`, etc.). Writes prompt with an inline `[Y/F2/N/Esc]` widget. |
 | `strict` | `readonly` | unchanged, minus `"*"` | unchanged | `shell` tool removed from the model's registry entirely, and every acting tool is refused by the autonomy gate. Agent describes commands the user can run, doesn't execute. CC plan-mode analog. |
 | `off` / `full` | `full` | unchanged, minus `"*"` | unchanged | No gating. Forbidden paths still enforced. CI / trusted-env only. |
 

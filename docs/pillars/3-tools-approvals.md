@@ -17,7 +17,7 @@ The blast radius surface. Every tool call routes through one approval gate befor
 
 When the agent attempts a shell command not on the active preset's allowlist:
 
-1. **Boxed inline prompt** replaces the input row — amber border, command preview, action chips (`[Y]` yes (session) · `[A]` always (persist) · `[N]` no · `[Esc]` deny). Single keypress resolves.
+1. **Boxed inline prompt** replaces the input row — amber border, command preview, action chips (`[Y]` yes (session) · `[F2]` always (persist) · `[N]` no · `[Esc]` deny). A single keypress resolves, and only while the composer is empty: a letter typed as part of a message is text, not an answer. The persist answer is a function key because it writes to disk — no letterpress can produce it, so a stray letter can never allowlist a command.
 2. **No auto-deny timeout** — the prompt sits indefinitely until you act. Matches CC's pause semantics; the LLM is genuinely frozen while waiting.
 3. **Deny cancels the entire turn**, not just the tool call. Stops the LLM from trying alternative commands behind your back.
 4. **Cascading approvals** walk `&&` chains — approving `cd` then re-prompts for the next blocking basename (e.g. `python3`), capped at 6 prompts per call.
@@ -92,7 +92,7 @@ Manual and Smart are both `supervised`, so the level cannot tell them apart — 
 Inside the TUI:
 - `Shift+Tab` — cycle Manual → Smart → Strict → Off → Manual
 - `/autonomy` — interactive picker; `/autonomy <preset>` for direct switch
-- `[Y]` / `[A]` / `[N]` / `[Esc]` — resolve the inline approval prompt
+- `[Y]` / `[F2]` / `[N]` / `[Esc]` — resolve the inline approval prompt. An answer key counts only while the composer is empty, and `F2` is the chord that persists the allowlist entry.
 - `/allow <basename> [--persist]` — fallback for non-TUI channels (Telegram, webhook)
 
 ```toml

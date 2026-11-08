@@ -206,7 +206,7 @@ pub fn build_system_prompt_with_mode(
     // Resolve the active approval preset so SafetySection renders the
     // channel-accurate guidance (Strict really drops `shell` here after
     // PR3b-strict; Smart/Manual describe owner-approval, not the TUI's inline
-    // Y/N/A). The preset reaches the prompt only when it implies exactly
+    // Y/N/F2). The preset reaches the prompt only when it implies exactly
     // `enforced_autonomy` — a drifted marker names no preset, and the safety
     // section keeps its generic floor. Failure to read the policy is
     // non-fatal — `None` falls back to the generic safety floor. The shell
