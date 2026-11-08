@@ -448,6 +448,17 @@ impl PendingApprovals {
         v
     }
 
+    /// True when `id` is still awaiting a decision.
+    ///
+    /// `resolve` removes the request from the waiting map at once, while the
+    /// snapshot entry survives until the awaiting future unwinds — so the
+    /// snapshot can still report a request that was already answered. This
+    /// reads the waiting map, which is the authoritative "still unanswered"
+    /// state.
+    pub fn is_pending(&self, id: Uuid) -> bool {
+        self.inner.waiting.lock().contains_key(&id)
+    }
+
     /// Block until the user decides on this basename. When `timeout`
     /// is `Some`, auto-denies after the deadline; when `None`, waits
     /// indefinitely (CC-style — the prompt sits until the user acts

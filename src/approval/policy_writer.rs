@@ -598,7 +598,7 @@ const ALLOWLIST_HEADER: &str = "\
 # model's prompt as pre-approved. The shell gate does not read this
 # file; it enforces `[autonomy].allowed_commands` in config.toml.
 # An always-allow answer is never written here. A persisted one (the
-# TUI's [A], or a channel reply with persist) goes to
+# TUI's [F2], or a channel reply with persist) goes to
 # runtime_allowlist.toml, which survives restarts and stays untouched
 # when a preset is applied. Applying a preset with `rantaiclaw
 # autonomy`, `/autonomy`, or `setup approvals --force` regenerates this
@@ -1398,7 +1398,7 @@ mod tests {
 # model's prompt as pre-approved. The shell gate does not read this
 # file; it enforces `[autonomy].allowed_commands` in config.toml.
 # An always-allow answer is never written here. A persisted one (the
-# TUI's [A], or a channel reply with persist) goes to
+# TUI's [F2], or a channel reply with persist) goes to
 # runtime_allowlist.toml, which survives restarts and stays untouched
 # when a preset is applied. Applying a preset with `rantaiclaw
 # autonomy`, `/autonomy`, or `setup approvals --force` regenerates this

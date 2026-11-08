@@ -107,6 +107,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A TUI approval is answered only by a deliberate action.** The inline approval prompt claimed any
+  unmodified key as an answer while the composer stayed live, so a letter typed as part of a message
+  was read as an answer: an operator typing `/allow gv1` sent the `a`, which answered the open
+  prompt with `Persist` and wrote an allowlist entry to disk. An answer key now counts only when the
+  composer is empty, and only when the key was not already queued in the terminal when the prompt
+  appeared — a key typed before the operator could see the prompt is not an answer to it. The
+  marker rides the one event the terminal still held, so a queued mouse move or resize cannot take
+  the next deliberate answer with it. `Persist`, the answer that writes to disk, is the `F2` key
+  instead of a letter: a function key is one no letterpress can produce, and a shifted letter cannot
+  carry it either, because crossterm reports an ordinary capital `A` as `Char('A')` + `SHIFT` —
+  exactly what a "shifted A" looks like, so the two cannot be told apart. `Esc` still denies, and a
+  Deny still ends the turn.
+
+- **`/allow` and `/deny` now close the approval pane.** Both resolved the request but left
+  `pending_approval` set, so a dead prompt stayed over the composer after the request was already
+  answered. The pane now closes and the next queued request takes its place, exactly as it does after
+  an answer key.
+
+- **The inline approval prompt now shows its action chips.** The layout gave the prompt three rows — a
+  title, the command preview and nothing else — so the row of chips, the only place the answer keys
+  are named, was clipped away and the operator could not see which key granted what. The prompt takes
+  four rows now, and the `F2` chord it names is visible.
+
 - **A Deny on the shell, `pty` and `ssh` approval prompts now ends the turn on every surface.** The
   console's modal already cancelled the turn when a person answered no there; a Deny at the prompt a
   tool raises itself — the shell tool's two command gates, `pty` and `ssh` — only failed the call,

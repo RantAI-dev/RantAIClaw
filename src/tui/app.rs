@@ -498,10 +498,28 @@ pub struct TuiApp {
     /// boot failed; a reload that rebuilds the agent sets it again.
     pub actor_has_agent: bool,
     /// Most-recent unresolved pending approval. When `Some`, the input
-    /// box surfaces a single-key Y/N/A prompt and absorbs Y/N/A/Esc so
-    /// the user doesn't have to type `/allow X`. Resolves via
-    /// `security.pending().resolve_by_basename(...)` and clears here.
+    /// box surfaces the approval prompt and absorbs the answer keys
+    /// (`Y` for the session, `F2` to persist, `N`/`Esc` to deny) so the
+    /// user doesn't have to type `/allow X`. An answer key only answers
+    /// while the composer is empty — see [`TuiApp::approval_answer`].
     pub pending_approval: Option<crate::security::PendingRequest>,
+    /// Whether an approval prompt opened since this flag was last taken.
+    ///
+    /// The run loop drains events before it renders, so a prompt that is
+    /// on screen opened during this frame — and anything the terminal
+    /// still held at that moment was typed before the operator could see
+    /// the prompt. Such a key is not an answer to it.
+    approval_prompt_opened: bool,
+    /// Whether the event that is about to be handled was already queued
+    /// when the prompt opened.
+    ///
+    /// The run loop reads exactly one event when a prompt opens and marks
+    /// it here, so the marker lands on the event that was actually queued
+    /// instead of on whatever key happens to come next — a mouse move or
+    /// a resize must not take the next key's answering power with it.
+    /// `handle_event` takes the marker for one event only, and a key that
+    /// carries it types into the composer instead of answering.
+    approval_input_prequeued: bool,
     /// The reload this app is waiting on, and what its outcome may change.
     /// An outcome whose id is at or past the pending id adopts the model label
     /// and writes the unsaved config; an older outcome moves nothing.
@@ -683,6 +701,8 @@ impl TuiApp {
             pending_turns: std::collections::VecDeque::new(),
             actor_has_agent: true,
             pending_approval: None,
+            approval_prompt_opened: false,
+            approval_input_prequeued: false,
             pending_reload: None,
             reload_seq: 0,
             model_picker_entries: None,
@@ -840,13 +860,15 @@ impl TuiApp {
         Ok(())
     }
 
-    /// Resolve the current pending approval inline via Y/N/A keystroke.
-    /// `Session` allows the basename for this session only; `Persist`
-    /// writes it to runtime_allowlist.toml; `Deny` rejects the call
-    /// **and cancels the entire turn** so the LLM doesn't loop on
-    /// alternative commands after the user has said no. Clears
-    /// `self.pending_approval` regardless of outcome so the prompt
-    /// overlay disappears.
+    /// Resolve the current pending approval from an answer key. `Session`
+    /// allows the basename for this session only; `Persist` writes it to
+    /// runtime_allowlist.toml; `Deny` rejects the call **and cancels the
+    /// entire turn** so the LLM doesn't loop on alternative commands after
+    /// the user has said no. Clears `self.pending_approval` regardless of
+    /// outcome so the prompt overlay disappears.
+    ///
+    /// Which key carries which answer is [`TuiApp::approval_answer`]'s
+    /// business; this function only carries the decision out.
     ///
     /// What an answer actually holds for depends on the gate that raised the
     /// request, and the message says so:
@@ -866,6 +888,9 @@ impl TuiApp {
             Some(r) => r,
             None => return,
         };
+        // The prompt this marker belonged to is gone. A marker left over
+        // must never reach the next prompt.
+        self.approval_input_prequeued = false;
         let basename = req.basename.clone();
         let scope = req.session_scope;
         let Some(security) = self.context.security.as_ref() else {
@@ -1002,6 +1027,141 @@ impl TuiApp {
             // Requeued whether or not this one resolved: if it did not, the
             // box would otherwise be left empty with calls still blocked.
             self.pending_approval = pending.list().into_iter().find(|r| r.id != req.id);
+            if self.pending_approval.is_some() {
+                // A fresh prompt is on screen. It obeys the same rule as the
+                // first one: input the terminal already held when it opened
+                // cannot be an answer to it.
+                self.approval_prompt_opened = true;
+            }
+        }
+    }
+
+    /// The decision a key carries for the open approval prompt, or `None`
+    /// when the key is not an answer at all.
+    ///
+    /// An approval is answered only by an action the operator takes *after
+    /// seeing the prompt*. Each rule below exists because a key that was not
+    /// meant as an answer used to become one:
+    ///
+    /// - **no prompt open** — there is nothing to answer;
+    /// - **the key was already queued when the prompt opened** — it was
+    ///   typed before the operator could see the prompt, so it is not an
+    ///   answer to it (it types into the composer instead);
+    /// - **the composer holds text** — the letter belongs to the message
+    ///   being typed. This is the reported defect: an operator typing
+    ///   `/allow gv1` sent the `a`, which answered the open prompt with
+    ///   `Persist` and wrote an allowlist entry to disk. `Esc` is the
+    ///   exception: it dismisses rather than types, and denying on it is
+    ///   what the operator expects;
+    /// - **`Persist` is `F2`, not a letter** — it is the answer that writes
+    ///   to disk, and it must not be the result of one letterpress. A
+    ///   shifted letter cannot carry it: crossterm reports an ordinary
+    ///   capital letter as `Char('A')` + `SHIFT` (see crossterm's
+    ///   `KeyCode::Char(c) if c.is_uppercase()` parse rule), so a "shifted
+    ///   A" is exactly what a typed capital `A` looks like and the two
+    ///   cannot be told apart. A function key can be: no text entry
+    ///   produces `KeyCode::F(2)`, so `F2` is the one answer that a
+    ///   letterpress can never reach. `F2` is free in this app — nothing
+    ///   else binds a function key.
+    ///
+    /// `Y` (session) and `N` (deny) need no modifier, as before.
+    fn approval_answer(&self, key: KeyEvent, prequeued: bool) -> Option<crate::security::Decision> {
+        if self.pending_approval.is_none() || prequeued {
+            return None;
+        }
+        // Esc denies even with text in the composer — it dismisses rather
+        // than types.
+        if key.code == KeyCode::Esc && key.modifiers.is_empty() {
+            return Some(crate::security::Decision::Deny);
+        }
+        // Text in the composer means the key belongs to the message being
+        // typed, not to the prompt.
+        if self.context.input_char_count() > 0 {
+            return None;
+        }
+        match key.code {
+            KeyCode::Char('y' | 'Y') if key.modifiers.is_empty() => {
+                Some(crate::security::Decision::Session)
+            }
+            KeyCode::Char('n' | 'N') if key.modifiers.is_empty() => {
+                Some(crate::security::Decision::Deny)
+            }
+            // `Persist` writes to disk, so it takes a key no letterpress
+            // produces. The modifier set must be empty, so `Ctrl+F2` and
+            // `Shift+F2` do not answer.
+            KeyCode::F(2) if key.modifiers.is_empty() => Some(crate::security::Decision::Persist),
+            // A plain letter is never an answer: `a` and `A` belong to the
+            // message being typed, and `Char('A')` + `SHIFT` is what
+            // crossterm reports for an ordinary capital A.
+            _ => None,
+        }
+    }
+
+    /// Whether an approval prompt opened since the last call, and clears the
+    /// flag so one opening is reported once.
+    ///
+    /// The run loop asks right after draining events: a prompt that is on
+    /// screen opened during the frame that just ended, and anything the
+    /// terminal still held at that moment was typed before the operator
+    /// could see it.
+    pub fn take_approval_prompt_opened(&mut self) -> bool {
+        std::mem::take(&mut self.approval_prompt_opened)
+    }
+
+    /// Mark the event that is about to be handled as pre-queued: it was
+    /// already in the terminal's queue when the approval prompt opened, so
+    /// it was typed before the operator could see the prompt and cannot be
+    /// an answer to it.
+    ///
+    /// The marker covers one event only. `handle_event` takes it for
+    /// whichever event arrives and hands it to the key path alone, so a
+    /// mouse move or a resize that happened to be queued cannot take the
+    /// answering power of a deliberate key with it.
+    pub fn mark_approval_input_prequeued(&mut self) {
+        self.approval_input_prequeued = true;
+    }
+
+    /// A slash command may have resolved the request the pane is showing
+    /// (`/allow`, `/deny`). The pane must close and the next queued request
+    /// must take its place — a resolved request must not leave a dead prompt
+    /// on screen.
+    ///
+    /// The registry decides whether the pane's request is still waiting:
+    /// `/allow` and `/deny` resolve by basename, so they can answer a
+    /// *different* request than the one on screen. Only a request that is
+    /// no longer pending closes the pane.
+    fn close_resolved_approval_pane(&mut self) {
+        let Some(shown) = self.pending_approval.clone() else {
+            return;
+        };
+        let Some(pending) = self.context.security.as_ref().and_then(|s| s.pending()) else {
+            return;
+        };
+        if pending.is_pending(shown.id) {
+            // Still waiting: the command answered something else, or
+            // nothing at all.
+            return;
+        }
+        // The prompt this marker belonged to is gone. A marker left over
+        // must never reach the next prompt.
+        self.approval_input_prequeued = false;
+        // The request on screen is answered. Show the next one that is
+        // still waiting. The resolved request's snapshot entry survives
+        // until its awaiting future unwinds, so the list is filtered by
+        // `is_pending` rather than trusted as-is — otherwise the pane
+        // would put the dead prompt right back on screen.
+        self.pending_approval = pending
+            .list()
+            .into_iter()
+            .find(|r| pending.is_pending(r.id));
+        if self.pending_approval.is_some() {
+            // A fresh prompt is on screen. It obeys the same rule as the
+            // first one: input the terminal already held when it opened
+            // cannot be an answer to it. The answer-key path reports the
+            // same thing in `resolve_pending_approval` — both paths put a
+            // request that was not on screen before onto the pane, so both
+            // must report it.
+            self.approval_prompt_opened = true;
         }
     }
 
@@ -1031,7 +1191,16 @@ impl TuiApp {
     }
 
     /// Process a single terminal event, returning whether to continue or quit.
+    ///
+    /// The pre-queued marker is taken here, at the top of the function, and
+    /// handed to the key path only. Every other event kind therefore drops
+    /// it: a mouse move or a resize that happened to be queued when the
+    /// prompt opened must not take the answering power of the *next* key
+    /// with it — that key may well be a deliberate answer typed seconds
+    /// later, and swallowing it would leave the operator with a prompt
+    /// they cannot dismiss.
     pub async fn handle_event(&mut self, event: Event) -> Result<EventResult> {
+        let prequeued = std::mem::take(&mut self.approval_input_prequeued);
         match event {
             Event::Key(key) => {
                 // Windows + terminals that enable the kitty keyboard protocol
@@ -1042,7 +1211,7 @@ impl TuiApp {
                 if key.kind != KeyEventKind::Press {
                     return Ok(EventResult::Continue);
                 }
-                self.handle_key(key).await
+                self.handle_key_with(key, prequeued).await
             }
             // Bracketed-paste payload: insert verbatim at the cursor.
             // Modals (setup overlay, wizard, picker) absorb their own
@@ -1125,7 +1294,23 @@ impl TuiApp {
     }
 
     /// Dispatch a key event.
+    ///
+    /// The key is treated as a deliberate one: it cannot be an answer that
+    /// was already queued before the operator saw the prompt. Only the
+    /// event path ([`TuiApp::handle_event`]) knows about queued input, so
+    /// this stays a plain dispatcher.
     pub async fn handle_key(&mut self, key: KeyEvent) -> Result<EventResult> {
+        self.handle_key_with(key, false).await
+    }
+
+    /// Dispatch a key event that may have been queued before the approval
+    /// prompt was visible.
+    ///
+    /// `prequeued` is true for the one event the run loop read from the
+    /// terminal's queue at the moment the prompt opened: it was typed
+    /// before the operator could see the prompt, so it types into the
+    /// composer instead of answering.
+    async fn handle_key_with(&mut self, key: KeyEvent, prequeued: bool) -> Result<EventResult> {
         // Drain any pending ClawHub search results before processing the
         // next key — late-arriving results land in the picker before the
         // user's next action so they always see the freshest state.
@@ -1171,30 +1356,15 @@ impl TuiApp {
             return Ok(EventResult::Continue);
         }
 
-        // Inline pending-approval prompt: when an approval is open and
-        // the user hits Y/N/A/Esc, resolve it without going through
-        // `/allow` slash commands. Modifiers must be empty so we don't
-        // clash with Ctrl-Y (none today, future-proofing) or
-        // accidentally fire when the user types "yes" into the buffer.
-        // This arm runs BEFORE the Ctrl+D/Ctrl+C globals so the prompt
-        // wins for these specific keys; quit shortcuts still work for
-        // everything else.
-        if self.pending_approval.is_some() && key.modifiers.is_empty() {
-            match key.code {
-                KeyCode::Char('y' | 'Y') => {
-                    self.resolve_pending_approval(crate::security::Decision::Session);
-                    return Ok(EventResult::Continue);
-                }
-                KeyCode::Char('a' | 'A') => {
-                    self.resolve_pending_approval(crate::security::Decision::Persist);
-                    return Ok(EventResult::Continue);
-                }
-                KeyCode::Char('n' | 'N') | KeyCode::Esc => {
-                    self.resolve_pending_approval(crate::security::Decision::Deny);
-                    return Ok(EventResult::Continue);
-                }
-                _ => {} // fall through to normal key handling
-            }
+        // Inline pending-approval prompt: when an approval is open and the
+        // user hits an answer key, resolve it without going through the
+        // `/allow` slash commands. Which key carries which answer is
+        // decided by `approval_answer`; this arm runs BEFORE the
+        // Ctrl+D/Ctrl+C globals so the prompt wins for these specific keys;
+        // quit shortcuts still work for everything else.
+        if let Some(decision) = self.approval_answer(key, prequeued) {
+            self.resolve_pending_approval(decision);
+            return Ok(EventResult::Continue);
         }
 
         match key.code {
@@ -2344,7 +2514,7 @@ impl TuiApp {
                         // command was approved without ever being shown
                         // in full anywhere.
                         let line = format!(
-                            "🔒 awaiting decision on `{}` (press Y/A/N or Esc)\n    {}",
+                            "🔒 awaiting decision on `{}` (press Y, F2, N or Esc)\n    {}",
                             req.basename,
                             req.full_command.replace('\n', "\n    ")
                         );
@@ -2362,6 +2532,17 @@ impl TuiApp {
                         // auto-denies — the queue drains only by user action.
                         if self.pending_approval.is_none() {
                             self.pending_approval = Some(req);
+                            // A new prompt inherits no marker: a marker left
+                            // over from an earlier prompt must never reach
+                            // this one.
+                            self.approval_input_prequeued = false;
+                            // The prompt opened in this frame, before the
+                            // operator could see it. The run loop reads the
+                            // event the terminal still holds at this moment:
+                            // anything buffered now was typed before the
+                            // prompt was visible, so it cannot be an answer
+                            // to it.
+                            self.approval_prompt_opened = true;
                         }
                     }
                     Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
@@ -3615,6 +3796,9 @@ impl TuiApp {
                 if matches!(self.state, AppState::Ready) {
                     if let Err(e) = self.context.drop_last_reply() {
                         self.context.last_error = Some(format!("retry failed: {e}"));
+                        // The pane still has to close if the command answered
+                        // the approval it was showing.
+                        self.close_resolved_approval_pane();
                         return Ok(());
                     }
                 }
@@ -3765,6 +3949,11 @@ impl TuiApp {
                 self.context.cursor_to_end();
             }
         }
+        // A slash command can resolve the approval the pane is showing
+        // (`/allow`, `/deny`). The pane must not keep a dead prompt on
+        // screen after that — and the next queued request has to take its
+        // place, exactly as it does after an answer key.
+        self.close_resolved_approval_pane();
         Ok(())
     }
 
@@ -5206,11 +5395,12 @@ impl TuiApp {
             // the same visual rows the renderer draws.
             context.last_composer_width = inner_w;
             let text_rows = needed_composer_rows(&context.input_buffer, inner_w);
+            let composer_rows = composer_area_rows(text_rows, pending_approval_snapshot.is_some());
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Min(1),                // 0: chat pane
-                    Constraint::Length(text_rows + 2), // 1: composer / approval prompt
+                    Constraint::Length(composer_rows), // 1: composer / approval prompt
                     Constraint::Length(1),             // 2: status bar
                 ])
                 .split(area);
@@ -6478,19 +6668,34 @@ fn render_stream_preview_pane(
     frame.render_widget(paragraph, area);
 }
 
+/// Rows the approval prompt takes in the layout: two border rows, the
+/// command preview and the row of action chips.
+///
+/// The row of chips is where the answer keys are named. A pane that is one
+/// row short shows the title and the command and clips the chips away, so
+/// the operator cannot see which key grants what.
+const APPROVAL_PANE_ROWS: u16 = 4;
+
 /// Render the boxed approval prompt that replaces the input row while
 /// a `PendingRequest` is open. Designed to match Claude Code's prompt
 /// style: amber border (caution), basename in bold, full command in a
 /// muted block with newlines preserved, action chips with the hotkey
-/// letter highlighted.
+/// highlighted.
 ///
-/// Layout (4 rows total, same height as the input box it replaces):
+/// The chips name the keys that answer the prompt. `Persist` is `F2`,
+/// because it writes to disk and must not be the result of a single
+/// letterpress — and a letter cannot carry it: crossterm reports an
+/// ordinary capital letter as `Char('A')` + `SHIFT`, so a shifted letter
+/// is indistinguishable from a typed capital A. A function key is a key
+/// no text entry produces.
+///
+/// Layout ([`APPROVAL_PANE_ROWS`] rows: two border rows, the command
+/// preview and the row of action chips):
 ///
 /// ```text
 /// ╭ 🔒 Approval needed · cd ────────────────────────────╮
 /// │ cd /home/.../skills/stocks && .venv/bin/python …   │
-/// │                                                     │
-/// │ [Y] yes (session)   [A] always   [N] no   [Esc] deny │
+/// │ [Y] yes (session)  [F2] always  [N] no  [Esc] deny  │
 /// ╰─────────────────────────────────────────────────────╯
 /// ```
 fn render_approval_pane(
@@ -6540,8 +6745,11 @@ fn render_approval_pane(
     chip_spans.extend(chip("Y", "yes (session)", key_bg, key_fg, muted));
     // Says what it grants. "always (persist)" reads as "this command";
     // allowlisting one long `curl` invocation permits EVERY future `curl`.
+    // The key is `F2`: `Persist` writes to disk, so it must not be the
+    // result of a single stray letter, and no letterpress can produce a
+    // function key.
     let always_label = format!("always: any `{}`", req.basename);
-    chip_spans.extend(chip("A", &always_label, key_bg, key_fg, muted));
+    chip_spans.extend(chip("F2", &always_label, key_bg, key_fg, muted));
     chip_spans.extend(chip("N", "no", key_bg, key_fg, muted));
     chip_spans.extend(chip("Esc", "deny", key_bg, key_fg, muted));
 
@@ -6667,6 +6875,8 @@ pub(super) mod test_support {
             pending_turns: std::collections::VecDeque::new(),
             actor_has_agent: true,
             pending_approval: None,
+            approval_prompt_opened: false,
+            approval_input_prequeued: false,
             pending_reload: None,
             reload_seq: 0,
             model_picker_entries: None,
@@ -7386,6 +7596,21 @@ fn needed_composer_rows(buffer: &str, inner_w: u16) -> u16 {
     // can never fail; `unwrap_or(6)` is a dead-safe fallback that also keeps
     // clippy's pedantic cast lint happy.
     u16::try_from(rows.clamp(1, 6)).unwrap_or(6)
+}
+
+/// Rows the composer/approval row occupies in the layout.
+///
+/// The composer is a bordered box: its text rows plus a top and a bottom
+/// border row. The approval pane that replaces it needs room for its own
+/// two lines — the command preview and the row of action chips — plus the
+/// two border rows, so it asks for [`APPROVAL_PANE_ROWS`] instead of the
+/// composer's height.
+fn composer_area_rows(text_rows: u16, approval_open: bool) -> u16 {
+    if approval_open {
+        APPROVAL_PANE_ROWS
+    } else {
+        text_rows + 2
+    }
 }
 
 /// Vertical scroll that keeps `caret_row` inside an `inner_h`-row window.
@@ -9419,6 +9644,34 @@ async fn run_loop(
         // reflects the latest streaming state.
         app.drain_events();
 
+        // A prompt that opened while the terminal already held input: that
+        // input was typed before the operator could see the prompt, so it
+        // cannot be an answer.
+        //
+        // The queued event is READ, not just polled for, and it is the
+        // event that carries the marker — so the marker lands on the input
+        // that was actually queued. Polling alone would flag whatever key
+        // came next, seconds later, and swallow a deliberate answer.
+        //
+        // Exactly one event is read: the rest of the queue belongs to the
+        // operator's next actions, which are deliberate by definition.
+        if app.take_approval_prompt_opened() && event::poll(std::time::Duration::ZERO)? {
+            let queued = event::read()?;
+            if matches!(queued, Event::Resize(_, _)) {
+                // A resize is not input: it says nothing about what the
+                // operator typed, so it must not take the next key's
+                // answering power with it. Repaint the terminal instead, so
+                // the resize does not leave ghost rows behind.
+                let _ = terminal.clear();
+            } else {
+                app.mark_approval_input_prequeued();
+                match app.handle_event(queued).await? {
+                    EventResult::Quit => break,
+                    EventResult::Continue => {}
+                }
+            }
+        }
+
         // Re-arm the login gate after an idle stretch, so an unattended
         // terminal does not stay unlocked. Config is re-read every iteration
         // rather than captured once, so a reload that changes the timeout (or
@@ -9518,8 +9771,9 @@ async fn run_loop(
                 // first-run wizard — see `want_alt` above), no `/help`
                 // overlay, and no pending-approval prompt. Those surfaces
                 // have their own key handling in `handle_key` (Tab-complete,
-                // picker install, overlay dismiss, Y/N/A approval) that a
-                // blind paste-coalescing intercept would otherwise shadow.
+                // picker install, overlay dismiss, the Y/F2/N approval
+                // answers) that a blind paste-coalescing intercept would
+                // otherwise shadow.
                 let first =
                     leading_text_key(&ev).expect("guarded by leading_text_key(&ev).is_some()");
                 let mut batch = String::new();
@@ -10390,6 +10644,8 @@ mod tests {
             pending_turns: std::collections::VecDeque::new(),
             actor_has_agent: true,
             pending_approval: None,
+            approval_prompt_opened: false,
+            approval_input_prequeued: false,
             pending_reload: None,
             reload_seq: 0,
             model_picker_entries: None,
@@ -15189,5 +15445,684 @@ mod resume_view_tests {
 
         assert_eq!(fixture.llm.request_count(), 1);
         fixture.assert_last_system_prompt_carries_the_owner_files();
+    }
+}
+
+#[cfg(test)]
+mod approval_answer_tests {
+    use super::test_support::app_with_profile_root;
+    use super::*;
+    use crate::security::Decision;
+    use crate::tui::async_bridge::TurnRequest;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// An open approval prompt, the blocked calls waiting on it, and a
+    /// security policy whose `policy_dir` is a tempdir — so a test can tell
+    /// "nothing was persisted" from "persisting failed".
+    struct ApprovalFixture {
+        app: TuiApp,
+        approvals: Arc<crate::security::PendingApprovals>,
+        security: Arc<crate::security::SecurityPolicy>,
+        policy_dir: PathBuf,
+        req_rx: tokio::sync::mpsc::Receiver<TurnRequest>,
+        /// The request the pane shows.
+        shown_id: uuid::Uuid,
+        /// One handle per blocked call, in the order the requests were made.
+        handles: Vec<tokio::task::JoinHandle<Decision>>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl ApprovalFixture {
+        /// The decision the blocked call of the request on screen received.
+        /// Every request still waiting is denied first, so a test that
+        /// never answered still unblocks the calls instead of leaking them.
+        async fn decision(&mut self) -> Decision {
+            for req in self.approvals.list() {
+                let _ = self.approvals.resolve(req.id, Decision::Deny);
+            }
+            let mut first = None;
+            for handle in self.handles.drain(..) {
+                let decision = handle.await.expect("the blocked call unblocks");
+                first.get_or_insert(decision);
+            }
+            first.expect("at least one blocked call")
+        }
+
+        /// The runtime allowlist the policy holds, and whether anything was
+        /// written to disk.
+        fn allowlist(&self) -> (Vec<String>, bool) {
+            (
+                self.security.runtime_allowlist_snapshot(),
+                self.policy_dir.join("runtime_allowlist.toml").exists(),
+            )
+        }
+    }
+
+    /// An app with `basenames` queued for approval, the first one showing in
+    /// the pane. The calls block until they are answered.
+    async fn fixture_with(basenames: &[&str]) -> ApprovalFixture {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let policy_dir = dir.path().join("policy");
+        let (mut ctx, req_rx, _events_tx) = crate::tui::context::TuiContext::test_context();
+        let security = Arc::new(
+            crate::security::SecurityPolicy::from_config_with_policy_dir(
+                &crate::config::AutonomyConfig::default(),
+                dir.path(),
+                Some(policy_dir.clone()),
+            ),
+        );
+        let approvals = Arc::new(crate::security::PendingApprovals::new(None));
+        security.set_pending(approvals.clone());
+        ctx.security = Some(security.clone());
+
+        // The app subscribes to the registry BEFORE the requests are made, so
+        // the prompt it shows is one the app opened itself — the same path a
+        // real approval takes. A prompt installed behind the app's back
+        // would report no opening, and the flag under test would be a
+        // fiction.
+        let mut app = app_with_profile_root(ctx, dir.path().to_path_buf());
+        app.pending_approvals_rx = Some(approvals.subscribe());
+
+        let mut requests = Vec::new();
+        for basename in basenames {
+            let id = uuid::Uuid::new_v4();
+            let name = basename.to_string();
+            let full_command = format!("{basename} https://example.com");
+            let handle = tokio::spawn({
+                let approvals = approvals.clone();
+                let name = name.clone();
+                let full_command = full_command.clone();
+                async move {
+                    approvals
+                        .request_decision_in_scope(
+                            id,
+                            name,
+                            full_command,
+                            "tui",
+                            String::new(),
+                            crate::security::SessionScope::None,
+                        )
+                        .await
+                }
+            });
+            // One request at a time: the pane shows the first one, and the
+            // registry's order is the order the requests registered in.
+            for _ in 0..500 {
+                if approvals.list().len() == requests.len() + 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            assert_eq!(
+                approvals.list().len(),
+                requests.len() + 1,
+                "every request must register"
+            );
+            requests.push((id, name, full_command, handle));
+        }
+
+        // The app picks the request up and shows it.
+        app.drain_events();
+        let shown = app
+            .pending_approval
+            .clone()
+            .expect("the app must show the first request");
+        assert_eq!(
+            shown.basename, basenames[0],
+            "the pane shows the first request"
+        );
+
+        let mut handles = Vec::new();
+        for (_, _, _, handle) in requests {
+            handles.push(handle);
+        }
+
+        ApprovalFixture {
+            app,
+            approvals,
+            security,
+            policy_dir,
+            req_rx,
+            shown_id: shown.id,
+            handles,
+            _dir: dir,
+        }
+    }
+
+    /// A letter typed as part of a message is never an answer. The reported
+    /// defect: an operator typing `/allow gv1` sent the `a`, which answered
+    /// the open prompt with `Persist` and wrote an allowlist entry to disk.
+    #[tokio::test]
+    async fn text_in_the_composer_is_never_an_answer() {
+        let mut f = fixture_with(&["curl"]).await;
+        f.app.context.input_buffer = "/allow gv".to_string();
+        f.app.context.cursor_to_end();
+
+        for c in ['y', 'a', 'n'] {
+            f.app
+                .handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            f.approvals.is_pending(f.shown_id),
+            "the request must still be waiting for an answer"
+        );
+        let (allowlist, on_disk) = f.allowlist();
+        assert!(
+            allowlist.is_empty(),
+            "nothing may be allowlisted: {allowlist:?}"
+        );
+        assert!(!on_disk, "nothing may be written to disk");
+        assert_eq!(
+            f.app.context.input_buffer, "/allow gvyan",
+            "the letters belong to the message being typed"
+        );
+    }
+
+    /// An empty composer answers: `y` grants the session, `n` denies, and
+    /// `F2` persists.
+    #[tokio::test]
+    async fn an_empty_composer_answers_with_the_expected_decision() {
+        for (code, modifiers, expected) in [
+            (KeyCode::Char('y'), KeyModifiers::NONE, Decision::Session),
+            (KeyCode::Char('n'), KeyModifiers::NONE, Decision::Deny),
+            (KeyCode::F(2), KeyModifiers::NONE, Decision::Persist),
+        ] {
+            let mut f = fixture_with(&["curl"]).await;
+            f.app
+                .handle_key(KeyEvent::new(code, modifiers))
+                .await
+                .unwrap();
+            assert_eq!(
+                f.decision().await,
+                expected,
+                "{code:?} with {modifiers:?} must answer {expected:?}"
+            );
+        }
+    }
+
+    /// `Persist` writes to disk, so it must not be the result of one
+    /// letterpress: `F2` is the only chord that persists.
+    ///
+    /// A letter cannot carry it. Crossterm reports an ordinary capital
+    /// letter as `Char('A')` + `SHIFT`, so a "shifted A" is exactly what a
+    /// typed capital `A` looks like — the two cannot be told apart, and a
+    /// letterpress must never persist a command.
+    #[tokio::test]
+    async fn f2_is_the_only_persist_chord() {
+        for (code, modifiers, typed) in [
+            (KeyCode::Char('a'), KeyModifiers::NONE, "a"),
+            (KeyCode::Char('A'), KeyModifiers::NONE, "A"),
+            // What crossterm reports for a typed capital A.
+            (KeyCode::Char('A'), KeyModifiers::SHIFT, "A"),
+            // The function key persists only without modifiers.
+            (KeyCode::F(2), KeyModifiers::SHIFT, ""),
+            (KeyCode::F(2), KeyModifiers::CONTROL, ""),
+        ] {
+            let mut f = fixture_with(&["curl"]).await;
+
+            f.app
+                .handle_key(KeyEvent::new(code, modifiers))
+                .await
+                .unwrap();
+
+            assert!(
+                f.approvals.is_pending(f.shown_id),
+                "{code:?} with {modifiers:?} must not answer the prompt"
+            );
+            let (allowlist, on_disk) = f.allowlist();
+            assert!(
+                allowlist.is_empty(),
+                "{code:?} with {modifiers:?} must not allowlist anything: {allowlist:?}"
+            );
+            assert!(
+                !on_disk,
+                "{code:?} with {modifiers:?} must not write to disk"
+            );
+            assert_eq!(
+                f.app.context.input_buffer, typed,
+                "{code:?} with {modifiers:?} belongs to the message being typed"
+            );
+        }
+    }
+
+    /// `F2` is the answer that persists: the command lands in the runtime
+    /// allowlist and in the allowlist file on disk.
+    #[tokio::test]
+    async fn f2_persists_the_command_to_disk() {
+        let mut f = fixture_with(&["curl"]).await;
+
+        f.app
+            .handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert_eq!(f.decision().await, Decision::Persist);
+        let (allowlist, on_disk) = f.allowlist();
+        assert_eq!(allowlist, vec!["curl".to_string()]);
+        assert!(on_disk, "F2 must write the allowlist to disk");
+    }
+
+    /// A key that was already in the terminal's queue when the prompt
+    /// appeared was typed before the operator could see the prompt, so it
+    /// cannot be an answer to it.
+    ///
+    /// The marker is read on the event path, so the key is delivered as an
+    /// event — `handle_key` knows nothing about queued input and would
+    /// answer.
+    #[tokio::test]
+    async fn a_pre_queued_key_does_not_answer() {
+        let mut f = fixture_with(&["curl"]).await;
+        f.app.mark_approval_input_prequeued();
+
+        f.app
+            .handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('y'),
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+
+        assert!(
+            f.approvals.is_pending(f.shown_id),
+            "a pre-queued key must not answer the prompt"
+        );
+        assert_eq!(f.app.context.input_buffer, "y");
+    }
+
+    /// An event that is not input — a focus change, a mouse move, a resize —
+    /// is not an answer, and it must not take the answering power of the
+    /// *next* key with it: that key may well be a deliberate answer typed
+    /// seconds later, and swallowing it would leave a prompt the operator
+    /// cannot dismiss.
+    #[tokio::test]
+    async fn a_non_key_event_does_not_swallow_the_next_answer() {
+        let mut f = fixture_with(&["curl"]).await;
+        f.app.mark_approval_input_prequeued();
+
+        f.app.handle_event(Event::FocusGained).await.unwrap();
+
+        f.app
+            .handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('y'),
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            f.decision().await,
+            Decision::Session,
+            "a deliberate answer after a non-key event must still answer"
+        );
+    }
+
+    /// The marker belongs to one prompt: it must not survive it, or it
+    /// would take the next prompt's first answer away as well.
+    #[tokio::test]
+    async fn the_pre_queued_marker_does_not_survive_the_prompt() {
+        let mut f = fixture_with(&["curl", "git"]).await;
+        f.app.mark_approval_input_prequeued();
+
+        f.app
+            .handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(
+            !f.app.approval_input_prequeued,
+            "the marker must not reach the next prompt"
+        );
+        let shown = f
+            .app
+            .pending_approval
+            .as_ref()
+            .expect("the next queued request must take the pane's place")
+            .id;
+        assert_eq!(
+            f.app
+                .pending_approval
+                .as_ref()
+                .expect("the pane still shows the next request")
+                .basename,
+            "git"
+        );
+
+        f.app
+            .handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(
+            !f.approvals.is_pending(shown),
+            "the second prompt must be answerable too"
+        );
+    }
+
+    /// The run loop asks the app whether a prompt opened; the flag is
+    /// consumed by the ask, so one opening is reported once.
+    #[tokio::test]
+    async fn the_prompt_opened_flag_is_reported_once() {
+        let mut f = fixture_with(&["curl"]).await;
+
+        assert!(
+            f.app.take_approval_prompt_opened(),
+            "the prompt the app opened must be reported"
+        );
+        assert!(
+            !f.app.take_approval_prompt_opened(),
+            "the flag is consumed by the take"
+        );
+    }
+
+    /// An answer key that advances the pane puts a request that was not on
+    /// screen before onto it, so the app reports a new prompt. The run loop
+    /// may then read the event the terminal still holds, so a key queued
+    /// before the new prompt appeared cannot answer it.
+    #[tokio::test]
+    async fn an_answer_key_that_advances_the_pane_reports_a_new_prompt() {
+        let mut f = fixture_with(&["curl", "git"]).await;
+        // The run loop takes the flag when it asks.
+        assert!(f.app.take_approval_prompt_opened());
+
+        f.app
+            .handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            f.app
+                .pending_approval
+                .as_ref()
+                .expect("the next queued request must take the pane's place")
+                .basename,
+            "git"
+        );
+        assert!(
+            f.app.take_approval_prompt_opened(),
+            "the prompt the pane advanced to must be reported"
+        );
+    }
+
+    /// The same for the slash-command path: `/allow` replaces the pane under
+    /// the same conditions an answer key does, so it must report the new
+    /// prompt too.
+    #[tokio::test]
+    async fn a_slash_command_that_advances_the_pane_reports_a_new_prompt() {
+        let mut f = fixture_with(&["curl", "git"]).await;
+        assert!(f.app.take_approval_prompt_opened());
+
+        f.app.handle_command("allow curl").await.unwrap();
+
+        assert_eq!(
+            f.app
+                .pending_approval
+                .as_ref()
+                .expect("the next queued request must take the pane's place")
+                .basename,
+            "git"
+        );
+        assert!(
+            f.app.take_approval_prompt_opened(),
+            "the prompt the pane advanced to must be reported"
+        );
+    }
+
+    /// A slash command that answers a *different* request leaves the pane
+    /// alone, so there is no new prompt and the run loop must not read the
+    /// terminal's queue for it.
+    #[tokio::test]
+    async fn a_slash_command_that_does_not_advance_the_pane_reports_no_new_prompt() {
+        let mut f = fixture_with(&["curl", "git"]).await;
+        assert!(f.app.take_approval_prompt_opened());
+
+        f.app.handle_command("allow git").await.unwrap();
+
+        assert_eq!(
+            f.app
+                .pending_approval
+                .as_ref()
+                .expect("the pane must stay")
+                .basename,
+            "curl"
+        );
+        assert!(
+            !f.app.take_approval_prompt_opened(),
+            "the pane did not change: there is no new prompt to report"
+        );
+    }
+
+    /// The marker belongs to the prompt that was on screen. When that prompt
+    /// closes, the marker goes with it — a marker that survived would
+    /// swallow the first key of the *next* prompt.
+    #[tokio::test]
+    async fn the_marker_is_dropped_when_an_answer_key_closes_the_prompt() {
+        let mut f = fixture_with(&["curl", "git"]).await;
+        f.app.mark_approval_input_prequeued();
+
+        f.app
+            .handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(
+            !f.app.approval_input_prequeued,
+            "the marker must not survive the prompt it belonged to"
+        );
+        let next = f
+            .app
+            .pending_approval
+            .as_ref()
+            .expect("the next queued request must take the pane's place")
+            .id;
+        // The next prompt is answerable. The key is delivered as an event,
+        // so a marker that had survived would swallow it.
+        f.app
+            .handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('y'),
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+
+        assert!(
+            !f.approvals.is_pending(next),
+            "the next prompt must be answerable"
+        );
+    }
+
+    /// The same for the slash-command path.
+    #[tokio::test]
+    async fn the_marker_is_dropped_when_a_slash_command_closes_the_prompt() {
+        let mut f = fixture_with(&["curl", "git"]).await;
+        f.app.mark_approval_input_prequeued();
+
+        f.app.handle_command("allow curl").await.unwrap();
+
+        assert!(
+            !f.app.approval_input_prequeued,
+            "the marker must not survive the prompt it belonged to"
+        );
+        let next = f
+            .app
+            .pending_approval
+            .as_ref()
+            .expect("the next queued request must take the pane's place")
+            .id;
+        f.app
+            .handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('y'),
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+
+        assert!(
+            !f.approvals.is_pending(next),
+            "the next prompt must be answerable"
+        );
+    }
+
+    /// `/allow` resolves the request the pane is showing, so the pane must
+    /// close instead of leaving a dead prompt on screen.
+    #[tokio::test]
+    async fn allow_closes_the_approval_pane() {
+        let mut f = fixture_with(&["curl"]).await;
+
+        f.app.handle_command("allow curl").await.unwrap();
+
+        assert!(
+            f.app.pending_approval.is_none(),
+            "the pane must close after the request is answered"
+        );
+        assert_eq!(f.decision().await, Decision::Session);
+    }
+
+    /// The next queued request takes the pane's place when the request on
+    /// screen is answered by a slash command.
+    #[tokio::test]
+    async fn allow_closes_the_pane_and_shows_the_next_queued_request() {
+        let mut f = fixture_with(&["curl", "git"]).await;
+
+        f.app.handle_command("allow curl").await.unwrap();
+
+        let shown = f
+            .app
+            .pending_approval
+            .as_ref()
+            .expect("the next queued request must take the pane's place");
+        assert_eq!(shown.basename, "git");
+        assert!(
+            f.approvals.is_pending(shown.id),
+            "the request now on screen must still be waiting"
+        );
+    }
+
+    /// A slash command that answers a *different* request leaves the pane
+    /// alone — the request on screen is still waiting.
+    #[tokio::test]
+    async fn allow_of_another_command_leaves_the_pane_alone() {
+        let mut f = fixture_with(&["curl"]).await;
+
+        f.app.handle_command("allow git").await.unwrap();
+
+        assert!(
+            f.app.pending_approval.is_some(),
+            "the pane must stay: its request is still waiting"
+        );
+        assert!(f.approvals.is_pending(f.shown_id));
+    }
+
+    /// `/deny` closes the pane too, and still cancels the turn — the
+    /// behaviour from issue #1134.
+    #[tokio::test]
+    async fn deny_closes_the_pane_and_cancels_the_turn() {
+        let mut f = fixture_with(&["curl"]).await;
+
+        f.app.handle_command("deny curl").await.unwrap();
+
+        assert!(
+            f.app.pending_approval.is_none(),
+            "the pane must close after the request is denied"
+        );
+        assert_eq!(f.decision().await, Decision::Deny);
+        assert!(
+            matches!(f.req_rx.try_recv(), Ok(TurnRequest::Cancel)),
+            "a denied approval must still cancel the turn"
+        );
+    }
+
+    /// Typing `/allow gv1` into the composer saves nothing: the letters are
+    /// text, not an answer.
+    #[tokio::test]
+    async fn typing_an_allow_command_saves_nothing() {
+        let mut f = fixture_with(&["curl"]).await;
+
+        for c in "/allow gv1".chars() {
+            f.app
+                .handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            f.approvals.is_pending(f.shown_id),
+            "the request must still be waiting for an answer"
+        );
+        let (allowlist, on_disk) = f.allowlist();
+        assert!(
+            allowlist.is_empty(),
+            "nothing may be allowlisted: {allowlist:?}"
+        );
+        assert!(!on_disk, "nothing may be written to disk");
+        assert_eq!(f.app.context.input_buffer, "/allow gv1");
+    }
+
+    /// The approval pane, rendered the way the layout renders it.
+    fn approval_pane_text(
+        req: &crate::security::PendingRequest,
+        width: u16,
+        height: u16,
+    ) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            render_approval_pane(req, f, area);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..height)
+            .flat_map(|y| (0..width).map(move |x| (x, y)))
+            .map(|(x, y)| buf[(x, y)].symbol().to_string())
+            .collect()
+    }
+
+    /// The pane must show every answer key. An operator cannot use a key
+    /// they cannot see, and `F2` is the only way to persist — so the row
+    /// of chips has to fit in the rows the layout gives the pane.
+    #[test]
+    fn the_approval_pane_shows_the_persist_chord() {
+        let req = crate::security::PendingRequest {
+            id: uuid::Uuid::new_v4(),
+            basename: "curl".to_string(),
+            full_command: "curl https://example.com".to_string(),
+            channel: "tui".to_string(),
+            reply_target: String::new(),
+            created_at: 0,
+            session_scope: crate::security::SessionScope::None,
+        };
+
+        let text = approval_pane_text(&req, 100, composer_area_rows(1, true));
+
+        for expected in ["F2", "yes (session)", "no", "deny"] {
+            assert!(
+                text.contains(expected),
+                "the pane must show `{expected}`: {text:?}"
+            );
+        }
+    }
+
+    /// The composer keeps its own height when no approval is open: giving
+    /// the approval pane more room must not move the layout for the
+    /// ordinary case.
+    #[test]
+    fn the_composer_keeps_its_height_when_no_approval_is_open() {
+        assert_eq!(
+            composer_area_rows(1, false),
+            3,
+            "an empty composer is one text row plus two border rows"
+        );
+        assert_eq!(
+            composer_area_rows(4, false),
+            6,
+            "four text rows plus two border rows"
+        );
     }
 }

@@ -657,13 +657,14 @@ impl PromptSection for SafetySection {
         );
 
         // Whether this prompt targets a messaging channel. On channels the
-        // approval *mechanism* differs from the TUI's inline single-key Y/N/A
-        // prompt: there is no terminal to prompt, so a tool that needs approval
-        // is decided by an authorized **owner** of the channel (the owner-gated
-        // relay) and, absent an approving owner, is declined. The preset text
-        // must describe that reality, not the TUI prompt, or the model will
-        // promise a Y/N/A flow that never appears. Strict/Off read the same on
-        // both surfaces (shell un-registered / no per-call gate respectively).
+        // approval *mechanism* differs from the TUI's inline single-key
+        // Y/N/F2 prompt: there is no terminal to prompt, so a tool that needs
+        // approval is decided by an authorized **owner** of the channel (the
+        // owner-gated relay) and, absent an approving owner, is declined. The
+        // preset text must describe that reality, not the TUI prompt, or the
+        // model will promise a Y/N/F2 flow that never appears. Strict/Off read
+        // the same on both surfaces (shell un-registered / no per-call gate
+        // respectively).
         let is_channel = matches!(ctx.surface, PromptSurface::Channel { .. });
 
         match ctx.autonomy_preset {
@@ -722,7 +723,7 @@ impl PromptSection for SafetySection {
                      approval from an authorized **owner** of this channel. When \
                      an owner is configured the agent posts the request in chat \
                      and waits for their `/approve`; without an approving owner \
-                     the action is declined. There is no inline Y/N/A prompt \
+                     the action is declined. There is no inline Y/N/F2 prompt \
                      here.\n\
                      - Never claim you ran a command or made a change that was \
                      actually declined; report the denial plainly and, if \
@@ -735,7 +736,7 @@ impl PromptSection for SafetySection {
                      - Read-only and trivially-safe commands are pre-allowed \
                      (see allowlist below) and run without prompting.\n\
                      - Any command **not** matching the allowlist will pause \
-                     for a single-key user prompt (Y/N/A); plan for that \
+                     for a single-key user prompt (Y/N/F2); plan for that \
                      latency — bundle related ops when reasonable.\n\
                      - Forbidden paths (secrets, ssh, gnupg, aws, etc.) \
                      are blocked unconditionally regardless of approval.\n",
@@ -1267,8 +1268,8 @@ mod tests {
             "owner approval wording: {out}"
         );
         assert!(
-            !out.contains("(Y/N/A)") || out.contains("no inline Y/N/A"),
-            "channel text must not promise a TUI Y/N/A prompt: {out}"
+            !out.contains("(Y/N/F2)") || out.contains("no inline Y/N/F2"),
+            "channel text must not promise a TUI Y/N/F2 prompt: {out}"
         );
         // Shell allowlist globs are not surfaced on channels (Layer-A gating).
         assert!(
@@ -1435,7 +1436,7 @@ mod tests {
     }
 
     #[test]
-    fn safety_section_agent_smart_keeps_yna_prompt_text() {
+    fn safety_section_agent_smart_keeps_ynf2_prompt_text() {
         use crate::approval::policy_writer::PolicyPreset;
         let tools: Vec<Box<dyn Tool>> = vec![];
         let ctx = PromptContext {
@@ -1455,7 +1456,7 @@ mod tests {
         };
         let out = SafetySection.build(&ctx).unwrap();
         assert!(
-            out.contains("(Y/N/A)"),
+            out.contains("(Y/N/F2)"),
             "TUI keeps inline prompt text: {out}"
         );
         assert!(
