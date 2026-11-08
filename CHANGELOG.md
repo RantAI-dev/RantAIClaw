@@ -180,6 +180,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **A locked channel's webhook route refuses every message instead of running a turn.** `POST /linq`
+  and `POST /nextcloud-talk` are the gateway's routes for two channels the catalog locks
+  (`under development`). The daemon's channel listeners honour that lock — `build_configured_channels`
+  filters the locked keys out — but the gateway's routes did not: each one verified the signature and
+  then handed the message to the dispatch loop, which started an agent turn. The reply was dropped,
+  because the dispatch registry is built from that filtered list and holds no channel under those
+  names. So a signed request cost a provider request and answered `200` for a turn nobody could see.
+  Both routes now answer **403** with `{"error": "<Channel> channel is under development"}` after the
+  same authentication they did before: an unsigned request still gets `401`, so an unauthenticated
+  caller learns nothing new. No agent turn runs, no provider request is made and nothing is queued on
+  the channel bus. A usable channel's route is unchanged, and the gateway's own `/webhook` endpoint
+  is unaffected — it is the gateway's own surface, not a locked channel's route. The startup banner
+  says the same: a locked channel's route is listed as refused. One request is answered otherwise on
+  purpose: a byte-identical replay on `/nextcloud-talk` still gets `200` `{"status": "duplicate"}`,
+  because the anti-replay gate runs ahead of the refusal and a duplicate starts no turn.
+
 - **A stored Claude subscription login no longer reaches any host.** The Anthropic auth profile,
   a setup token and `ANTHROPIC_OAUTH_TOKEN` are not read, refreshed or sent by any code path:
   `anthropic` and `anthropic-custom:<url>` send only an API key the operator stored in the

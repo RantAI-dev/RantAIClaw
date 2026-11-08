@@ -936,6 +936,12 @@ see each channel's subsection. "n/a — the agent calls out" means there is no
 inbound port: the process opens the connection, so there is nothing for an
 attacker to POST to.
 
+The two gateway routes that belong to a channel the catalog locks
+(`under development`) — `POST /linq` and `POST /nextcloud-talk` — answer
+with a refusal instead of running a turn. They verify the signature exactly
+as before and then answer **403** with the channel's name and the reason; no
+agent turn runs, no provider request is made and nothing is queued. A usable
+channel's route is unchanged.
 
 ---
 
@@ -1313,9 +1319,15 @@ Linq notes:
 
 - Inbound endpoint: `POST /linq` on the gateway. Requires a reachable HTTPS
   callback.
+- **The endpoint refuses every message.** Linq is locked in the channel catalog
+  (`under development`), so a correctly-signed request is answered **403** with
+  `{"error": "Linq channel is under development"}`. No agent turn runs, no
+  provider request is made and nothing is queued on the channel bus. The
+  refusal comes *after* the signature check, so an unsigned request still
+  gets **401** and an unauthenticated caller learns nothing new.
 - **`signing_secret` is required.** Without it the gateway returns **401** before
   parsing, the same fail-closed rule WhatsApp and Nextcloud Talk follow
-  (`src/gateway/mod.rs:2160-2168`). Log line to grep:
+  (`src/gateway/mod.rs:2955-2964`). Log line to grep:
 
   ```text
   Linq webhook rejected: no signing secret configured. Set RANTAICLAW_LINQ_SIGNING_SECRET to authenticate this endpoint.
@@ -1552,9 +1564,19 @@ allowed_users = ["*"]
 Notes:
 
 - Inbound webhook endpoint: `POST /nextcloud-talk`.
+- **The endpoint refuses every message.** Nextcloud Talk is locked in the
+  channel catalog (`under development`), so a correctly-signed request is
+  answered **403** with
+  `{"error": "Nextcloud Talk channel is under development"}`. No agent turn
+  runs, no provider request is made and nothing is queued on the channel bus.
+  The refusal comes *after* the signature check and the anti-replay nonce gate,
+  so an unsigned request still gets **401** and a replayed one still gets
+  **200** `{"status": "duplicate"}`. That duplicate answer is deliberate: a
+  byte-identical replay starts no turn and costs no provider request, and
+  acknowledging it stops the platform's retry loop instead of feeding it.
 - Signature verification uses `X-Nextcloud-Talk-Random` and `X-Nextcloud-Talk-Signature`.
 - The secret is **required**: with none configured the endpoint returns `401`
-  before parsing (`src/gateway/mod.rs:2338-2346`), and invalid signatures are
+  before parsing (`src/gateway/mod.rs:3093-3102`), and invalid signatures are
   rejected with `401` as well.
 - `RANTAICLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` overrides config secret.
 - See [nextcloud-talk-setup.md](nextcloud-talk-setup.md) for a full runbook.
@@ -1720,14 +1742,14 @@ rg -n "Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|D
 | Matrix | `Matrix channel listening on room` / `Matrix room ... is encrypted; E2EE decryption is enabled via matrix-sdk.` | `Matrix whoami failed; falling back to configured session hints for E2EE session restore:` / `Matrix whoami failed while resolving listener user_id; using configured user_id hint:` | `Matrix sync error: ... retrying...` |
 | Signal | `Signal channel listening via SSE on` | (allowlist checks are enforced by `allowed_from`) | `Signal SSE returned ...` / `Signal SSE connect error:` |
 | WhatsApp (channel) | `WhatsApp channel active (webhook mode).` / `WhatsApp Web connected successfully` | `WhatsApp webhook rejected: no app secret configured.` (401, endpoint disabled) / `WhatsApp webhook signature verification failed` / `WhatsApp: ignoring message from unauthorized number:` / `whatsapp_web: ignoring unauthorized sender (` | `WhatsApp send failed:` / `WhatsApp Web stream error:` |
-| Linq (gateway) | `POST /linq` | `Linq webhook rejected: no signing secret configured.` (401, endpoint disabled) / `Linq webhook signature verification failed` / `Linq: rejecting stale webhook timestamp` | `Linq send failed:` |
+| Linq (gateway) | `POST /linq      — Linq message webhook (iMessage/RCS/SMS) — refused: the channel is under development` | `Linq webhook rejected: no signing secret configured.` (401, endpoint disabled) / `Linq webhook signature verification failed` / `Linq: rejecting stale webhook timestamp` / `Linq webhook refused: the linq channel is under development` | `Linq send failed:` |
 | Webhook / WhatsApp (gateway) | `WhatsApp webhook verified successfully` | `Webhook: rejected — not paired / invalid bearer token` / `Webhook: rejected request — invalid or missing X-Webhook-Secret` / `WhatsApp webhook verification failed — token mismatch` | `Webhook JSON parse error:` |
 | Email | `Email polling every ...` / `Email sent to ...` | `Blocked email from ...` | `Email poll failed:` / `Email poll task panicked:` |
 | IRC | `IRC channel connecting to ...` / `IRC registered as ...` | (allowlist checks are enforced by `allowed_users`) | `IRC SASL authentication failed (...)` / `IRC server does not support SASL...` / `IRC nickname ... is in use, trying ...` |
 | Lark / Feishu | `Lark: WS connected` / `Lark event callback server listening on` | `lark: ignoring unauthorized sender (` | `Lark: ping failed, reconnecting` / `Lark: heartbeat timeout, reconnecting` / `Lark: WS read error:` |
 | DingTalk | `DingTalk: connected and listening for messages...` | `DingTalk: ignoring message from unauthorized user:` | `DingTalk WebSocket error:` / `DingTalk: message channel closed` |
 | QQ | `QQ: connected and identified` | `QQ: ignoring C2C message from unauthorized user:` / `QQ: ignoring group message from unauthorized user:` | `QQ: received Reconnect (op 7)` / `QQ: received Invalid Session (op 9)` / `QQ: message channel closed` |
-| Nextcloud Talk (gateway) | `POST /nextcloud-talk — Nextcloud Talk bot webhook` | `Nextcloud Talk webhook rejected: no webhook secret configured.` (401, endpoint disabled) / `Nextcloud Talk webhook signature verification failed` / `Nextcloud Talk: ignoring message from unauthorized actor:` | `Nextcloud Talk send failed:` / `LLM error for Nextcloud Talk message:` |
+| Nextcloud Talk (gateway) | `POST /nextcloud-talk — Nextcloud Talk bot webhook — refused: the channel is under development` | `Nextcloud Talk webhook rejected: no webhook secret configured.` (401, endpoint disabled) / `Nextcloud Talk webhook signature verification failed` / `Nextcloud Talk: ignoring message from unauthorized actor:` / `Nextcloud Talk webhook refused: the nextcloud_talk channel is under development` | `Nextcloud Talk send failed:` / `LLM error for Nextcloud Talk message:` |
 | iMessage | `iMessage channel listening (AppleScript bridge)...` | (contact allowlist enforced by `allowed_contacts`) | `iMessage poll error:` |
 
 ### 7.3 Runtime supervisor keywords
