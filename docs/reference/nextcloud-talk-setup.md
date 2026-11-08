@@ -2,6 +2,13 @@
 
 This guide covers native Nextcloud Talk integration for RantaiClaw.
 
+> **The endpoint currently refuses every message.** Nextcloud Talk is locked in
+> the channel catalog (`under development`), so `POST /nextcloud-talk` verifies
+> the signature exactly as before and then answers **403** with
+> `{"error": "Nextcloud Talk channel is under development"}`. No agent turn
+> runs, no provider request is made and no reply is sent, so the checklist in
+> §6 does not apply yet. See `docs/reference/channels.md` §4.14.
+
 ## 1. What this integration does
 
 - Receives inbound Talk bot webhook events via `POST /nextcloud-talk`.
@@ -75,4 +82,7 @@ If verification fails, the gateway returns `401 Unauthorized`.
 
 - `404 Nextcloud Talk not configured`: missing `[channels_config.nextcloud_talk]`.
 - `401 Invalid signature`: mismatch in `webhook_secret`, random header, or raw-body signing.
+- `403 Nextcloud Talk channel is under development`: the channel is locked in the
+  catalog, so the endpoint refuses instead of running a turn. Log line to grep:
+  `Nextcloud Talk webhook refused: the nextcloud_talk channel is under development`.
 - No reply but webhook `200`: event filtered (bot/system/non-allowed user/non-message payload).

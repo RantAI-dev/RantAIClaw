@@ -1592,10 +1592,16 @@ pub async fn run_gateway(
         println!("  POST /whatsapp  — WhatsApp message webhook");
     }
     if state.linq.is_some() {
-        println!("  POST /linq      — Linq message webhook (iMessage/RCS/SMS)");
+        println!(
+            "  POST /linq      — Linq message webhook (iMessage/RCS/SMS){}",
+            locked_channel_note("linq")
+        );
     }
     if state.nextcloud_talk.is_some() {
-        println!("  POST /nextcloud-talk — Nextcloud Talk bot webhook");
+        println!(
+            "  POST /nextcloud-talk — Nextcloud Talk bot webhook{}",
+            locked_channel_note("nextcloud_talk")
+        );
     }
     println!("  GET  /health    — liveness check");
     println!("  GET  /readyz    — readiness check (503 if a component is down)");
@@ -2687,6 +2693,84 @@ async fn enqueue_inbound(
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response()
 }
 
+/// The refusal a locked channel's route answers with, or `None` when the
+/// channel may run a turn.
+///
+/// The catalog locks a channel with `ChannelSupport::UnderDevelopment`, and a
+/// locked channel's daemon listener is never built — `build_configured_channels`
+/// filters the locked keys out. A gateway route that still queued its messages
+/// would therefore start a turn whose reply has no channel to go back to: the
+/// dispatch registry holds nothing under that channel's name, so the answer is
+/// dropped and the platform paid for a turn nobody saw. The route must refuse
+/// instead, before anything is parsed or queued.
+///
+/// The rule is decided here, once, so two locked routes cannot drift apart:
+/// every route asks this function with its own catalog key, and a route added
+/// later inherits the refusal by asking the same question.
+///
+/// The route decides it, not the shared hand-off [`enqueue_inbound`]. That seam
+/// sits downstream of the payload parse, the pairing interception and the media
+/// fetch, so a locked channel would still pay for all of that work — and would
+/// still enroll a sender — before the refusal arrived.
+///
+/// The locked channel also stays built rather than not being built at all. Were
+/// the gateway not to build it, the route's "not configured" arm would answer
+/// instead, and that arm sits *before* the signature check: an unauthenticated
+/// caller would learn that the channel is locked, which the refusal must not
+/// reveal. Because the route owns the decision, "not configured" (404) and
+/// "locked" (403) stay distinguishable.
+///
+/// The refusal is a 403: the request was well-formed and authenticated, and the
+/// answer is final. A 4xx marks the request as permanently refused, where a 5xx
+/// asks the caller to come back.
+///
+/// The channel's display name is read from the catalog rather than typed here,
+/// so the refusal cannot drift from the name the operator sees everywhere else.
+/// The support label comes from
+/// [`ChannelSupport::label`](crate::channels::ChannelSupport::label), which is
+/// defined exactly once. The refusal is logged here too, so the log line
+/// cannot drift from the answer the caller gets.
+fn locked_channel_refusal(channel: &str) -> Option<axum::response::Response> {
+    if crate::channels::channel_is_usable(channel) {
+        return None;
+    }
+    let display_name = crate::channels::CHANNEL_CATALOG
+        .iter()
+        .find(|(key, _, _, _)| *key == channel)
+        .map_or(channel, |(_, name, _, _)| *name);
+    let label = crate::channels::ChannelSupport::UnderDevelopment.label();
+    tracing::warn!("{display_name} webhook refused: the {channel} channel is {label}");
+    Some(
+        (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": format!("{display_name} channel is {label}"),
+            })),
+        )
+            .into_response(),
+    )
+}
+
+/// What the startup banner says about a channel webhook route: nothing while
+/// the channel is usable, and the refusal once it is locked.
+///
+/// The banner is the first place an operator learns what a route does, so it
+/// must not advertise a webhook that answers every request with a refusal.
+///
+/// It reads the catalog's own predicate rather than asking
+/// [`locked_channel_refusal`], because that function logs a refusal — and the
+/// banner describes a route, it does not refuse one.
+fn locked_channel_note(channel: &str) -> String {
+    if crate::channels::channel_is_usable(channel) {
+        String::new()
+    } else {
+        format!(
+            " — refused: the channel is {}",
+            crate::channels::ChannelSupport::UnderDevelopment.label()
+        )
+    }
+}
+
 async fn handle_whatsapp_verify(
     State(state): State<AppState>,
     Query(params): Query<WhatsAppVerifyQuery>,
@@ -2909,6 +2993,15 @@ async fn handle_linq_webhook(
             .into_response();
     }
 
+    // A locked channel's route refuses rather than running a turn. The catalog
+    // locks `linq`, the daemon's channel listeners honour that lock, and this
+    // route did not: it queued the message and the dispatch loop started a turn
+    // whose reply had no channel to go back to. The refusal comes *after* the
+    // signature check, so an unauthenticated caller learns nothing new.
+    if let Some(refusal) = locked_channel_refusal("linq") {
+        return refusal;
+    }
+
     // Parse JSON body
     let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
         return (
@@ -3051,6 +3144,18 @@ async fn handle_nextcloud_talk_webhook(
             .into_response();
     }
     finish_inbound(&state, "nextcloud_talk_nonce", random, true);
+
+    // A locked channel's route refuses rather than running a turn — see the
+    // Linq handler above.
+    //
+    // The anti-replay nonce gate stays *ahead* of the refusal on purpose: a
+    // byte-identical replay is still answered with the duplicate ACK it has
+    // always been answered with. That starts no turn, costs no provider
+    // request and stops the platform's retry loop rather than feeding it, so
+    // the replay is a deliberate deviation from the refusal, not an oversight.
+    if let Some(refusal) = locked_channel_refusal("nextcloud_talk") {
+        return refusal;
+    }
 
     // Parse JSON body
     let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
@@ -6604,6 +6709,53 @@ mod tests {
         }
     }
 
+    /// An `AppState` with the WhatsApp Cloud API channel configured and its app
+    /// secret set — the usable route the webhook tests drive.
+    fn whatsapp_state(
+        provider: Arc<dyn Provider>,
+        secret: &str,
+        rate_limiter: GatewayRateLimiter,
+        idempotency: IdempotencyStore,
+    ) -> AppState {
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            config_fingerprint: Arc::new(Mutex::new("test".to_string())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            memory_search_mode: Arc::new("keyword".to_string()),
+
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(rate_limiter),
+            idempotency_store: Arc::new(idempotency),
+            whatsapp: Some(Arc::new(crate::channels::whatsapp::WhatsAppChannel::new(
+                "placeholder-token".into(),
+                "100000000000001".into(),
+                "placeholder-verify".into(),
+                vec!["*".into()],
+            ))),
+            whatsapp_app_secret: Some(Arc::from(secret)),
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            whatsapp_pair_guard: crate::gateway::config_api::PairGuard::default(),
+            observer: Arc::new(crate::observability::NoopObserver),
+            webhook_routes: Arc::new(Vec::new()),
+            channel_bus: Arc::new(crate::channels::ChannelBus::default()),
+            ledger: None,
+            web_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
+            tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
+            live_autonomy: Arc::default(),
+        }
+    }
+
     /// A signed Nextcloud Talk message body with the given platform id.
     ///
     /// The nonce defaults to the platform id, so distinct ids are also distinct
@@ -6611,40 +6763,48 @@ mod tests {
     /// *before* it looks at the message id, so a fixture that reuses one nonce
     /// makes every request after the first a replay, whatever id it carries.
     fn signed_nextcloud(secret: &str, id: &str) -> (HeaderMap, Bytes) {
-        signed_nextcloud_with_nonce(secret, id, id)
-    }
-
-    /// As [`signed_nextcloud`], with the anti-replay nonce chosen separately —
-    /// for tests that need to vary the message id and the nonce independently.
-    fn signed_nextcloud_with_nonce(secret: &str, id: &str, nonce: &str) -> (HeaderMap, Bytes) {
-        signed_nextcloud_from(secret, id, nonce, "user_a", "room-token", "hello")
-    }
-
-    /// A signed Nextcloud Talk message with every field a conversation-identity
-    /// test needs to vary: who sent it, which room it landed in, and what it said.
-    fn signed_nextcloud_from(
-        secret: &str,
-        id: &str,
-        nonce: &str,
-        actor: &str,
-        room: &str,
-        text: &str,
-    ) -> (HeaderMap, Bytes) {
         let body = format!(
-            r#"{{"type":"message","object":{{"token":"{room}"}},"message":{{"id":"{id}","actorType":"users","actorId":"{actor}","message":"{text}"}}}}"#
+            r#"{{"type":"message","object":{{"token":"room-token"}},"message":{{"id":"{id}","actorType":"users","actorId":"user_a","message":"hello"}}}}"#
         );
-        let random = nonce;
-        let signature = compute_nextcloud_signature_hex(secret, random, &body);
+        let signature = compute_nextcloud_signature_hex(secret, id, &body);
         let mut headers = HeaderMap::new();
         headers.insert(
             "X-Nextcloud-Talk-Random",
-            HeaderValue::from_str(random).unwrap(),
+            HeaderValue::from_str(id).unwrap(),
         );
         headers.insert(
             "X-Nextcloud-Talk-Signature",
             HeaderValue::from_str(&signature).unwrap(),
         );
         (headers, Bytes::from(body))
+    }
+
+    /// A signed WhatsApp Cloud API message with every field a test needs to
+    /// vary: the platform id, who sent it and what it said.
+    ///
+    /// The sender carries no `+`: the channel normalizes it, so a fixture that
+    /// already had one would produce a different identity than the parser does.
+    fn signed_whatsapp_from(
+        secret: &str,
+        id: &str,
+        sender: &str,
+        text: &str,
+    ) -> (HeaderMap, Bytes) {
+        let body = format!(
+            r#"{{"object":"whatsapp_business_account","entry":[{{"id":"1","changes":[{{"field":"messages","value":{{"messages":[{{"from":"{sender}","id":"{id}","timestamp":"1700000000","type":"text","text":{{"body":"{text}"}}}}]}}}}]}}]}}"#
+        );
+        let signature = compute_whatsapp_signature_hex(secret, body.as_bytes());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Hub-Signature-256",
+            HeaderValue::from_str(&format!("sha256={signature}")).unwrap(),
+        );
+        (headers, Bytes::from(body))
+    }
+
+    /// A signed WhatsApp Cloud API message from the default test sender.
+    fn signed_whatsapp(secret: &str, id: &str) -> (HeaderMap, Bytes) {
+        signed_whatsapp_from(secret, id, "15550000001", "hello")
     }
 
     /// Wait for `calls` to reach `want`, or give up. The turn runs on a spawned
@@ -6671,15 +6831,24 @@ mod tests {
     /// A channel that records what dispatch sent it. Named `nextcloud_talk` so
     /// the dispatch loop's `channels_by_name` lookup finds it for messages the
     /// Nextcloud Talk handler parsed.
-    #[derive(Default)]
     struct RecordingChannel {
+        name: String,
         sent: Mutex<Vec<(String, String)>>,
+    }
+
+    impl Default for RecordingChannel {
+        fn default() -> Self {
+            Self {
+                name: "nextcloud_talk".to_string(),
+                sent: Mutex::new(Vec::new()),
+            }
+        }
     }
 
     #[async_trait]
     impl crate::channels::Channel for RecordingChannel {
         fn name(&self) -> &str {
-            "nextcloud_talk"
+            &self.name
         }
 
         async fn send(&self, message: &crate::channels::SendMessage) -> anyhow::Result<()> {
@@ -6754,6 +6923,10 @@ mod tests {
         /// gate closed rather than letting a channel approve for itself.
         approval: Option<Arc<crate::approval::ApprovalManager>>,
         approval_owners: Vec<String>,
+        /// The name the recording channel answers to. The dispatch loop resolves
+        /// a message's reply channel by name, so a test that enqueues under
+        /// another channel's name must register the recorder under it too.
+        channel_name: Option<String>,
     }
 
     /// Start a dispatch loop over `workspace`, and publish its sender.
@@ -6778,8 +6951,12 @@ mod tests {
             tools,
             approval,
             approval_owners,
+            channel_name,
         } = options;
-        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel_impl = Arc::new(RecordingChannel {
+            name: channel_name.unwrap_or_else(|| "nextcloud_talk".to_string()),
+            ..RecordingChannel::default()
+        });
         let channel: Arc<dyn crate::channels::Channel> = channel_impl.clone();
         let mut channels_by_name = std::collections::HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
@@ -6883,8 +7060,8 @@ mod tests {
         (bus, rx)
     }
 
-    async fn post_nextcloud(state: &AppState, headers: HeaderMap, body: Bytes) -> StatusCode {
-        handle_nextcloud_talk_webhook(State(state.clone()), test_peer(), headers, body)
+    async fn post_whatsapp(state: &AppState, headers: HeaderMap, body: Bytes) -> StatusCode {
+        handle_whatsapp_message(State(state.clone()), test_peer(), headers, body)
             .await
             .status()
     }
@@ -6897,15 +7074,18 @@ mod tests {
     /// on `reply_target`. One product, two conversation identities, decided by
     /// which transport the message happened to arrive on. Routing webhooks
     /// through the same dispatch loop settles it on the room key.
+    ///
+    /// The route that used to deliver these messages is gone — a locked
+    /// channel's webhook refuses — so the hand-off is driven where the property
+    /// lives: the message the dispatch loop receives.
     #[tokio::test]
     async fn a_webhook_conversation_is_keyed_by_room_not_by_sender() {
         let workspace = tempfile::tempdir().expect("temp workspace");
         let harness = spawn_dispatch(workspace.path(), false).await;
 
-        let secret = "nextcloud-test-secret";
         let mut state = nextcloud_state(
             Arc::new(MockProvider::default()),
-            secret,
+            "nextcloud-test-secret",
             GatewayRateLimiter::new(100, 100, 100, 100),
             IdempotencyStore::new(Duration::from_mins(5), 1000),
         );
@@ -6916,8 +7096,20 @@ mod tests {
             ("m2", "user_b", "room-2", "second"),
             ("m3", "user_a", "room-1", "third"),
         ] {
-            let (headers, body) = signed_nextcloud_from(secret, id, id, actor, room, text);
-            assert_eq!(post_nextcloud(&state, headers, body).await, StatusCode::OK);
+            let message = ChannelMessage {
+                sender_aliases: Vec::new(),
+                id: format!("nextcloud_{id}"),
+                reply_target: room.to_string(),
+                sender: actor.to_string(),
+                content: text.to_string(),
+                channel: "nextcloud_talk".to_string(),
+                timestamp: 1_700_000_000,
+                thread_ts: None,
+                reply_anchor: None,
+                is_direct: false,
+            };
+            let response = enqueue_inbound(&state, "nextcloud_talk", vec![message]).await;
+            assert_eq!(response.status(), StatusCode::OK);
             // One at a time: the assertions below are about what each turn could
             // see, which is only well defined if the previous one finished.
             wait_for_sends(&harness.channel, 1).await;
@@ -7026,6 +7218,9 @@ mod tests {
     /// product, chosen by the transport the message arrived on. Routing webhooks
     /// through dispatch retires the second one; the store and parser behind it
     /// are deleted in this change.
+    ///
+    /// It runs over WhatsApp: the webhook channels the gateway used to serve
+    /// are locked, and their routes now refuse.
     #[tokio::test]
     async fn an_approval_over_a_webhook_channel_uses_the_slash_approve_relay() {
         let workspace = tempfile::tempdir().expect("temp workspace");
@@ -7044,14 +7239,15 @@ mod tests {
                     runs: Arc::clone(&runs),
                 })],
                 approval: Some(Arc::new(approval)),
-                approval_owners: vec!["user_a".to_string()],
+                approval_owners: vec!["+15550000001".to_string()],
+                channel_name: Some("whatsapp".to_string()),
                 ..DispatchOptions::default()
             },
         )
         .await;
 
-        let secret = "nextcloud-test-secret";
-        let mut state = nextcloud_state(
+        let secret = "whatsapp-test-secret";
+        let mut state = whatsapp_state(
             Arc::new(MockProvider::default()),
             secret,
             GatewayRateLimiter::new(100, 100, 100, 100),
@@ -7059,9 +7255,8 @@ mod tests {
         );
         state.channel_bus = Arc::clone(&harness.bus);
 
-        let (headers, body) =
-            signed_nextcloud_from(secret, "m1", "m1", "user_a", "room-1", "run the probe");
-        assert_eq!(post_nextcloud(&state, headers, body).await, StatusCode::OK);
+        let (headers, body) = signed_whatsapp_from(secret, "m1", "15550000001", "run the probe");
+        assert_eq!(post_whatsapp(&state, headers, body).await, StatusCode::OK);
 
         let prompt = wait_for_sends(&harness.channel, 1).await;
         assert_eq!(prompt.len(), 1, "the owner must be asked: {prompt:?}");
@@ -7076,10 +7271,9 @@ mod tests {
             "the tool must not run before it is approved"
         );
 
-        // The owner answers in the same room, over the same webhook.
-        let (headers, body) =
-            signed_nextcloud_from(secret, "m2", "m2", "user_a", "room-1", "/approve probe");
-        assert_eq!(post_nextcloud(&state, headers, body).await, StatusCode::OK);
+        // The owner answers in the same chat, over the same webhook.
+        let (headers, body) = signed_whatsapp_from(secret, "m2", "15550000001", "/approve probe");
+        assert_eq!(post_whatsapp(&state, headers, body).await, StatusCode::OK);
 
         for _ in 0..600 {
             if runs.load(Ordering::SeqCst) == 1 {
@@ -7104,10 +7298,18 @@ mod tests {
     #[tokio::test]
     async fn a_webhook_turn_is_persisted_to_the_channel_history_store() {
         let workspace = tempfile::tempdir().expect("temp workspace");
-        let harness = spawn_dispatch(workspace.path(), true).await;
+        let harness = spawn_dispatch_with(
+            workspace.path(),
+            DispatchOptions {
+                persist_history: true,
+                channel_name: Some("whatsapp".to_string()),
+                ..DispatchOptions::default()
+            },
+        )
+        .await;
 
-        let secret = "nextcloud-test-secret";
-        let mut state = nextcloud_state(
+        let secret = "whatsapp-test-secret";
+        let mut state = whatsapp_state(
             Arc::new(MockProvider::default()),
             secret,
             GatewayRateLimiter::new(100, 100, 100, 100),
@@ -7115,9 +7317,8 @@ mod tests {
         );
         state.channel_bus = Arc::clone(&harness.bus);
 
-        let (headers, body) =
-            signed_nextcloud_from(secret, "m1", "m1", "user_a", "room-1", "remember this");
-        assert_eq!(post_nextcloud(&state, headers, body).await, StatusCode::OK);
+        let (headers, body) = signed_whatsapp_from(secret, "m1", "15550000001", "remember this");
+        assert_eq!(post_whatsapp(&state, headers, body).await, StatusCode::OK);
         assert_eq!(wait_for_sends(&harness.channel, 1).await.len(), 1);
 
         // Reopen the store the way a restarted daemon does.
@@ -7144,10 +7345,10 @@ mod tests {
     /// retrying and the message is gone with nothing recording that it existed.
     #[tokio::test]
     async fn a_webhook_is_refused_and_retryable_when_dispatch_is_down() {
-        let secret = "nextcloud-test-secret";
+        let secret = "whatsapp-test-secret";
         // No `spawn_dispatch`: the state's bus has never had a sender published,
         // which is exactly what a restarting channel runtime looks like.
-        let mut state = nextcloud_state(
+        let mut state = whatsapp_state(
             Arc::new(MockProvider::default()),
             secret,
             GatewayRateLimiter::new(100, 100, 100, 100),
@@ -7158,9 +7359,9 @@ mod tests {
         let observer = Arc::new(crate::observability::PrometheusObserver::new());
         state.observer = observer.clone();
 
-        let (headers, body) = signed_nextcloud(secret, "m1");
+        let (headers, body) = signed_whatsapp(secret, "m1");
         let response =
-            handle_nextcloud_talk_webhook(State(state.clone()), test_peer(), headers, body).await;
+            handle_whatsapp_message(State(state.clone()), test_peer(), headers, body).await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(
             response.headers().contains_key(header::RETRY_AFTER),
@@ -7169,21 +7370,26 @@ mod tests {
         let metrics = observer.encode();
         assert!(
             metrics.contains(
-                r#"rantaiclaw_channel_enqueue_rejected_total{channel="nextcloud_talk",reason="closed"} 1"#
+                r#"rantaiclaw_channel_enqueue_rejected_total{channel="whatsapp",reason="closed"} 1"#
             ),
             "the refusal must reach the process registry: {metrics}"
         );
 
         // The claim was released, so the platform's retry is processed rather
-        // than discarded as a redelivery. A fresh nonce keeps the anti-replay
-        // gate out of the way; the message id is the same one.
+        // than discarded as a redelivery. The message id is the same one.
         let workspace = tempfile::tempdir().expect("temp workspace");
-        let harness = spawn_dispatch(workspace.path(), false).await;
+        let harness = spawn_dispatch_with(
+            workspace.path(),
+            DispatchOptions {
+                channel_name: Some("whatsapp".to_string()),
+                ..DispatchOptions::default()
+            },
+        )
+        .await;
         state.channel_bus = Arc::clone(&harness.bus);
-        let (headers, body) =
-            signed_nextcloud_from(secret, "m1", "retry-nonce", "user_a", "room-1", "hello");
+        let (headers, body) = signed_whatsapp_from(secret, "m1", "15550000001", "hello");
         assert_eq!(
-            post_nextcloud(&state, headers, body).await,
+            post_whatsapp(&state, headers, body).await,
             StatusCode::OK,
             "the retry of a refused message must be accepted, not deduplicated away"
         );
@@ -7199,9 +7405,16 @@ mod tests {
     /// the handler answers having only *queued* the message, with a provider
     /// that would never have answered.
     #[tokio::test]
-    async fn nextcloud_talk_webhook_acks_without_running_a_turn() {
+    async fn whatsapp_webhook_acks_without_running_a_turn() {
         let workspace = tempfile::tempdir().expect("temp workspace");
-        let harness = spawn_dispatch(workspace.path(), false).await;
+        let harness = spawn_dispatch_with(
+            workspace.path(),
+            DispatchOptions {
+                channel_name: Some("whatsapp".to_string()),
+                ..DispatchOptions::default()
+            },
+        )
+        .await;
 
         // Parked, and wired into the gateway's own AppState: if the handler ran
         // a turn of its own, it would block here forever.
@@ -7212,19 +7425,19 @@ mod tests {
         });
         let provider: Arc<dyn Provider> = provider_impl.clone();
 
-        let secret = "nextcloud-test-secret";
-        let mut state = nextcloud_state(
+        let secret = "whatsapp-test-secret";
+        let mut state = whatsapp_state(
             provider,
             secret,
             GatewayRateLimiter::new(100, 100, 100, 100),
             IdempotencyStore::new(Duration::from_mins(5), 1000),
         );
         state.channel_bus = Arc::clone(&harness.bus);
-        let (headers, body) = signed_nextcloud(secret, "msg-1");
+        let (headers, body) = signed_whatsapp(secret, "msg-1");
 
         let response = tokio::time::timeout(
             Duration::from_secs(2),
-            handle_nextcloud_talk_webhook(State(state), test_peer(), headers, body),
+            handle_whatsapp_message(State(state), test_peer(), headers, body),
         )
         .await
         .expect("the handler must answer without awaiting a turn");
@@ -7250,13 +7463,20 @@ mod tests {
     /// swallows the second request. So the same harness first has to show two
     /// distinct messages arriving as two.
     #[tokio::test]
-    async fn nextcloud_talk_webhook_enqueues_a_redelivered_message_once() {
-        let secret = "nextcloud-test-secret";
+    async fn whatsapp_webhook_enqueues_a_redelivered_message_once() {
+        let secret = "whatsapp-test-secret";
 
-        // Control: two different messages, two different nonces => two turns.
+        // Control: two different messages => two turns.
         let control_workspace = tempfile::tempdir().expect("temp workspace");
-        let control_harness = spawn_dispatch(control_workspace.path(), false).await;
-        let mut control = nextcloud_state(
+        let control_harness = spawn_dispatch_with(
+            control_workspace.path(),
+            DispatchOptions {
+                channel_name: Some("whatsapp".to_string()),
+                ..DispatchOptions::default()
+            },
+        )
+        .await;
+        let mut control = whatsapp_state(
             Arc::new(MockProvider::default()),
             secret,
             GatewayRateLimiter::new(100, 100, 100, 100),
@@ -7264,11 +7484,8 @@ mod tests {
         );
         control.channel_bus = Arc::clone(&control_harness.bus);
         for id in ["control-1", "control-2"] {
-            let (headers, body) = signed_nextcloud(secret, id);
-            assert_eq!(
-                post_nextcloud(&control, headers, body).await,
-                StatusCode::OK
-            );
+            let (headers, body) = signed_whatsapp(secret, id);
+            assert_eq!(post_whatsapp(&control, headers, body).await, StatusCode::OK);
         }
         assert_eq!(
             wait_for_sends(&control_harness.channel, 2).await.len(),
@@ -7277,22 +7494,28 @@ mod tests {
              without this the dedup assertion below proves nothing"
         );
 
-        // The real case: one message, delivered twice under distinct nonces, so
-        // the anti-replay gate lets both through and the message-id dedup is
-        // what decides.
+        // The real case: one message, delivered twice. The platform id is the
+        // same both times, so the message-id dedup is what decides.
         let workspace = tempfile::tempdir().expect("temp workspace");
-        let harness = spawn_dispatch(workspace.path(), false).await;
-        let mut state = nextcloud_state(
+        let harness = spawn_dispatch_with(
+            workspace.path(),
+            DispatchOptions {
+                channel_name: Some("whatsapp".to_string()),
+                ..DispatchOptions::default()
+            },
+        )
+        .await;
+        let mut state = whatsapp_state(
             Arc::new(MockProvider::default()),
             secret,
             GatewayRateLimiter::new(100, 100, 100, 100),
             IdempotencyStore::new(Duration::from_mins(5), 1000),
         );
         state.channel_bus = Arc::clone(&harness.bus);
-        for nonce in ["nonce-a", "nonce-b"] {
-            let (headers, body) = signed_nextcloud_with_nonce(secret, "redelivered", nonce);
+        for _ in 0..2 {
+            let (headers, body) = signed_whatsapp(secret, "redelivered");
             assert_eq!(
-                post_nextcloud(&state, headers, body).await,
+                post_whatsapp(&state, headers, body).await,
                 StatusCode::OK,
                 "a redelivery is ACKed, not refused — the platform must stop retrying"
             );
@@ -7329,7 +7552,11 @@ mod tests {
         let first = handle_nextcloud_talk_webhook(State(state.clone()), test_peer(), headers, body)
             .await
             .into_response();
-        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(
+            first.status(),
+            StatusCode::FORBIDDEN,
+            "a locked channel's route refuses, and the limiter is still ahead of it"
+        );
 
         let (headers, body) = signed_nextcloud(secret, "burst-2");
         let second = handle_nextcloud_talk_webhook(State(state), test_peer(), headers, body)
@@ -7664,31 +7891,56 @@ mod tests {
         headers
     }
 
-    async fn call_webhook(
+    /// The whole response a handler produced, so a test can read its status
+    /// *and* its body.
+    ///
+    /// [`call_webhook`] answers the status alone. A refusal is a body as much
+    /// as a status, and a test that cannot read the body cannot say the
+    /// refusal says the right thing.
+    async fn call_webhook_response(
         endpoint: Endpoint,
         state: AppState,
         headers: HeaderMap,
         body: &str,
-    ) -> StatusCode {
+    ) -> axum::response::Response {
         let bytes = Bytes::from(body.to_string());
         match endpoint {
             Endpoint::WhatsApp => {
                 handle_whatsapp_message(State(state), test_peer(), headers, bytes)
                     .await
                     .into_response()
-                    .status()
             }
             Endpoint::Linq => handle_linq_webhook(State(state), test_peer(), headers, bytes)
                 .await
-                .into_response()
-                .status(),
+                .into_response(),
             Endpoint::NextcloudTalk => {
                 handle_nextcloud_talk_webhook(State(state), test_peer(), headers, bytes)
                     .await
                     .into_response()
-                    .status()
             }
         }
+    }
+
+    async fn call_webhook(
+        endpoint: Endpoint,
+        state: AppState,
+        headers: HeaderMap,
+        body: &str,
+    ) -> StatusCode {
+        call_webhook_response(endpoint, state, headers, body)
+            .await
+            .status()
+    }
+
+    /// The JSON body of a handler response.
+    async fn response_json(response: axum::response::Response) -> serde_json::Value {
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("a response body")
+            .to_bytes();
+        serde_json::from_slice(&bytes).expect("a JSON body")
     }
 
     const AUTH_ENDPOINTS: [Endpoint; 3] =
@@ -7771,31 +8023,137 @@ mod tests {
         }
     }
 
-    /// A correct signature → 200. The turn does not run here at all: since plan
-    /// 313 the handler only queues the message, so the provider counter is not
-    /// the oracle on this path — the rejection cases above are where it carries
-    /// the meaning.
+    /// A correct signature → 200 on a usable route, and a refusal on a locked
+    /// one. The turn does not run here at all: since plan 313 the handler only
+    /// queues the message, so the provider counter is not the oracle on this
+    /// path — the rejection cases above are where it carries the meaning.
     #[tokio::test]
-    async fn webhook_with_a_valid_signature_is_accepted() {
+    async fn a_valid_signature_is_accepted_on_a_usable_route_and_refused_on_a_locked_one() {
         for endpoint in AUTH_ENDPOINTS {
             let provider_impl = Arc::new(MockProvider::default());
             let mut state = auth_test_state(endpoint, Some("test-webhook-secret"), &provider_impl);
-            let (bus, _rx) = accepting_bus().await;
-            state.channel_bus = bus;
+            // The bus is held here as well as in the state: the handler takes
+            // the state by value and drops it, and a dropped bus takes its
+            // sender with it — which would make an empty bus indistinguishable
+            // from a closed one.
+            let (bus, mut rx) = accepting_bus().await;
+            state.channel_bus = Arc::clone(&bus);
             let body = auth_test_body(endpoint);
             let headers = auth_test_headers(endpoint, "test-webhook-secret", body);
             let status = call_webhook(endpoint, state, headers, body).await;
 
+            if matches!(endpoint, Endpoint::WhatsApp) {
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "{endpoint:?} must accept a correctly-signed request"
+                );
+                assert!(
+                    rx.try_recv().is_ok(),
+                    "{endpoint:?} must queue the message it accepted"
+                );
+            } else {
+                assert_eq!(
+                    status,
+                    StatusCode::FORBIDDEN,
+                    "{endpoint:?} must refuse a locked channel's route"
+                );
+            }
+        }
+    }
+
+    /// A locked channel's route must not run a turn.
+    ///
+    /// The catalog locks `linq` and `nextcloud_talk`
+    /// (`ChannelSupport::UnderDevelopment`), and the daemon's channel listeners
+    /// honour that lock: `build_configured_channels` filters the locked keys
+    /// out. The gateway's routes did not. `POST /linq` and
+    /// `POST /nextcloud-talk` verified the signature and then handed the message
+    /// to the dispatch loop, which started an agent turn — and the reply was
+    /// dropped, because the dispatch registry is built from that filtered list
+    /// and holds no channel under those names. So a signed request cost a
+    /// provider request and answered 200 for a turn nobody could see.
+    ///
+    /// The refusal comes after the route's own authentication, so an
+    /// unauthenticated caller learns nothing new, and before the message is
+    /// parsed, so a locked channel costs no provider request and puts nothing
+    /// on the channel bus.
+    #[tokio::test]
+    async fn a_locked_channel_route_refuses_a_signed_request_and_runs_no_turn() {
+        for (endpoint, channel) in [
+            (Endpoint::Linq, "Linq"),
+            (Endpoint::NextcloudTalk, "Nextcloud Talk"),
+        ] {
+            let provider_impl = Arc::new(MockProvider::default());
+            let mut state = auth_test_state(endpoint, Some("test-webhook-secret"), &provider_impl);
+            // The bus is held here as well as in the state: the handler takes
+            // the state by value and drops it, and a dropped bus takes its
+            // sender with it — which would make an empty bus indistinguishable
+            // from a closed one.
+            let (bus, mut rx) = accepting_bus().await;
+            state.channel_bus = Arc::clone(&bus);
+            let body = auth_test_body(endpoint);
+            let headers = auth_test_headers(endpoint, "test-webhook-secret", body);
+
+            let response = call_webhook_response(endpoint, state, headers, body).await;
             assert_eq!(
-                status,
-                StatusCode::OK,
-                "{endpoint:?} must accept a correctly-signed request"
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "{endpoint:?} must refuse a locked channel's route"
+            );
+
+            let json = response_json(response).await;
+            assert_eq!(
+                json["error"],
+                format!(
+                    "{channel} channel is {}",
+                    crate::channels::ChannelSupport::UnderDevelopment.label()
+                ),
+                "{endpoint:?} must name the channel and say why it refuses"
+            );
+
+            assert_eq!(
+                provider_impl.calls.load(Ordering::SeqCst),
+                0,
+                "{endpoint:?} must not cost a provider request"
+            );
+            assert!(
+                matches!(
+                    rx.try_recv(),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                ),
+                "{endpoint:?} must leave the channel bus empty"
             );
         }
     }
 
+    /// The startup banner must not advertise a webhook that refuses every
+    /// request it receives.
+    #[test]
+    fn the_startup_banner_says_a_locked_channel_route_refuses() {
+        assert_eq!(
+            locked_channel_note("linq"),
+            format!(
+                " — refused: the channel is {}",
+                crate::channels::ChannelSupport::UnderDevelopment.label()
+            ),
+            "a locked channel's route must say that it refuses"
+        );
+        assert_eq!(
+            locked_channel_note("whatsapp"),
+            String::new(),
+            "a usable channel's route keeps the wording it always had"
+        );
+    }
+
     /// A captured Nextcloud request replays forever unless the nonce it already
     /// carries is remembered. #495 records it; this pins that.
+    ///
+    /// The nonce gate sits *ahead* of the locked-channel refusal, so the first
+    /// request is refused for the channel and the replay is still answered as
+    /// the duplicate it is. That order is deliberate: a replay starts no turn
+    /// and costs no provider request, and acknowledging it stops the
+    /// platform's retry loop instead of feeding it.
     #[tokio::test]
     async fn nextcloud_talk_rejects_a_replayed_nonce() {
         let provider_impl = Arc::new(MockProvider::default());
@@ -7809,21 +8167,30 @@ mod tests {
         let body = auth_test_body(Endpoint::NextcloudTalk);
         let headers = auth_test_headers(Endpoint::NextcloudTalk, "test-webhook-secret", body);
 
-        let first = call_webhook(
+        let first = call_webhook_response(
             Endpoint::NextcloudTalk,
             state.clone(),
             headers.clone(),
             body,
         )
         .await;
-        assert_eq!(first, StatusCode::OK);
+        assert_eq!(
+            first.status(),
+            StatusCode::FORBIDDEN,
+            "a locked channel's route refuses — after the nonce gate, which already recorded it"
+        );
 
         // Byte-identical replay — same nonce, same signature.
-        let second = call_webhook(Endpoint::NextcloudTalk, state, headers, body).await;
+        let second = call_webhook_response(Endpoint::NextcloudTalk, state, headers, body).await;
         assert_eq!(
-            second,
+            second.status(),
             StatusCode::OK,
             "a replay is acknowledged, not errored — but it must not be reprocessed"
+        );
+        assert_eq!(
+            response_json(second).await["status"],
+            "duplicate",
+            "the replay must be answered as the duplicate it is"
         );
     }
 
