@@ -139,6 +139,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   characters, which cut the guidance off mid-sentence. The bound applies to the refusal only: the
   model that goes on the wire keeps its full name.
 
+- **The anonymous GHCR pull check in the Docker publish workflow requests the lowercase image name.**
+  It sent the mixed-case repository name, which GHCR refuses with `NAME_INVALID`, so the check warned
+  on every run. It now requests `ghcr.io/rantai-dev/rantaiclaw`. The check stays non-blocking, and its
+  warning stays until an org admin makes the package public for anonymous pulls.
+
 ### Security
 
 - **A stored Claude subscription login no longer reaches any host.** The Anthropic auth profile,
