@@ -1043,6 +1043,98 @@ mod tests {
             .contains(&"brew".to_string()));
     }
 
+    /// The channel's Layer B `/allow` answer is a session grant: it resolves
+    /// the shell prompt with `Session` and the basename lands on the runtime
+    /// allowlist. Only "Once" was narrowed, so this must stay as it is.
+    #[tokio::test]
+    async fn a_channel_allow_answer_still_grants_the_session() {
+        use crate::runtime::NativeRuntime;
+        use crate::tools::traits::Tool;
+
+        let security = Arc::new(
+            SecurityPolicy::default()
+                .with_autonomy(crate::security::AutonomyLevel::Supervised)
+                .with_allowed_commands(vec!["echo".into()])
+                .with_workspace_dir(std::env::temp_dir()),
+        );
+        let pending = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        security.set_pending(pending.clone());
+        let tool = crate::tools::ShellTool::new(security.clone(), Arc::new(NativeRuntime::new()));
+
+        // The shell tool's own command gate is what asks.
+        let call = tokio::spawn(async move {
+            tool.execute(serde_json::json!({ "command": "true" }))
+                .await
+                .expect("the command should return a result")
+        });
+        await_pending(&pending, 1).await;
+
+        let owners = vec!["owner1".to_string()];
+        let ack = try_handle_reply(
+            "/allow true",
+            &security,
+            "owner1",
+            &owners,
+            "telegram",
+            "chat-1",
+        )
+        .expect("recognised");
+        assert!(ack.contains("session"), "{ack}");
+
+        let result = call.await.unwrap();
+        assert!(result.success, "the allowed command must run: {result:?}");
+        assert!(
+            security
+                .runtime_allowlist_snapshot()
+                .contains(&"true".to_string()),
+            "a channel /allow is a session grant and must reach the runtime allowlist: {:?}",
+            security.runtime_allowlist_snapshot()
+        );
+    }
+
+    /// The channel's Layer A `/approve` answer is a `Once`: it covers that one
+    /// tool call and grants no runtime command.
+    #[tokio::test]
+    async fn a_channel_approve_answer_grants_no_runtime_command() {
+        let security = supervised_only_echo();
+        let relay = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        let task = tokio::spawn({
+            let relay = relay.clone();
+            async move {
+                relay
+                    .request_decision_in_outcome(
+                        uuid::Uuid::new_v4(),
+                        "shell",
+                        "true",
+                        "telegram",
+                        "chat-1",
+                    )
+                    .await
+                    .decision
+            }
+        });
+        await_pending(&relay, 1).await;
+
+        let owners = vec!["owner1".to_string()];
+        let ack = try_handle_tool_reply(
+            "/approve shell",
+            &relay,
+            "owner1",
+            &owners,
+            "telegram",
+            "chat-1",
+        )
+        .expect("recognised");
+        assert!(ack.contains("shell"), "{ack}");
+
+        assert_eq!(task.await.unwrap(), Decision::Once);
+        assert!(
+            security.runtime_allowlist_snapshot().is_empty(),
+            "a channel /approve covers one call and grants no runtime command: {:?}",
+            security.runtime_allowlist_snapshot()
+        );
+    }
+
     /// A risk-gate answer holds for the session at medium risk. It must not
     /// claim an allowlist entry, because none is written.
     #[tokio::test]

@@ -917,6 +917,32 @@ impl SecurityPolicy {
     /// Validate full command execution policy (credential-directory refusal,
     /// allowlist + risk gate).
     ///
+    /// The public wrapper is unchanged: a command outside the allowlist is
+    /// rejected and nothing here grants it. A one-call grant is a separate,
+    /// crate-internal entry point (`validate_command_execution_with`).
+    pub fn validate_command_execution(
+        &self,
+        command: &str,
+        approved: bool,
+    ) -> Result<CommandRiskLevel, String> {
+        self.validate_command_execution_with(command, approved, &[])
+    }
+
+    /// As [`validate_command_execution`](Self::validate_command_execution), but a
+    /// basename listed in `once_allowed` counts as allowed.
+    ///
+    /// `once_allowed` holds plain basenames (`"true"`, `"brew"`), never paths,
+    /// and is compared exactly the way the runtime list is. It carries a "Once"
+    /// answer: the human allowed that basename for the call that was asked
+    /// about and for nothing else, so it is handed in per call instead of
+    /// being written to the shared allowlist, where it would outlive the
+    /// answer and be visible to every other turn in the process.
+    ///
+    /// Everything else is unchanged: the credential-directory refusal still
+    /// comes first and is still a hard block, the risk gate still applies, and
+    /// the structural rules (subshells, redirects, dangerous arguments) still
+    /// reject the command.
+    ///
     /// The credential-directory refusal runs first and is a hard block: it does
     /// not depend on the allowlist or the autonomy level, so `full` is covered
     /// and an approval cannot lift it.
@@ -925,16 +951,17 @@ impl SecurityPolicy {
     /// a session grant is treated as approved: that is what a "Session" answer
     /// to the risk gate means. The grant is never consulted for high risk, a
     /// high-risk command always asks again.
-    pub fn validate_command_execution(
+    pub(crate) fn validate_command_execution_with(
         &self,
         command: &str,
         approved: bool,
+        once_allowed: &[String],
     ) -> Result<CommandRiskLevel, String> {
         if let Some(dir) = self.command_names_credential_dir(command) {
             return Err(credential_refusal(&dir));
         }
 
-        if !self.is_command_allowed(command) {
+        if !self.is_command_allowed_with(command, once_allowed) {
             return Err(format!("Command not allowed by security policy: {command}"));
         }
 
@@ -1148,7 +1175,28 @@ impl SecurityPolicy {
     /// - Blocks single `&` background chaining (`&&` remains supported)
     /// - Blocks output redirections (`>`, `>>`) that could write outside workspace
     /// - Blocks dangerous arguments (e.g. `find -exec`, `git config`)
+    ///
+    /// The public wrapper is unchanged: nothing outside the allowlist is
+    /// allowed here. A one-call grant is a separate, crate-internal entry
+    /// point (`is_command_allowed_with`).
     pub fn is_command_allowed(&self, command: &str) -> bool {
+        self.is_command_allowed_with(command, &[])
+    }
+
+    /// As [`is_command_allowed`](Self::is_command_allowed), but a basename
+    /// listed in `once_allowed` counts as allowed.
+    ///
+    /// `once_allowed` holds plain basenames, never paths, and is compared
+    /// exactly the way the runtime list is — against the basename the walk
+    /// computes (`base_raw.rsplit('/').next()`). It carries a "Once" answer:
+    /// the human allowed that basename for the call that was asked about, so
+    /// it is handed in per call instead of being written to the shared
+    /// allowlist, where it would outlive the answer.
+    ///
+    /// The grant covers the allowlist check and nothing else: the structural
+    /// rules and the dangerous-argument check still apply to an approved
+    /// basename, exactly as they do to an allowlisted one.
+    pub(crate) fn is_command_allowed_with(&self, command: &str, once_allowed: &[String]) -> bool {
         if self.effective_autonomy() == AutonomyLevel::ReadOnly {
             return false;
         }
@@ -1212,7 +1260,12 @@ impl SecurityPolicy {
                 let set = self.runtime_allowlist.read();
                 set.contains(base_cmd)
             };
-            if !on_config_list && !on_runtime_list {
+            // A one-call grant, held beside the two lists rather than in them:
+            // it covers this call and dies with it.
+            let allowed = on_config_list
+                || on_runtime_list
+                || once_allowed.iter().any(|name| name == base_cmd);
+            if !allowed {
                 return false;
             }
 
@@ -1639,7 +1692,25 @@ impl SecurityPolicy {
     /// This is the basename a UI should surface in an approval prompt:
     /// approving `brew` makes the next attempt at `brew --version`
     /// succeed.
+    ///
+    /// The public wrapper is unchanged: nothing outside the allowlist is
+    /// reported as allowed here. A one-call grant is a separate,
+    /// crate-internal entry point (`first_unallowed_basename_with`).
     pub fn first_unallowed_basename(&self, command: &str) -> Option<String> {
+        self.first_unallowed_basename_with(command, &[])
+    }
+
+    /// As [`first_unallowed_basename`](Self::first_unallowed_basename), but a
+    /// basename listed in `once_allowed` is not reported as unallowed.
+    ///
+    /// The walk has to agree with the allowlist check, or a chain would ask
+    /// again about a basename the human already allowed for this call and run
+    /// into the cascading-approval limit.
+    pub(crate) fn first_unallowed_basename_with(
+        &self,
+        command: &str,
+        once_allowed: &[String],
+    ) -> Option<String> {
         let autonomy = self.effective_autonomy();
         if autonomy == AutonomyLevel::ReadOnly || autonomy == AutonomyLevel::Full {
             return None;
@@ -1677,7 +1748,11 @@ impl SecurityPolicy {
                 let set = self.runtime_allowlist.read();
                 set.contains(base_cmd)
             };
-            if !on_config_list && !on_runtime {
+            // A one-call grant, held beside the two lists rather than in them:
+            // it covers this call and dies with it.
+            let allowed =
+                on_config_list || on_runtime || once_allowed.iter().any(|name| name == base_cmd);
+            if !allowed {
                 return Some(base_cmd.to_string());
             }
         }

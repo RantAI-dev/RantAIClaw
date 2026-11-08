@@ -444,11 +444,18 @@ impl Tool for ShellTool {
             });
         }
         let mut iters = 0;
+        // The basenames a "Once" answer covered for THIS call. A "Once" means
+        // "that one call", so the grant lives here, in the call that asked
+        // about it — not on the shared runtime allowlist, where it would
+        // outlive the answer and let every later call of the same basename run
+        // unasked.
+        let mut once_allowed: Vec<String> = Vec::new();
         loop {
-            match self
-                .security
-                .validate_command_execution(command, human_approved)
-            {
+            match self.security.validate_command_execution_with(
+                command,
+                human_approved,
+                &once_allowed,
+            ) {
                 Ok(_) => break,
                 Err(reason) => {
                     iters += 1;
@@ -478,9 +485,12 @@ impl Tool for ShellTool {
                     // by naming the command.
                     let (channel, reply_target) = crate::security::current_turn_scope();
 
-                    if let Some(basename) = self.security.first_unallowed_basename(command) {
-                        // Case 1: an unallowed basename in the chain — approve it,
-                        // add to the runtime allowlist, and re-validate.
+                    if let Some(basename) = self
+                        .security
+                        .first_unallowed_basename_with(command, &once_allowed)
+                    {
+                        // Case 1: an unallowed basename in the chain — approve it
+                        // and re-validate.
                         // Always here records a command grant for the conversation
                         // (see the gateway), so the request is flagged as one that
                         // Always can hold for.
@@ -497,10 +507,19 @@ impl Tool for ShellTool {
                         // to say so, or the record claims nobody was asked.
                         crate::security::record_tool_approval(decision_outcome(decision));
                         match decision {
-                            // Once/Session/Persist fall through to re-validate on
+                            // Once covers this call only: the basename is held
+                            // in `once_allowed` for the rest of THIS call and is
+                            // recorded nowhere else. Writing it to the runtime
+                            // allowlist here would make "Once" a session grant —
+                            // the next call of that basename would run with no
+                            // prompt at all.
+                            Decision::Once => {
+                                once_allowed.push(basename);
+                            }
+                            // Session/Persist fall through to re-validate on
                             // the next loop iteration (an explicit `continue` here
                             // is redundant — the loop re-iterates anyway).
-                            Decision::Once | Decision::Session => {
+                            Decision::Session => {
                                 if let Err(e) = self.security.add_runtime_command(&basename, false)
                                 {
                                     tracing::warn!(target: "shell", error = %e, "add_runtime_command failed");
@@ -526,7 +545,7 @@ impl Tool for ShellTool {
                         }
                     } else if self
                         .security
-                        .validate_command_execution(command, true)
+                        .validate_command_execution_with(command, true, &once_allowed)
                         .is_ok()
                     {
                         // Case 2: the ONLY thing blocking this command is the
@@ -1942,6 +1961,174 @@ mod tests {
                 .runtime_allowlist_snapshot()
                 .contains(&"true".to_string()),
             "session approval must add basename to runtime allowlist"
+        );
+    }
+
+    /// A "Once" answer to the unallowed-command gate covers that one call
+    /// only: the command runs, nothing is recorded on the runtime allowlist,
+    /// and the next identical call asks again.
+    ///
+    /// A "Once" that wrote to the allowlist would be a session grant wearing
+    /// the name of a one-call answer — every later call of that basename would
+    /// run with no prompt.
+    #[tokio::test]
+    async fn a_once_answer_to_an_unallowed_basename_allows_that_call_only() {
+        let security = supervised_security_only_echo();
+        let approvals = Arc::new(PendingApprovals::new(Some(Duration::from_secs(5))));
+        security.set_pending(approvals.clone());
+        let asked = answer_every_request(approvals.clone(), Decision::Once);
+        let tool = ShellTool::new(security.clone(), test_runtime());
+
+        let first = tool
+            .execute(json!({"command": "true"}))
+            .await
+            .expect("the command should return a result");
+        assert!(
+            first.success,
+            "a once answer must let the command run: {first:?}"
+        );
+        assert_eq!(
+            asked_count(&asked),
+            1,
+            "the unallowed basename must ask once"
+        );
+        assert!(
+            security.runtime_allowlist_snapshot().is_empty(),
+            "a once answer must record nothing on the runtime allowlist: {:?}",
+            security.runtime_allowlist_snapshot()
+        );
+
+        let second = tool
+            .execute(json!({"command": "true"}))
+            .await
+            .expect("the second command should return a result");
+        assert!(
+            second.success,
+            "the second run must run as well: {second:?}"
+        );
+        assert_eq!(
+            asked_count(&asked),
+            2,
+            "the next identical call must ask again"
+        );
+    }
+
+    /// A chain whose segments are each outside the allowlist asks once per
+    /// segment, and a "Once" answer covers its segment for the rest of the
+    /// call. The chain must not ask again about a basename it already covered,
+    /// or the cascade would run into its own prompt limit.
+    #[tokio::test]
+    async fn a_once_answer_covers_its_segment_of_a_chain() {
+        let security = Arc::new(
+            SecurityPolicy::default()
+                .with_autonomy(AutonomyLevel::Supervised)
+                .with_workspace_dir(std::env::temp_dir())
+                .with_allowed_commands(vec![]),
+        );
+        let approvals = Arc::new(PendingApprovals::new(Some(Duration::from_secs(5))));
+        security.set_pending(approvals.clone());
+        let asked = answer_every_request(approvals.clone(), Decision::Once);
+        let tool = ShellTool::new(security.clone(), test_runtime());
+
+        let result = tool
+            .execute(json!({"command": "true && echo rantaiclaw_shell_once_chain"}))
+            .await
+            .expect("the chain should return a result");
+        assert!(result.success, "the chain must run: {result:?}");
+        assert_eq!(
+            asked_count(&asked),
+            2,
+            "each distinct blocked basename must ask exactly once"
+        );
+        assert!(
+            security.runtime_allowlist_snapshot().is_empty(),
+            "a once answer must record nothing on the runtime allowlist: {:?}",
+            security.runtime_allowlist_snapshot()
+        );
+    }
+
+    /// A "Session" answer to the unallowed-command gate keeps its meaning: the
+    /// basename lands on the runtime allowlist and the next identical call runs
+    /// without asking. Only "Once" was narrowed; this must not move.
+    #[tokio::test]
+    async fn a_session_answer_to_an_unallowed_basename_still_grants_the_session() {
+        let security = supervised_security_only_echo();
+        let approvals = Arc::new(PendingApprovals::new(Some(Duration::from_secs(5))));
+        security.set_pending(approvals.clone());
+        let asked = answer_every_request(approvals.clone(), Decision::Session);
+        let tool = ShellTool::new(security.clone(), test_runtime());
+
+        let first = tool
+            .execute(json!({"command": "true"}))
+            .await
+            .expect("the command should return a result");
+        assert!(
+            first.success,
+            "a session answer must let the command run: {first:?}"
+        );
+        assert_eq!(
+            asked_count(&asked),
+            1,
+            "the unallowed basename must ask once"
+        );
+        assert!(
+            security
+                .runtime_allowlist_snapshot()
+                .contains(&"true".to_string()),
+            "a session answer must add the basename to the runtime allowlist: {:?}",
+            security.runtime_allowlist_snapshot()
+        );
+
+        let second = tool
+            .execute(json!({"command": "true"}))
+            .await
+            .expect("the second command should return a result");
+        assert!(
+            second.success,
+            "the second run must run as well: {second:?}"
+        );
+        assert_eq!(
+            asked_count(&asked),
+            1,
+            "a session answer must hold for the next run"
+        );
+    }
+
+    /// An "Always" (Persist) answer to the unallowed-command gate writes the
+    /// basename to the profile's runtime allowlist file, so it survives a
+    /// restart. Only "Once" was narrowed; this must not move.
+    #[tokio::test]
+    async fn a_persist_answer_to_an_unallowed_basename_writes_the_overlay() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // The persist answer writes into the profile directory, so the policy
+        // has to carry one.
+        let mut policy = supervised_security_only_echo().as_ref().clone();
+        policy.policy_dir = Some(dir.path().to_path_buf());
+        let security = Arc::new(policy);
+        let approvals = Arc::new(PendingApprovals::new(Some(Duration::from_secs(5))));
+        security.set_pending(approvals.clone());
+        let asked = answer_every_request(approvals.clone(), Decision::Persist);
+        let tool = ShellTool::new(security.clone(), test_runtime());
+
+        let result = tool
+            .execute(json!({"command": "true"}))
+            .await
+            .expect("the command should return a result");
+        assert!(
+            result.success,
+            "a persist answer must let the command run: {result:?}"
+        );
+        assert_eq!(
+            asked_count(&asked),
+            1,
+            "the unallowed basename must ask once"
+        );
+
+        let overlay = crate::security::runtime_overlay::overlay_path(dir.path());
+        let written = std::fs::read_to_string(&overlay).expect("the overlay file");
+        assert!(
+            written.contains("true"),
+            "a persist answer must write the basename to the overlay file: {written}"
         );
     }
 
