@@ -335,7 +335,12 @@ reply (`/approve`, `/deny`, `/allow`, or a slash-prefixed bare verb) that names 
 is answered the same way. A reply that is none of those — a slash-less non-handle-shaped token
 (`approve helm`), a bare verb (`ok`, `yes`), or plain chat — stays chat. An approval reply
 resolves a request only by its handle or its exact tool name: naming a command
-(`/approve kubectl`) resolves nothing. Slack has no reset
+(`/approve kubectl`) resolves nothing. An answer says what it covers: `/allow
+<command>` answers the shell command gate and allowlists that basename for the
+life of the process — `--persist` writes it to disk as well, so it survives a
+restart — while `/approve <tool>` answers the tool gate and covers that one call
+only, granting no command.
+Slack has no reset
 command: a new top-level message already starts a new conversation.
 
 ## Channel Session Recording

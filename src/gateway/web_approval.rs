@@ -439,6 +439,59 @@ mod tests {
         assert_eq!(task.await.unwrap(), Decision::Once);
     }
 
+    /// The console's "approve, not always" answer is a `Once`: the shell
+    /// command it covers runs, and nothing lands on the runtime allowlist, so
+    /// the next call of the same command asks again.
+    ///
+    /// The answer goes through [`resolve`] — the endpoint the browser posts to
+    /// — so the test pins the console's own path, not the registry's.
+    #[tokio::test]
+    async fn a_console_approval_without_always_grants_the_shell_call_only() {
+        use crate::runtime::NativeRuntime;
+        use crate::security::{AutonomyLevel, SecurityPolicy};
+        use crate::tools::traits::Tool;
+
+        let relay = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        let security = Arc::new(
+            SecurityPolicy::default()
+                .with_autonomy(AutonomyLevel::Supervised)
+                .with_allowed_commands(vec!["echo".into()])
+                .with_workspace_dir(std::env::temp_dir()),
+        );
+        security.set_pending(relay.clone());
+        let tool = crate::tools::ShellTool::new(security.clone(), Arc::new(NativeRuntime::new()));
+
+        let call = tokio::spawn(async move {
+            tool.execute(serde_json::json!({ "command": "true" }))
+                .await
+                .expect("the command should return a result")
+        });
+
+        // Wait for the shell tool's command prompt, then answer it the way the
+        // console does: approve, not always.
+        let mut id = String::new();
+        for _ in 0..500 {
+            if let Some(req) = relay.list().first() {
+                id = req.id.to_string();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(
+            !id.is_empty(),
+            "the shell tool should have registered an approval"
+        );
+        assert!(resolve(&relay, &id, true, false));
+
+        let result = call.await.unwrap();
+        assert!(result.success, "the approved command must run: {result:?}");
+        assert!(
+            security.runtime_allowlist_snapshot().is_empty(),
+            "a console approval without always must record nothing on the runtime allowlist: {:?}",
+            security.runtime_allowlist_snapshot()
+        );
+    }
+
     #[test]
     fn exempt_shell_removes_it_from_layer_a_even_when_always_ask() {
         // Even if `shell` is on always_ask (which normally forces a Layer-A

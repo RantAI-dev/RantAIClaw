@@ -297,17 +297,21 @@ is on, i.e. `channels_config.autonomous_tools` is not set.
   ```json
   { "approve": true }
   ```
-  `true` approves the tool call once; `false` denies it.
+  `true` approves the tool call once — that one call only, and nothing is
+  recorded, so the next call of the same command asks again; `false` denies it.
   `"always": true` with `"approve": true` is Always. For a command outside the
-  allowlist it holds until the conversation ends: the same command runs without
-  a prompt in the next message of that conversation, and nowhere else. For a
-  medium-risk command it holds at medium risk for the rest of the conversation:
-  the basenames that command runs stop asking, and a high-risk command still
-  asks every time. Always does not persist past the conversation, a gateway
-  restart, an autonomy preset change, or a config reload. The `always_available`
-  field on the `approval_request` event says whether the modal should offer it —
-  `false` for a high-risk command and for a tool forced to prompt by
-  `always_ask` or Manual.
+  allowlist it adds that basename to the runtime allowlist, which every clone of
+  the policy shares: the same command runs without a prompt in later
+  conversations too, for as long as the process lives, and it holds for the
+  conversation as well. That grant does not survive a gateway restart, but it
+  does survive the end of the conversation, an autonomy preset change and a
+  config reload. For a medium-risk command it holds at medium risk for the rest
+  of the conversation: the basenames that command runs stop asking, and a
+  high-risk command still asks every time. That grant ends with the
+  conversation, and an autonomy preset change or a config reload revokes it.
+  The `always_available` field on the `approval_request` event says whether the
+  modal should offer it — `false` for a high-risk command and for a tool forced
+  to prompt by `always_ask` or Manual.
 - **Response** `200`:
   ```json
   { "resolved": true, "id": "...", "approved": true }

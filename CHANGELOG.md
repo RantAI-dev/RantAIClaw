@@ -107,6 +107,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A "Once" answer to an unallowed-command prompt now covers that one call only.** The shell tool's
+  unallowed-basename gate treated "Once" like "Session": it added the basename to the runtime
+  allowlist, which every clone of the policy shares, so the command stayed allowed for the life of
+  the process and later calls of the same basename ran with no prompt. A "Once" answer now allows
+  exactly the call that was asked about and is recorded nowhere — not on the runtime allowlist, not
+  in the conversation grants, not on disk — so the next call of the same command asks again. "Session"
+  and "Always" keep their meaning (the basename is allowlisted for the life of the process, which is
+  wider than the conversation), and a Deny still ends the turn. The console's "approve" without
+  "always" and the channel's `/approve` answer one call each; the channel's `/allow` answers for the
+  life of the process.
+
 - **A TUI approval is answered only by a deliberate action.** The inline approval prompt claimed any
   unmodified key as an answer while the composer stayed live, so a letter typed as part of a message
   was read as an answer: an operator typing `/allow gv1` sent the `a`, which answered the open
