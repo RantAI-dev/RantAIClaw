@@ -262,21 +262,23 @@ jobs:
               shell: bash
               run: |
                   set -euo pipefail
-                  token_resp="$(curl -sS "https://ghcr.io/token?scope=repository:${GITHUB_REPOSITORY}:pull")"
+                  # GHCR rejects a mixed-case repository name with NAME_INVALID, so check the lowercase name users pull.
+                  image="${GITHUB_REPOSITORY,,}"
+                  token_resp="$(curl -sS "https://ghcr.io/token?scope=repository:${image}:pull")"
                   token="$(echo "$token_resp" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')"
 
                   if [ -z "$token" ]; then
-                    echo "::warning::Anonymous GHCR token request failed: $token_resp"
+                    echo "::warning::Anonymous GHCR token request failed for ghcr.io/${image}: $token_resp. An org admin must make the package public for anonymous pulls."
                     exit 0
                   fi
 
                   code="$(curl -sS -o /tmp/ghcr-manifest.json -w "%{http_code}" \
                     -H "Authorization: Bearer ${token}" \
                     -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
-                    "https://ghcr.io/v2/${GITHUB_REPOSITORY}/manifests/latest")"
+                    "https://ghcr.io/v2/${image}/manifests/latest")"
 
                   if [ "$code" != "200" ]; then
-                    echo "::warning::Anonymous manifest pull failed with HTTP ${code}"
+                    echo "::warning::Anonymous manifest pull of ghcr.io/${image}:latest failed with HTTP ${code}. An org admin must make the package public for anonymous pulls."
                     cat /tmp/ghcr-manifest.json || true
                     exit 0
                   fi
