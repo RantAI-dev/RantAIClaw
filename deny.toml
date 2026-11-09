@@ -134,6 +134,58 @@ ignore = [
     # the async-imap upgrade already queued upstream (checked 2026-11-05: the
     # hyper 1.8 chain keeps it either way).
     "RUSTSEC-2026-0441",
+    # libsqlite3-sys 0.38.2 — RUSTSEC-2026-0459 (CVE-2026-119375 /
+    # GHSA-72w2-rjgg-q729), memory-exposure: SQLite before 3.54.0 can return
+    # uninitialized page-cache memory when a database file is opened together
+    # with a sibling write-ahead-log (-wal) file whose page size differs from
+    # the database's, so a crafted file pair makes ordinary queries return
+    # stale bytes from the process's memory. Patched in libsqlite3-sys >=
+    # 0.39.0 (bundles SQLite 3.54.0); 0.39.1 ships SQLite 3.54.1. The lockfile
+    # holds 0.38.2, which bundles SQLite 3.53.2. The direct dependency
+    # `rusqlite` 0.40 (bundled, non-optional) requires libsqlite3-sys ^0.38.2,
+    # so the crate is in every default build and every released binary — the
+    # affected code is not dead. The upgrade is blocked: libsqlite3-sys >=
+    # 0.39.0 is only reachable through rusqlite 0.41, and the published
+    # matrix-sdk-sqlite 0.19.1 pins rusqlite = "0.40.2". Both rusqlite
+    # versions link the native `sqlite3` library, so Cargo refuses the tree:
+    # "package 'libsqlite3-sys' links to the native library 'sqlite3', but it
+    # conflicts with a previous package which links to 'sqlite3' as well".
+    # matrix-sdk-sqlite 0.19.1 is still the latest PUBLISHED release (checked
+    # 2026-11-09), so rusqlite 0.41 cannot resolve in our tree today.
+    # Upstream main has already moved to rusqlite = "0.41.1" (upstream commit
+    # 18757f7e08ec, 2026-11-09), so the next matrix-sdk-sqlite release clears
+    # this block and the fix is close.
+    #
+    # Residual risk: every database the product opens sits at a path the
+    # operator controls — under the operator's own profile tree
+    # (~/.rantaiclaw/profiles/<name>/…) or at an operator-set path outside it.
+    # The paths outside the profile tree are named, not implied: the
+    # KB_DB_PATH environment override; the ./kb.db current-directory fallback,
+    # used only when HOME is unavailable; the WhatsApp Web session database
+    # (channels.whatsapp_web.session_path, shipped default
+    # ~/.rantaiclaw/state/whatsapp-web/session.db, tightened to mode 0600);
+    # the legacy global migration databases (the pre-profile global data dir,
+    # ~/.local/share/rantaiclaw/{sessions,kb}.db on Linux), opened read-write
+    # to move them into the default profile; and a read-only open of Apple's
+    # own chat.db. No database is opened from a download, an attachment, a
+    # synced directory, a mounted share, a URL, a tool argument or a channel
+    # message, so no remote or less-trusted party supplies the file.
+    #
+    # The advisory scores itself
+    # CVSS:4.0/AV:L/AC:L/AT:N/PR:N/UI:P/VC:H/VI:N/VA:N/SC:N/SI:N/SA:N.
+    # AV:L keeps the attack local, and UI:P reflects that the files have to be
+    # opened — which the product does with its own databases automatically on
+    # daemon start, so that vector is not a deliberate user step we can lean
+    # on. An attacker therefore needs local write access to an operator-owned
+    # path: the same access that already lets them read the database files and
+    # the process memory directly. WAL mode is on for several stores, so the
+    # -wal sibling the advisory mechanism needs genuinely exists in our
+    # layout: the risk is low, but not zero.
+    #
+    # REVIEW BY 2026-12-15: drop once the next matrix-sdk-sqlite release
+    # (upstream main already accepts rusqlite 0.41.1) lands and the lockfile
+    # picks up libsqlite3-sys >= 0.39.0.
+    "RUSTSEC-2026-0459",
 ]
 
 [licenses]
