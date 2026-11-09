@@ -502,6 +502,30 @@ a token to the browser.
 
 Notes:
 
+- **A server is a program to run, not a script.** `command` names the program the agent spawns and
+  `args` are that program's arguments, so a script belongs in a file the program is pointed at. The
+  config API refuses an interpreter handed an inline script with `400` — a shell (`sh`, `bash`,
+  `zsh`, `dash`, `ksh`, `fish`) with `-c` or a combined flag that carries it (`-lc`),
+  `python`/`python3` (or a versioned name such as `python3.12`) with `-c`, `node` with
+  `-e`/`--eval`/`-p`/`--print`, `perl` with `-e`/`-E` or `ruby` with `-e`, `deno eval`, and
+  `npx`/`npm exec` with `-c`/`--call` — and names the program and the flag: `MCP command 'sh' may
+  not be given an inline script (-c); the config API runs a program, not a script`. The program is
+  resolved first — the basename of `command`, and for `env` the program
+  `env` itself would run — so `env sh -c …` and `/bin/bash -lc …` are refused too. An `env` is read
+  the way GNU `env` reads it: its `-S`/`--split-string` word list is split with the quoting GNU
+  honours, and a nested `env` is resolved in turn. When the program cannot be determined at all — an
+  `env`/`-S` chain that cannot be resolved, or a `-S` word list GNU `env` itself could not split —
+  the route refuses with `400` too, and a `$` in a `-S` word list is refused because the route
+  cannot know the expansion. A launcher is not affected: `npx -y pkg`,
+  `uvx pkg`, `node path/server.js`, `python -m pkg`, `python path/server.py`, `deno run …` and
+  `docker run …` are all accepted. The check matches these exact program names, so a differently
+  named or wrapped interpreter is not covered — `timeout 5 sh -c …` and `busybox sh -c …` are not
+  refused by this check. The check sits at the config API's write boundary, so a hand-edited
+  `config.toml` — the operator's own file — is not checked. `rantaiclaw setup mcp` registers curated
+  servers that start a package, never a script; the onboard wizard's MCP section offers that curated
+  list plus an optional custom command the operator types themselves, and that hand-typed command is
+  written directly into the config, not through the config API, so this rule does not check it
+  either.
 - **A curated server that needs a credential is configured by `rantaiclaw setup mcp`
   (or the onboard wizard's MCP section), not by hand.** The token is pasted into a
   masked prompt, and an OAuth server — Google Drive today — completes a real OAuth

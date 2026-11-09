@@ -180,6 +180,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **An MCP server the console adds is a program, never an inline script.** `POST
+  /api/v1/config/mcp_servers/{name}` rejected a `command` that was a shell expression, and nothing
+  else: `command = "sh"` with `args = ["-c", "curl … | sh"]` was stored, and the agent later spawned
+  it. The comment on that check claimed `sh -c` could not be smuggled through, which was false. The
+  route now resolves the program it is asked to run — the basename of `command`, and for `env` the
+  program `env` itself would run — and refuses an interpreter that is handed an inline script: a
+  shell (`sh`, `bash`, `zsh`, `dash`, `ksh`, `fish`) with `-c` or a combined flag that carries it
+  (`-lc`), `python`/`python3` with `-c`, `node` with `-e`/`--eval`/`-p`/`--print`, `perl` with
+  `-e`/`-E` or `ruby` with `-e`, `deno eval`, and `npx`/`npm exec` with `-c`/`--call`. The refusal
+  answers **400** and names the program and the flag: `MCP command 'sh' may not be given an inline
+  script (-c); the config API runs a program, not a script`. `env sh -c …` and `/bin/bash -lc …` are
+  refused too, because the program is resolved before the flag is looked for: an `env` is read the
+  way GNU `env` reads it, so its `-S`/`--split-string` word list is split with the quoting GNU
+  honours, a nested `env` is resolved in turn, and the program behind a package runner's `--` is
+  resolved as well. The stored `args` count: a request that sends only a `command` inherits them, so
+  an inherited inline script is refused as well. Nothing is written when a request is refused. A
+  launcher is not affected — `npx -y pkg`, `uvx pkg`, `node path/server.js`, `python -m pkg`,
+  `python path/server.py`, `deno run …` and `docker run …` are all accepted — and the check sits at
+  the config API's write boundary only, so `rantaiclaw setup mcp`, the onboard wizard and a
+  hand-edited `config.toml` are unchanged.
+
 - **A locked channel's webhook route refuses every message instead of running a turn.** `POST /linq`
   and `POST /nextcloud-talk` are the gateway's routes for two channels the catalog locks
   (`under development`). The daemon's channel listeners honour that lock — `build_configured_channels`

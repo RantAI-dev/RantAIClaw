@@ -1250,7 +1250,7 @@ reads as "keep what is stored". Sending a read back never erases or weakens a st
 | `PUT /config/knowledge` keys | omitted keeps it | send `""` |
 | `POST /config/mcp_servers/{name}` `env` | a name sent with `""` keeps the stored value of that name | leave the name out of the map |
 | `POST /config/mcp_servers/{name}` `args` | an arg equal to the blanked form of a stored arg keeps the stored arg, unless the next read would then show it in the clear (a placeholder sent without its flag, or after a renamed flag), in which case the arg is taken as written | leave the arg out of the list |
-| `POST /config/mcp_servers/{name}` `command` | a command that looks like a provider key reads as `""`, and sending `""` back is refused with `400` (`command must not be empty`), so the stored command stays | send the new command |
+| `POST /config/mcp_servers/{name}` `command` | a command that looks like a provider key reads as `""`, and sending `""` back is refused with `400` (`command must not be empty`), so the stored command stays. A command that runs an interpreter with an inline script is refused with `400` as well (`MCP command 'sh' may not be given an inline script (-c)`), so the stored entry stays | send the new command |
 | `POST /channels/telegram`, `discord`, `slack` `bot_token` | omitted or empty keeps it | `DELETE` the channel |
 | `POST /channels/slack` `app_token` | omitted or empty keeps it | `DELETE` the channel |
 | `POST /channels/lark` `app_id` and `app_secret` | both omitted or empty keeps the pair. One without the other is refused with `400` | `DELETE` the channel |
@@ -1325,6 +1325,27 @@ no stored arg is taken as written.
   `env` is encrypted at rest. An omitted `args` or `env` keeps the stored value. A supplied one
   replaces it, except that an `env` name sent with `""` and an arg equal to the blanked form of a stored
   arg keep the stored value (see [Writing back what you read](#writing-back-what-you-read)).
+- **A server is a program to run, not a script.** `command` names the program the agent spawns and
+  `args` are that program's arguments. An interpreter handed an inline script is refused with `400`:
+  a shell (`sh`, `bash`, `zsh`, `dash`, `ksh`, `fish`) with `-c` or a combined flag that carries it
+  (`-lc`), `python`/`python3` (or a versioned name such as `python3.12`) with `-c`, `node` with
+  `-e`/`--eval`/`-p`/`--print`, `perl` with `-e`/`-E` or `ruby` with `-e`, `deno eval`, and
+  `npx`/`npm exec` with `-c`/`--call`. The program is
+  resolved first — the basename of `command`, and for `env` the program `env` itself would run — so
+  `env sh -c …` and `/bin/bash -lc …` are refused as well. An `env` is read the way GNU `env` reads
+  it: its `-S`/`--split-string` word list is split with the quoting GNU honours, a nested `env` is
+  resolved in turn, and the program behind a package runner's `--` is resolved as well. When the
+  program cannot be determined at all — an `env`/`-S` chain that cannot be resolved, or a `-S` word
+  list GNU `env` itself could not split — the route refuses with `400` too, and a `$` in a `-S` word
+  list is refused because the route cannot know the expansion. The refusal
+  names the program and the flag:
+  `MCP command 'sh' may not be given an inline script (-c); the config API runs a program, not a script`.
+  A launcher is not affected: `npx -y pkg`, `uvx pkg`, `node path/server.js`, `python -m pkg`,
+  `python path/server.py`, `deno run …` and `docker run …` are all accepted. The check matches these
+  exact program names, so a differently named or wrapped interpreter is not covered —
+  `timeout 5 sh -c …` and `busybox sh -c …` are not refused by this check. The stored `args` count:
+  a request that sends only a `command` inherits them, and an inherited inline script is refused too.
+  Nothing is written when a request is refused.
 - **POST response** `200`: `{ "name": "...", "added": true, "count": 3 }`
 - **DELETE response** `200`: `{ "name": "...", "removed": true, "count": 2 }`
 - **Status codes**: `200`, `400`, `401`, `500`.
