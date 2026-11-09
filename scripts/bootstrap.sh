@@ -1,5 +1,19 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# Sourced-mode detection. When this file is sourced instead of executed, only
+# the definitions below are loaded and the install run at the bottom is
+# skipped — that is how the shell tests drive the installer. `curl … | bash`
+# pipes the script into bash's stdin, where BASH_SOURCE[0] is empty and $0 is
+# "bash", so an empty BASH_SOURCE[0] means "executed", not "sourced".
+__BOOTSTRAP_SOURCED=false
+if [[ -n "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != "${0}" ]]; then
+  __BOOTSTRAP_SOURCED=true
+fi
+
+# `set -euo pipefail` is the installer's contract. A sourced copy must not
+# change the shell options of the shell that sourced it.
+if [[ "$__BOOTSTRAP_SOURCED" == false ]]; then
+  set -euo pipefail
+fi
 
 __BOOTSTRAP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" >/dev/null 2>&1 && pwd || pwd)"
 
@@ -212,6 +226,14 @@ sha256_compute() {
   fi
 }
 
+# Status returned by install_prebuilt_binary when the release archive cannot
+# be verified: the SHA256 in SHA256SUMS does not match the archive, or
+# SHA256SUMS carries no entry for it. It is distinct from 1 ("no pre-built
+# binary available") because the two need different reactions — a tampered
+# archive stops the install, an unavailable release falls back to a source
+# build.
+PREBUILT_TAMPERED=2
+
 install_prebuilt_binary() {
   local target archive_url checksums_url temp_dir archive_path checksums_path
   local extracted_bin install_dir expected_sum actual_sum
@@ -262,8 +284,10 @@ install_prebuilt_binary() {
         spinner_stop_fail "Checksum file missing entry for $archive_basename"
         warn "Could not find $archive_basename in SHA256SUMS — release artifacts may be mid-publish."
         warn "Re-run with VERIFY_CHECKSUM=false to skip (offline / mirror scenarios)."
+        error "Re-run with --from-source on a machine with a Rust toolchain to build locally."
+        error "Refusing to install a tampered or corrupt archive."
         rm -rf "$temp_dir"
-        return 1
+        return "$PREBUILT_TAMPERED"
       fi
       actual_sum="$(sha256_compute "$archive_path" || true)"
       if [[ -z "$actual_sum" ]]; then
@@ -276,9 +300,10 @@ install_prebuilt_binary() {
         spinner_stop_fail "Checksum mismatch"
         error "Expected: $expected_sum"
         error "Actual:   $actual_sum"
+        error "Re-run with --from-source on a machine with a Rust toolchain to build locally."
         error "Refusing to install a tampered or corrupt archive."
         rm -rf "$temp_dir"
-        return 1
+        return "$PREBUILT_TAMPERED"
       fi
       spinner_stop "Checksum verified"
     else
@@ -323,6 +348,45 @@ install_prebuilt_binary() {
   # (this runs at top level after install_prebuilt_binary returns).
   RANTAICLAW_FINAL_INSTALL_DIR="$install_dir"
 
+  return 0
+}
+
+# Run the pre-built binary install path and decide what the install does next.
+#
+# Returns:
+#   0                 — the binary was installed, the path was skipped, or the
+#                       install fell back to a source build
+#   1                 — no pre-built binary is available and --prebuilt-only
+#                       forbids the source build: the install has to stop
+#   $PREBUILT_TAMPERED — the archive was tampered with or could not be
+#                       verified: the install has to stop
+install_prebuilt_or_fallback() {
+  # Same gate the install used before: the pre-built path runs unless the
+  # operator asked for a source build.
+  if [[ "$FORCE_SOURCE_BUILD" != false || "$PREFER_PREBUILT" != true ]]; then
+    return 0
+  fi
+
+  local status=0
+  install_prebuilt_binary || status=$?
+  if [[ "$status" -eq 0 ]]; then
+    PREBUILT_INSTALLED=true
+    SKIP_BUILD=true
+    SKIP_INSTALL=true
+    return 0
+  fi
+  if [[ "$status" -eq "$PREBUILT_TAMPERED" ]]; then
+    # install_prebuilt_binary already printed the refusal, and that refusal is
+    # the last message: the install stops here, whatever the flags say.
+    return "$PREBUILT_TAMPERED"
+  fi
+  if [[ "$PREBUILT_ONLY" == true ]]; then
+    error "No pre-built binary available for this platform."
+    error "Re-run with --from-source on a machine with a Rust toolchain to build locally."
+    return 1
+  fi
+  warn "Binary install unavailable; falling back to source build."
+  FORCE_SOURCE_BUILD=true
   return 0
 }
 
@@ -959,6 +1023,65 @@ API_KEY="${RANTAICLAW_API_KEY:-}"
 PROVIDER="${RANTAICLAW_PROVIDER:-openrouter}"
 MODEL="${RANTAICLAW_MODEL:-}"
 
+# Compute total visible steps from CLI flag combination so [N/T] labels
+# show a stable progress denominator across the whole install. The shape
+# follows the user's chosen mode: binary path = 1 install step, source
+# path = 2 (build + install). Optional steps (system deps, Rust install,
+# onboarding) add on top.
+compute_step_total() {
+  local total=1  # final bootstrap label
+  [[ "${INSTALL_SYSTEM_DEPS:-false}" == "true" ]] && total=$((total + 1))
+  [[ "${INSTALL_RUST:-false}" == "true" ]] && total=$((total + 1))
+  if [[ "${FORCE_SOURCE_BUILD:-false}" == "true" ]]; then
+    [[ "${SKIP_BUILD:-false}" != "true" ]] && total=$((total + 1))     # source build
+    [[ "${SKIP_INSTALL:-false}" != "true" ]] && total=$((total + 1))   # cargo install
+  else
+    total=$((total + 1))   # prebuilt download+install (covers both phases)
+  fi
+  [[ "${RUN_ONBOARD:-false}" == "true" ]] && total=$((total + 1))
+  __STEP_TOTAL="$total"
+  __STEP_CURRENT=0
+}
+
+# Increment step counter and print a step label.
+next_step() {
+  __STEP_CURRENT=$((__STEP_CURRENT + 1))
+  step "$__STEP_CURRENT/$__STEP_TOTAL" "$1"
+}
+
+cleanup() {
+  __ui_spinner_kill 2>/dev/null || true
+  if [[ "$TEMP_CLONE" == true && -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
+    rm -rf "$TEMP_DIR"
+  fi
+}
+
+# Clone the repo into a temp dir on demand. Used only when source build or
+# docker mode actually needs files on disk — never on the binary-install path.
+# $1: human-readable reason (printed in the error if git is missing)
+ensure_temp_clone() {
+  local reason="$1"
+  if ! have_cmd git; then
+    error "git is required: $reason."
+    error "Install git, or use the default binary install (omit --from-source / --docker)."
+    exit 1
+  fi
+  TEMP_DIR="$(mktemp -d -t rantaiclaw-bootstrap-XXXXXX)"
+  info "Cloning $REPO_URL (depth 1) for $reason"
+  git clone --depth 1 "$REPO_URL" "$TEMP_DIR"
+  WORK_DIR="$TEMP_DIR"
+  TEMP_CLONE=true
+  HAS_LOCAL_REPO=true
+}
+
+# A sourced copy loads the definitions above and stops here: the install run
+# below is the part that acts. `return` ends the sourced file, so neither the
+# flag parsing nor the install happens in a shell that only wanted the
+# functions.
+if [[ "$__BOOTSTRAP_SOURCED" == true ]]; then
+  return 0
+fi
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --guided)
@@ -1069,32 +1192,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Compute total visible steps from CLI flag combination so [N/T] labels
-# show a stable progress denominator across the whole install. The shape
-# follows the user's chosen mode: binary path = 1 install step, source
-# path = 2 (build + install). Optional steps (system deps, Rust install,
-# onboarding) add on top.
-compute_step_total() {
-  local total=1  # final bootstrap label
-  [[ "${INSTALL_SYSTEM_DEPS:-false}" == "true" ]] && total=$((total + 1))
-  [[ "${INSTALL_RUST:-false}" == "true" ]] && total=$((total + 1))
-  if [[ "${FORCE_SOURCE_BUILD:-false}" == "true" ]]; then
-    [[ "${SKIP_BUILD:-false}" != "true" ]] && total=$((total + 1))     # source build
-    [[ "${SKIP_INSTALL:-false}" != "true" ]] && total=$((total + 1))   # cargo install
-  else
-    total=$((total + 1))   # prebuilt download+install (covers both phases)
-  fi
-  [[ "${RUN_ONBOARD:-false}" == "true" ]] && total=$((total + 1))
-  __STEP_TOTAL="$total"
-  __STEP_CURRENT=0
-}
-
-# Increment step counter and print a step label.
-next_step() {
-  __STEP_CURRENT=$((__STEP_CURRENT + 1))
-  step "$__STEP_CURRENT/$__STEP_TOTAL" "$1"
-}
-
 compute_step_total
 
 # Opening banner — sets the visual identity for the install run.
@@ -1148,31 +1245,7 @@ WORK_DIR="$ROOT_DIR"
 TEMP_CLONE=false
 TEMP_DIR=""
 
-cleanup() {
-  __ui_spinner_kill 2>/dev/null || true
-  if [[ "$TEMP_CLONE" == true && -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
-    rm -rf "$TEMP_DIR"
-  fi
-}
 trap cleanup EXIT
-
-# Clone the repo into a temp dir on demand. Used only when source build or
-# docker mode actually needs files on disk — never on the binary-install path.
-# $1: human-readable reason (printed in the error if git is missing)
-ensure_temp_clone() {
-  local reason="$1"
-  if ! have_cmd git; then
-    error "git is required: $reason."
-    error "Install git, or use the default binary install (omit --from-source / --docker)."
-    exit 1
-  fi
-  TEMP_DIR="$(mktemp -d -t rantaiclaw-bootstrap-XXXXXX)"
-  info "Cloning $REPO_URL (depth 1) for $reason"
-  git clone --depth 1 "$REPO_URL" "$TEMP_DIR"
-  WORK_DIR="$TEMP_DIR"
-  TEMP_CLONE=true
-  HAS_LOCAL_REPO=true
-}
 
 # Decide whether we already have a local repo checkout (script run from a
 # clone) or are running detached (curl | bash). When detached, we only need
@@ -1215,19 +1288,10 @@ fi
 
 # Try the binary install path first (the new default). This runs without
 # any clone — curl|bash to install never triggers a GitHub auth prompt.
-if [[ "$FORCE_SOURCE_BUILD" == false && "$PREFER_PREBUILT" == true ]]; then
-  if install_prebuilt_binary; then
-    PREBUILT_INSTALLED=true
-    SKIP_BUILD=true
-    SKIP_INSTALL=true
-  elif [[ "$PREBUILT_ONLY" == true ]]; then
-    error "No pre-built binary available for this platform."
-    error "Re-run with --from-source on a machine with a Rust toolchain to build locally."
-    exit 1
-  else
-    warn "Binary install unavailable; falling back to source build."
-    FORCE_SOURCE_BUILD=true
-  fi
+__prebuilt_status=0
+install_prebuilt_or_fallback || __prebuilt_status=$?
+if [[ "$__prebuilt_status" -ne 0 ]]; then
+  exit "$__prebuilt_status"
 fi
 
 # Source build needs the repository on disk. Clone on demand only when
