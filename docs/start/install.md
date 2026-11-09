@@ -53,7 +53,7 @@ Unsupported platform? Use [Build from source](#option-c-build-from-source).
 1. Detects your OS and architecture.
 2. Picks the matching archive from the [latest GitHub release](https://github.com/RantAI-dev/RantAIClaw/releases/latest).
 3. Downloads `rantaiclaw-<target>.tar.gz` (or `.zip` for Windows).
-4. Verifies its SHA256 against the published `SHA256SUMS`.
+4. Verifies its SHA256 against the published `SHA256SUMS`; an archive that fails verification stops the install.
 5. Extracts the binary and installs it to `~/.cargo/bin` or `~/.local/bin`.
 6. Tells you exactly how to add the install dir to PATH if needed.
 7. **Runs `rantaiclaw setup --force` automatically** (full guided wizard). Reattaches `/dev/tty` when invoked via `curl | bash` so prompts still work; falls back to a bold "run setup manually" reminder on truly headless systems.
@@ -113,6 +113,9 @@ RANTAICLAW_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.c
 ```bash
 curl -fsSL https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/bootstrap.sh | VERIFY_CHECKSUM=false bash
 ```
+
+The archive is then installed unverified. With verification on, an archive
+that fails it stops the install instead.
 
 ### Pin to a specific release
 
@@ -663,9 +666,12 @@ Re-run with `--from-source` to build locally.
 
 ### Checksum mismatch
 
-The script refuses to install. This either means a corrupt download (retry)
-or a mirror serving a stale/tampered archive. **Don't** override with
-`VERIFY_CHECKSUM=false` unless you've verified through another channel.
+The script refuses to install the archive and stops, with the refusal as its
+last message — it does not fall back to a source build. This either means a
+corrupt download (retry) or a mirror serving a stale/tampered archive. Re-run
+with `--from-source` when you want to build locally on purpose. **Don't**
+override with `VERIFY_CHECKSUM=false` unless you've verified through another
+channel.
 
 ### More
 

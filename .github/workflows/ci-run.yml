@@ -46,6 +46,17 @@ jobs:
               shell: bash
               run: bash ./scripts/ci/tests/test_run_filtered_lib_tests.sh
 
+            # Same shape as the self-tests above: the installer's pre-built
+            # binary path is the one step that runs before anything lands on
+            # disk, so a release archive that fails verification has to stop
+            # the install there instead of falling back to a source build. The
+            # self-test drives that path over a file:// release fixture — no
+            # network, no Rust toolchain — so a regression fails the job
+            # instead of silently weakening the installer.
+            - name: Self-test the pre-built binary tamper handling
+              shell: bash
+              run: bash ./scripts/ci/tests/test_bootstrap_prebuilt_tamper.sh
+
             - name: Detect docs-only changes
               id: scope
               shell: bash

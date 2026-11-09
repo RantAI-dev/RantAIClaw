@@ -107,6 +107,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Copying a selection in the TUI no longer puts the role label on the clipboard.** The copy took the
+  pane's rendered lines, and a rendered message starts with its role label, so the clipboard held
+  "Assistant: hello" instead of "hello". The label comes off the copied text now: the message body, the
+  blank line between messages, the code fences and the tool-call lines pass through unchanged. The pane
+  itself still draws the label.
+
+- **The onboarding skills text no longer states how many skills the pack holds.** The setup hint, both
+  setup descriptions and the wizard's install label each carried a hand-written "5". The number could not
+  keep itself true: the starter pack grows without the text being touched, and `setup skills
+  --starter-pack` installs the always-on core skill on top of the starter pack, so the number of skills on
+  disk was never the number in the text. The number is gone from all of those texts, and a test fails if a
+  count comes back into any of them.
+
+- **`rantaiclaw channel --help` and `rantaiclaw channel add --help` name the same channel kinds.** The
+  `channel` command's help named seven kinds and `channel add`'s named sixteen, the two lists disagreed with
+  each other, and neither named `whatsapp_web`, which the channel catalog has carried since 2026-09-09. Both
+  help texts and the `channel_type` argument's help now name every kind the catalog holds, in the catalog's
+  order, and the `channel` command's one-line summary no longer names a stale subset. A test reads the
+  rendered help back, so the next channel added to the catalog cannot be missed there.
+
+- **A pre-built release archive that fails verification now stops the install with its own refusal.** The
+  installer refused a checksum mismatch the same way it refused every other failure, so the caller reported
+  "No pre-built binary available for this platform." or warned and fell back to a source build — a tampered
+  archive looked like a missing one. A checksum mismatch and a `SHA256SUMS` that carries no entry for the
+  archive now return their own status, and the install stops with "Refusing to install a tampered or corrupt
+  archive." as its last message, with or without `--prebuilt-only`. An archive that is merely unavailable (no
+  asset for this platform, a failed download) keeps its old messages and its source-build fallback, and
+  `--from-source` still skips the pre-built path entirely.
+
+- **`rantaiclaw completions <shell>` no longer panics when its reader goes away.** Piping the script
+  into a reader that stops early (`rantaiclaw completions bash | head`) closed the pipe while the
+  script was still being written, and the write error panicked the process. The script is now
+  generated into memory and written in one go, a closed pipe ends the command quietly with exit
+  code 0, and every other write error still fails loudly with a message.
+
 - **A "Once" answer to an unallowed-command prompt now covers that one call only.** The shell tool's
   unallowed-basename gate treated "Once" like "Session": it added the basename to the runtime
   allowlist, which every clone of the policy shares, so the command stayed allowed for the life of

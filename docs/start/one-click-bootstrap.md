@@ -16,6 +16,12 @@ The default installer downloads the **latest pre-built binary** for your
 platform, verifies its SHA256 checksum, and installs it. No Rust toolchain,
 no compiler, no git clone.
 
+If the archive fails verification — the checksum does not match, or the
+published `SHA256SUMS` has no entry for it — the installer refuses to
+install it and stops, with the refusal as its last message. It does not fall
+back to a source build in that case: re-run with `--from-source` when you
+want to build locally on purpose.
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/bootstrap.sh | bash
 ```
@@ -94,7 +100,9 @@ Highlights:
 Backward-compatible (deprecated) aliases:
 
 - `--prefer-prebuilt` — no-op (binary is the default now)
-- `--prebuilt-only` — fail if no compatible release asset is published
+- `--prebuilt-only` — fail if no compatible release asset is published (a
+  release archive that fails verification stops the install with or without
+  this flag)
 - `--force-source-build` — alias for `--from-source`
 
 ## Optional onboarding modes
@@ -145,7 +153,7 @@ RANTAICLAW_API_KEY="sk-..." RANTAICLAW_PROVIDER="openrouter" ./bootstrap.sh --on
 | `RANTAICLAW_REPO_URL` | Override git URL for `--from-source` / `--docker` clones |
 | `RANTAICLAW_FALLBACK_IMAGE` | Override fallback Docker image |
 | `RANTAICLAW_INSTALL_DIR` | Override install directory (default: `~/.cargo/bin`, else `~/.local/bin`) |
-| `VERIFY_CHECKSUM` | Set to `false` to skip SHA256 check |
+| `VERIFY_CHECKSUM` | Set to `false` to skip SHA256 check (the archive is then installed unverified) |
 | `RANTAICLAW_API_KEY` | Used when `--api-key` is not provided |
 | `RANTAICLAW_PROVIDER` | Used when `--provider` is not provided |
 | `RANTAICLAW_MODEL` | Used when `--model` is not provided |

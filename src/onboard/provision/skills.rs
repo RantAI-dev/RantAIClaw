@@ -1,7 +1,7 @@
 //! Skills provisioner — implements [`TuiProvisioner`] for in-TUI skills setup.
 //!
 //! `run` does two things:
-//!   1. Offer to install the bundled 5-skill starter pack.
+//!   1. Offer to install the bundled starter pack.
 //!   2. Point the user at `/skills install` (the live ClawHub search/install
 //!      picker) for anything beyond the starter pack — that flow doesn't fit
 //!      the provisioner's request-response `Choose`/`Prompt` protocol, so
@@ -18,7 +18,19 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 pub const SKILLS_NAME: &str = "skills";
-pub const SKILLS_DESC: &str = "Bundled 5-skill starter pack + optional ClawHub skills";
+
+/// The one-line description the wizard shows for the skills step.
+///
+/// It names no count of skills on purpose. The number was hand-written and
+/// could not keep itself true: the starter pack grows without this text
+/// being touched, and the always-on core skill installs on top of it.
+pub const SKILLS_DESC: &str = "Bundled starter pack + optional ClawHub skills";
+
+/// The label the wizard asks the operator with before the starter pack.
+pub const SKILLS_INSTALL_LABEL: &str = "Install the starter pack?";
+
+/// The message shown when every starter-pack skill is already on disk.
+pub const SKILLS_ALREADY_PRESENT: &str = "All starter-pack skills already present.";
 
 #[derive(Debug, Clone)]
 pub struct SkillsProvisioner;
@@ -105,7 +117,7 @@ impl TuiProvisioner for SkillsProvisioner {
             &events,
             ProvisionEvent::Choose {
                 id: "install_pack".into(),
-                label: "Install the 5-skill starter pack?".into(),
+                label: SKILLS_INSTALL_LABEL.into(),
                 options: vec!["Yes — install starter pack".to_string(), "Skip".to_string()],
                 multi: false,
                 filterable: false,
@@ -128,7 +140,7 @@ impl TuiProvisioner for SkillsProvisioner {
                             &events,
                             ProvisionEvent::Message {
                                 severity: Severity::Info,
-                                text: "All 5 starter-pack skills already present.".into(),
+                                text: SKILLS_ALREADY_PRESENT.into(),
                             },
                         )
                         .await?;

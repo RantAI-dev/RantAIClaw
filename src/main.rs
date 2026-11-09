@@ -492,7 +492,7 @@ Examples:
     /// List supported AI providers
     Providers,
 
-    /// Manage channels (telegram, discord, slack)
+    /// Manage channels (list, add, remove, health-check)
     #[command(
         alias = "channels",
         long_about = "\
@@ -500,7 +500,8 @@ Manage communication channels.
 
 Add, remove, list, and health-check channels that connect RantaiClaw \
 to messaging platforms. Supported channel types: telegram, discord, \
-slack, whatsapp, matrix, imessage, email.
+slack, mattermost, webhook, imessage, matrix, signal, whatsapp, \
+whatsapp_web, linq, nextcloud_talk, email, irc, lark, dingtalk, qq.
 
 The `run` subcommand is the recommended way to keep channels polling \
 in the background after closing the TUI — wrap it with `nohup`, \
@@ -1011,7 +1012,7 @@ enum DoctorFormat {
 enum ChannelCommands {
     /// List configured channels
     List,
-    /// Start all configured channels (Telegram, Discord, Slack) — foreground
+    /// Start all configured channels — foreground
     Start,
     /// Run all configured channels in the foreground until Ctrl-C.
     ///
@@ -1032,12 +1033,12 @@ and directs you to the interactive setup. Configure channels with:
 or edit the active profile's `config.toml` directly.
 
 Supported channel types: telegram, discord, slack, mattermost, webhook, \
-imessage, matrix, signal, whatsapp, linq, nextcloud_talk, email, irc, lark, \
-dingtalk, qq.")]
+imessage, matrix, signal, whatsapp, whatsapp_web, linq, nextcloud_talk, \
+email, irc, lark, dingtalk, qq.")]
     Add {
-        /// Channel type (telegram, discord, slack, mattermost, webhook, imessage,
-        /// matrix, signal, whatsapp, linq, nextcloud_talk, email, irc, lark,
-        /// dingtalk, qq)
+        /// Channel type. Supported channel types: telegram, discord, slack,
+        /// mattermost, webhook, imessage, matrix, signal, whatsapp,
+        /// whatsapp_web, linq, nextcloud_talk, email, irc, lark, dingtalk, qq.
         channel_type: String,
     },
     /// Remove a channel (currently redirects to config edit — see long help)
@@ -1419,7 +1420,7 @@ async fn main() -> Result<()> {
     // This avoids warnings/log lines corrupting sourced completion scripts.
     if let Some(Commands::Completions { shell }) = &cli.command {
         let mut stdout = std::io::stdout().lock();
-        write_shell_completion(*shell, &mut stdout)?;
+        run_completions(*shell, &mut stdout)?;
         return Ok(());
     }
 
@@ -2460,25 +2461,46 @@ async fn main() -> Result<()> {
     }
 }
 
-fn write_shell_completion<W: Write>(shell: CompletionShell, writer: &mut W) -> Result<()> {
+/// Write the completion script for `shell` to `writer`.
+///
+/// The script is generated into memory first and written out afterwards.
+/// clap_complete's `generate` panics when its writer fails, and a closed pipe
+/// is the normal end of a piped command (`rantaiclaw completions bash | head`),
+/// not a reason to abort the process.
+fn write_shell_completion<W: Write>(shell: CompletionShell, writer: &mut W) -> std::io::Result<()> {
     use clap_complete::generate;
     use clap_complete::shells;
 
     let mut cmd = Cli::command();
     let bin_name = cmd.get_name().to_string();
 
+    let mut script: Vec<u8> = Vec::new();
     match shell {
-        CompletionShell::Bash => generate(shells::Bash, &mut cmd, bin_name.clone(), writer),
-        CompletionShell::Fish => generate(shells::Fish, &mut cmd, bin_name.clone(), writer),
-        CompletionShell::Zsh => generate(shells::Zsh, &mut cmd, bin_name.clone(), writer),
+        CompletionShell::Bash => generate(shells::Bash, &mut cmd, bin_name.clone(), &mut script),
+        CompletionShell::Fish => generate(shells::Fish, &mut cmd, bin_name.clone(), &mut script),
+        CompletionShell::Zsh => generate(shells::Zsh, &mut cmd, bin_name.clone(), &mut script),
         CompletionShell::PowerShell => {
-            generate(shells::PowerShell, &mut cmd, bin_name.clone(), writer);
+            generate(shells::PowerShell, &mut cmd, bin_name.clone(), &mut script);
         }
-        CompletionShell::Elvish => generate(shells::Elvish, &mut cmd, bin_name, writer),
+        CompletionShell::Elvish => generate(shells::Elvish, &mut cmd, bin_name, &mut script),
     }
 
+    writer.write_all(&script)?;
     writer.flush()?;
     Ok(())
+}
+
+/// Write the completion script for `shell` to `writer` and decide the exit.
+///
+/// A reader that goes away (`rantaiclaw completions bash | head`) closes the
+/// pipe: that is the normal end of a pipe, not a failure, so the command
+/// exits 0 and quietly. Every other write error fails loudly.
+fn run_completions<W: Write>(shell: CompletionShell, writer: &mut W) -> Result<()> {
+    match write_shell_completion(shell, writer) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(err) => Err(anyhow::Error::new(err).context("failed to write the completion script")),
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2774,6 +2796,96 @@ mod tests {
         );
     }
 
+    /// The channel kinds a help text names, in the order it names them.
+    ///
+    /// The help sentences are hand-written and `CHANNEL_CATALOG` is the source
+    /// of truth, so the kinds are read back out of the rendered help and
+    /// compared with the catalog. Whitespace is flattened first: clap renders
+    /// a long help as wrapped lines, and the catalog order is what the
+    /// sentences have to keep.
+    fn channel_kinds_named_in(help: &str) -> Vec<String> {
+        const MARKER: &str = "Supported channel types: ";
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        let start = flat.find(MARKER).unwrap_or_else(|| {
+            panic!("the help must name the channel kinds after {MARKER:?}: {flat}")
+        });
+        let rest = &flat[start + MARKER.len()..];
+        // The sentence ends the list. A help whose last kind lost its period
+        // (clap strips it from a one-line help) ends the list at the end of
+        // the text instead.
+        let end = rest.find('.').unwrap_or(rest.len());
+        rest[..end]
+            .split(',')
+            .map(|kind| kind.trim().to_string())
+            .filter(|kind| !kind.is_empty())
+            .collect()
+    }
+
+    /// `channel --help` and `channel add --help` must name the same channel
+    /// kinds, and those kinds must be the catalog's.
+    ///
+    /// Each help carried its own hand-written list: the `channel` command
+    /// named seven kinds, `channel add` named sixteen, and neither named
+    /// `whatsapp_web`, which the catalog has carried since 2026-09-09. An
+    /// operator reading one help could not tell what the other one meant, and
+    /// neither was the list the rest of the project renders from
+    /// `CHANNEL_CATALOG`.
+    #[test]
+    fn channel_help_names_the_same_kinds_as_the_catalog() {
+        let catalog: Vec<String> = crate::channels::CHANNEL_CATALOG
+            .iter()
+            .map(|(key, _, _, _)| (*key).to_string())
+            .collect();
+
+        let mut command = Cli::command();
+        let channel = command
+            .find_subcommand_mut("channel")
+            .expect("the channel subcommand must exist");
+        let channel_help = channel.render_long_help().to_string();
+        let add = channel
+            .find_subcommand_mut("add")
+            .expect("channel add must exist");
+        let add_help = add.render_long_help().to_string();
+        let channel_type_help = add
+            .get_arguments()
+            .find(|arg| arg.get_id().as_str() == "channel_type")
+            .and_then(|arg| arg.get_help())
+            .map(ToString::to_string)
+            .expect("channel add must document its channel_type argument");
+
+        let channel_kinds = channel_kinds_named_in(&channel_help);
+        let add_kinds = channel_kinds_named_in(&add_help);
+        let argument_kinds = channel_kinds_named_in(&channel_type_help);
+
+        for key in &catalog {
+            assert!(
+                channel_kinds.iter().any(|kind| kind == key),
+                "the channel help does not name the {key} channel"
+            );
+            assert!(
+                add_kinds.iter().any(|kind| kind == key),
+                "the channel add help does not name the {key} channel"
+            );
+        }
+
+        assert_eq!(
+            channel_kinds, add_kinds,
+            "the channel help and the channel add help must name the same kinds"
+        );
+        assert_eq!(
+            channel_kinds, catalog,
+            "the channel help must name every catalog kind, in catalog order"
+        );
+        assert_eq!(
+            add_kinds, catalog,
+            "the channel add help must name every catalog kind, in catalog order"
+        );
+        assert_eq!(
+            argument_kinds, catalog,
+            "the channel_type help must name every catalog kind, in catalog order"
+        );
+    }
+
     #[test]
     fn onboard_help_includes_model_flag() {
         let cmd = Cli::command();
@@ -2848,6 +2960,49 @@ mod tests {
         assert!(
             script.contains("rantaiclaw"),
             "completion script should reference binary name"
+        );
+    }
+
+    /// A writer that fails every write, standing in for a closed pipe.
+    struct FailingWriter {
+        kind: std::io::ErrorKind,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(self.kind, "closed pipe"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The defect: `rantaiclaw completions bash | head` panicked. The reader
+    /// went away, the pipe closed, and the write failed — the normal end of a
+    /// pipe, not a failure.
+    #[test]
+    fn completions_survive_a_closed_pipe() {
+        let mut writer = FailingWriter {
+            kind: std::io::ErrorKind::BrokenPipe,
+        };
+        let outcome = run_completions(CompletionShell::Bash, &mut writer);
+        assert!(
+            outcome.is_ok(),
+            "a closed pipe ends the pipe, it does not fail the command: {outcome:?}"
+        );
+    }
+
+    /// A write error that is not a closed pipe still fails the command.
+    #[test]
+    fn completions_report_other_write_errors() {
+        let mut writer = FailingWriter {
+            kind: std::io::ErrorKind::PermissionDenied,
+        };
+        let outcome = run_completions(CompletionShell::Bash, &mut writer);
+        assert!(
+            outcome.is_err(),
+            "a write error that is not a closed pipe must fail loudly"
         );
     }
 
