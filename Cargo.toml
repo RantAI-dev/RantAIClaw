@@ -112,7 +112,7 @@ argon2 = { version = "0.5", features = ["std"] }
 rand = "0.10"
 
 # Fast mutexes that don't poison on panic
-parking_lot = "0.12"
+parking_lot = "0.13"
 
 # Async traits
 async-trait = "0.1"
