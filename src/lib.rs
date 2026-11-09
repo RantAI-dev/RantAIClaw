@@ -134,12 +134,12 @@ and directs you to the interactive setup. Configure channels with:
 or edit the active profile's `config.toml` directly.
 
 Supported channel types: telegram, discord, slack, mattermost, webhook, \
-imessage, matrix, signal, whatsapp, linq, nextcloud_talk, email, irc, lark, \
-dingtalk, qq.")]
+imessage, matrix, signal, whatsapp, whatsapp_web, linq, nextcloud_talk, \
+email, irc, lark, dingtalk, qq.")]
     Add {
-        /// Channel type (telegram, discord, slack, mattermost, webhook, imessage,
-        /// matrix, signal, whatsapp, linq, nextcloud_talk, email, irc, lark,
-        /// dingtalk, qq)
+        /// Channel type. Supported channel types: telegram, discord, slack,
+        /// mattermost, webhook, imessage, matrix, signal, whatsapp,
+        /// whatsapp_web, linq, nextcloud_talk, email, irc, lark, dingtalk, qq.
         channel_type: String,
     },
     /// Remove a channel (currently redirects to config edit — see long help)

@@ -107,6 +107,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`rantaiclaw channel --help` and `rantaiclaw channel add --help` name the same channel kinds.** The
+  `channel` command's help named seven kinds and `channel add`'s named sixteen, the two lists disagreed with
+  each other, and neither named `whatsapp_web`, which the channel catalog has carried since 2026-09-09. Both
+  help texts and the `channel_type` argument's help now name every kind the catalog holds, in the catalog's
+  order, and the `channel` command's one-line summary no longer names a stale subset. A test reads the
+  rendered help back, so the next channel added to the catalog cannot be missed there.
+
 - **A pre-built release archive that fails verification now stops the install with its own refusal.** The
   installer refused a checksum mismatch the same way it refused every other failure, so the caller reported
   "No pre-built binary available for this platform." or warned and fell back to a source build — a tampered
