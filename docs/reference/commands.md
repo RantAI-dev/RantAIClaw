@@ -470,6 +470,8 @@ rows, and the output says when it is showing a subset.
 
 `completions` is stdout-only by design so scripts can be sourced directly without log/warning contamination.
 
+A reader that stops early (`rantaiclaw completions bash | head`) closes the pipe. That ends the command quietly with exit code `0`; any other write error exits non-zero with a message on stderr.
+
 ### `kb` (Knowledge Base)
 
 Built by the `kb` feature, which is part of the **default** feature set — available in a normal `cargo build` / released binary. Drop it only with `--no-default-features`. See [kb.md](kb.md) for the full KB chapter (architecture, sidecars, HTTP API).

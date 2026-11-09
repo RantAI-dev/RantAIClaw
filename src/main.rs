@@ -1419,7 +1419,7 @@ async fn main() -> Result<()> {
     // This avoids warnings/log lines corrupting sourced completion scripts.
     if let Some(Commands::Completions { shell }) = &cli.command {
         let mut stdout = std::io::stdout().lock();
-        write_shell_completion(*shell, &mut stdout)?;
+        run_completions(*shell, &mut stdout)?;
         return Ok(());
     }
 
@@ -2460,25 +2460,46 @@ async fn main() -> Result<()> {
     }
 }
 
-fn write_shell_completion<W: Write>(shell: CompletionShell, writer: &mut W) -> Result<()> {
+/// Write the completion script for `shell` to `writer`.
+///
+/// The script is generated into memory first and written out afterwards.
+/// clap_complete's `generate` panics when its writer fails, and a closed pipe
+/// is the normal end of a piped command (`rantaiclaw completions bash | head`),
+/// not a reason to abort the process.
+fn write_shell_completion<W: Write>(shell: CompletionShell, writer: &mut W) -> std::io::Result<()> {
     use clap_complete::generate;
     use clap_complete::shells;
 
     let mut cmd = Cli::command();
     let bin_name = cmd.get_name().to_string();
 
+    let mut script: Vec<u8> = Vec::new();
     match shell {
-        CompletionShell::Bash => generate(shells::Bash, &mut cmd, bin_name.clone(), writer),
-        CompletionShell::Fish => generate(shells::Fish, &mut cmd, bin_name.clone(), writer),
-        CompletionShell::Zsh => generate(shells::Zsh, &mut cmd, bin_name.clone(), writer),
+        CompletionShell::Bash => generate(shells::Bash, &mut cmd, bin_name.clone(), &mut script),
+        CompletionShell::Fish => generate(shells::Fish, &mut cmd, bin_name.clone(), &mut script),
+        CompletionShell::Zsh => generate(shells::Zsh, &mut cmd, bin_name.clone(), &mut script),
         CompletionShell::PowerShell => {
-            generate(shells::PowerShell, &mut cmd, bin_name.clone(), writer);
+            generate(shells::PowerShell, &mut cmd, bin_name.clone(), &mut script);
         }
-        CompletionShell::Elvish => generate(shells::Elvish, &mut cmd, bin_name, writer),
+        CompletionShell::Elvish => generate(shells::Elvish, &mut cmd, bin_name, &mut script),
     }
 
+    writer.write_all(&script)?;
     writer.flush()?;
     Ok(())
+}
+
+/// Write the completion script for `shell` to `writer` and decide the exit.
+///
+/// A reader that goes away (`rantaiclaw completions bash | head`) closes the
+/// pipe: that is the normal end of a pipe, not a failure, so the command
+/// exits 0 and quietly. Every other write error fails loudly.
+fn run_completions<W: Write>(shell: CompletionShell, writer: &mut W) -> Result<()> {
+    match write_shell_completion(shell, writer) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(err) => Err(anyhow::Error::new(err).context("failed to write the completion script")),
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2848,6 +2869,49 @@ mod tests {
         assert!(
             script.contains("rantaiclaw"),
             "completion script should reference binary name"
+        );
+    }
+
+    /// A writer that fails every write, standing in for a closed pipe.
+    struct FailingWriter {
+        kind: std::io::ErrorKind,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(self.kind, "closed pipe"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The defect: `rantaiclaw completions bash | head` panicked. The reader
+    /// went away, the pipe closed, and the write failed — the normal end of a
+    /// pipe, not a failure.
+    #[test]
+    fn completions_survive_a_closed_pipe() {
+        let mut writer = FailingWriter {
+            kind: std::io::ErrorKind::BrokenPipe,
+        };
+        let outcome = run_completions(CompletionShell::Bash, &mut writer);
+        assert!(
+            outcome.is_ok(),
+            "a closed pipe ends the pipe, it does not fail the command: {outcome:?}"
+        );
+    }
+
+    /// A write error that is not a closed pipe still fails the command.
+    #[test]
+    fn completions_report_other_write_errors() {
+        let mut writer = FailingWriter {
+            kind: std::io::ErrorKind::PermissionDenied,
+        };
+        let outcome = run_completions(CompletionShell::Bash, &mut writer);
+        assert!(
+            outcome.is_err(),
+            "a write error that is not a closed pipe must fail loudly"
         );
     }
 

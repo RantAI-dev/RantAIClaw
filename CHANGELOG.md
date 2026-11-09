@@ -107,6 +107,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`rantaiclaw completions <shell>` no longer panics when its reader goes away.** Piping the script
+  into a reader that stops early (`rantaiclaw completions bash | head`) closed the pipe while the
+  script was still being written, and the write error panicked the process. The script is now
+  generated into memory and written in one go, a closed pipe ends the command quietly with exit
+  code 0, and every other write error still fails loudly with a message.
+
 - **A "Once" answer to an unallowed-command prompt now covers that one call only.** The shell tool's
   unallowed-basename gate treated "Once" like "Session": it added the basename to the runtime
   allowlist, which every clone of the policy shares, so the command stayed allowed for the life of
