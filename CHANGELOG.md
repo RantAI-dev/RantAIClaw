@@ -269,6 +269,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the Olm ratchet, so the path is real there. This release moves to vodozemac 0.11.2 through
   matrix-sdk 0.19.1, so the fix ships in the same release. The same move clears RUSTSEC-2026-0318.
 
+- **Bundled SQLite stays at 3.53.2 and the advisory `RUSTSEC-2026-0459` is accepted with a
+  reason, not fixed.** SQLite before 3.54.0 can return uninitialized page-cache memory when a
+  database is opened next to a sibling `-wal` file whose page size differs from the database's,
+  so a crafted pair of files makes ordinary queries return stale bytes from process memory
+  (`CVE-2026-119375`, memory-exposure; the lockfile's `libsqlite3-sys` 0.38.2 is affected,
+  patched in >= 0.39.0). The crate is in every default build, because `rusqlite` is a direct
+  dependency, not an optional feature. Every database the product opens sits at a path the
+  operator controls, and no database is opened from a remote or less-trusted path, so the attack
+  needs local write access to that path. The upgrade is blocked: the published
+  `matrix-sdk-sqlite` 0.19.1 still pins `rusqlite` 0.40.2, and both `rusqlite` versions link
+  the native `sqlite3` library, so `rusqlite` 0.41 cannot resolve today. Upstream has already
+  moved to `rusqlite` 0.41.1, so the next `matrix-sdk-sqlite` release lifts the block and the
+  fix is close. The advisory is accepted in `deny.toml` and the audit workflow, for review by
+  2026-12-15.
+
 ## [0.34.0-alpha] — 2026-11-05
 
 The hardening release. A caller can no longer borrow a stored credential for a host the
