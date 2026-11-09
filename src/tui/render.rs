@@ -168,6 +168,25 @@ pub fn render_block_line(text: &str, theme: &RenderTheme) -> Line<'static> {
     Line::from(parse_inline_markdown(text, theme))
 }
 
+/// The role label the renderer draws in front of a message's first line.
+///
+/// Single source for the pane and for the copy path: the copy strips the
+/// label off what it puts on the clipboard, so both sides must agree on what
+/// the label is.
+pub fn role_label(role: &str) -> &'static str {
+    match role {
+        "user" => "You",
+        "assistant" => "Assistant",
+        _ => "System",
+    }
+}
+
+/// The exact prefix [`render_message_lines`] puts in front of a message's
+/// first line (`"Assistant: "`). The copy path strips this prefix.
+pub fn role_label_prefix(role: &str) -> String {
+    format!("{}: ", role_label(role))
+}
+
 /// Render a complete message (label + content + tool blocks) into one or
 /// more lines. Tool blocks render as indented sub-lines under the content.
 pub fn render_message_lines(
@@ -177,17 +196,17 @@ pub fn render_message_lines(
     streaming_blocks: &[ToolBlockState],
     theme: &RenderTheme,
 ) -> Vec<Line<'static>> {
-    let (label, color) = match role {
-        "user" => ("You", theme.user_label),
-        "assistant" => ("Assistant", theme.assistant_label),
-        _ => ("System", theme.system_label),
+    let color = match role {
+        "user" => theme.user_label,
+        "assistant" => theme.assistant_label,
+        _ => theme.system_label,
     };
 
     let mut lines = Vec::new();
 
     // First line: bold label + the first run of the content (with markdown).
     let mut first = vec![Span::styled(
-        format!("{label}: "),
+        role_label_prefix(role),
         Style::default().fg(color).add_modifier(Modifier::BOLD),
     )];
     let mut content_iter = content.split('\n');

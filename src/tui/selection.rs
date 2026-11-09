@@ -13,6 +13,9 @@
 //! appends tool-block lines, so content-line indices never align with what is
 //! on screen; anchoring and extraction must both index the same rendered
 //! output or a copy silently grabs the wrong lines.
+//!
+//! The pane keeps the role label the renderer draws (`Assistant: `); the copy
+//! does not — extraction strips it, so the clipboard holds the message text.
 
 use ratatui::layout::Rect;
 use ratatui::text::Line;
@@ -121,19 +124,22 @@ fn line_text(line: &Line<'_>) -> String {
 ///
 /// `rendered_for(msg_idx)` must produce the SAME lines the pane renders for
 /// that message (the shared rendered-lines function) — single source, the two
-/// cannot diverge. Out-of-range message or line indices are clamped: a
+/// cannot diverge. `prefix_for(msg_idx)` must be the exact prefix the renderer
+/// puts in front of that message's first line (`"Assistant: "`); it is
+/// stripped from the copy, so the clipboard holds the message text and not
+/// the pane's role label. Out-of-range message or line indices are clamped: a
 /// dangling selection (history replaced under it) yields whatever still
 /// exists, or an empty string — never a panic.
 ///
 /// Output: rendered lines joined with `\n`, messages joined with `\n\n`.
-/// WYSIWYG minus borders and wrap — multi-line code fences pass through
-/// verbatim (the markdown parser is inline-only), inline styling is already
-/// resolved (`**bold**` copies as `bold`), and a range that includes a
-/// message's first rendered line carries its role label.
+/// WYSIWYG minus borders, wrap and role labels — multi-line code fences pass
+/// through verbatim (the markdown parser is inline-only) and inline styling is
+/// already resolved (`**bold**` copies as `bold`).
 pub fn extract_text(
     messages_len: usize,
     range: (LineAnchor, LineAnchor),
     mut rendered_for: impl FnMut(usize) -> Vec<Line<'static>>,
+    mut prefix_for: impl FnMut(usize) -> String,
 ) -> String {
     let ((msg_a, line_a), (msg_b, line_b)) = range;
     if messages_len == 0 || msg_a >= messages_len {
@@ -159,7 +165,20 @@ pub fn extract_text(
         if lo > hi || lo >= lines.len() {
             continue;
         }
-        let text: Vec<String> = lines[lo..=hi].iter().map(line_text).collect();
+        let mut text: Vec<String> = lines[lo..=hi].iter().map(line_text).collect();
+        // The pane draws the role label in front of a message's first line
+        // ("Assistant: "); the clipboard gets the message text. The label is a
+        // prefix of that line, so removing it changes no other line and adds
+        // none. A selection that starts on a later line never carries the
+        // label, and neither does a message whose first line is out of range.
+        if lo == 0 {
+            if let Some(first) = text.first_mut() {
+                let prefix = prefix_for(msg_idx);
+                if let Some(rest) = first.strip_prefix(prefix.as_str()) {
+                    *first = rest.to_string();
+                }
+            }
+        }
         parts.push(text.join("\n"));
     }
     parts.join("\n\n")
@@ -304,49 +323,56 @@ mod tests {
         }
     }
 
+    /// The label prefix the renderer puts in front of each fixture message's
+    /// first line — the copy path strips it.
+    fn two_message_prefix(idx: usize) -> String {
+        match idx {
+            0 => "You: ".to_string(),
+            1 => "Assistant: ".to_string(),
+            _ => String::new(),
+        }
+    }
+
     #[test]
     fn extract_within_one_message() {
-        let got = extract_text(2, ((0, 0), (0, 1)), two_messages);
-        assert_eq!(got, "You: first\nsecond line");
+        let got = extract_text(2, ((0, 0), (0, 1)), two_messages, two_message_prefix);
+        assert_eq!(got, "first\nsecond line");
     }
 
     #[test]
     fn extract_across_messages_keeps_fence_verbatim() {
-        let got = extract_text(2, ((0, 1), (1, 3)), two_messages);
-        assert_eq!(
-            got,
-            "second line\n\nAssistant: reply\n```rust\nfn main() {}\n```"
-        );
+        let got = extract_text(2, ((0, 1), (1, 3)), two_messages, two_message_prefix);
+        assert_eq!(got, "second line\n\nreply\n```rust\nfn main() {}\n```");
     }
 
     #[test]
     fn extract_mid_message_endpoints() {
-        let got = extract_text(2, ((1, 1), (1, 2)), two_messages);
+        let got = extract_text(2, ((1, 1), (1, 2)), two_messages, two_message_prefix);
         assert_eq!(got, "```rust\nfn main() {}");
     }
 
     #[test]
     fn extract_dangling_message_index_is_empty_not_panic() {
         // History was replaced under the selection (/compress) — msg 5 gone.
-        let got = extract_text(2, ((5, 0), (6, 3)), two_messages);
+        let got = extract_text(2, ((5, 0), (6, 3)), two_messages, two_message_prefix);
         assert_eq!(got, "");
     }
 
     #[test]
     fn extract_dangling_line_index_clamps() {
-        let got = extract_text(2, ((1, 2), (1, 999)), two_messages);
+        let got = extract_text(2, ((1, 2), (1, 999)), two_messages, two_message_prefix);
         assert_eq!(got, "fn main() {}\n```");
     }
 
     #[test]
     fn extract_start_line_past_message_end_skips() {
-        let got = extract_text(2, ((0, 99), (1, 0)), two_messages);
-        assert_eq!(got, "Assistant: reply");
+        let got = extract_text(2, ((0, 99), (1, 0)), two_messages, two_message_prefix);
+        assert_eq!(got, "reply");
     }
 
     #[test]
     fn extract_empty_history_is_empty() {
-        let got = extract_text(0, ((0, 0), (0, 0)), |_| Vec::new());
+        let got = extract_text(0, ((0, 0), (0, 0)), |_| Vec::new(), |_| String::new());
         assert_eq!(got, "");
     }
 

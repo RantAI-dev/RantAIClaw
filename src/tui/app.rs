@@ -5497,9 +5497,7 @@ impl TuiApp {
     fn copy_selection(&mut self, sel: super::selection::Selection) {
         let theme = super::render::RenderTheme::default();
         let messages = &self.context.messages;
-        let text = super::selection::extract_text(messages.len(), sel.range(), |i| {
-            rendered_message_lines(&messages[i], &theme)
-        });
+        let text = copy_text_for(messages, sel, &theme);
         if text.is_empty() {
             self.context.status_notice = Some("nothing to copy".to_string());
             return;
@@ -6295,6 +6293,55 @@ fn rendered_message_lines(
         .map(super::render::parse_persisted_tool_calls)
         .unwrap_or_default();
     super::render::render_message_lines(&msg.role, &msg.content, &persisted, &[], theme)
+}
+
+/// The text the copy path puts on the clipboard for a selection: the
+/// selected messages' rendered lines, minus the role label the pane draws
+/// in front of them.
+fn copy_text_for(
+    messages: &[crate::sessions::Message],
+    sel: super::selection::Selection,
+    theme: &super::render::RenderTheme,
+) -> String {
+    super::selection::extract_text(
+        messages.len(),
+        sel.range(),
+        |i| rendered_message_lines(&messages[i], theme),
+        |i| super::render::role_label_prefix(&messages[i].role),
+    )
+}
+
+#[cfg(test)]
+mod copy_text_tests {
+    use super::*;
+    use crate::sessions::Message;
+
+    #[test]
+    fn copied_text_carries_no_role_label_and_keeps_the_blank_line() {
+        let theme = super::super::render::RenderTheme::default();
+        // An assistant message with a persisted tool call: the tool block
+        // renders as extra lines under the content and must be copied too.
+        let mut assistant = Message::assistant("s", "hi there");
+        assistant.tool_calls =
+            serde_json::to_string(&vec![super::super::render::PersistedToolCall {
+                id: "1".to_string(),
+                name: "shell".to_string(),
+                args: serde_json::json!({}),
+                result: Some((true, "ok".to_string())),
+            }])
+            .ok();
+        let msgs = vec![Message::user("s", "hello"), assistant];
+        let sel = super::super::selection::Selection {
+            anchor: (0, 0),
+            head: (1, 1),
+        };
+        let text = copy_text_for(&msgs, sel, &theme);
+        assert!(
+            !text.contains("You:") && !text.contains("Assistant:"),
+            "the copy must not carry a role label: {text:?}"
+        );
+        assert_eq!(text, "hello\n\nhi there\n  └─ shell() ✓ ok");
+    }
 }
 
 /// Build the full display-line buffer for a non-empty transcript, plus the

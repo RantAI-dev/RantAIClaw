@@ -107,6 +107,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Copying a selection in the TUI no longer puts the role label on the clipboard.** The copy took the
+  pane's rendered lines, and a rendered message starts with its role label, so the clipboard held
+  "Assistant: hello" instead of "hello". The label comes off the copied text now: the message body, the
+  blank line between messages, the code fences and the tool-call lines pass through unchanged. The pane
+  itself still draws the label.
+
 - **The onboarding skills text no longer states how many skills the pack holds.** The setup hint, both
   setup descriptions and the wizard's install label each carried a hand-written "5". The number could not
   keep itself true: the starter pack grows without the text being touched, and `setup skills
