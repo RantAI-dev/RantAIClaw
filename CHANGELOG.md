@@ -107,6 +107,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The onboarding skills text no longer states how many skills the pack holds.** The setup hint, both
+  setup descriptions and the wizard's install label each carried a hand-written "5". The number could not
+  keep itself true: the starter pack grows without the text being touched, and `setup skills
+  --starter-pack` installs the always-on core skill on top of the starter pack, so the number of skills on
+  disk was never the number in the text. The number is gone from all of those texts, and a test fails if a
+  count comes back into any of them.
+
 - **`rantaiclaw channel --help` and `rantaiclaw channel add --help` name the same channel kinds.** The
   `channel` command's help named seven kinds and `channel add`'s named sixteen, the two lists disagreed with
   each other, and neither named `whatsapp_web`, which the channel catalog has carried since 2026-09-09. Both
