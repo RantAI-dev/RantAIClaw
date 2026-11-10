@@ -107,6 +107,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A channel `/approve` now answers one call, and `/allow` answers until the daemon restarts.** The
+  relay parsed `approve` and `allow` as the same verb, so `/approve <command>` allowlisted that
+  basename for the life of the process: the command stayed allowed in every chat, with no prompt,
+  until the daemon restarted — while the reply said it had been added to the session allowlist and
+  the documentation said it covered one call. `approve`, `approved`, `yes`, `y` and `ok` now cover
+  exactly one call and hold nothing: no allowlist entry, no conversation grant, no disk, so the same
+  command asks again on the next call. `allow <command>` is the wider grant and keeps its meaning —
+  the basename is allowed in every chat until the daemon restarts — and `--persist` (or `Y`) still
+  writes it to disk. The reply now says which grant it made: "one call only" for a one-call answer,
+  "allowed in every chat until restart" for the session grant. Deny is unchanged and still needs no
+  owner, while both kinds of grant still do: a stranger's approval is refused and resolves nothing.
+
 - **Copying a selection in the TUI no longer puts the role label on the clipboard.** The copy took the
   pane's rendered lines, and a rendered message starts with its role label, so the clipboard held
   "Assistant: hello" instead of "hello". The label comes off the copied text now: the message body, the

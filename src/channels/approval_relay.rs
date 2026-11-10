@@ -49,13 +49,22 @@
 //! channel dispatch loop before each inbound message is forwarded to the
 //! agent. It recognises shell-allowlist replies in formats natural over chat:
 //!
-//!    - `/allow brew` / `/allow brew --persist`
+//!    - `/approve brew` — one call only: nothing is held anywhere, so the same
+//!      command asks again on the next call
+//!    - `/allow brew` / `/allow brew --persist` — the wide grant: the basename
+//!      is allowed in every chat until the process restarts (`--persist` also
+//!      writes it to disk, so it survives a restart)
 //!    - `/deny brew`
-//!    - `allow brew`, `deny brew` (slash-less for SMS / WhatsApp)
-//!    - single-char shortcuts: `y brew` (once), `Y brew` (persist),
+//!    - `approve brew`, `allow brew`, `deny brew` (slash-less for SMS /
+//!      WhatsApp)
+//!    - single-char shortcuts: `y brew` (one call), `Y brew` (persist),
 //!      `n brew` (deny). The capital-letter convention mirrors
 //!      `git rebase -i` style and stays consistent with how the
 //!      design doc described the channel UX.
+//!
+//! Every verb that means "yes" — `approve`, `approved`, `yes`, `y`, `ok`, and
+//! the bare forms of them — covers exactly one call. The reply says which
+//! grant it made, so an answer never promises more than it gives.
 //!
 //! Returning `Some(reply)` from [`try_handle_reply`] means the
 //! message was consumed; the caller should *not* forward it to the
@@ -79,13 +88,14 @@ use crate::security::{Decision, PendingApprovals, PendingRequest, SecurityPolicy
 /// against `security`. On failure returns `None` so the caller can
 /// route the message to the agent as normal.
 ///
-/// `sender` + `owners` enforce the owner-authority gate: an `allow`/`/allow`
-/// reply that would grant a command is honored **only** from an authorized
-/// owner (`[channels_config] approval_owners`). Being able to chat with the
-/// bot does not make a sender able to approve its shell commands — otherwise
-/// any chat participant could allowlist arbitrary commands for the agent.
-/// `deny` is always honored regardless of sender (denying is safe and lets
-/// anyone stop a pending action).
+/// `sender` + `owners` enforce the owner-authority gate: a reply that grants
+/// something — `approve`/`/approve` (one call) or `allow`/`/allow` (the
+/// session) — is honored **only** from an authorized owner
+/// (`[channels_config] approval_owners`). Being able to chat with the bot does
+/// not make a sender able to approve its shell commands — otherwise any chat
+/// participant could allowlist arbitrary commands for the agent. `deny` is
+/// always honored regardless of sender (denying is safe and lets anyone stop a
+/// pending action).
 pub fn try_handle_reply(
     text: &str,
     security: &SecurityPolicy,
@@ -105,7 +115,7 @@ pub fn try_handle_reply(
         if !names_something_pending {
             return None;
         }
-        if parsed.verb == ReplyVerb::Allow && !can_approve(owners, sender) {
+        if parsed.verb.is_grant() && !can_approve(owners, sender) {
             return Some(format!(
                 "You're not authorized to approve `{}`. Ask an owner to reply `/allow {}`.",
                 parsed.basename, parsed.basename
@@ -146,13 +156,15 @@ pub fn try_handle_reply(
             let basename = snapshot[0].basename.clone();
             let parsed = ParsedReply {
                 verb: match verb {
-                    BareVerb::Approve => ReplyVerb::Allow,
+                    // A bare verb is a plain yes: it covers the one call that is
+                    // pending and holds nothing.
+                    BareVerb::Approve => ReplyVerb::Once,
                     BareVerb::Deny => ReplyVerb::Deny,
                 },
                 basename: basename.clone(),
                 persist: false,
             };
-            if parsed.verb == ReplyVerb::Allow && !can_approve(owners, sender) {
+            if parsed.verb.is_grant() && !can_approve(owners, sender) {
                 return Some(format!(
                     "You're not authorized to approve `{basename}`. Ask an owner to reply `/allow {basename}`."
                 ));
@@ -186,10 +198,27 @@ struct ParsedReply {
     persist: bool,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum ReplyVerb {
-    Allow,
+    /// Cover this one call only — `Decision::Once`. Nothing is held anywhere:
+    /// no allowlist entry, no conversation grant, no disk.
+    Once,
+    /// Cover every later call of the basename — `Decision::Session`, or
+    /// `Decision::Persist` when the reply carries the persist flag.
+    Session,
+    /// Refuse — `Decision::Deny`.
     Deny,
+}
+
+impl ReplyVerb {
+    /// Whether this verb grants something.
+    ///
+    /// Both grant kinds — the one-call answer (`approve`, `y`, a bare verb)
+    /// and the session answer (`allow`) — are owner-gated. Only a deny is not:
+    /// stopping a pending action is always safe.
+    fn is_grant(self) -> bool {
+        matches!(self, ReplyVerb::Once | ReplyVerb::Session)
+    }
 }
 
 fn parse_reply(text: &str) -> Option<ParsedReply> {
@@ -223,11 +252,19 @@ fn parse_reply(text: &str) -> Option<ParsedReply> {
     // `y` means once, so case is load-bearing there.
     let head_lower = head.to_ascii_lowercase();
     let (verb, persist) = match head {
-        "y" if !persist => (ReplyVerb::Allow, false),
-        "Y" if !persist => (ReplyVerb::Allow, true),
+        // A plain yes: one call, nothing held.
+        "y" if !persist => (ReplyVerb::Once, false),
+        // The capital convention: persist.
+        "Y" if !persist => (ReplyVerb::Session, true),
         "n" | "N" if !persist => (ReplyVerb::Deny, false),
         _ => match head_lower.as_str() {
-            "allow" | "approve" => (ReplyVerb::Allow, persist),
+            // The wide grant: the basename is allowed in every chat until the
+            // process restarts.
+            "allow" => (ReplyVerb::Session, persist),
+            // Every other verb that means "yes" covers one call. A persist tail
+            // on one of them is dropped rather than honoured: a one-call grant
+            // cannot be persisted, and the reply says so.
+            "approve" | "approved" | "yes" | "ok" => (ReplyVerb::Once, false),
             "deny" | "reject" => (ReplyVerb::Deny, persist),
             _ => return None,
         },
@@ -250,7 +287,22 @@ fn handle_parsed(
     pending: &PendingApprovals,
 ) -> Option<String> {
     match parsed.verb {
-        ReplyVerb::Allow => {
+        // One call only. The request is resolved and nothing is held: no
+        // allowlist entry, no conversation grant, no disk. The next call of the
+        // same command asks again — which is what "approve" says.
+        ReplyVerb::Once => {
+            let Some(_) = pending.resolve_by_basename(&parsed.basename, Decision::Once) else {
+                return Some(format!(
+                    "No pending approval for `{}` (or more than one queued) — nothing was allowed.",
+                    parsed.basename
+                ));
+            };
+            Some(format!(
+                "✅ Approved `{}` for one call only — pending approval resolved; the agent will retry.",
+                parsed.basename
+            ))
+        }
+        ReplyVerb::Session => {
             let decision = if parsed.persist {
                 Decision::Persist
             } else {
@@ -295,13 +347,13 @@ fn handle_parsed(
                     if let Err(e) = security.add_runtime_command(&parsed.basename, parsed.persist) {
                         return Some(format!("Failed to allow `{}`: {e}", parsed.basename));
                     }
-                    let allowlist_scope = if parsed.persist {
-                        "persistent"
+                    let (allowlist_scope, reach) = if parsed.persist {
+                        ("persistent", "allowed in every chat, and after a restart")
                     } else {
-                        "session"
+                        ("session", "allowed in every chat until restart")
                     };
                     Some(format!(
-                        "✅ Added `{}` to the {allowlist_scope} allowlist — pending approval resolved; \
+                        "✅ Added `{}` to the {allowlist_scope} allowlist — {reach}; pending approval resolved; \
                          the agent will retry.",
                         parsed.basename
                     ))
@@ -955,7 +1007,7 @@ mod tests {
     #[test]
     fn parse_slash_allow_basic() {
         let p = parse_reply("/allow brew").unwrap();
-        assert_eq!(p.verb, ReplyVerb::Allow);
+        assert_eq!(p.verb, ReplyVerb::Session);
         assert_eq!(p.basename, "brew");
         assert!(!p.persist);
     }
@@ -963,7 +1015,7 @@ mod tests {
     #[test]
     fn parse_slashless_works_for_chat_channels() {
         let p = parse_reply("allow brew").unwrap();
-        assert_eq!(p.verb, ReplyVerb::Allow);
+        assert_eq!(p.verb, ReplyVerb::Session);
     }
 
     #[test]
@@ -979,12 +1031,43 @@ mod tests {
     #[test]
     fn parse_short_forms() {
         let p = parse_reply("y brew").unwrap();
-        assert_eq!(p.verb, ReplyVerb::Allow);
+        assert_eq!(p.verb, ReplyVerb::Once);
         assert!(!p.persist);
         let p = parse_reply("Y brew").unwrap();
+        assert_eq!(p.verb, ReplyVerb::Session);
         assert!(p.persist);
         let p = parse_reply("n brew").unwrap();
         assert_eq!(p.verb, ReplyVerb::Deny);
+    }
+
+    /// Every verb that means "yes" covers one call; only `allow` widens the
+    /// grant to the session.
+    #[test]
+    fn parse_yes_verbs_cover_one_call_and_only_allow_widens() {
+        for verb in [
+            "/approve brew",
+            "approve brew",
+            "Approved brew",
+            "/approved brew",
+            "/yes brew",
+            "yes brew",
+            "/ok brew",
+            "y brew",
+        ] {
+            let p = parse_reply(verb).unwrap_or_else(|| panic!("recognised: {verb}"));
+            assert_eq!(p.verb, ReplyVerb::Once, "verb={verb}");
+            assert!(!p.persist, "verb={verb}");
+        }
+        for verb in ["/allow brew", "allow brew", "Allow brew"] {
+            let p = parse_reply(verb).unwrap_or_else(|| panic!("recognised: {verb}"));
+            assert_eq!(p.verb, ReplyVerb::Session, "verb={verb}");
+            assert!(!p.persist, "verb={verb}");
+        }
+        // A persist tail on a one-call verb is dropped rather than honoured: a
+        // one-call grant cannot be persisted.
+        let p = parse_reply("/approve brew --persist").unwrap();
+        assert_eq!(p.verb, ReplyVerb::Once);
+        assert!(!p.persist);
     }
 
     #[test]
@@ -1080,6 +1163,10 @@ mod tests {
         )
         .expect("recognised");
         assert!(ack.contains("session"), "{ack}");
+        assert!(
+            ack.contains("allowed in every chat until restart"),
+            "the reply must name the scope of the grant: {ack}"
+        );
 
         let result = call.await.unwrap();
         assert!(result.success, "the allowed command must run: {result:?}");
@@ -1092,47 +1179,276 @@ mod tests {
         );
     }
 
-    /// The channel's Layer A `/approve` answer is a `Once`: it covers that one
-    /// tool call and grants no runtime command.
+    /// A channel's Layer B `/approve` answer covers ONE call: the command
+    /// runs once, nothing is held anywhere, and the next identical call asks
+    /// again.
+    ///
+    /// `approve` used to be the same verb as `allow`, so it wrote the basename
+    /// onto the runtime allowlist and every later call of that command ran
+    /// unasked. This drives a real [`crate::tools::ShellTool`] so the grant is
+    /// proved where it is spent — the command gate — and not only in the
+    /// relay's own bookkeeping.
     #[tokio::test]
-    async fn a_channel_approve_answer_grants_no_runtime_command() {
-        let security = supervised_only_echo();
-        let relay = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
-        let task = tokio::spawn({
-            let relay = relay.clone();
+    async fn a_channel_approve_answer_covers_one_call_and_asks_again_next_time() {
+        use crate::runtime::NativeRuntime;
+        use crate::tools::traits::Tool;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let security = supervised_policy(dir.path());
+        let pending = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        security.set_pending(pending.clone());
+
+        // ── The first call asks; the owner's `/approve` answers it.
+        let call = tokio::spawn({
+            let security = Arc::clone(&security);
             async move {
-                relay
-                    .request_decision_in_outcome(
-                        uuid::Uuid::new_v4(),
-                        "shell",
-                        "true",
-                        "telegram",
-                        "chat-1",
-                    )
+                crate::tools::ShellTool::new(security, Arc::new(NativeRuntime::new()))
+                    .execute(serde_json::json!({ "command": "true" }))
                     .await
-                    .decision
+                    .expect("the command should return a result")
             }
         });
-        await_pending(&relay, 1).await;
+        await_pending(&pending, 1).await;
 
         let owners = vec!["owner1".to_string()];
-        let ack = try_handle_tool_reply(
-            "/approve shell",
-            &relay,
+        let ack = try_handle_reply(
+            "/approve true",
+            &security,
             "owner1",
             &owners,
             "telegram",
             "chat-1",
         )
         .expect("recognised");
-        assert!(ack.contains("shell"), "{ack}");
+        assert!(
+            ack.contains("one call only"),
+            "the reply must say what the answer covers: {ack}"
+        );
 
+        // ── The command runs, and the grant is not held anywhere.
+        let result = call.await.unwrap();
+        assert!(result.success, "the approved command must run: {result:?}");
+        assert!(
+            security.runtime_allowlist_snapshot().is_empty(),
+            "a one-call answer grants no command: {:?}",
+            security.runtime_allowlist_snapshot()
+        );
+
+        // ── The second, identical call asks again: nothing was held.
+        let call = tokio::spawn({
+            let security = Arc::clone(&security);
+            async move {
+                crate::tools::ShellTool::new(security, Arc::new(NativeRuntime::new()))
+                    .execute(serde_json::json!({ "command": "true" }))
+                    .await
+                    .expect("the command should return a result")
+            }
+        });
+        await_pending(&pending, 1).await;
+        assert_eq!(
+            pending.list().len(),
+            1,
+            "the second call must ask again — the one-call grant held nothing"
+        );
+
+        // The owner denies, so the second call ends without running.
+        let ack = try_handle_reply(
+            "/deny true",
+            &security,
+            "owner1",
+            &owners,
+            "telegram",
+            "chat-1",
+        )
+        .expect("recognised");
+        assert!(ack.contains("Denied"), "{ack}");
+        let result = call.await.unwrap();
+        assert!(!result.success, "a denied command must not run: {result:?}");
+    }
+
+    /// The distinction the split exists for: the same pending request, answered
+    /// two ways, grants two different things.
+    ///
+    /// `/approve <basename>` covers that one call and holds nothing;
+    /// `/allow <basename>` allows the basename in every chat until the process
+    /// restarts. `/allow <basename> --persist` and `Y <basename>` are the
+    /// persist variants of the same session grant.
+    #[tokio::test]
+    async fn an_approve_answer_covers_one_call_while_an_allow_answer_grants_the_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let security = Arc::new(SecurityPolicy::from_config_with_policy_dir(
+            &crate::config::AutonomyConfig {
+                level: crate::security::AutonomyLevel::Supervised,
+                always_ask: vec![],
+                auto_approve: vec![],
+                ..crate::config::AutonomyConfig::default()
+            },
+            dir.path(),
+            Some(dir.path().to_path_buf()),
+        ));
+        let pending = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        security.set_pending(pending.clone());
+        let owners = vec!["owner1".to_string()];
+
+        // `/approve brew` → Once, nothing held.
+        let p2 = pending.clone();
+        let task =
+            tokio::spawn(async move { p2.request_decision("brew", "brew --version", "t").await });
+        await_pending(&pending, 1).await;
+        let ack = try_handle_reply(
+            "/approve brew",
+            &security,
+            "owner1",
+            &owners,
+            "telegram",
+            "chat-1",
+        )
+        .expect("recognised");
+        assert!(ack.contains("one call only"), "{ack}");
         assert_eq!(task.await.unwrap(), Decision::Once);
         assert!(
             security.runtime_allowlist_snapshot().is_empty(),
-            "a channel /approve covers one call and grants no runtime command: {:?}",
+            "a one-call answer holds nothing: {:?}",
             security.runtime_allowlist_snapshot()
         );
+
+        // `/allow brew` → Session, on the runtime allowlist.
+        let p2 = pending.clone();
+        let task =
+            tokio::spawn(async move { p2.request_decision("brew", "brew --version", "t").await });
+        await_pending(&pending, 1).await;
+        let ack = try_handle_reply(
+            "/allow brew",
+            &security,
+            "owner1",
+            &owners,
+            "telegram",
+            "chat-1",
+        )
+        .expect("recognised");
+        assert!(ack.contains("session"), "{ack}");
+        assert_eq!(task.await.unwrap(), Decision::Session);
+        assert!(security
+            .runtime_allowlist_snapshot()
+            .contains(&"brew".to_string()));
+
+        // `/allow brew --persist` → Persist.
+        let p2 = pending.clone();
+        let task =
+            tokio::spawn(async move { p2.request_decision("brew", "brew --version", "t").await });
+        await_pending(&pending, 1).await;
+        try_handle_reply(
+            "/allow brew --persist",
+            &security,
+            "owner1",
+            &owners,
+            "telegram",
+            "chat-1",
+        )
+        .expect("recognised");
+        assert_eq!(task.await.unwrap(), Decision::Persist);
+
+        // `Y brew` → Persist.
+        let p2 = pending.clone();
+        let task =
+            tokio::spawn(async move { p2.request_decision("brew", "brew --version", "t").await });
+        await_pending(&pending, 1).await;
+        try_handle_reply("Y brew", &security, "owner1", &owners, "telegram", "chat-1")
+            .expect("recognised");
+        assert_eq!(task.await.unwrap(), Decision::Persist);
+    }
+
+    /// A bare verb is a plain yes: it covers the one call that is pending and
+    /// holds nothing.
+    #[tokio::test]
+    async fn a_bare_verb_covers_one_call_and_writes_no_allowlist_entry() {
+        let security = supervised_only_echo();
+        let pending = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        security.set_pending(pending.clone());
+        let p2 = pending.clone();
+        let task = tokio::spawn(async move {
+            p2.request_decision_in(
+                uuid::Uuid::new_v4(),
+                "brew",
+                "brew --version",
+                "telegram",
+                "chat-1",
+            )
+            .await
+        });
+        await_pending(&pending, 1).await;
+
+        let owners = vec!["owner1".to_string()];
+        let ack = try_handle_reply("ok", &security, "owner1", &owners, "telegram", "chat-1")
+            .expect("recognised");
+        assert!(ack.contains("one call only"), "{ack}");
+        assert_eq!(task.await.unwrap(), Decision::Once);
+        assert!(
+            security.runtime_allowlist_snapshot().is_empty(),
+            "a bare verb holds nothing: {:?}",
+            security.runtime_allowlist_snapshot()
+        );
+    }
+
+    /// Both kinds of grant stay owner-gated: a one-call answer and a session
+    /// answer are each refused from a stranger, and neither resolves the
+    /// request nor writes an allowlist entry. Denying stays ungated — stopping
+    /// a pending action is always safe.
+    #[tokio::test]
+    async fn a_grant_from_a_stranger_is_refused_for_one_call_and_for_the_session() {
+        let security = supervised_only_echo();
+        let pending = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        security.set_pending(pending.clone());
+        let p2 = pending.clone();
+        let task =
+            tokio::spawn(async move { p2.request_decision("brew", "brew --version", "t").await });
+        await_pending(&pending, 1).await;
+
+        let owners = vec!["owner1".to_string()];
+
+        // A one-call grant from a stranger.
+        let ack = try_handle_reply(
+            "/approve brew",
+            &security,
+            "stranger",
+            &owners,
+            "telegram",
+            "chat-1",
+        )
+        .expect("recognised");
+        assert!(ack.contains("not authorized"), "{ack}");
+        assert_eq!(pending.list().len(), 1, "the request stays pending");
+
+        // A session grant from a stranger.
+        let ack = try_handle_reply(
+            "/allow brew",
+            &security,
+            "stranger",
+            &owners,
+            "telegram",
+            "chat-1",
+        )
+        .expect("recognised");
+        assert!(ack.contains("not authorized"), "{ack}");
+        assert_eq!(pending.list().len(), 1, "the request stays pending");
+        assert!(
+            security.runtime_allowlist_snapshot().is_empty(),
+            "a refused grant writes no allowlist entry: {:?}",
+            security.runtime_allowlist_snapshot()
+        );
+
+        // The owner can still answer it.
+        let ack = try_handle_reply(
+            "/approve brew",
+            &security,
+            "owner1",
+            &owners,
+            "telegram",
+            "chat-1",
+        )
+        .expect("recognised");
+        assert!(ack.contains("one call only"), "{ack}");
+        assert_eq!(task.await.unwrap(), Decision::Once);
     }
 
     /// A risk-gate answer holds for the session at medium risk. It must not
@@ -1743,7 +2059,7 @@ mod tests {
     #[test]
     fn capitalised_verbs_are_recognised_but_case_still_selects_persistence() {
         let allow = parse_reply("Allow brew").expect("Allow is a verb");
-        assert_eq!(allow.verb, ReplyVerb::Allow);
+        assert_eq!(allow.verb, ReplyVerb::Session);
         assert!(!allow.persist);
 
         assert_eq!(
@@ -2009,7 +2325,10 @@ mod tests {
         // carries no originating message, so it has no chat to be answered from.
         // Naming the command is therefore how it is answered; a bare `ok` is
         // covered by `bare_verb_does_not_resolve_an_unscoped_shell_request`.
-        for verb in ["/allow brew", "allow brew", "Allow brew", "y brew"] {
+        //
+        // `y brew` is NOT in this list: `y` is a plain yes and covers one call
+        // only — see `a_single_char_yes_covers_one_call_and_writes_no_allowlist_entry`.
+        for verb in ["/allow brew", "allow brew", "Allow brew"] {
             let security = supervised_only_echo();
             let pending = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
             security.set_pending(pending.clone());
@@ -2029,6 +2348,31 @@ mod tests {
                 .runtime_allowlist_snapshot()
                 .contains(&"brew".to_string()));
         }
+    }
+
+    /// The single-char shortcut `y` is a plain yes: it covers the one call
+    /// that is pending and holds nothing — the same as `approve`, and not the
+    /// same as `allow`.
+    #[tokio::test]
+    async fn a_single_char_yes_covers_one_call_and_writes_no_allowlist_entry() {
+        let security = supervised_only_echo();
+        let pending = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        security.set_pending(pending.clone());
+        let p2 = pending.clone();
+        let task =
+            tokio::spawn(async move { p2.request_decision("brew", "brew --version", "t").await });
+        await_pending(&pending, 1).await;
+
+        let owners = vec!["owner1".to_string()];
+        let ack = try_handle_reply("y brew", &security, "owner1", &owners, "telegram", "chat-1")
+            .expect("recognised");
+        assert!(ack.contains("one call only"), "{ack}");
+        assert_eq!(task.await.unwrap(), Decision::Once);
+        assert!(
+            security.runtime_allowlist_snapshot().is_empty(),
+            "a one-call answer holds nothing: {:?}",
+            security.runtime_allowlist_snapshot()
+        );
     }
 
     /// A shell approval raised by a channel turn now names the chat it came
@@ -2070,11 +2414,13 @@ mod tests {
 
         let ack = try_handle_reply("ok", &security, "owner1", &owners, "telegram", "chat-1")
             .expect("a bare verb in the originating chat is recognised");
-        assert!(ack.contains("session"), "ack={ack}");
-        assert_eq!(task.await.unwrap(), Decision::Session);
-        assert!(security
-            .runtime_allowlist_snapshot()
-            .contains(&"brew".to_string()));
+        assert!(ack.contains("one call only"), "ack={ack}");
+        assert_eq!(task.await.unwrap(), Decision::Once);
+        assert!(
+            security.runtime_allowlist_snapshot().is_empty(),
+            "a bare verb holds nothing: {:?}",
+            security.runtime_allowlist_snapshot()
+        );
     }
 
     /// The mechanism the test above depends on: the dispatch loop sets the
@@ -2802,8 +3148,8 @@ mod tests {
             "y brew", &layer_a, &security, "owner1", &owners, "telegram", "chat-1",
         )
         .expect("Layer B resolves its own basename");
-        assert!(ack.contains("session"), "{ack}");
-        assert_eq!(task.await.unwrap(), Decision::Session);
+        assert!(ack.contains("brew"), "{ack}");
+        assert_eq!(task.await.unwrap(), Decision::Once);
     }
 
     /// Same single-pending state, but the token doesn't match the command:
@@ -2920,8 +3266,8 @@ mod tests {
             "chat-1",
         )
         .expect("Layer B resolves its own basename");
-        assert!(ack.contains("session"), "{ack}");
-        assert_eq!(tb.await.unwrap(), Decision::Session);
+        assert!(ack.contains("one call only"), "{ack}");
+        assert_eq!(tb.await.unwrap(), Decision::Once);
         assert_eq!(layer_a.list().len(), 1, "the Layer A request stays pending");
 
         // Cleanup.
