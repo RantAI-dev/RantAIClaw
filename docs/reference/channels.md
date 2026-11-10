@@ -335,11 +335,18 @@ reply (`/approve`, `/deny`, `/allow`, or a slash-prefixed bare verb) that names 
 is answered the same way. A reply that is none of those — a slash-less non-handle-shaped token
 (`approve helm`), a bare verb (`ok`, `yes`), or plain chat — stays chat. An approval reply
 resolves a request only by its handle or its exact tool name: naming a command
-(`/approve kubectl`) resolves nothing. An answer says what it covers: `/allow
-<command>` answers the shell command gate and allowlists that basename for the
-life of the process — `--persist` writes it to disk as well, so it survives a
-restart — while `/approve <tool>` answers the tool gate and covers that one call
-only, granting no command.
+(`/approve kubectl`) resolves nothing.
+
+An answer says what it covers, on both layers. `/approve <command>` and `/approve <tool>`
+answer the pending request and cover that one call only: nothing is allowlisted and nothing is
+held, so the same command asks again on the next call. `/allow <command>` is the wider grant —
+the basename is allowlisted for the life of the process, in every chat, until the daemon
+restarts, and `--persist` writes it to disk as well, so it survives a restart. `y <command>`
+covers one call, `Y <command>` persists, and a bare verb (`ok`, `yes`) covers one call. The
+reply names the grant it made: "one call only" for a one-call answer, "allowed in every chat
+until restart" for the session grant. Deny needs no owner — stopping a pending action is
+always safe — while every kind of grant needs one.
+
 Slack has no reset
 command: a new top-level message already starts a new conversation.
 
