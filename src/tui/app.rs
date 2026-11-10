@@ -510,16 +510,18 @@ pub struct TuiApp {
     /// still held at that moment was typed before the operator could see
     /// the prompt. Such a key is not an answer to it.
     approval_prompt_opened: bool,
-    /// Whether the event that is about to be handled was already queued
-    /// when the prompt opened.
+    /// How many keys were already queued when the prompt opened and have
+    /// not been spent yet.
     ///
-    /// The run loop reads exactly one event when a prompt opens and marks
-    /// it here, so the marker lands on the event that was actually queued
-    /// instead of on whatever key happens to come next — a mouse move or
-    /// a resize must not take the next key's answering power with it.
-    /// `handle_event` takes the marker for one event only, and a key that
-    /// carries it types into the composer instead of answering.
-    approval_input_prequeued: bool,
+    /// The run loop drains the whole queue when a prompt opens and marks
+    /// every key among the drained events here, so that none of them can
+    /// answer: each of them was typed before the operator could see the
+    /// prompt. The count is spent by the keys themselves, one marking per
+    /// key, so an event that is not a key never takes a queued key's
+    /// marking with it — a mouse move or a resize must not swallow the
+    /// answering power of a key, queued or deliberate. A key that carries
+    /// a marking types into the composer instead of answering.
+    approval_input_prequeued: usize,
     /// The reload this app is waiting on, and what its outcome may change.
     /// An outcome whose id is at or past the pending id adopts the model label
     /// and writes the unsaved config; an older outcome moves nothing.
@@ -702,7 +704,7 @@ impl TuiApp {
             actor_has_agent: true,
             pending_approval: None,
             approval_prompt_opened: false,
-            approval_input_prequeued: false,
+            approval_input_prequeued: 0,
             pending_reload: None,
             reload_seq: 0,
             model_picker_entries: None,
@@ -890,7 +892,7 @@ impl TuiApp {
         };
         // The prompt this marker belonged to is gone. A marker left over
         // must never reach the next prompt.
-        self.approval_input_prequeued = false;
+        self.approval_input_prequeued = 0;
         let basename = req.basename.clone();
         let scope = req.session_scope;
         let Some(security) = self.context.security.as_ref() else {
@@ -1108,17 +1110,29 @@ impl TuiApp {
         std::mem::take(&mut self.approval_prompt_opened)
     }
 
-    /// Mark the event that is about to be handled as pre-queued: it was
-    /// already in the terminal's queue when the approval prompt opened, so
-    /// it was typed before the operator could see the prompt and cannot be
-    /// an answer to it.
+    /// Mark one more key as pre-queued: it was already in the terminal's
+    /// queue when the approval prompt opened, so it was typed before the
+    /// operator could see the prompt and cannot be an answer to it.
     ///
-    /// The marker covers one event only. `handle_event` takes it for
-    /// whichever event arrives and hands it to the key path alone, so a
-    /// mouse move or a resize that happened to be queued cannot take the
-    /// answering power of a deliberate key with it.
+    /// The marking is a count, because the whole queue is drained when a
+    /// prompt opens and every key in it is marked. Each key spends one
+    /// marking, so an event that is not a key cannot take a queued key's
+    /// marking with it.
     pub fn mark_approval_input_prequeued(&mut self) {
-        self.approval_input_prequeued = true;
+        self.approval_input_prequeued = self.approval_input_prequeued.saturating_add(1);
+    }
+
+    /// Spend one pre-queued marking, if any is left.
+    ///
+    /// The marking belongs to a key that was in the terminal's queue when
+    /// the approval prompt opened, so it is spent by that key and by no
+    /// other event.
+    fn take_approval_input_prequeued(&mut self) -> bool {
+        if self.approval_input_prequeued == 0 {
+            return false;
+        }
+        self.approval_input_prequeued -= 1;
+        true
     }
 
     /// A slash command may have resolved the request the pane is showing
@@ -1144,7 +1158,7 @@ impl TuiApp {
         }
         // The prompt this marker belonged to is gone. A marker left over
         // must never reach the next prompt.
-        self.approval_input_prequeued = false;
+        self.approval_input_prequeued = 0;
         // The request on screen is answered. Show the next one that is
         // still waiting. The resolved request's snapshot entry survives
         // until its awaiting future unwinds, so the list is filtered by
@@ -1192,17 +1206,22 @@ impl TuiApp {
 
     /// Process a single terminal event, returning whether to continue or quit.
     ///
-    /// The pre-queued marker is taken here, at the top of the function, and
-    /// handed to the key path only. Every other event kind therefore drops
-    /// it: a mouse move or a resize that happened to be queued when the
-    /// prompt opened must not take the answering power of the *next* key
-    /// with it — that key may well be a deliberate answer typed seconds
-    /// later, and swallowing it would leave the operator with a prompt
-    /// they cannot dismiss.
+    /// The pre-queued marking is spent by the key it was made for, and by
+    /// no other event: it is taken in the key arm, before the kitty
+    /// release filter, so a release that was queued spends the marking it
+    /// was given. An event that is not a key never touches the count, so
+    /// a mouse move or a resize that happened to be queued when the
+    /// prompt opened cannot take a queued key's marking with it, and
+    /// cannot swallow the answering power of a key typed later either.
     pub async fn handle_event(&mut self, event: Event) -> Result<EventResult> {
-        let prequeued = std::mem::take(&mut self.approval_input_prequeued);
         match event {
             Event::Key(key) => {
+                // The marking belongs to a key that was in the terminal's
+                // queue when the approval prompt opened. It is taken here,
+                // before the release filter below, because a release is a
+                // key too: it types nothing, but it must still spend the
+                // marking it was given.
+                let prequeued = self.take_approval_input_prequeued();
                 // Windows + terminals that enable the kitty keyboard protocol
                 // emit BOTH Press and Release for every keystroke. Without
                 // this guard each char is pushed twice into the input buffer.
@@ -1306,7 +1325,7 @@ impl TuiApp {
     /// Dispatch a key event that may have been queued before the approval
     /// prompt was visible.
     ///
-    /// `prequeued` is true for the one event the run loop read from the
+    /// `prequeued` is true for a key that the run loop read from the
     /// terminal's queue at the moment the prompt opened: it was typed
     /// before the operator could see the prompt, so it types into the
     /// composer instead of answering.
@@ -2535,13 +2554,13 @@ impl TuiApp {
                             // A new prompt inherits no marker: a marker left
                             // over from an earlier prompt must never reach
                             // this one.
-                            self.approval_input_prequeued = false;
+                            self.approval_input_prequeued = 0;
                             // The prompt opened in this frame, before the
                             // operator could see it. The run loop reads the
-                            // event the terminal still holds at this moment:
-                            // anything buffered now was typed before the
-                            // prompt was visible, so it cannot be an answer
-                            // to it.
+                            // events the terminal still holds at this
+                            // moment: anything buffered now was typed
+                            // before the prompt was visible, so it cannot
+                            // be an answer to it.
                             self.approval_prompt_opened = true;
                         }
                     }
@@ -6923,7 +6942,7 @@ pub(super) mod test_support {
             actor_has_agent: true,
             pending_approval: None,
             approval_prompt_opened: false,
-            approval_input_prequeued: false,
+            approval_input_prequeued: 0,
             pending_reload: None,
             reload_seq: 0,
             model_picker_entries: None,
@@ -9675,6 +9694,52 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
     Ok(())
 }
 
+/// What draining the terminal's queue at prompt-open found.
+struct QueuedDrain {
+    /// A resize was among the drained events: the terminal has to
+    /// repaint, or the resize leaves ghost rows behind.
+    resized: bool,
+    /// One of the drained events asked the app to quit.
+    quit: bool,
+}
+
+/// Drain the events the terminal already holds when an approval prompt
+/// opened.
+///
+/// `next` yields the next queued event, or `None` when the queue is
+/// empty. The run loop passes the terminal's queue; a test passes a list.
+///
+/// The whole queue is drained, not one event: a mouse move or a resize
+/// in front of a key used to leave that key free to answer, because only
+/// the first event was marked. Every key among the drained events is
+/// marked before it is handled, so none of them can answer — they were
+/// all typed before the operator could see the prompt. Events that are
+/// not keys keep their normal handling and never take a queued key's
+/// marking with them.
+async fn drain_queued_events<F>(app: &mut TuiApp, mut next: F) -> Result<QueuedDrain>
+where
+    F: FnMut() -> Result<Option<Event>>,
+{
+    let mut resized = false;
+    let mut quit = false;
+    while let Some(event) = next()? {
+        if matches!(event, Event::Resize(_, _)) {
+            resized = true;
+        }
+        // Only a key can answer the prompt, so only a key is marked. A
+        // mouse move or a resize says nothing about what the operator
+        // typed, and must not take a queued key's marking with it.
+        if matches!(event, Event::Key(_)) {
+            app.mark_approval_input_prequeued();
+        }
+        if matches!(app.handle_event(event).await?, EventResult::Quit) {
+            quit = true;
+            break;
+        }
+    }
+    Ok(QueuedDrain { resized, quit })
+}
+
 /// Inner event loop separated from terminal lifecycle for easier testing.
 async fn run_loop(
     app: &mut TuiApp,
@@ -9695,27 +9760,35 @@ async fn run_loop(
         // input was typed before the operator could see the prompt, so it
         // cannot be an answer.
         //
-        // The queued event is READ, not just polled for, and it is the
-        // event that carries the marker — so the marker lands on the input
-        // that was actually queued. Polling alone would flag whatever key
-        // came next, seconds later, and swallow a deliberate answer.
+        // The queued events are READ, not just polled for, and every key
+        // among them is marked — so the marking lands on the input that
+        // was actually queued, whatever its place in the queue. Polling
+        // alone would flag whatever key came next, seconds later, and
+        // swallow a deliberate answer.
         //
-        // Exactly one event is read: the rest of the queue belongs to the
-        // operator's next actions, which are deliberate by definition.
-        if app.take_approval_prompt_opened() && event::poll(std::time::Duration::ZERO)? {
-            let queued = event::read()?;
-            if matches!(queued, Event::Resize(_, _)) {
-                // A resize is not input: it says nothing about what the
-                // operator typed, so it must not take the next key's
-                // answering power with it. Repaint the terminal instead, so
-                // the resize does not leave ghost rows behind.
-                let _ = terminal.clear();
-            } else {
-                app.mark_approval_input_prequeued();
-                match app.handle_event(queued).await? {
-                    EventResult::Quit => break,
-                    EventResult::Continue => {}
+        // The whole queue the terminal holds is drained, not one event: a
+        // mouse move or a resize in front of a key used to leave that key
+        // free to answer. Events that are not keys keep their normal
+        // handling and never take a queued key's marking with them. A key
+        // read after the drain is the operator's deliberate answer.
+        if app.take_approval_prompt_opened() {
+            let drained = drain_queued_events(app, || -> Result<Option<Event>> {
+                if event::poll(std::time::Duration::ZERO)? {
+                    Ok(Some(event::read()?))
+                } else {
+                    Ok(None)
                 }
+            })
+            .await?;
+            if drained.resized {
+                // A resize is not input: it says nothing about what the
+                // operator typed, so it is not marked and it never takes a
+                // queued key's marking with it. Repaint the terminal instead,
+                // so the resize does not leave ghost rows behind.
+                let _ = terminal.clear();
+            }
+            if drained.quit {
+                break;
             }
         }
 
@@ -10692,7 +10765,7 @@ mod tests {
             actor_has_agent: true,
             pending_approval: None,
             approval_prompt_opened: false,
-            approval_input_prequeued: false,
+            approval_input_prequeued: 0,
             pending_reload: None,
             reload_seq: 0,
             model_picker_entries: None,
@@ -15501,7 +15574,11 @@ mod approval_answer_tests {
     use super::*;
     use crate::security::Decision;
     use crate::tui::async_bridge::TurnRequest;
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseEvent,
+        MouseEventKind,
+    };
+    use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
@@ -15783,12 +15860,12 @@ mod approval_answer_tests {
     }
 
     /// An event that is not input — a focus change, a mouse move, a resize —
-    /// is not an answer, and it must not take the answering power of the
-    /// *next* key with it: that key may well be a deliberate answer typed
-    /// seconds later, and swallowing it would leave a prompt the operator
-    /// cannot dismiss.
+    /// is not an answer, and it does not take a queued key's marking with
+    /// it: the marking belongs to the key it was made for, so the key
+    /// behind the mouse move keeps its marking and cannot answer either.
+    /// The key after that one is deliberate again.
     #[tokio::test]
-    async fn a_non_key_event_does_not_swallow_the_next_answer() {
+    async fn a_non_key_event_does_not_take_a_queued_keys_marking() {
         let mut f = fixture_with(&["curl"]).await;
         f.app.mark_approval_input_prequeued();
 
@@ -15802,10 +15879,141 @@ mod approval_answer_tests {
             .await
             .unwrap();
 
+        assert!(
+            f.approvals.is_pending(f.shown_id),
+            "the queued key keeps its marking across a non-key event"
+        );
+
+        // The marking is spent by the key it belonged to, so the next key
+        // reaches the prompt. Esc answers even with text in the composer,
+        // and the queued 'y' above put its letter there.
+        f.app
+            .handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .await
+            .unwrap();
+
+        assert!(
+            !f.approvals.is_pending(f.shown_id),
+            "the key after the queued one is a deliberate answer"
+        );
+    }
+
+    /// Drive the run loop the way it runs at a prompt opening: the queue
+    /// the terminal already holds is drained, and the events that are read
+    /// afterwards go through the normal read path.
+    ///
+    /// A drain that takes the whole queue leaves nothing over, and the
+    /// second phase is where a key typed after the prompt was visible
+    /// goes. The second phase is also what a drain that stops early
+    /// leaks into: the events it left behind are read one by one, as the
+    /// operator types them, so a queued key would answer there.
+    async fn run_loop_at_prompt_open(
+        f: &mut ApprovalFixture,
+        mut queue: VecDeque<Event>,
+    ) -> QueuedDrain {
+        let drained = drain_queued_events(&mut f.app, || Ok(queue.pop_front()))
+            .await
+            .unwrap();
+        while let Some(event) = queue.pop_front() {
+            f.app.handle_event(event).await.unwrap();
+        }
+        drained
+    }
+
+    /// A mouse move that was queued when the prompt opened must not take
+    /// the queued key's answering power with it: the key was typed before
+    /// the operator could see the prompt, so it cannot answer.
+    #[tokio::test]
+    async fn a_queued_mouse_move_does_not_let_the_queued_key_answer() {
+        let mut f = fixture_with(&["curl"]).await;
+
+        let drained = run_loop_at_prompt_open(
+            &mut f,
+            VecDeque::from(vec![
+                Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Moved,
+                    column: 0,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                }),
+                Event::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+            ]),
+        )
+        .await;
+
+        assert!(!drained.quit, "a queued event must not quit the app");
+        assert!(
+            f.approvals.is_pending(f.shown_id),
+            "a key that was queued when the prompt opened must not answer it"
+        );
+        let _ = f.decision().await;
+    }
+
+    /// A queue that mixes a kitty release, a chord and a letter answers
+    /// nothing: every one of them was typed before the operator could see
+    /// the prompt.
+    #[tokio::test]
+    async fn a_queued_release_and_chord_do_not_answer_the_prompt() {
+        let mut f = fixture_with(&["curl"]).await;
+
+        run_loop_at_prompt_open(
+            &mut f,
+            VecDeque::from(vec![
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char('y'),
+                    modifiers: KeyModifiers::NONE,
+                    kind: KeyEventKind::Release,
+                    state: KeyEventState::NONE,
+                }),
+                Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+                Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+            ]),
+        )
+        .await;
+
+        assert!(
+            f.approvals.is_pending(f.shown_id),
+            "no queued key may answer the prompt"
+        );
+        let _ = f.decision().await;
+    }
+
+    /// A key that is read after the drain answers: the drain marked every
+    /// key it found, and every marking was spent by the key it belonged
+    /// to — including the release half of a queued keystroke, which types
+    /// nothing but still spends its marking.
+    #[tokio::test]
+    async fn a_key_read_after_the_drain_answers() {
+        let mut f = fixture_with(&["curl"]).await;
+
+        run_loop_at_prompt_open(
+            &mut f,
+            VecDeque::from(vec![
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char('y'),
+                    modifiers: KeyModifiers::NONE,
+                    kind: KeyEventKind::Release,
+                    state: KeyEventState::NONE,
+                }),
+                // A chord types no text into the composer, so the composer
+                // stays empty and the deliberate key below can answer.
+                Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            ]),
+        )
+        .await;
+
+        f.app
+            .handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('y'),
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+
         assert_eq!(
             f.decision().await,
             Decision::Session,
-            "a deliberate answer after a non-key event must still answer"
+            "a key read after the drain is a deliberate answer"
         );
     }
 
@@ -15821,8 +16029,8 @@ mod approval_answer_tests {
             .await
             .unwrap();
 
-        assert!(
-            !f.app.approval_input_prequeued,
+        assert_eq!(
+            f.app.approval_input_prequeued, 0,
             "the marker must not reach the next prompt"
         );
         let shown = f
@@ -15957,8 +16165,8 @@ mod approval_answer_tests {
             .await
             .unwrap();
 
-        assert!(
-            !f.app.approval_input_prequeued,
+        assert_eq!(
+            f.app.approval_input_prequeued, 0,
             "the marker must not survive the prompt it belonged to"
         );
         let next = f
@@ -15991,8 +16199,8 @@ mod approval_answer_tests {
 
         f.app.handle_command("allow curl").await.unwrap();
 
-        assert!(
-            !f.app.approval_input_prequeued,
+        assert_eq!(
+            f.app.approval_input_prequeued, 0,
             "the marker must not survive the prompt it belonged to"
         );
         let next = f

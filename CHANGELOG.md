@@ -158,13 +158,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was read as an answer: an operator typing `/allow gv1` sent the `a`, which answered the open
   prompt with `Persist` and wrote an allowlist entry to disk. An answer key now counts only when the
   composer is empty, and only when the key was not already queued in the terminal when the prompt
-  appeared — a key typed before the operator could see the prompt is not an answer to it. The
-  marker rides the one event the terminal still held, so a queued mouse move or resize cannot take
-  the next deliberate answer with it. `Persist`, the answer that writes to disk, is the `F2` key
+  appeared — a key typed before the operator could see the prompt is not an answer to it. Every
+  key the terminal still held is marked, and each marking belongs to the key it was made for, so
+  a queued mouse move or resize cannot take a queued key's marking, or the next deliberate answer,
+  with it. `Persist`, the answer that writes to disk, is the `F2` key
   instead of a letter: a function key is one no letterpress can produce, and a shifted letter cannot
   carry it either, because crossterm reports an ordinary capital `A` as `Char('A')` + `SHIFT` —
   exactly what a "shifted A" looks like, so the two cannot be told apart. `Esc` still denies, and a
   Deny still ends the turn.
+
+- **Every key the terminal still held when a TUI approval prompt appeared is marked now, not only
+  the first event.** The run loop read one event out of the terminal's queue when the prompt opened
+  and marked it, so a queue that began with a mouse move or a resize left the key behind it free to
+  answer: the operator's `y`, typed before the prompt was on screen, granted the session. The run
+  loop drains the whole queue the terminal already holds and marks every key in it, so no queued
+  key can answer the prompt, whatever its place in the queue. A marked key is still handed to the
+  app as a key event, so a queued `Enter` or slash command behaves as it did before. Events that
+  are not keys keep their normal handling and never take a queued key's marking with them, and a
+  key read after the drain is a deliberate answer, as before.
 
 - **`/allow` and `/deny` now close the approval pane.** Both resolved the request but left
   `pending_approval` set, so a dead prompt stayed over the composer after the request was already
