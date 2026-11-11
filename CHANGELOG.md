@@ -119,6 +119,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The MCP console API's inline-script rule now reads environment variables and the options of
+  `npx`/`npm`, and no longer refuses four launchers it should accept.** Through
+  `POST /api/v1/config/mcp_servers/{name}`, an entry could still run code in these shapes:
+  `env: {"NODE_OPTIONS": "--import=data:text/javascript,…"}` on `npx -y pkg`, the same variable as
+  a `NAME=value` word of `env … npx -y pkg`, `npx -p cowsay node -e '…'` and
+  `npx --cache /tmp node -e '…'` (the option's value was taken as the package),
+  `npm --prefix /tmp x -c '…'`, `node --loader data:…` and `--experimental-loader`, `DATA:` in
+  upper case, `npx -yc '…'`, and `npx --cal '…'`. The route now refuses `NODE_OPTIONS` that holds
+  `-e`/`--eval`/`-p`/`--print`, or a `data:` module behind `--import`, `--require`, `-r` or a loader
+  flag, and `PERL5OPT` that holds `-e`/`-E` or a `-M`/`-m` that carries code. It reads the stored
+  `env` a request inherits or restores from an empty value, and the `NAME=value` words of `env`.
+  `NODE_OPTIONS` is split the way node splits it: only a space separates options, and inside
+  double quotes a backslash takes the next character literally, so `--import="d\ata:…"` is read as
+  `--import=data:…`. A package runner treats every positional argument before the `--` as a
+  candidate program, so the program behind an option's value is found whichever option it is
+  (`npx -C /tmp node -e '…'`, `npx --reg https://r.example node -e '…'`,
+  `npx --loglevel silent node -e '…'`, `npm -C /tmp x -c '…'`); a candidate named like an
+  interpreter and followed by an inline flag is refused even when it is the package's own argument.
+  `npx -pc '…'` is refused too: only an exact `-p` is `--package`, and inside a cluster it is
+  `--parseable`. `npm exe` is read as `npm exec`. `-c` is read inside a cluster, `--ca` and `--cal`
+  are refused as a conservative reading of `--call`, and the `data:` scheme is read in any case.
+  The candidate scan is bounded so a long argument list cannot make it expensive: an entry over 256
+  programs in its chain, or a program given more than 256 arguments, is refused with a 400 that
+  says the launch chain is too long or too complex to verify. A module that is a file
+  (`--require ./preload.js`) is still accepted. The short-option reading also stops at a letter
+  that takes a value, so `ruby -rbundler/setup server.rb`,
+  `perl -I/home/user/lib server.pl`, `python -Wignore::DeprecationWarning -m pkg` and
+  `node -rdotenv/config server.js` are accepted, while `python -Wignore -c '…'` and
+  `ruby -rx -e '…'` stay refused. A script's own flag that looks like an inline flag
+  (`node server.js -p 3000`) is still refused. A package's own argument whose last path segment is
+  `env` (`npx -y @modelcontextprotocol/server-filesystem /srv/data/env`) is read as a candidate
+  `env` that cannot be resolved, so the entry is refused too. That over-refusal is accepted.
+  `npm_config_*` environment variables, `npx --node-options=…`, debugger options such as
+  `--inspect`, `perl -d:Module;code`, `uv run`, `bun`, `php`, `pwsh` and modules that run code (`python -m timeit`)
+  are still not read: the rule is a best-effort guard at the console API's write boundary, not a
+  sandbox. Every refusal
+  answers **400** and writes nothing. No config key and no default changed, so the config schema
+  stays at version 40.
 - **The model-routes wizard no longer saves a route to a removed login, and the legacy-login sweep
   logs a removal it cannot make.** The wizard asked the provider factory whether a name was valid,
   and the factory still builds a provider for `copilot`, `openai-codex`, `qwen-code` and the

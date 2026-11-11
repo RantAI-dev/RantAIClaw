@@ -1346,9 +1346,52 @@ no stored arg is taken as written.
   and for `env` the program `env` itself would run — so
   `env sh -c …` and `/bin/bash -lc …` are refused as well. An `env` is read the way GNU `env` reads
   it: its `-S`/`--split-string` word list is split with the quoting GNU honours, a nested `env` is
-  resolved in turn, and the program behind a package runner's `--` is resolved as well. Without a
-  `--`, the runner's first positional argument is taken as the package it runs (`node@22` runs
-  `node`), and that program is checked too, so `npx -y node@22 -e …` is refused. When the
+  resolved in turn, and the program behind a package runner's `--` is resolved as well. Every
+  positional argument of `npx`/`npm exec` (or `npm x`) before the `--` is a candidate for the
+  program the runner runs (`node@22` runs `node`), and each candidate is checked with the arguments
+  after it, so `npx -y node@22 -e …` is refused. The guard does not try to tell an option's value
+  from the package, because npm has shorthands (`-C`, `--reg`) and
+  more value options than a list could keep: `npx -p cowsay node -e …`, `npx -C /tmp node -e …`,
+  `npx --loglevel silent node -e …` and `npm --prefix /tmp x -c …` are all refused, and a value is
+  only a candidate named `tmp` or `silent`, which no rule reads. A candidate named like an
+  interpreter and followed by an inline flag is refused even when it is the package's own
+  argument (`npx -y pkg node -e …`): that over-refusal is accepted. So is a candidate that is only
+  an option's value and ends in `env` (`npx --prefix /srv/app/env -y pkg` reads `env` as a
+  candidate program and is refused). An argument of the package itself whose last path segment is
+  `env` is read the same way: `npx -y @modelcontextprotocol/server-filesystem /srv/data/env` is
+  refused, because `env` is read as a candidate that cannot be resolved. That over-refusal is
+  accepted. `npm x`, `npm exe` and `npm exec` are found wherever the word
+  stands among npm's arguments, so a value equal to `x`, `exe` or `exec` reads as the subcommand
+  too. The scan is bounded: the guard checks at most 256 programs per entry, the runner and its
+  candidates included, and reads at most 256 arguments of any one program. An entry over either
+  limit (a runner with 256 or more positional arguments, a list of more than 256 arguments) is
+  refused with `400` and a message that says the launch chain is too long or too complex to
+  verify. `-c` is read inside a cluster (`npx -yc …`, `npx -pc …`: only an exact `-p` is
+  `--package`, `-p` inside a cluster is `--parseable`). The abbreviations `--ca` and `--cal` of
+  `--call` are refused too. That is conservative: npm does not necessarily resolve them to
+  `--call`, and the guard makes no claim that it does. `node` with `--loader` or `--experimental-loader` is refused for a `data:`
+  URL like `--import`, and the scheme is read in any case, so `DATA:` is refused too. A module that
+  is a file is not refused, because running a file is running a program. The reading of a short
+  option stops at a letter that takes a value (`python -W`, `-m`, `-X`, `node -r`, `-C`,
+  `perl -I`, `-M`, `-m`, `ruby -r`, `-I`, `npx -w`), so `ruby -rbundler/setup server.rb` and
+  `python -Wignore -m pkg` are accepted while `python -Wignore -c …` is still refused. Perl builds
+  a `use` statement from `-M` and `-m`, so `perl -Mstrict;print(1)` is refused, and an `=` import
+  list (`-MPOSIX=floor`) is not. An environment variable the launcher reads as options counts too:
+  `NODE_OPTIONS` is refused when it holds `-e`, `--eval`, `-p`, `--print`, or `--import`,
+  `--require`, `-r`, `--loader` or `--experimental-loader` with a `data:` URL, and `PERL5OPT` when
+  it holds `-e`, `-E` or a code carrying `-M`/`-m`. `NODE_OPTIONS` is split the way node splits
+  it: only a space separates options, a `"` opens or closes a quoted part, and inside quotes a
+  backslash takes the next character literally, so `--import="d\ata:…"` is read as
+  `--import=data:…`. The check reads the stored `env` that a request inherits or restores from an
+  empty value, and the `NAME=value` words of an `env` command. `RUBYOPT` and `PYTHONSTARTUP` are
+  not read, since neither can hand the launcher code (`RUBYOPT` takes `-r` but no `-e`, and
+  `PYTHONSTARTUP` runs only in an interactive session). The guard reads every argument, so a
+  script's own flag that looks like an inline-script flag (`node server.js -p 3000`,
+  `python server.py -c cfg.json`) is refused too. The guard is best-effort and does not cover:
+  `npm_config_*` environment variables that npm reads as options, `npx --node-options=…`,
+  debugger options such as `--inspect` (in `NODE_OPTIONS` or on the command line), `perl
+  -d:Module;code`, interpreters it does not know (`uv run`, `bun`, `php`, `pwsh`), and modules that
+  run code (`python -m timeit`). When the
   program cannot be determined at all — an `env`/`-S` chain that cannot be resolved, or a `-S` word
   list GNU `env` itself could not split — the route refuses with `400` too, and a `$` in a `-S` word
   list is refused because the route cannot know the expansion. The refusal

