@@ -15949,6 +15949,40 @@ mod approval_answer_tests {
         let _ = f.decision().await;
     }
 
+    /// A queue holding only a mouse move marks nothing: the move is not a key,
+    /// so it leaves no marking behind to swallow the first deliberate answer
+    /// typed afterwards into the empty composer.
+    #[tokio::test]
+    async fn a_queued_mouse_move_alone_does_not_swallow_the_next_answer() {
+        let mut f = fixture_with(&["curl"]).await;
+
+        let drained = run_loop_at_prompt_open(
+            &mut f,
+            VecDeque::from(vec![Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            })]),
+        )
+        .await;
+        assert!(!drained.quit, "a queued event must not quit the app");
+
+        f.app
+            .handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('y'),
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            f.decision().await,
+            Decision::Session,
+            "a deliberate key after a lone queued mouse move answers the prompt"
+        );
+    }
+
     /// A queue that mixes a kitty release, a chord and a letter answers
     /// nothing: every one of them was typed before the operator could see
     /// the prompt.

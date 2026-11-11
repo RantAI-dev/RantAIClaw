@@ -27,7 +27,8 @@
 //!    - `reject` is accepted for `deny`, `approved` for `approve`
 //!    - the verb is case-insensitive, and a leading `/` is optional
 //!    - **no `--persist`**: a tool approval answers one request, and a trailing
-//!      token makes the whole reply fall through to the agent as ordinary chat
+//!      token means the reply is no tool approval at all (Layer B reads it, or
+//!      the unmatched-reply stage answers it, or it is ordinary chat)
 //!
 //! Layer A resolves a reply only by its request handle or the exact tool
 //! basename — a token naming neither (`/approve kubectl` against a pending
@@ -64,7 +65,9 @@
 //!
 //! Every verb that means "yes" — `approve`, `approved`, `yes`, `y`, `ok`, and
 //! the bare forms of them — covers exactly one call. The reply says which
-//! grant it made, so an answer never promises more than it gives.
+//! grant it made, so an answer never promises more than it gives. A persist
+//! tail on one of them (`/approve brew --persist`) is dropped, and the reply
+//! says so and names `/allow brew --persist`.
 //!
 //! Returning `Some(reply)` from [`try_handle_reply`] means the
 //! message was consumed; the caller should *not* forward it to the
@@ -117,7 +120,7 @@ pub fn try_handle_reply(
         }
         if parsed.verb.is_grant() && !can_approve(owners, sender) {
             return Some(format!(
-                "You're not authorized to approve `{}`. Ask an owner to reply `/allow {}`.",
+                "You're not authorized to approve `{}`. Ask an owner to reply `/approve {}`.",
                 parsed.basename, parsed.basename
             ));
         }
@@ -163,15 +166,16 @@ pub fn try_handle_reply(
                 },
                 basename: basename.clone(),
                 persist: false,
+                persist_ignored: false,
             };
             if parsed.verb.is_grant() && !can_approve(owners, sender) {
                 return Some(format!(
-                    "You're not authorized to approve `{basename}`. Ask an owner to reply `/allow {basename}`."
+                    "You're not authorized to approve `{basename}`. Ask an owner to reply `/approve {basename}`."
                 ));
             }
             handle_parsed(&parsed, security, &pending)
         }
-        _ => Some(ambiguous_pending_message(&snapshot, "allow", false)),
+        _ => Some(ambiguous_pending_message(&snapshot, false)),
     }
 }
 
@@ -196,6 +200,9 @@ struct ParsedReply {
     verb: ReplyVerb,
     basename: String,
     persist: bool,
+    /// A one-call verb carried a persist tail that was dropped. The reply says
+    /// so, so the owner is not left believing the grant was saved.
+    persist_ignored: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -237,7 +244,7 @@ fn parse_reply(text: &str) -> Option<ParsedReply> {
     // sentences like "allow brew because it's safe" don't silently
     // toggle the allowlist.
     let trailing: Vec<&str> = tokens.collect();
-    let persist = match trailing.as_slice() {
+    let tail_persist = match trailing.as_slice() {
         [] => false,
         ["--persist" | "--save" | "-p" | "persist"] => true,
         _ => return None,
@@ -253,19 +260,19 @@ fn parse_reply(text: &str) -> Option<ParsedReply> {
     let head_lower = head.to_ascii_lowercase();
     let (verb, persist) = match head {
         // A plain yes: one call, nothing held.
-        "y" if !persist => (ReplyVerb::Once, false),
+        "y" if !tail_persist => (ReplyVerb::Once, false),
         // The capital convention: persist.
-        "Y" if !persist => (ReplyVerb::Session, true),
-        "n" | "N" if !persist => (ReplyVerb::Deny, false),
+        "Y" if !tail_persist => (ReplyVerb::Session, true),
+        "n" | "N" if !tail_persist => (ReplyVerb::Deny, false),
         _ => match head_lower.as_str() {
             // The wide grant: the basename is allowed in every chat until the
             // process restarts.
-            "allow" => (ReplyVerb::Session, persist),
+            "allow" => (ReplyVerb::Session, tail_persist),
             // Every other verb that means "yes" covers one call. A persist tail
             // on one of them is dropped rather than honoured: a one-call grant
-            // cannot be persisted, and the reply says so.
+            // cannot be persisted, and `persist_ignored` makes the reply say so.
             "approve" | "approved" | "yes" | "ok" => (ReplyVerb::Once, false),
-            "deny" | "reject" => (ReplyVerb::Deny, persist),
+            "deny" | "reject" => (ReplyVerb::Deny, tail_persist),
             _ => return None,
         },
     };
@@ -278,6 +285,7 @@ fn parse_reply(text: &str) -> Option<ParsedReply> {
         verb,
         basename: basename.to_string(),
         persist,
+        persist_ignored: tail_persist && verb == ReplyVerb::Once,
     })
 }
 
@@ -297,8 +305,17 @@ fn handle_parsed(
                     parsed.basename
                 ));
             };
+            let persist_note = if parsed.persist_ignored {
+                format!(
+                    " `--persist` was ignored: `/approve` saves nothing. To allow `{0}` in every chat \
+                     and after a restart, reply `/allow {0} --persist`.",
+                    parsed.basename
+                )
+            } else {
+                String::new()
+            };
             Some(format!(
-                "✅ Approved `{}` for one call only — pending approval resolved; the agent will retry.",
+                "✅ Approved `{}` for one call only — pending approval resolved; the agent will retry.{persist_note}",
                 parsed.basename
             ))
         }
@@ -717,7 +734,7 @@ pub fn try_handle_tool_reply(
             channel,
             reply_target,
         )),
-        _ => Some(ambiguous_pending_message(&pending, "approve", true)),
+        _ => Some(ambiguous_pending_message(&pending, true)),
     }
 }
 
@@ -746,7 +763,9 @@ fn resolve_handle(
                 );
             }
             match relay.resolve_by_handle(handle, Decision::Once) {
-                Some(_) => format!("✅ Approved `{basename}` — the agent will run it now."),
+                Some(_) => format!(
+                    "✅ Approved `{basename}` for one call only — the agent will run it now."
+                ),
                 None => format!("Request `{handle}` is no longer pending."),
             }
         }
@@ -774,7 +793,9 @@ fn resolve_tool(
                 );
             }
             match relay.resolve_by_basename_in(tool, channel, reply_target, Decision::Once) {
-                Some(_) => format!("✅ Approved `{tool}` — the agent will run it now."),
+                Some(_) => {
+                    format!("✅ Approved `{tool}` for one call only — the agent will run it now.")
+                }
                 None => {
                     format!("Couldn't approve `{tool}` — more than one request is queued for it.")
                 }
@@ -792,17 +813,16 @@ fn resolve_tool(
 /// Build a "which one?" message listing the pending requests so the owner can
 /// name a specific target rather than us guessing.
 ///
+/// The advice is always `/approve`: it answers one call. `/allow` grants every
+/// chat until restart, and a "which one?" prompt is no place to offer that.
+///
 /// `named_by_handle` selects the form the owner can actually use to answer:
 /// - `true` (Layer A, the tool-approval relay) — basenames AND short request
 ///   handles, so the reply advertises both forms. The relay resolves both.
 /// - `false` (Layer B, the shell allowlist) — basenames only. The Layer B
 ///   registry resolves by basename only, so naming a handle would lead the
 ///   owner to "Nothing pending matches `<handle>`" and contradict the list.
-fn ambiguous_pending_message(
-    pending: &[PendingRequest],
-    verb: &str,
-    named_by_handle: bool,
-) -> String {
+fn ambiguous_pending_message(pending: &[PendingRequest], named_by_handle: bool) -> String {
     let names: Vec<String> = pending
         .iter()
         .map(|r| {
@@ -818,9 +838,9 @@ fn ambiguous_pending_message(
         })
         .collect();
     let advice = if named_by_handle {
-        format!("Reply `/{verb} <name or handle>` to pick one.")
+        "Reply `/approve <name or handle>` to pick one.".to_string()
     } else {
-        format!("Reply `/{verb} <name>` to pick one.")
+        "Reply `/approve <name>` to pick one.".to_string()
     };
     format!("Still pending here: {}. {advice}", names.join(", "))
 }
@@ -934,11 +954,11 @@ fn build_unmatched_ack(
         ack.push_str(" Still answerable in this chat:");
         if !layer_a.is_empty() {
             ack.push('\n');
-            ack.push_str(&ambiguous_pending_message(&layer_a, "approve", true));
+            ack.push_str(&ambiguous_pending_message(&layer_a, true));
         }
         if !layer_b.is_empty() {
             ack.push('\n');
-            ack.push_str(&ambiguous_pending_message(&layer_b, "allow", false));
+            ack.push_str(&ambiguous_pending_message(&layer_b, false));
         }
     }
     ack
@@ -1702,6 +1722,57 @@ mod tests {
         )
         .expect("recognised");
         assert!(ack.contains("Approved"), "{ack}");
+        assert_eq!(task.await.unwrap(), Decision::Once);
+    }
+
+    /// A tool approval covers one call, and the reply says so on both ways of
+    /// naming the request: by tool name and by handle.
+    #[tokio::test]
+    async fn tool_approve_reply_names_one_call_only() {
+        let relay = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        let owners = vec!["owner1".to_string()];
+
+        let r = relay.clone();
+        let task = tokio::spawn(async move {
+            r.request_decision_in(
+                uuid::Uuid::new_v4(),
+                "web_search",
+                "query: rust",
+                "telegram",
+                "chat-1",
+            )
+            .await
+        });
+        await_pending(&relay, 1).await;
+        let ack = try_handle_tool_reply(
+            "/approve web_search",
+            &relay,
+            "owner1",
+            &owners,
+            "telegram",
+            "chat-1",
+        )
+        .expect("recognised");
+        assert!(ack.contains("`web_search` for one call only"), "{ack}");
+        assert_eq!(task.await.unwrap(), Decision::Once);
+
+        let id = uuid::Uuid::new_v4();
+        let r = relay.clone();
+        let task = tokio::spawn(async move {
+            r.request_decision_in(id, "web_search", "query: rust", "telegram", "chat-1")
+                .await
+        });
+        await_pending(&relay, 1).await;
+        let ack = try_handle_tool_reply(
+            &format!("/approve {}", PendingApprovals::handle_for(id)),
+            &relay,
+            "owner1",
+            &owners,
+            "telegram",
+            "chat-1",
+        )
+        .expect("recognised");
+        assert!(ack.contains("`web_search` for one call only"), "{ack}");
         assert_eq!(task.await.unwrap(), Decision::Once);
     }
 
@@ -2539,6 +2610,155 @@ mod tests {
         let _ = t2.await;
     }
 
+    /// A bare `yes` is a one-call answer, so the list of requests it could not
+    /// pick between points at `/approve`. Pointing at `/allow` sent the owner to
+    /// a grant that holds in every chat until restart, for a reply that only
+    /// asked which request was meant.
+    #[tokio::test]
+    async fn bare_yes_with_two_shell_pending_points_at_approve_not_allow() {
+        let security = supervised_only_echo();
+        let pending = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        security.set_pending(pending.clone());
+        let p1 = pending.clone();
+        let p2 = pending.clone();
+        let t1 = tokio::spawn(async move {
+            p1.request_decision_in(uuid::Uuid::new_v4(), "brew", "brew", "telegram", "chat-1")
+                .await
+        });
+        let t2 = tokio::spawn(async move {
+            p2.request_decision_in(uuid::Uuid::new_v4(), "npm", "npm i", "telegram", "chat-1")
+                .await
+        });
+        await_pending(&pending, 2).await;
+
+        let owners = vec!["owner1".to_string()];
+        let ack = try_handle_reply("yes", &security, "owner1", &owners, "telegram", "chat-1")
+            .expect("consumed");
+        assert!(ack.contains("`/approve <name>`"), "{ack}");
+        assert!(!ack.contains("/allow"), "{ack}");
+        assert_eq!(pending.list().len(), 2, "nothing was resolved");
+
+        pending.resolve_by_basename("brew", Decision::Deny);
+        pending.resolve_by_basename("npm", Decision::Deny);
+        let _ = t1.await;
+        let _ = t2.await;
+    }
+
+    /// A non-owner who typed `/allow brew` is told to ask an owner for the
+    /// narrowest answer, `/approve brew`, not for the every-chat grant.
+    #[tokio::test]
+    async fn targeted_reply_from_non_owner_points_at_approve_not_allow() {
+        let security = supervised_only_echo();
+        let pending = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        security.set_pending(pending.clone());
+        let p = pending.clone();
+        let task = tokio::spawn(async move {
+            p.request_decision("brew", "brew --version", "telegram")
+                .await
+        });
+        await_pending(&pending, 1).await;
+
+        let owners = vec!["owner1".to_string()];
+        let ack = try_handle_reply(
+            "/allow brew",
+            &security,
+            "stranger",
+            &owners,
+            "telegram",
+            "chat-1",
+        )
+        .expect("recognised");
+        assert!(ack.contains("not authorized"), "{ack}");
+        assert!(ack.contains("`/approve brew`"), "{ack}");
+        assert!(!ack.contains("/allow"), "{ack}");
+
+        pending.resolve_by_basename("brew", Decision::Deny);
+        let _ = task.await;
+    }
+
+    /// The same refusal on the bare-verb path: a non-owner's `yes` with one
+    /// request pending in the chat names `/approve`, not `/allow`.
+    #[tokio::test]
+    async fn bare_yes_from_non_owner_points_at_approve_not_allow() {
+        let security = supervised_only_echo();
+        let pending = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        security.set_pending(pending.clone());
+        let p = pending.clone();
+        let task = tokio::spawn(async move {
+            p.request_decision_in(uuid::Uuid::new_v4(), "brew", "brew", "telegram", "chat-1")
+                .await
+        });
+        await_pending(&pending, 1).await;
+
+        let owners = vec!["owner1".to_string()];
+        let ack = try_handle_reply("yes", &security, "stranger", &owners, "telegram", "chat-1")
+            .expect("recognised");
+        assert!(ack.contains("not authorized"), "{ack}");
+        assert!(ack.contains("`/approve brew`"), "{ack}");
+        assert!(!ack.contains("/allow"), "{ack}");
+        assert_eq!(pending.list().len(), 1, "the request stays open");
+
+        pending.resolve_by_basename("brew", Decision::Deny);
+        let _ = task.await;
+    }
+
+    /// `/approve X --persist` covers one call and holds nothing. The reply says
+    /// the flag was ignored and names `/allow X --persist` with what that grants.
+    /// A plain `/approve X` has nothing to report.
+    #[tokio::test]
+    async fn approve_with_persist_tail_says_the_flag_was_ignored() {
+        let security = supervised_only_echo();
+        let pending = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        security.set_pending(pending.clone());
+        let owners = vec!["owner1".to_string()];
+
+        let p = pending.clone();
+        let task = tokio::spawn(async move {
+            p.request_decision("brew", "brew --version", "telegram")
+                .await
+        });
+        await_pending(&pending, 1).await;
+        let ack = try_handle_reply(
+            "/approve brew --persist",
+            &security,
+            "owner1",
+            &owners,
+            "telegram",
+            "chat-1",
+        )
+        .expect("recognised");
+        assert!(ack.contains("for one call only"), "{ack}");
+        assert!(ack.contains("`--persist` was ignored"), "{ack}");
+        assert!(ack.contains("`/allow brew --persist`"), "{ack}");
+        assert!(ack.contains("after a restart"), "{ack}");
+        assert_eq!(task.await.unwrap(), Decision::Once);
+        assert!(
+            !security
+                .runtime_allowlist_snapshot()
+                .contains(&"brew".to_string()),
+            "a one-call answer holds nothing"
+        );
+
+        let p = pending.clone();
+        let task = tokio::spawn(async move {
+            p.request_decision("brew", "brew --version", "telegram")
+                .await
+        });
+        await_pending(&pending, 1).await;
+        let ack = try_handle_reply(
+            "/approve brew",
+            &security,
+            "owner1",
+            &owners,
+            "telegram",
+            "chat-1",
+        )
+        .expect("recognised");
+        assert!(ack.contains("for one call only"), "{ack}");
+        assert!(!ack.contains("--persist"), "{ack}");
+        assert_eq!(task.await.unwrap(), Decision::Once);
+    }
+
     #[tokio::test]
     async fn tool_reply_deny_is_honored_from_anyone() {
         let relay = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
@@ -3364,6 +3584,36 @@ mod tests {
         let ack = try_unmatched_approval_reply("/deny", &relay, &security, "telegram", "chat-1")
             .expect("slash-prefixed bare deny is command form");
         assert!(ack.contains("Nothing pending matches `deny`"), "{ack}");
+    }
+
+    /// The unmatched-reply answer lists a Layer B request under `/approve`, the
+    /// one-call verb, and never offers `/allow`, which grants every chat until
+    /// restart.
+    #[tokio::test]
+    async fn unmatched_ack_lists_shell_requests_under_approve_not_allow() {
+        let relay = PendingApprovals::new(Some(Duration::from_secs(10)));
+        let security = supervised_only_echo();
+        let pending = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        security.set_pending(pending.clone());
+        let p = pending.clone();
+        let task = tokio::spawn(async move {
+            p.request_decision_in(uuid::Uuid::new_v4(), "brew", "brew", "telegram", "chat-1")
+                .await
+        });
+        await_pending(&pending, 1).await;
+
+        let ack =
+            try_unmatched_approval_reply("/approve zzz", &relay, &security, "telegram", "chat-1")
+                .expect("command form is answered");
+        assert!(ack.contains("`brew`"), "{ack}");
+        assert!(
+            ack.contains("Reply `/approve <name>` to pick one."),
+            "{ack}"
+        );
+        assert!(!ack.contains("/allow"), "{ack}");
+
+        pending.resolve_by_basename("brew", Decision::Deny);
+        let _ = task.await;
     }
 
     /// The ambiguous list now names the handles alongside the basenames, so

@@ -343,26 +343,38 @@ Telegram, Discord, Lark, WhatsApp Cloud API and WhatsApp Web answer three more k
   fetched once per process on Telegram, whether or not `mention_only` is on, because the question
   comes up in every group rather than only where mentions are required.
 
-Approval replies (`/approve`, `/deny`) and pairing (`/bind`, `/claim`) are handled before any of
-these and behave as before. An approval reply that names a request handle is answered by the
+Approval replies (`/approve`, `/deny`, `/allow`) and pairing (`/bind`, `/claim`) are handled before
+any of these and behave as before. An approval reply that names a request handle is answered by the
 relay itself, whichever approval verb it uses (`approve`, `allow`, `y`, `n`, ...) and whether or
 not it carries the leading slash — a handle that names nothing pending resolves nothing, so the
 relay says so and lists what is still answerable in this chat. A slash-prefixed approval-form
 reply (`/approve`, `/deny`, `/allow`, or a slash-prefixed bare verb) that names nothing pending
 is answered the same way. A reply that is none of those — a slash-less non-handle-shaped token
-(`approve helm`), a bare verb (`ok`, `yes`), or plain chat — stays chat. An approval reply
-resolves a request only by its handle or its exact tool name: naming a command
-(`/approve kubectl`) resolves nothing.
+(`approve helm`), a bare verb (`ok`, `yes`), or plain chat — stays chat.
 
-An answer says what it covers, on both layers. `/approve <command>` and `/approve <tool>`
-answer the pending request and cover that one call only: nothing is allowlisted and nothing is
-held, so the same command asks again on the next call. `/allow <command>` is the wider grant —
-the basename is allowlisted for the life of the process, in every chat, until the daemon
-restarts, and `--persist` writes it to disk as well, so it survives a restart. `y <command>`
-covers one call, `Y <command>` persists, and a bare verb (`ok`, `yes`) covers one call. The
-reply names the grant it made: "one call only" for a one-call answer, "allowed in every chat
-until restart" for the session grant. Deny needs no owner — stopping a pending action is
-always safe — while every kind of grant needs one.
+Two relays answer approval replies, and they resolve a name differently:
+
+- **Tool approvals** resolve a request only by its handle or its exact tool name.
+  `/approve <handle>` and `/approve <tool>` answer the request; naming a command
+  (`/approve kubectl` against a pending `shell` request) resolves nothing, and the relay says so.
+  A `--persist` tail makes the reply no tool approval at all, so it resolves nothing.
+- **Shell approvals** resolve a request by the command's basename. `/approve brew` answers the
+  pending `brew` request. When several are pending in one chat, a bare verb does not pick one:
+  the reply lists them and asks for `/approve <name>`.
+
+An answer says what it covers. `/approve`, `y`, `yes`, `ok` and the other plain-yes verbs
+cover one call only, on both relays: nothing is allowlisted and nothing is held, so the same
+command asks again on the next call. A tool approval's reply reads "Approved `<tool>` for one call
+only"; a shell approval's reply reads "Approved `<command>` for one call only". `/allow <command>`
+is the wider grant: the basename is allowlisted in every chat until the daemon restarts, and the
+reply reads "allowed in every chat until restart". `/allow <command> --persist` also writes it to
+disk, so it survives a restart. `Y <command>` persists too. `/approve <command> --persist` still
+covers one call only: the reply says `--persist` was ignored and names `/allow <command> --persist`
+for the persistent grant. A risk-gate prompt answered with `/allow` or `Y` gives a medium-risk
+session grant, or a grant for this run only at high risk; it does not change the allowlist and
+cannot be persisted.
+Deny needs no owner — stopping a pending action is always safe — while every kind of grant needs one,
+and a refused non-owner is told to ask an owner for `/approve`.
 
 Slack has no reset
 command: a new top-level message already starts a new conversation.
