@@ -12,23 +12,16 @@ yanked = "deny"
 # and (c) why the risk is acceptable for our usage.
 # When you add an id here, add it to .github/workflows/sec-audit.yml too.
 ignore = [
-    # SECURITY (2026-08-20 supply-chain incident): arrayref 0.3.9 is YANKED, but
-    # EVERY legitimate version (0.3.5–0.3.9) was yanked the same day to force an
-    # "update" onto a trojaned 0.3.10 — it declares a dependency on `proc-macro1`,
-    # a proc-macro2 typosquat published the same day that pulls an HTTP client
-    # (ureq) + rustls to exfiltrate at compile time. 0.3.9 is the last known-good
-    # release (crates.io versions are immutable — a yank cannot alter its bytes)
-    # and is pinned EXACTLY in Cargo.toml so no build can resolve forward to
-    # 0.3.10. Suppress the yanked check for THIS version only; the pin is the real
-    # mitigation. REMOVE (and unpin Cargo.toml) once arrayref publishes a
-    # verified-clean release. Reached transitively via blake3 + wa-rs-libsignal.
-    "arrayref@0.3.9",
+    # arrayref 0.3.9 needs no entry here: crates.io has un-yanked 0.3.4 to 0.3.9
+    # (checked 2026-11-08), so the yanked check passes. The exact pin
+    # `arrayref = "=0.3.9"` in Cargo.toml guards against the 2026-08-20 supply-chain
+    # incident, which is resolved upstream. Do not bump that pin.
     # chacha20 0.10.0 was YANKED upstream (RustCrypto), flagged by cargo-deny's
     # yanked check — NOT a RUSTSEC vulnerability. Two pull paths in the current
     # lockfile: rand 0.10.3 (its default ChaCha RNG), which rantaiclaw depends on
-    # directly and which lopdf 0.42 (via pdf-extract) and russh 0.63 (directly,
+    # directly and which lopdf 0.42 (via pdf-extract) and russh 0.65 (directly,
     # and via num-bigint) also pull, and ssh-cipher 0.3 (via ssh-key), which
-    # russh 0.63 pulls separately. crates.io bytes are immutable, so the yanked
+    # russh 0.65 pulls separately. crates.io bytes are immutable, so the yanked
     # version is byte-identical to when it was published. A non-yanked 0.10.2 is
     # in range, but moving the lockfile to it is deliberately deferred as a
     # separate concern; REMOVE this entry when that bump lands.

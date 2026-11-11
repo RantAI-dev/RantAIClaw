@@ -405,7 +405,7 @@ leaves open.
 version was yanked the same day and a trojaned `0.3.10` was published declaring a
 dependency on `proc-macro1` — a typosquat of `proc-macro2` that pulls an HTTP client to
 exfiltrate **at compile time**. crates.io versions are immutable, so a yank cannot alter
-`0.3.9`'s bytes; the exact pin stops `cargo update` resolving forward. See `deny.toml`.
+`0.3.9`'s bytes; the exact pin stops `cargo update` resolving forward. See the pin comment in `Cargo.toml` and the `arrayref` entry in `CHANGELOG.md`.
 Do not bump it without independently verifying the crate is clean.
 
 ## Contributing

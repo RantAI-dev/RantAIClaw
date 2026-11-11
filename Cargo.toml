@@ -16,16 +16,8 @@ categories = ["command-line-utilities", "api-bindings"]
 rust-version = "1.91"
 
 [dependencies]
-# SECURITY PIN (2026-08-20 supply-chain incident): `arrayref` (a transitive dep
-# via blake3 + wa-rs-libsignal) was compromised — every legitimate version
-# (0.3.5–0.3.9) was yanked the same day and a trojaned 0.3.10 was published that
-# declares a dependency on `proc-macro1`, a typosquat of proc-macro2 that pulls
-# an HTTP client (ureq) + rustls to exfiltrate at compile time. 0.3.9 is the last
-# known-good release (crates.io versions are immutable; a yank cannot alter its
-# bytes). Pin it EXACTLY so `cargo update` cannot resolve forward to the malicious
-# 0.3.10. Do NOT bump this without independently verifying arrayref is clean again.
-# See deny.toml (arrayref@0.3.9 is allow-listed past the yanked check for the same
-# reason). This is an explicit-pin-only dependency; the crate is used transitively.
+# Exact pin from the 2026-08-20 supply-chain incident, resolved upstream. Do not bump it
+# or run `cargo update -p arrayref`. The crate is used transitively.
 arrayref = "=0.3.9"
 
 # CLI - minimal and fast
@@ -186,7 +178,7 @@ opentelemetry = { version = "0.33", default-features = false, features = ["trace
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "metrics"], optional = true }
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls"], optional = true }
 
-# Serial port for peripheral communication (STM32, etc.)
+# SSH transport for the `remote-install` feature (see the feature list below)
 russh = { version = "0.65", optional = true }
 russh-sftp = { version = "2.0", optional = true }
 

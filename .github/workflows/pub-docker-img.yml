@@ -228,7 +228,8 @@ jobs:
               run: |
                   set -euo pipefail
                   owner="${GITHUB_REPOSITORY_OWNER,,}"
-                  repo="${GITHUB_REPOSITORY#*/}"
+                  repo="${GITHUB_REPOSITORY,,}"
+                  repo="${repo#*/}"
 
                   # Package path can vary depending on repository/package linkage.
                   candidates=(

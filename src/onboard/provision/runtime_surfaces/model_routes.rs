@@ -127,6 +127,23 @@ impl TuiProvisioner for ModelRoutesProvisioner {
             if provider.is_empty() {
                 continue;
             }
+            // A removed login is asked first: the factory still builds a
+            // provider for those names (so the daemon stays up), which would
+            // let this route through and fail on its first request.
+            if let Some(refusal) = crate::providers::removed_login_refusal(&provider) {
+                send(
+                    &events,
+                    ProvisionEvent::Message {
+                        severity: Severity::Warn,
+                        text: format!(
+                            "Provider \"{provider}\" cannot be used for a route: {refusal} \
+                             Route skipped."
+                        ),
+                    },
+                )
+                .await?;
+                continue;
+            }
             // Reject an unknown provider here rather than accepting a typo that
             // is valid nowhere and fails only at routing time. `create_provider`
             // is the same oracle the doctor `config.schema` check uses.
@@ -197,5 +214,96 @@ impl TuiProvisioner for ModelRoutesProvisioner {
         .await?;
 
         Ok(ProvisionOutcome::Configured)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::onboard::provision::traits::ProvisionResponse;
+
+    /// Drive the provisioner through one "Add a route" round and then "Done",
+    /// and return the resulting config with every message it sent.
+    async fn add_one_route(provider: &str, model: Option<&str>) -> (Config, Vec<String>) {
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
+        let (resp_tx, resp_rx) = tokio::sync::mpsc::channel(8);
+        resp_tx
+            .send(ProvisionResponse::Selection(vec![0]))
+            .await
+            .unwrap(); // Add a route
+        resp_tx
+            .send(ProvisionResponse::Text("fast".into()))
+            .await
+            .unwrap(); // hint
+        resp_tx
+            .send(ProvisionResponse::Text(provider.into()))
+            .await
+            .unwrap(); // provider
+        if let Some(model) = model {
+            resp_tx
+                .send(ProvisionResponse::Text(model.into()))
+                .await
+                .unwrap();
+        }
+        resp_tx
+            .send(ProvisionResponse::Selection(vec![1]))
+            .await
+            .unwrap(); // Done
+
+        let mut config = Config::default();
+        let profile = Profile {
+            name: "default".into(),
+            root: std::path::PathBuf::from("/tmp"),
+        };
+        ModelRoutesProvisioner::new()
+            .run(
+                &mut config,
+                &profile,
+                ProvisionIo {
+                    events: events_tx,
+                    responses: resp_rx,
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut messages = Vec::new();
+        while let Ok(event) = events_rx.try_recv() {
+            if let ProvisionEvent::Message { text, .. } = event {
+                messages.push(text);
+            }
+        }
+        (config, messages)
+    }
+
+    /// The factory still builds a provider for a removed login, so a route to
+    /// one passed the `create_provider` check and was saved without a word.
+    /// The wizard now skips it and names the provider and the replacement.
+    #[tokio::test]
+    async fn a_route_to_a_removed_login_is_skipped_with_its_refusal() {
+        let (config, messages) = add_one_route("copilot", None).await;
+
+        assert!(
+            config.model_routes.is_empty(),
+            "a route to a removed login must not be saved: {:?}",
+            config.model_routes
+        );
+        let warning = messages
+            .iter()
+            .find(|text| text.contains("Route skipped"))
+            .unwrap_or_else(|| panic!("the wizard must say the route was skipped: {messages:?}"));
+        assert!(warning.contains("copilot"), "{warning}");
+        assert!(warning.contains("removed"), "{warning}");
+    }
+
+    /// The control: a route to a provider that is still a provider is saved,
+    /// so the removed-login check cannot be satisfied by refusing everything.
+    #[tokio::test]
+    async fn a_route_to_a_registered_provider_is_saved() {
+        let (config, _messages) = add_one_route("openrouter", Some("example/model")).await;
+
+        assert_eq!(config.model_routes.len(), 1);
+        assert_eq!(config.model_routes[0].provider, "openrouter");
+        assert_eq!(config.model_routes[0].model, "example/model");
     }
 }

@@ -116,6 +116,7 @@ comes when a request is sent.
 | `lmstudio` | `lm-studio` | Yes | (optional; local by default) |
 | `llamacpp` | `llama.cpp` | Yes | `LLAMACPP_API_KEY` (optional; only if server auth is enabled) |
 | `nvidia` | `nvidia-nim`, `build.nvidia.com` | No | `NVIDIA_API_KEY` |
+| `ovhcloud` | `ovh` | No | `OVH_AI_ENDPOINTS_ACCESS_TOKEN` |
 | `astrai` | — | No | `ASTRAI_API_KEY` |
 
 The OpenAI-compatible, Anthropic, OpenRouter, Ollama and Bedrock providers
