@@ -238,6 +238,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **The MCP console API's inline-script rule reads flag clusters, attached values and the programs
+  a package runner runs.** The rule compared whole arguments against the inline flags, so shapes
+  like these were stored and would have run: a short-option cluster (`python -Sc '…'`,
+  `node -pe '…'`, `perl -we '…'`, `ruby -we '…'`), a value attached to the flag
+  (`python -cprint(1)`), fish's own command flag `-C` and the long forms `--command=`/`--execute=`,
+  `node --import data:text/javascript,…` (`--require` and `-r` took a `data:` URL too), `npm x -c
+  '…'` (`npm x` is `npm exec`), and `npx -y node@22 -e '…'`, whose child program was resolved only
+  behind a `--`. A short option is now read as a cluster — the inline flag is caught when any
+  letter of the argument carries it, attached value or not — and, with no `--`, a package runner's
+  first positional argument is taken as the package it runs (`node@22` runs `node`) and that
+  program is checked too. Program names are compared case-insensitively, so `/bin/SH -c …` and
+  `Python3 -c …` are refused on a case-insensitive file system as well. Every refusal still
+  answers **400** and writes nothing. The legitimate launchers are unaffected — `npx -y pkg`,
+  `uvx pkg`, `node path/server.js`, `python -m pkg`, `npm run start`, `env … uvx …` and
+  `npx -- node server.js` are all still accepted — and the rule stays a guard at the console API's
+  write boundary, not a sandbox: a paired caller can still store any package through `npx -y`, and
+  a wrapped interpreter (`timeout 5 sh -c …`) is still not resolved.
+
 - **An MCP server the console adds is a program, never an inline script.** `POST
   /api/v1/config/mcp_servers/{name}` rejected a `command` that was a shell expression, and nothing
   else: `command = "sh"` with `args = ["-c", "curl … | sh"]` was stored, and the agent later spawned

