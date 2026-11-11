@@ -1327,25 +1327,35 @@ no stored arg is taken as written.
   arg keep the stored value (see [Writing back what you read](#writing-back-what-you-read)).
 - **A server is a program to run, not a script.** `command` names the program the agent spawns and
   `args` are that program's arguments. An interpreter handed an inline script is refused with `400`:
-  a shell (`sh`, `bash`, `zsh`, `dash`, `ksh`, `fish`) with `-c` or a combined flag that carries it
-  (`-lc`), `python`/`python3` (or a versioned name such as `python3.12`) with `-c`, `node` with
-  `-e`/`--eval`/`-p`/`--print`, `perl` with `-e`/`-E` or `ruby` with `-e`, `deno eval`, and
-  `npx`/`npm exec` with `-c`/`--call`. The program is
-  resolved first — the basename of `command`, and for `env` the program `env` itself would run — so
+  a shell (`sh`, `bash`, `zsh`, `dash`, `ksh`) with `-c` or any short-option cluster that carries
+  it (`-lc`), fish with `-c`/`-C` — fish's own command flag is uppercase — or the long forms
+  `--command=`/`--execute=`, `python`/`python3` (or a versioned name such as `python3.12`) with
+  `-c`, `node` with `-e`/`--eval`/`-p`/`--print`, or with `--import`/`--require`/`-r` handed a
+  `data:` URL, `perl` with `-e`/`-E` or `ruby` with `-e`, `deno eval`, and `npx`/`npm exec` (or
+  `npm x`) with `-c`/`--call`. A short option is read as a cluster, so the flag is caught when it
+  shares its argument with other flags (`python -Sc`, `node -pe`, `perl -we`) or carries its value
+  attached (`-cprint(1)`). The program is
+  resolved first — the basename of `command`, compared case-insensitively so `/bin/SH` is `sh`,
+  and for `env` the program `env` itself would run — so
   `env sh -c …` and `/bin/bash -lc …` are refused as well. An `env` is read the way GNU `env` reads
   it: its `-S`/`--split-string` word list is split with the quoting GNU honours, a nested `env` is
-  resolved in turn, and the program behind a package runner's `--` is resolved as well. When the
+  resolved in turn, and the program behind a package runner's `--` is resolved as well. Without a
+  `--`, the runner's first positional argument is taken as the package it runs (`node@22` runs
+  `node`), and that program is checked too, so `npx -y node@22 -e …` is refused. When the
   program cannot be determined at all — an `env`/`-S` chain that cannot be resolved, or a `-S` word
   list GNU `env` itself could not split — the route refuses with `400` too, and a `$` in a `-S` word
   list is refused because the route cannot know the expansion. The refusal
   names the program and the flag:
   `MCP command 'sh' may not be given an inline script (-c); the config API runs a program, not a script`.
   A launcher is not affected: `npx -y pkg`, `uvx pkg`, `node path/server.js`, `python -m pkg`,
-  `python path/server.py`, `deno run …` and `docker run …` are all accepted. The check matches these
-  exact program names, so a differently named or wrapped interpreter is not covered —
-  `timeout 5 sh -c …` and `busybox sh -c …` are not refused by this check. The stored `args` count:
-  a request that sends only a `command` inherits them, and an inherited inline script is refused too.
-  Nothing is written when a request is refused.
+  `python path/server.py`, `deno run …` and `docker run …` are all accepted. The check matches
+  these program names (case-insensitively, since a file system may be case-insensitive), so a
+  wrapped interpreter is still not covered — `timeout 5 sh -c …` and `busybox sh -c …` are not
+  refused by this check. This is a guard at the console API's write boundary, not a sandbox: it
+  reads the arguments it is given and resolves the programs they name, and a paired caller can
+  still store any package the registry offers (`npx -y <package>` is accepted). The stored `args`
+  count: a request that sends only a `command` inherits them, and an inherited inline script is
+  refused too. Nothing is written when a request is refused.
 - **POST response** `200`: `{ "name": "...", "added": true, "count": 3 }`
 - **DELETE response** `200`: `{ "name": "...", "removed": true, "count": 2 }`
 - **Status codes**: `200`, `400`, `401`, `500`.
