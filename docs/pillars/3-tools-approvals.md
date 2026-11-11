@@ -93,7 +93,7 @@ Inside the TUI:
 - `Shift+Tab` — cycle Manual → Smart → Strict → Off → Manual
 - `/autonomy` — interactive picker; `/autonomy <preset>` for direct switch
 - `[Y]` / `[F2]` / `[N]` / `[Esc]` — resolve the inline approval prompt. An answer key counts only while the composer is empty, and `F2` is the chord that persists the allowlist entry.
-- `/allow <basename> [--persist]` — fallback for non-TUI channels (Telegram, webhook)
+- On non-TUI channels (Telegram, webhook), `/approve <basename>` answers one call and holds nothing. `/allow <basename> [--persist]` is the wider grant: the basename is allowed in every chat until restart, and `--persist` also writes it to disk. A risk-gate prompt answered with `/allow` gives a medium-risk session grant, or a grant for this run only at high risk; it does not change the allowlist and cannot be persisted.
 
 ```toml
 [autonomy]
