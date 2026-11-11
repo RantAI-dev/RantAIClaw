@@ -941,7 +941,7 @@ expression: pretty
           "default": true
         },
         "webhook": {
-          "description": "Webhook channel configuration. Support: **under development**. Verification: **not yet verified**.",
+          "description": "Webhook channel configuration. Support: **served by the gateway**. Verification: **not yet verified**.",
           "anyOf": [
             {
               "$ref": "#/$defs/WebhookConfig"
