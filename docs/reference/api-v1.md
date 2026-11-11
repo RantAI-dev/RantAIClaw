@@ -1085,7 +1085,10 @@ is created first.
   builds from, so a channel cannot exist in one and not the other.
 
   **Two axes, not one.** `support` is `"supported"` or `"under_development"` and
-  says what the project undertakes; it is the owner's decision. `verification` is
+  says what the project undertakes; it is the owner's decision. The `webhook`
+  row alone carries a third value, `"gateway_served"`: it has no `Channel`
+  implementer, because the gateway serves `POST /webhook` itself, so it sits on
+  neither rung. `verification` is
   `"driven"` or `"not_driven"` and says whether anyone has driven a round trip
   against the real platform. They move independently, and the Discord row above
   is the combination that made the split necessary: committed to, never driven.

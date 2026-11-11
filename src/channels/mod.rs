@@ -636,14 +636,14 @@ pub(crate) const CHANNEL_CATALOG: [(&str, &str, ChannelSupport, ChannelVerificat
         ChannelSupport::UnderDevelopment,
         ChannelVerification::NotDriven,
     ),
-    // `webhook` is not a `Channel` implementer at all — the gateway serves it —
-    // so it was never in the four the owner named, and the promotion checklist
-    // in `docs/reference/channels.md` cannot even be run against it. It is
-    // `UnderDevelopment` by that fact, not by falling through a default.
+    // `webhook` is not a `Channel` implementer. The gateway serves it, so the
+    // promotion checklist in `docs/reference/channels.md` cannot be run
+    // against it. It carries `GatewayServed`, not `UnderDevelopment`, which
+    // would claim a listener that was never started.
     (
         "webhook",
         "Webhook",
-        ChannelSupport::UnderDevelopment,
+        ChannelSupport::GatewayServed,
         ChannelVerification::NotDriven,
     ),
     (
@@ -729,9 +729,12 @@ pub(crate) const CHANNEL_CATALOG: [(&str, &str, ChannelSupport, ChannelVerificat
 /// carrying it. The commitment is what survives here; the evidence moved to
 /// [`ChannelVerification`].
 ///
-/// Two values, not a ladder. A third ("beta", "deprecated") would need a
-/// definition in `docs/reference/channels.md` and a rule for reaching it before
-/// it meant anything, and neither exists.
+/// `Supported` and `UnderDevelopment` are the two rungs. A third rung ("beta",
+/// "deprecated") would need a definition in `docs/reference/channels.md` and a
+/// rule for reaching it before it meant anything, and neither exists.
+/// [`ChannelSupport::GatewayServed`] is not a third rung. The rungs say how
+/// committed the project is to a channel. `GatewayServed` says who serves the
+/// row, for the one row that has no `Channel` implementer.
 ///
 /// `pub` rather than `pub(crate)` because `TuiContext` is public and carries it,
 /// and because it is already public over the wire on `/api/v1/channels`.
@@ -743,6 +746,12 @@ pub enum ChannelSupport {
     Supported,
     /// Ships, but outside what an alpha release claims.
     UnderDevelopment,
+    /// Not a maturity rung. The row has no `Channel` implementer: the gateway
+    /// serves its route itself (`/webhook`). The verification checklist cannot
+    /// be run against a route with no channel behind it. Defined in
+    /// `docs/reference/channels.md`, under "The one row that is on neither
+    /// rung".
+    GatewayServed,
 }
 
 impl ChannelSupport {
@@ -756,6 +765,7 @@ impl ChannelSupport {
         match self {
             Self::Supported => "supported",
             Self::UnderDevelopment => "under development",
+            Self::GatewayServed => "served by the gateway",
         }
     }
 }
@@ -902,6 +912,10 @@ fn dm_detection_for(key: &str) -> bool {
 /// configured · supported · not yet verified
 /// configured · under development · not yet verified
 /// ```
+///
+/// A gateway-served row ([`ChannelSupport::GatewayServed`], the `webhook`)
+/// renders the ordinary configured line, because the gateway is serving it. The
+/// special case below is keyed on `UnderDevelopment` alone.
 pub(crate) fn channel_roster_note(
     configured: bool,
     support: ChannelSupport,

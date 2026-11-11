@@ -133,11 +133,11 @@ and directs you to the interactive setup. Configure channels with:
   rantaiclaw onboard          # guided channel setup (recommended)
 or edit the active profile's `config.toml` directly.
 
-Supported channel types: telegram, discord, slack, mattermost, webhook, \
+Channel types: telegram, discord, slack, mattermost, webhook, \
 imessage, matrix, signal, whatsapp, whatsapp_web, linq, nextcloud_talk, \
 email, irc, lark, dingtalk, qq.")]
     Add {
-        /// Channel type. Supported channel types: telegram, discord, slack,
+        /// Channel type. Channel types: telegram, discord, slack,
         /// mattermost, webhook, imessage, matrix, signal, whatsapp,
         /// whatsapp_web, linq, nextcloud_talk, email, irc, lark, dingtalk, qq.
         channel_type: String,

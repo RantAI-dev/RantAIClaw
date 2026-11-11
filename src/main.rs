@@ -499,7 +499,7 @@ Examples:
 Manage communication channels.
 
 Add, remove, list, and health-check channels that connect RantaiClaw \
-to messaging platforms. Supported channel types: telegram, discord, \
+to messaging platforms. Channel types: telegram, discord, \
 slack, mattermost, webhook, imessage, matrix, signal, whatsapp, \
 whatsapp_web, linq, nextcloud_talk, email, irc, lark, dingtalk, qq.
 
@@ -1032,11 +1032,11 @@ and directs you to the interactive setup. Configure channels with:
   rantaiclaw onboard          # guided channel setup (recommended)
 or edit the active profile's `config.toml` directly.
 
-Supported channel types: telegram, discord, slack, mattermost, webhook, \
+Channel types: telegram, discord, slack, mattermost, webhook, \
 imessage, matrix, signal, whatsapp, whatsapp_web, linq, nextcloud_talk, \
 email, irc, lark, dingtalk, qq.")]
     Add {
-        /// Channel type. Supported channel types: telegram, discord, slack,
+        /// Channel type. Channel types: telegram, discord, slack,
         /// mattermost, webhook, imessage, matrix, signal, whatsapp,
         /// whatsapp_web, linq, nextcloud_talk, email, irc, lark, dingtalk, qq.
         channel_type: String,
@@ -2804,7 +2804,7 @@ mod tests {
     /// a long help as wrapped lines, and the catalog order is what the
     /// sentences have to keep.
     fn channel_kinds_named_in(help: &str) -> Vec<String> {
-        const MARKER: &str = "Supported channel types: ";
+        const MARKER: &str = "Channel types: ";
         let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
         let start = flat.find(MARKER).unwrap_or_else(|| {
             panic!("the help must name the channel kinds after {MARKER:?}: {flat}")
