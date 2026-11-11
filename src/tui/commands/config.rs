@@ -342,6 +342,11 @@ fn build_channels_panel(ctx: &TuiContext) -> InfoPanel {
     let not_configured_supported = unconfigured_by_tier(crate::channels::ChannelSupport::Supported);
     let not_configured_under_development =
         unconfigured_by_tier(crate::channels::ChannelSupport::UnderDevelopment);
+    // The gateway-served row (`webhook`) is not locked, so it must not sit
+    // under the under-development heading. With no bucket of its own it would
+    // vanish from the panel.
+    let not_configured_gateway_served =
+        unconfigured_by_tier(crate::channels::ChannelSupport::GatewayServed);
 
     // Auto-start state — drives the per-channel status icon + the footer
     // diagnostic. Mirrors the v0.6.6 logic but renders into typed rows.
@@ -488,6 +493,15 @@ fn build_channels_panel(ctx: &TuiContext) -> InfoPanel {
                 crate::channels::ChannelSupport::UnderDevelopment.label()
             ))
             .inline_list(not_configured_under_development),
+        );
+    }
+    if !not_configured_gateway_served.is_empty() {
+        panel = panel.section(
+            InfoSection::new(format!(
+                "Not configured · {}",
+                crate::channels::ChannelSupport::GatewayServed.label()
+            ))
+            .inline_list(not_configured_gateway_served),
         );
     }
 
@@ -700,6 +714,59 @@ mod tests {
         assert!(matches!(scheduler_diag(&path).0, StatusKind::Ok));
         std::fs::write(&path, state_body("error", 0)).unwrap();
         assert!(matches!(scheduler_diag(&path).0, StatusKind::Fail));
+    }
+
+    /// An unconfigured `webhook` row must still be listed by the `/channels`
+    /// panel, outside the locked bucket. The gateway serves the webhook, so it
+    /// is not locked. A row that lands in neither "not configured" section
+    /// would vanish from the panel.
+    #[test]
+    fn the_channels_panel_lists_an_unconfigured_webhook_outside_the_locked_bucket() {
+        let mut ctx = test_context();
+        ctx.channels_summary =
+            crate::channels::channel_status_roster(&crate::config::Config::default())
+                .into_iter()
+                .map(|(name, configured, support, verification)| {
+                    (name.to_string(), configured, support, verification)
+                })
+                .collect();
+        let CommandResult::OpenInfoPanel(panel) = ChannelsCommand.execute("", &mut ctx).unwrap()
+        else {
+            panic!("/channels opens a panel");
+        };
+
+        let webhook_in_bucket = |heading: &str| -> bool {
+            panel
+                .sections
+                .iter()
+                .filter(|s| s.heading.as_deref() == Some(heading))
+                .flat_map(|s| s.rows.iter())
+                .any(|row| match row {
+                    InfoRow::InlineList { items } => items.iter().any(|i| i == "Webhook"),
+                    _ => false,
+                })
+        };
+
+        let locked_heading = format!(
+            "Not configured · {}",
+            crate::channels::ChannelSupport::UnderDevelopment.label()
+        );
+        assert!(
+            !webhook_in_bucket(&locked_heading),
+            "the webhook is served by the gateway, not locked; it must not sit in \
+             the {locked_heading:?} bucket"
+        );
+        assert!(
+            panel
+                .sections
+                .iter()
+                .flat_map(|s| s.rows.iter())
+                .any(|row| match row {
+                    InfoRow::InlineList { items } => items.iter().any(|i| i == "Webhook"),
+                    _ => false,
+                }),
+            "the webhook row must not vanish from the panel entirely"
+        );
     }
 
     /// A file whose `written_at` is older than three flush intervals was

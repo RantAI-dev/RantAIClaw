@@ -376,6 +376,12 @@ async fn get_channels_publishes_the_catalog_with_both_axes() {
         match entry["support"].as_str() {
             Some("supported") => supported += 1,
             Some("under_development") => {}
+            // The one row the gateway serves itself. It sits on neither rung,
+            // so no other key may carry it.
+            Some("gateway_served") => assert_eq!(
+                entry["key"], "webhook",
+                "only the webhook row is served by the gateway: {entry}"
+            ),
             other => panic!("unknown support value {other:?} in {entry}"),
         }
         match entry["verification"].as_str() {

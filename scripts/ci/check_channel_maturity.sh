@@ -89,7 +89,7 @@ fi
 # ── 2. Each label string is defined once, not typed per surface. ────────────
 # One check per axis. A single combined count would pass while one axis grew a
 # second copy and the other lost one.
-for label in "under development" "not yet verified"; do
+for label in "under development" "not yet verified" "served by the gateway"; do
   label_defs="$(grep -rnF "\"$label\"" src/ --include='*.rs' | wc -l | tr -d ' ')"
   if [ "$label_defs" -ne 1 ]; then
     echo "ERROR: the string \"$label\" appears $label_defs times in src/."
@@ -116,6 +116,10 @@ while IFS= read -r row; do
   case "$sup_variant" in
     Supported) support="supported"; supported=$((supported + 1)) ;;
     UnderDevelopment) support="under development" ;;
+    # Not a maturity rung: the row is served by the gateway (see "The one row
+    # that is on neither rung" in docs/reference/channels.md). It counts
+    # toward neither decision below, which is why it has no counter here.
+    GatewayServed) support="served by the gateway" ;;
     *) echo "ERROR: $key has unknown support variant '$sup_variant'."; fail=1; continue ;;
   esac
   case "$ver_variant" in

@@ -2889,6 +2889,12 @@ async fn handle_whatsapp_message(
             .into_response();
     }
 
+    // Same locked-channel gate as the other channel webhook routes. It does
+    // nothing while the catalog supports whatsapp.
+    if let Some(refusal) = locked_channel_refusal("whatsapp") {
+        return refusal;
+    }
+
     // Parse JSON body
     let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
         return (
@@ -4814,6 +4820,11 @@ mod tests {
             assert!(
                 !body.contains("String::from_utf8_lossy("),
                 "{handler} must verify the bytes it parses"
+            );
+            // Every handler runs the locked-channel gate for its own channel.
+            assert!(
+                body.contains(&format!("locked_channel_refusal(\"{channel}\")")),
+                "{handler} must run the locked-channel gate for its own channel"
             );
         }
 

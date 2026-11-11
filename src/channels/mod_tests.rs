@@ -5332,14 +5332,99 @@ fn locked_channel_key_for_provisioner_never_refuses_a_non_channel_topic() {
     );
 }
 
-/// `webhook` carries an `UnderDevelopment` catalog row, but it is served by
-/// the gateway, not opened by a setup/pairing surface — it is explicitly not
-/// an entry point this lock covers, so it must never be refused as "locked".
+/// `webhook` is in the catalog but is not a `Channel` implementer. The
+/// gateway serves its route, so it is listed in `NON_CHANNEL_CATALOG_KEYS`
+/// and the lock never covers it: there is no setup or pairing surface that
+/// could refuse it.
 #[test]
 fn locked_channel_key_for_provisioner_never_refuses_webhook() {
     assert_eq!(
         crate::channels::locked_channel_key_for_provisioner("webhook"),
         None
+    );
+}
+
+/// The webhook row reads `served by the gateway`, not a maturity rung, and it
+/// is not usable. The row describes who serves it; the usability rule still
+/// demands `Supported`, which the row has never carried. A future "just mark
+/// it Supported" edit fails here, because that would hand a channel with no
+/// `Channel` implementation to the factory, the cron gate and the prompt gate.
+///
+/// The wire value is pinned because the console reads it: `gateway_served` is
+/// what leaves claw-ui's locked list (it filters on the old
+/// `under_development` value) while staying a row no runtime surface accepts.
+#[test]
+fn the_webhook_row_is_gateway_served_and_never_usable() {
+    let (_, _, support, verification) = CHANNEL_CATALOG
+        .iter()
+        .copied()
+        .find(|(key, _, _, _)| *key == "webhook")
+        .expect("webhook is in the catalog");
+    assert_eq!(
+        support,
+        ChannelSupport::GatewayServed,
+        "the webhook row says who serves it, not how mature it is"
+    );
+    assert_eq!(
+        verification,
+        ChannelVerification::NotDriven,
+        "no one has driven a round trip through the webhook route's checklist"
+    );
+    assert!(
+        !crate::channels::channel_is_usable("webhook"),
+        "the webhook is served by the gateway; it is not a Channel implementer \
+         and must never reach the factory, the cron gate or the prompt gate"
+    );
+    let value = serde_json::to_value(support).expect("support serializes");
+    assert_eq!(
+        value,
+        serde_json::json!("gateway_served"),
+        "the wire value on /api/v1/channels is part of the console contract"
+    );
+}
+
+/// A configured webhook runs, because the gateway serves it, so the roster note
+/// must never say "not started" about it. The "· not started" special case
+/// stays exactly where it was: a configured, genuinely locked channel. The
+/// support value is read from the catalog row, so this test tracks the row
+/// rather than a hand-typed copy of it.
+#[test]
+fn a_configured_webhook_note_says_it_is_served_never_not_started() {
+    let (_, _, support, verification) = CHANNEL_CATALOG
+        .iter()
+        .copied()
+        .find(|(key, _, _, _)| *key == "webhook")
+        .expect("webhook is in the catalog");
+    let note = channel_roster_note(true, support, verification);
+    assert!(
+        !note.contains("not started"),
+        "the webhook is served by the gateway; a configured webhook runs, got: {note}"
+    );
+    assert_eq!(
+        note,
+        format!(
+            "configured · {} · {}",
+            support.label(),
+            verification.label()
+        ),
+        "a configured gateway-served row renders the ordinary configured line"
+    );
+}
+
+/// A config whose only catalog entry is the webhook must produce no wont-start
+/// warning at daemon start: the gateway serves the webhook, so there is
+/// nothing configured that will fail to start. The warn loop skips
+/// `NON_CHANNEL_CATALOG_KEYS` and must keep skipping it.
+#[test]
+fn a_webhook_only_config_gets_no_wont_start_warning() {
+    let config = config_with_only_channel("webhook");
+    let logged = warnings_from(|| {
+        crate::channels::warn_configured_channels_that_will_not_start(&config);
+    });
+    assert!(
+        !logged.contains("webhook"),
+        "the gateway serves the webhook; a wont-start warning about it would be \
+         false: {logged:?}"
     );
 }
 

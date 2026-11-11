@@ -2622,7 +2622,7 @@ pub struct ChannelsConfig {
     pub slack: Option<SlackConfig>,
     /// Mattermost bot channel configuration. Support: **under development**. Verification: **not yet verified**.
     pub mattermost: Option<MattermostConfig>,
-    /// Webhook channel configuration. Support: **under development**. Verification: **not yet verified**.
+    /// Webhook channel configuration. Support: **served by the gateway**. Verification: **not yet verified**.
     pub webhook: Option<WebhookConfig>,
     /// iMessage channel configuration (macOS only). Support: **under development**. Verification: **not yet verified**.
     pub imessage: Option<IMessageConfig>,

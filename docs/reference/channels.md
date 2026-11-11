@@ -38,7 +38,7 @@ label fixes the contradiction without demoting anything.
 
 | Axis | Values | What it says | Who moves it |
 |---|---|---|---|
-| **support** | `supported`, `under development` | What the project undertakes. A bug in a supported channel is a bug we own, and `channel doctor` probes it | The owner. It is a product commitment |
+| **support** | `supported`, `under development`, `served by the gateway` | What the project undertakes. A bug in a supported channel is a bug we own, and `channel doctor` probes it. `served by the gateway` is held by one row only; see "The one row that is on neither rung" below | The owner. It is a product commitment |
 | **verification** | `verified`, `not yet verified` | Whether anyone has driven a round trip against the real platform | The checklist below, once the evidence exists |
 
 Both live in `CHANNEL_CATALOG` (`src/channels/mod.rs`), one row per channel, and
@@ -66,8 +66,24 @@ opposite of what this split is for. `committed_but_undriven_is_a_legitimate_stat
 in `src/channels/mod_tests.rs` fails if that set changes, so the demotion cannot
 happen quietly.
 
-"Under development" is not "broken" either. Twelve of these channels have tests
+"Under development" is not "broken" either. Ten of these channels have tests
 and several are in use.
+
+### The one row that is on neither rung
+
+`webhook` carries a third support value: **served by the gateway**. It is not a
+rung of the ladder. The two rungs answer how much the project commits to a
+channel; this value says who serves the row, for the one catalog row that has no
+`Channel` implementer to commit to.
+
+`webhook` is in the catalog because operators think of it as a channel, but
+`POST /webhook` is the gateway's own endpoint: there is no listener to start,
+no setup step refuses it and no doctor probe is registered for it. The
+verification checklist (below) cannot be run against a row with no channel
+behind it. It stays `not yet verified`, and it cannot become verified while it
+is gateway-served, for that reason and not because anyone failed to drive it.
+It is also not usable: `channel_is_usable` demands `Supported`, so the factory,
+the cron gate and every setup surface treat the webhook as they always did.
 
 ### How a channel becomes verified
 
@@ -107,7 +123,7 @@ probing three channels the owner committed to.
 | `discord` | supported | verified |
 | `slack` | supported | verified |
 | `mattermost` | under development | not yet verified |
-| `webhook` | under development | not yet verified |
+| `webhook` | served by the gateway | not yet verified |
 | `imessage` | under development | not yet verified |
 | `matrix` | under development | not yet verified |
 | `signal` | under development | not yet verified |
@@ -121,10 +137,11 @@ probing three channels the owner committed to.
 | `dingtalk` | under development | not yet verified |
 | `qq` | under development | not yet verified |
 
-`webhook` is in the catalog because operators think of it as a channel, but it is
-served by the gateway and is not a `Channel` implementer, so the checklist above
-cannot be run against it at all. It is under development by that fact rather than
-by a default, and it can never become verified while that stays true.
+`webhook` is in the catalog because operators think of it as a channel, but it
+is served by the gateway and is not a `Channel` implementer. Its support value
+says that, `served by the gateway`, rather than a maturity rung. The checklist
+above cannot be run against it, so it cannot become verified while that stays
+true.
 
 ---
 

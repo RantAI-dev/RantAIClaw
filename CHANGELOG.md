@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The `webhook` catalog row now says what it is.** The row carried `under development`, so the
+  console listed the webhook as locked and the TUI roster called it "not started", although the
+  route ships and answers requests. The catalog gains a third support value, `served by the
+  gateway` (wire value `gateway_served` on `/api/v1/channels`). It is not a maturity rung. It
+  marks a row with no `Channel` implementer whose route the gateway serves itself. The TUI
+  /channels panel lists it in its own bucket. Nothing about `/webhook`'s behavior changes. The
+  factory, the cron gate and the setup prompt all read `channel_is_usable`, which is untouched,
+  so the webhook stays not usable and locked channels stay locked. The `channel` and `channel add`
+  help texts now say "Channel types:" instead of "Supported channel types:", which claimed a
+  support commitment the catalog does not carry for most of the list. The claw-ui TypeScript
+  union for the support value is a follow-up in that repository.
+
 - **The bundled SQLite moves from 3.50.2 to 3.53.2, and matrix-sdk moves from 0.18 to 0.19.1.** The
   `rusqlite` crate moves from 0.37 to 0.40.2, and `libsqlite3-sys` from 0.35 to 0.38.2. The
   `matrix-sdk` crate moves from 0.18 to 0.19.1, which moves `vodozemac` from 0.10 to 0.11.2 and
