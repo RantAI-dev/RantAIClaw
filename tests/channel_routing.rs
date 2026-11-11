@@ -35,7 +35,8 @@
 //! - **QQ, IRC** — genuinely uncovered. Both build the message inside their
 //!   listen loop with no extracted seam, so closing this needs the same
 //!   extraction Discord got, not a test.
-//! - **Matrix** — unverifiable by anything: `matrix-sdk` compiles in no CI job.
+//! - **Matrix**, not covered here: `matrix-sdk` sits behind the `channel-matrix`
+//!   feature, which only its own CI job builds.
 
 use async_trait::async_trait;
 use rantaiclaw::channels::traits::{Channel, ChannelMessage, SendMessage};

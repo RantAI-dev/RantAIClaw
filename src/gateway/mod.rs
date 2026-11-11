@@ -3849,6 +3849,25 @@ mod tests {
         );
     }
 
+    /// A config that still names a removed subscription login must not stop
+    /// the gateway from building: a build-time error would keep it from
+    /// binding, and the supervisor would retry the start in a loop. The
+    /// refusal happens when a request is sent, which other tests cover.
+    #[test]
+    fn the_router_builds_when_default_provider_is_a_removed_login() {
+        for name in ["copilot", "openai-codex", "qwen-code", "minimax-oauth"] {
+            let workspace = tempfile::tempdir().expect("temp workspace");
+            let mut config = crate::config::Config::default();
+            config.workspace_dir = workspace.path().to_path_buf();
+            config.default_provider = Some(name.into());
+
+            assert!(
+                super::build_gateway_router(config, None, None).is_ok(),
+                "default_provider = {name:?} must still build a router"
+            );
+        }
+    }
+
     // ── One registry per process (plan 307) ─────────────────────────────────
 
     async fn metrics_body(app: &axum::Router) -> String {
@@ -8035,8 +8054,8 @@ mod tests {
     }
 
     /// A correct signature → 200 on a usable route, and a refusal on a locked
-    /// one. The turn does not run here at all: since plan 313 the handler only
-    /// queues the message, so the provider counter is not the oracle on this
+    /// one. The turn does not run here at all: the handler only queues the
+    /// message, so the provider counter is not the oracle on this
     /// path — the rejection cases above are where it carries the meaning.
     #[tokio::test]
     async fn a_valid_signature_is_accepted_on_a_usable_route_and_refused_on_a_locked_one() {

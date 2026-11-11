@@ -10,7 +10,7 @@ This reference is derived from the current CLI surface (`rantaiclaw --help`).
   that exists and is not here fails the build.
 - **Flags, subcommands and behaviour are checked by hand.** Nothing enforces those, so they
   carry a date:
-  - **September 7, 2026** — `autonomy`, `auth`, `chat`, `insights`, `permissions`,
+  - **September 7, 2026** — `autonomy`, `chat`, `insights`, `permissions`,
     `personality`, `profile`, `rollback`, `session`, `uninstall`, `update`, and the
     `doctor` / `doctor models` split. Written from the `--help` output of a binary built at
     that commit.
@@ -597,6 +597,7 @@ that did not run is not a pass.
 | `config.provider_key` | `config` | Does a provider credential resolve, and from where? |
 | `config.api_url` | `config` | Is the provider `api_url` override a usable URL? |
 | `config.paths` | `config` | Do the configured workspace and data directories exist and are they writable? |
+| `config.legacy_logins` | `config` | Did the startup sweep leave credential files from the removed subscription logins on disk? Warns with their paths, never their contents. |
 | `policy.allowlist` | `config` | Is the shell command allowlist coherent (missing, empty, or healthy)? |
 | `policy.approval_owners` | `config` | Are approval owners configured? |
 | `channels.dm_detection` | `config` | Can the DM-detection policy be read for the configured channels? |

@@ -9605,7 +9605,7 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
     }
 
     // Idempotent first-run skill seeding: if the workspace skills dir
-    // is empty, drop the 5-skill starter pack (web-search, summarizer,
+    // is empty, drop the five starter skills (web-search, summarizer,
     // research-assistant, scheduler-reminders, meeting-notes) so the
     // /skills picker has real content out of the box. Mirrors Hermes'
     // bundled-skills-on-install UX. Best-effort — failure is logged but

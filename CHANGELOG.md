@@ -119,6 +119,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The model-routes wizard no longer saves a route to a removed login, and the legacy-login sweep
+  logs a removal it cannot make.** The wizard asked the provider factory whether a name was valid,
+  and the factory still builds a provider for `copilot`, `openai-codex`, `qwen-code` and the
+  `minimax-oauth` aliases so the daemon stays up. A route to one of them was saved without a word and
+  failed on its first request. The wizard now skips it and shows the refusal sentence, which names the
+  API-key replacement wherever there is one. Separately, the sweep that deletes the login files an
+  earlier release wrote dropped the error when a file could not be removed, for example in a read-only
+  directory, so a credential stayed on disk without a line in the start log. It now logs a WARN that
+  names the path and the error and never the file contents.
+
 - **A channel `/approve` now answers one call, and `/allow` answers until the daemon restarts.** The
   relay parsed `approve` and `allow` as the same verb, so `/approve <command>` allowlisted that
   basename for the life of the process: the command stayed allowed in every chat, with no prompt,

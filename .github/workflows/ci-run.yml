@@ -188,7 +188,7 @@ jobs:
     # in ~3m. `channel-matrix` now has its own job below for the same reason.
     # `Cargo.toml` declares `rust-version`, and until this job existed nothing
     # built at it: every other Rust job pins 1.92.0, the `channel-matrix` job
-    # 1.96.0 and the Dockerfile `rust:1.93-slim`. A declared MSRV that no build
+    # 1.96.0 and the Dockerfile `rust:1.98-slim`. A declared MSRV that no build
     # exercises is a claim, and this repository treats claims as things that get
     # checked.
     #

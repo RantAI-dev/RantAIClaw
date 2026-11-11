@@ -2,10 +2,10 @@
 //!
 //! RantaiClaw used to keep subscription logins on disk: the Anthropic auth
 //! profile store beside `config.toml`, and the Copilot token pair under the
-//! platform config directory. Both logins are gone (plans 640 and 641), so
-//! nothing reads those files any more — but an install that ran an older
-//! build still has them, and a credential left on disk is a credential the
-//! operator did not ask to keep.
+//! platform config directory. Both logins are gone, so nothing reads those
+//! files any more — but an install that ran an older build still has them,
+//! and a credential left on disk is a credential the operator did not ask to
+//! keep.
 //!
 //! The sweep runs on every start and removes what it finds. It is idempotent:
 //! a file that is not there produces no line and no error, so only the first
@@ -103,13 +103,25 @@ pub fn remove_legacy_login_files(config: &Config) -> Vec<PathBuf> {
 /// Remove the files at `paths` that exist, and return the ones removed.
 ///
 /// A file that cannot be removed — a read-only directory, a file owned by
-/// someone else — is left alone and reported by `doctor`, which is the only
-/// place that can say so without failing a start.
+/// someone else — is left alone and logged as a WARN that names the path and
+/// the error, never the contents. A start must not fail over it, but the
+/// operator needs to learn that a credential is still on disk. A file that
+/// vanished between the check and the removal is not a failure.
 fn remove_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
     paths
         .iter()
         .filter(|path| path.is_file())
-        .filter(|path| std::fs::remove_file(path).is_ok())
+        .filter(|path| match std::fs::remove_file(path) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                tracing::warn!(
+                    "could not remove legacy login file {}: {error}",
+                    path.display()
+                );
+                false
+            }
+        })
         .cloned()
         .collect()
 }
@@ -236,6 +248,7 @@ mod tests {
             let dir = home.join(name);
             std::fs::create_dir_all(&dir).expect("other cli dir");
             std::fs::write(dir.join("marker"), "keep me").expect("write marker");
+            std::fs::write(dir.join("oauth_creds.json"), "keep me").expect("write oauth creds");
         }
         let _home = crate::test_env::EnvGuard::set("HOME", &home);
 
@@ -245,10 +258,105 @@ mod tests {
         remove_legacy_login_files(&config);
 
         for name in [".gemini", ".qwen"] {
-            assert!(
-                home.join(name).join("marker").exists(),
-                "{name} belongs to another CLI and must survive"
-            );
+            for file in ["marker", "oauth_creds.json"] {
+                assert!(
+                    home.join(name).join(file).exists(),
+                    "{name}/{file} belongs to another CLI and must survive"
+                );
+            }
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("buffer lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for LogBuffer {
+        type Writer = Self;
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn capture_tracing<R>(f: impl FnOnce() -> R) -> (R, String) {
+        let buffer = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let result = f();
+        let captured =
+            String::from_utf8(buffer.0.lock().expect("buffer lock").clone()).expect("utf-8 log");
+        (result, captured)
+    }
+
+    /// A file the sweep cannot remove stays on disk, is not reported as
+    /// removed, and is named in a WARN so the operator learns a credential is
+    /// still there. The warning carries the path, never the file contents.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_removal_is_warned_about_and_not_reported_as_removed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let locked_dir = scratch.path().join("locked");
+        std::fs::create_dir_all(&locked_dir).expect("locked dir");
+        let stuck = locked_dir.join(AUTH_PROFILES_FILE);
+        std::fs::write(&stuck, "legacy-login-secret-marker").expect("write legacy file");
+        std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o555))
+            .expect("make the directory read-only");
+
+        // A privileged user can still unlink from a read-only directory, so
+        // the failure this test needs cannot be produced there.
+        let probe = locked_dir.join("probe");
+        if std::fs::write(&probe, "x").is_ok() {
+            std::fs::remove_file(&probe).expect("remove probe");
+            std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o755))
+                .expect("restore permissions");
+            return;
+        }
+
+        let (removed, log) = capture_tracing(|| remove_paths(std::slice::from_ref(&stuck)));
+
+        std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("restore permissions");
+        assert!(removed.is_empty(), "removed: {removed:?}");
+        assert!(
+            stuck.exists(),
+            "the file could not be removed and must stay"
+        );
+        assert!(log.contains("WARN"), "the failure must be a WARN: {log}");
+        assert!(
+            log.contains(AUTH_PROFILES_FILE),
+            "the WARN must name the path: {log}"
+        );
+        assert!(
+            !log.contains("legacy-login-secret-marker"),
+            "the WARN must not carry file contents: {log}"
+        );
+    }
+
+    /// A path that is not there is the normal case on every start after the
+    /// first, so it must stay silent.
+    #[test]
+    fn a_missing_file_is_skipped_silently() {
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let missing = scratch.path().join(AUTH_PROFILES_FILE);
+
+        let (removed, log) = capture_tracing(|| remove_paths(std::slice::from_ref(&missing)));
+
+        assert!(removed.is_empty(), "removed: {removed:?}");
+        assert!(log.is_empty(), "a missing file must not log: {log}");
     }
 }

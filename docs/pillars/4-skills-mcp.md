@@ -6,7 +6,7 @@ Composable, reusable agent capabilities. Skills are markdown bundles with tool w
 
 ## What this pillar covers
 
-- 5-skill bundled starter pack (web-search, scheduler-reminders, summarizer, research-assistant, meeting-notes)
+- Bundled pack: five starter skills (web-search, scheduler-reminders, summarizer, research-assistant, meeting-notes) plus the core owner-permissions skill
 - ClawHub multi-select skill picker (sorted by stars, SHA-256 verified install)
 - 6 MCP servers curated picker — 2 zero-auth + 4 authenticated, with inline auth (filesystem dropped in v0.6.51 — see below)
 - Spawn-and-validate at setup time (zero-auth servers)

@@ -1269,7 +1269,11 @@ no stored arg is taken as written.
   ```json
   { "provider": "openrouter", "model": "...", "temperature": 0.7 }
   ```
-- **Response** `200`: `{ "default_provider": "...", "default_model": "...", "default_temperature": 0.7 }`
+- **Response** `200`: `{ "default_provider": "...", "default_model": "...", "default_temperature": 0.7 }`,
+  plus a `warning` string when the switch leaves the new provider unusable (see below).
+- **`warning`** is present only when the request sets `provider` and the new provider has no usable
+  credential, or is a removed subscription login. The switch is still saved. Channels and chat
+  cannot use that provider until a key is added. The field is absent otherwise.
 - **Status codes**: `200`, `400`, `401`, `500`.
 
 ### PUT /api/v1/config/autonomy
