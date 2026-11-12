@@ -775,6 +775,12 @@ pub async fn run_quick_setup(
     memory_backend: Option<&str>,
     force: bool,
 ) -> Result<Config> {
+    // A removed login name builds (a refusing provider), so nothing later in
+    // this function would catch it. Refuse before anything is written.
+    if let Some(refusal) = provider.and_then(crate::providers::removed_login_refusal) {
+        bail!("{refusal}");
+    }
+
     println!("{}", style(BANNER).cyan().bold());
     println!(
         "  {}",
@@ -6491,6 +6497,45 @@ mod tests {
         let config_raw = tokio::fs::read_to_string(config.config_path).await.unwrap();
         assert!(config_raw.contains("default_provider = \"openrouter\""));
         assert!(config_raw.contains("default_model = \"custom-model-946\""));
+    }
+
+    /// A removed login name builds (a refusing provider), so a build check
+    /// cannot catch it. Quick setup refuses it, names the replacement, and
+    /// writes nothing.
+    #[tokio::test]
+    async fn quick_setup_refuses_a_removed_login_provider_and_writes_nothing() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = TempDir::new().unwrap();
+        let _home = pin_home(&tmp);
+        let cfg_dir = tmp.path().join("cfg");
+        let _dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", &cfg_dir);
+        let _ws = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+
+        for name in ["codex", "copilot", "qwen-oauth", "minimax-oauth"] {
+            let err = run_quick_setup(Some("sk-unused"), Some(name), None, Some("sqlite"), false)
+                .await
+                .expect_err("a removed login must not be saved as the provider");
+            let expected = crate::providers::removed_login_refusal(name)
+                .expect("the fixture name is a removed login");
+            assert!(
+                err.to_string().contains(expected),
+                "the error for {name:?} must carry the replacement text, got {err}"
+            );
+            assert!(
+                !cfg_dir.join("config.toml").exists(),
+                "a refused {name:?} must not write config.toml"
+            );
+        }
+
+        let codex_err = run_quick_setup(None, Some("codex"), None, Some("sqlite"), false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(codex_err.contains("openai") && codex_err.contains("OPENAI_API_KEY"));
+        assert!(
+            !cfg_dir.exists(),
+            "a refused name must not create the config directory"
+        );
     }
 
     #[tokio::test]

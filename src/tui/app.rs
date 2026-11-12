@@ -9271,6 +9271,11 @@ fn session_model_differs(recorded: &str, running: &str) -> bool {
 /// no network request class.
 pub(crate) fn check_model_buildable(config: &crate::config::Config) -> anyhow::Result<()> {
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
+    // A removed login name builds (a refusing provider), so the factory call
+    // below would pass it. Name the replacement instead of saving it.
+    if let Some(refusal) = crate::providers::removed_login_refusal(provider_name) {
+        anyhow::bail!("{refusal}");
+    }
     let model_name = config
         .default_model
         .as_deref()
@@ -10908,6 +10913,49 @@ mod tests {
                 .await
                 .is_err(),
             "no Reload is sent for a refused target"
+        );
+    }
+
+    /// A removed login name builds (a refusing provider), so the build check
+    /// passes it. `/model` must still refuse it with the replacement and keep
+    /// the provider, the status bar and the file as they were.
+    #[tokio::test]
+    async fn model_selection_refuses_a_removed_login_provider() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let (mut app, mut req_rx) = make_app_with_bridge_from_store(
+            SessionStore::in_memory().expect("store"),
+            "openai:old-model",
+        );
+        app.config.config_path = tmp.path().join("config.toml");
+        app.config.workspace_dir = tmp.path().to_path_buf();
+        app.config.default_provider = Some("openai".to_string());
+        app.config.default_model = Some("old-model".to_string());
+
+        app.apply_model_selection(Some("codex"), "gpt-5");
+
+        let expected = crate::providers::removed_login_refusal("codex")
+            .expect("codex is a removed login name");
+        let error = app.context.last_error.clone().unwrap_or_default();
+        assert!(
+            error.contains(expected),
+            "the refusal carries the replacement text: {error:?}"
+        );
+        assert!(
+            error.contains("OPENAI_API_KEY"),
+            "the refusal names the replacement key: {error:?}"
+        );
+        assert_eq!(app.context.model, "openai:old-model");
+        assert_eq!(app.config.default_provider.as_deref(), Some("openai"));
+        assert_eq!(app.config.default_model.as_deref(), Some("old-model"));
+        assert!(
+            !tmp.path().join("config.toml").exists(),
+            "nothing is saved for a removed login"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), req_rx.recv())
+                .await
+                .is_err(),
+            "no Reload is sent for a removed login"
         );
     }
 
