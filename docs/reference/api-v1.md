@@ -1337,9 +1337,10 @@ no stored arg is taken as written.
   a shell (`sh`, `bash`, `zsh`, `dash`, `ksh`) with `-c` or any short-option cluster that carries
   it (`-lc`), fish with `-c`/`-C` — fish's own command flag is uppercase — or the long forms
   `--command=`/`--execute=`, `python`/`python3` (or a versioned name such as `python3.12`) with
-  `-c`, `node` with `-e`/`--eval`/`-p`/`--print`, or with `--import`/`--require`/`-r` handed a
-  `data:` URL, `perl` with `-e`/`-E` or `ruby` with `-e`, `deno eval`, and `npx`/`npm exec` (or
-  `npm x`) with `-c`/`--call`. A short option is read as a cluster, so the flag is caught when it
+  `-c`, `node` with `-e`/`--eval`/`-p`/`--print`, with `--import`/`--require`/`-r` handed a
+  `data:` URL, or with `--inspect`/`--inspect-brk`/`--inspect-wait` (which open a debugger port),
+  `perl` with `-e`/`-E` or `ruby` with `-e`, `deno eval`, and `npx`/`npm exec` (or `npm x`) with
+  `-c`/`--call`. A short option is read as a cluster, so the flag is caught when it
   shares its argument with other flags (`python -Sc`, `node -pe`, `perl -we`) or carries its value
   attached (`-cprint(1)`). The program is
   resolved first — the basename of `command`, compared case-insensitively so `/bin/SH` is `sh`,
@@ -1355,21 +1356,31 @@ no stored arg is taken as written.
   `npx --loglevel silent node -e …` and `npm --prefix /tmp x -c …` are all refused, and a value is
   only a candidate named `tmp` or `silent`, which no rule reads. A candidate named like an
   interpreter and followed by an inline flag is refused even when it is the package's own
-  argument (`npx -y pkg node -e …`): that over-refusal is accepted. So is a candidate that is only
-  an option's value and ends in `env` (`npx --prefix /srv/app/env -y pkg` reads `env` as a
-  candidate program and is refused). An argument of the package itself whose last path segment is
-  `env` is read the same way: `npx -y @modelcontextprotocol/server-filesystem /srv/data/env` is
-  refused, because `env` is read as a candidate that cannot be resolved. That over-refusal is
-  accepted. `npm x`, `npm exe` and `npm exec` are found wherever the word
-  stands among npm's arguments, so a value equal to `x`, `exe` or `exec` reads as the subcommand
-  too. The scan is bounded: the guard checks at most 256 programs per entry, the runner and its
-  candidates included, and reads at most 256 arguments of any one program. An entry over either
-  limit (a runner with 256 or more positional arguments, a list of more than 256 arguments) is
-  refused with `400` and a message that says the launch chain is too long or too complex to
-  verify. `-c` is read inside a cluster (`npx -yc …`, `npx -pc …`: only an exact `-p` is
-  `--package`, `-p` inside a cluster is `--parseable`). The abbreviations `--ca` and `--cal` of
-  `--call` are refused too. That is conservative: npm does not necessarily resolve them to
-  `--call`, and the guard makes no claim that it does. `node` with `--loader` or `--experimental-loader` is refused for a `data:`
+  argument (`npx -y pkg node -e …`): that over-refusal is accepted. A candidate whose last path
+  segment is `env` is skipped in two cases. In the first, the arguments behind it are read in full
+  and name no program, as in `npx -y @modelcontextprotocol/server-filesystem /srv/data/env`. In the
+  second, the arguments behind it cannot be read (an option of `env` the guard does not know, a `-S`
+  string it cannot split, more nested `-S` than it follows) and no later word is a `-S` word or a
+  `NAME=value` word, as in `npx --prefix /srv/app/env -y pkg` and
+  `npm exec --prefix /srv/app/env -y pkg`. There GNU `env` would stop at `-y`, so the guard cannot
+  read the words behind it. Every plain word is still checked as a candidate of its own, so `pkg`
+  is checked as a program. Only `-S` and `NAME=value` need the extra refusal: `-S` assembles a
+  program from words that are not candidates, and an assignment changes the environment of the next
+  program. npx runs a binary it finds in the global bin directory, so any other `env` candidate is
+  read as `env`: its `NAME=value` words are checked (`npx -y env NODE_OPTIONS=… pkg`). When the
+  arguments behind it cannot be read and a `-S` or `NAME=value` word follows, the entry is still
+  refused as a program that cannot be determined, as in `npx -y env -S '${P} ${A} ${B}'`. `npm x`, `npm exe` and `npm exec` are
+  found wherever the word stands among npm's arguments, so a value equal to `x`, `exe` or `exec`
+  reads as the subcommand too. The scan is bounded: the guard checks at most 256 programs per entry,
+  the runner and its candidates included, and reads at most 256 arguments of any one program. An
+  entry over either limit (a runner with 256 or more positional arguments, a list of more than 256
+  arguments) is refused with `400` and a message that says the launch chain is too long or too
+  complex to verify. `-c` is read inside a cluster (`npx -yc …`, `npx -pc …`: only an exact `-p`
+  is `--package`, `-p` inside a cluster is `--parseable`). The abbreviation `--c` of `--call` is
+  refused too, because npm resolves it to `--call` (`npx --c '…'`, `npx --c='…'`). `--ca` and `--cal`
+  are refused as well. That is conservative: npm does not necessarily resolve them to `--call`, and
+  the guard makes no claim that it does. `node` with `--loader` or `--experimental-loader` is
+  refused for a `data:`
   URL like `--import`, and the scheme is read in any case, so `DATA:` is refused too. A module that
   is a file is not refused, because running a file is running a program. The reading of a short
   option stops at a letter that takes a value (`python -W`, `-m`, `-X`, `node -r`, `-C`,
@@ -1378,7 +1389,9 @@ no stored arg is taken as written.
   a `use` statement from `-M` and `-m`, so `perl -Mstrict;print(1)` is refused, and an `=` import
   list (`-MPOSIX=floor`) is not. An environment variable the launcher reads as options counts too:
   `NODE_OPTIONS` is refused when it holds `-e`, `--eval`, `-p`, `--print`, or `--import`,
-  `--require`, `-r`, `--loader` or `--experimental-loader` with a `data:` URL, and `PERL5OPT` when
+  `--require`, `-r`, `--loader` or `--experimental-loader` with a `data:` URL, or a debugger flag
+  (`--inspect`, `--inspect-brk`, `--inspect-wait`, with or without `=host:port`: the port takes
+  commands from whoever can reach it), and `PERL5OPT` when
   it holds `-e`, `-E` or a code carrying `-M`/`-m`. `NODE_OPTIONS` is split the way node splits
   it: only a space separates options, a `"` opens or closes a quoted part, and inside quotes a
   backslash takes the next character literally, so `--import="d\ata:…"` is read as
@@ -1388,12 +1401,13 @@ no stored arg is taken as written.
   `PYTHONSTARTUP` runs only in an interactive session). The guard reads every argument, so a
   script's own flag that looks like an inline-script flag (`node server.js -p 3000`,
   `python server.py -c cfg.json`) is refused too. The guard is best-effort and does not cover:
-  `npm_config_*` environment variables that npm reads as options, `npx --node-options=…`,
-  debugger options such as `--inspect` (in `NODE_OPTIONS` or on the command line), `perl
-  -d:Module;code`, interpreters it does not know (`uv run`, `bun`, `php`, `pwsh`), and modules that
-  run code (`python -m timeit`). When the
-  program cannot be determined at all — an `env`/`-S` chain that cannot be resolved, or a `-S` word
-  list GNU `env` itself could not split — the route refuses with `400` too, and a `$` in a `-S` word
+  `npm_config_*` environment variables that npm reads as options, `npx --node-options=…`, Python
+  environment variables (`PYTHONWARNINGS` with a dotted category imports a module such as
+  `antigravity`, which runs the program named by `BROWSER`, so a Python launcher can still be
+  made to run code), `perl -d:Module;code`, interpreters it does not know (`uv run`, `bun`, `php`,
+  `pwsh`), and modules that run code (`python -m timeit`). When the program cannot be determined at
+  all — an `env`/`-S` chain that cannot be resolved, or a `-S` word list GNU `env` itself could not
+  split — the route refuses with `400` too, and a `$` in a `-S` word
   list is refused because the route cannot know the expansion. The refusal
   names the program and the flag:
   `MCP command 'sh' may not be given an inline script (-c); the config API runs a program, not a script`.

