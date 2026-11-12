@@ -119,6 +119,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Two setup paths no longer accept a removed login (`copilot`, `openai-codex`/`codex`, the Qwen
+  Code and MiniMax OAuth names) without naming the replacement.** A removed login name still builds
+  a provider that refuses every request, so the build checks in these paths passed it and the
+  install failed only on the first chat. `rantaiclaw onboard --provider <name>` now exits with the
+  replacement (for `codex`, the `openai` provider with `OPENAI_API_KEY`) before it creates the
+  config directory or writes `config.toml`. The TUI `/model` switch shows the same text, and the
+  provider, the status bar and the config file keep what they had. The console
+  `PUT /api/v1/config/model` is unchanged: it still saves and returns a warning that names the
+  replacement. No config key or default changes.
+
 - **The MCP console API's inline-script rule now reads environment variables and the options of
   `npx`/`npm`, and no longer refuses four launchers it should accept.** Through
   `POST /api/v1/config/mcp_servers/{name}`, an entry could still run code in these shapes:
