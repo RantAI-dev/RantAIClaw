@@ -125,9 +125,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   install failed only on the first chat. `rantaiclaw onboard --provider <name>` now exits with the
   replacement (for `codex`, the `openai` provider with `OPENAI_API_KEY`) before it creates the
   config directory or writes `config.toml`. The TUI `/model` switch shows the same text, and the
-  provider, the status bar and the config file keep what they had. The console
-  `PUT /api/v1/config/model` is unchanged: it still saves and returns a warning that names the
-  replacement. No config key or default changes.
+  provider, the status bar and the config file keep what they had. The same refusal applies when the
+  removed login arrives as the credential. `rantaiclaw onboard --provider qwen --api-key qwen-oauth`
+  used to save `qwen-oauth` as the API key, and so did a typed `qwen-oauth` or `minimax-oauth` in
+  `rantaiclaw onboard --interactive`, in `rantaiclaw setup provider` and in the TUI provider setup
+  (including its custom endpoint step). All four now refuse it with the replacement and save
+  nothing. The console `PUT /api/v1/config/model` is unchanged: it still saves and returns a
+  warning that names the replacement, and no other path that stores a credential changes. No
+  config key or default changes.
+
+- **Approval replies name what the owner typed and what was ignored, and the channel docs list the
+  forms each approval relay accepts.** `yes brew --persist` or `ok brew --persist` answered
+  "`/approve` saves nothing" although the owner had not typed `/approve`; the note now names the
+  verb and the flag as typed. On the risk gate, `/allow brew --persist` and `Y brew` gave a session
+  grant (medium risk) or a grant for this run (high risk) without saying that the persistent request
+  was not applied. The reply now says the gate does not save it, and a one-call reply there no
+  longer suggests `/allow brew --persist` as the way to persist.
+  `docs/reference/channels.md` claimed `/approve`, `y`, `yes` and `ok` work on both relays and that
+  tool approvals resolve only by handle or tool name. A table now lists each form per relay,
+  including the bare verbs (with the exactly-one-pending-in-this-chat condition) and bare `allow`,
+  which covers one call. No config key or default changes.
 
 - **The MCP console API's inline-script rule now reads environment variables and the options of
   `npx`/`npm`, and no longer refuses four launchers it should accept.** Through

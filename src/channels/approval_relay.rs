@@ -67,7 +67,8 @@
 //! the bare forms of them — covers exactly one call. The reply says which
 //! grant it made, so an answer never promises more than it gives. A persist
 //! tail on one of them (`/approve brew --persist`) is dropped, and the reply
-//! says so and names `/allow brew --persist`.
+//! says so. For an unallowed command it also names `/allow brew --persist`.
+//! On the risk gate it names nothing, because a risk-gate grant is never saved.
 //!
 //! Returning `Some(reply)` from [`try_handle_reply`] means the
 //! message was consumed; the caller should *not* forward it to the
@@ -166,7 +167,8 @@ pub fn try_handle_reply(
                 },
                 basename: basename.clone(),
                 persist: false,
-                persist_ignored: false,
+                typed_verb: String::new(),
+                typed_flag: None,
             };
             if parsed.verb.is_grant() && !can_approve(owners, sender) {
                 return Some(format!(
@@ -200,9 +202,26 @@ struct ParsedReply {
     verb: ReplyVerb,
     basename: String,
     persist: bool,
-    /// A one-call verb carried a persist tail that was dropped. The reply says
+    /// The verb token as the owner wrote it, slash included (`/approve`, `yes`,
+    /// `Y`). Empty for a bare verb, which carries no flag to report on.
+    typed_verb: String,
+    /// The persist flag token as the owner wrote it (`--persist`, `-p`), if any.
+    /// On a one-call verb it is dropped rather than honoured, and the reply says
     /// so, so the owner is not left believing the grant was saved.
-    persist_ignored: bool,
+    typed_flag: Option<String>,
+}
+
+impl ParsedReply {
+    /// What the owner typed to ask for a persistent grant: the flag, or the
+    /// capital `Y` verb, which means persist without any flag. `None` when the
+    /// reply asked for nothing persistent.
+    fn persist_request(&self) -> Option<&str> {
+        match self.typed_flag.as_deref() {
+            Some(flag) => Some(flag),
+            None if self.persist => Some(&self.typed_verb),
+            None => None,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -239,16 +258,22 @@ fn parse_reply(text: &str) -> Option<ParsedReply> {
 
     let mut tokens = body.split_whitespace();
     let head = tokens.next()?;
+    let typed_verb = if trimmed.starts_with('/') {
+        format!("/{head}")
+    } else {
+        head.to_string()
+    };
     let basename_raw = tokens.next()?;
     // Reject anything beyond `--persist` / `--save` so chatty
     // sentences like "allow brew because it's safe" don't silently
     // toggle the allowlist.
     let trailing: Vec<&str> = tokens.collect();
-    let tail_persist = match trailing.as_slice() {
-        [] => false,
-        ["--persist" | "--save" | "-p" | "persist"] => true,
+    let typed_flag = match trailing.as_slice() {
+        [] => None,
+        [flag @ ("--persist" | "--save" | "-p" | "persist")] => Some((*flag).to_string()),
         _ => return None,
     };
+    let tail_persist = typed_flag.is_some();
 
     // Multi-character verbs are matched case-insensitively: a phone keyboard
     // capitalises the first word, so `Allow brew` matched neither this nor the
@@ -270,7 +295,7 @@ fn parse_reply(text: &str) -> Option<ParsedReply> {
             "allow" => (ReplyVerb::Session, tail_persist),
             // Every other verb that means "yes" covers one call. A persist tail
             // on one of them is dropped rather than honoured: a one-call grant
-            // cannot be persisted, and `persist_ignored` makes the reply say so.
+            // cannot be persisted, and the reply says so.
             "approve" | "approved" | "yes" | "ok" => (ReplyVerb::Once, false),
             "deny" | "reject" => (ReplyVerb::Deny, tail_persist),
             _ => return None,
@@ -285,7 +310,8 @@ fn parse_reply(text: &str) -> Option<ParsedReply> {
         verb,
         basename: basename.to_string(),
         persist,
-        persist_ignored: tail_persist && verb == ReplyVerb::Once,
+        typed_verb,
+        typed_flag,
     })
 }
 
@@ -299,20 +325,37 @@ fn handle_parsed(
         // allowlist entry, no conversation grant, no disk. The next call of the
         // same command asks again — which is what "approve" says.
         ReplyVerb::Once => {
+            // Read BEFORE the resolve: the scope is gone once it is resolved.
+            let request_scope = pending.scope_by_basename(&parsed.basename);
             let Some(_) = pending.resolve_by_basename(&parsed.basename, Decision::Once) else {
                 return Some(format!(
                     "No pending approval for `{}` (or more than one queued) — nothing was allowed.",
                     parsed.basename
                 ));
             };
-            let persist_note = if parsed.persist_ignored {
-                format!(
-                    " `--persist` was ignored: `/approve` saves nothing. To allow `{0}` in every chat \
-                     and after a restart, reply `/allow {0} --persist`.",
-                    parsed.basename
-                )
-            } else {
-                String::new()
+            let persist_note = match parsed.typed_flag.as_deref() {
+                Some(flag) => {
+                    let ignored = format!(
+                        " `{flag}` was ignored: `{}` saves nothing.",
+                        parsed.typed_verb
+                    );
+                    // On the risk gate `/allow <name> --persist` holds for a
+                    // session or a run and is never saved, so it is not offered
+                    // as the way to persist.
+                    if matches!(
+                        request_scope,
+                        Some(SessionScope::MediumRisk | SessionScope::HighRisk)
+                    ) {
+                        ignored
+                    } else {
+                        format!(
+                            "{ignored} To allow `{name}` in every chat and after a restart, reply \
+                             `/allow {name} --persist`.",
+                            name = parsed.basename
+                        )
+                    }
+                }
+                None => String::new(),
             };
             Some(format!(
                 "✅ Approved `{}` for one call only — pending approval resolved; the agent will retry.{persist_note}",
@@ -344,18 +387,27 @@ fn handle_parsed(
                     parsed.basename
                 ));
             };
+            // The risk gate writes no allowlist entry, so a persistent request
+            // (a `--persist` flag, or the capital `Y`) is not applied there. The
+            // reply names what the owner typed and says so.
+            let risk_gate_persist_note = match parsed.persist_request() {
+                Some(typed) => format!(
+                    " `{typed}` asks for a persistent allow, which the risk gate does not save."
+                ),
+                None => String::new(),
+            };
             match request_scope {
                 // The risk gate: the answer holds for this basename at medium
                 // risk for the rest of the session — the shell tool records that
                 // grant — and it never touches the allowlist.
                 Some(SessionScope::MediumRisk) => Some(format!(
                     "✅ Approved `{}` for this session (medium risk only) — pending approval resolved; \
-                     the agent will retry.",
+                     the agent will retry.{risk_gate_persist_note}",
                     parsed.basename
                 )),
                 // High risk holds nothing beyond this run.
                 Some(SessionScope::HighRisk) => Some(format!(
-                    "✅ Approved `{}` for this run only — pending approval resolved; the agent will retry.",
+                    "✅ Approved `{}` for this run only — pending approval resolved; the agent will retry.{risk_gate_persist_note}",
                     parsed.basename
                 )),
                 // The unallowed-command gate (and every prompt that is not the
@@ -2757,6 +2809,192 @@ mod tests {
         assert!(ack.contains("for one call only"), "{ack}");
         assert!(!ack.contains("--persist"), "{ack}");
         assert_eq!(task.await.unwrap(), Decision::Once);
+    }
+
+    /// The ignored-flag note names the verb the owner typed. `yes brew
+    /// --persist` must not tell the owner that `/approve` saves nothing.
+    #[tokio::test]
+    async fn yes_with_persist_tail_names_the_typed_verb_not_approve() {
+        let security = supervised_only_echo();
+        let pending = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        security.set_pending(pending.clone());
+        let owners = vec!["owner1".to_string()];
+
+        let p = pending.clone();
+        let task = tokio::spawn(async move {
+            p.request_decision("brew", "brew --version", "telegram")
+                .await
+        });
+        await_pending(&pending, 1).await;
+        let ack = try_handle_reply(
+            "yes brew --persist",
+            &security,
+            "owner1",
+            &owners,
+            "telegram",
+            "chat-1",
+        )
+        .expect("recognised");
+        assert!(ack.contains("`--persist` was ignored"), "{ack}");
+        assert!(ack.contains("`yes` saves nothing"), "{ack}");
+        assert!(
+            !ack.contains("`/approve` saves nothing"),
+            "the note must not name a verb the owner did not type: {ack}"
+        );
+        assert_eq!(task.await.unwrap(), Decision::Once);
+    }
+
+    /// Reply to one pending risk-gate request in `scope` and return the reply
+    /// text and the decision the producer received.
+    async fn answer_risk_gate_request(
+        scope: crate::security::SessionScope,
+        reply: &str,
+    ) -> (String, Decision) {
+        let security = supervised_only_echo();
+        let pending = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        security.set_pending(pending.clone());
+        let owners = vec!["owner1".to_string()];
+
+        let p = pending.clone();
+        let task = tokio::spawn(async move {
+            p.request_decision_in_scope(
+                uuid::Uuid::new_v4(),
+                "brew",
+                "brew install probe",
+                "telegram",
+                String::new(),
+                scope,
+            )
+            .await
+        });
+        await_pending(&pending, 1).await;
+        let ack = try_handle_reply(reply, &security, "owner1", &owners, "telegram", "chat-1")
+            .expect("recognised");
+        (ack, task.await.unwrap())
+    }
+
+    /// The risk gate saves no allowlist entry, so a `--persist` tail on
+    /// `/allow` is not applied. The reply names the flag the owner typed and
+    /// says the gate does not save it.
+    #[tokio::test]
+    async fn risk_gate_allow_with_persist_tail_says_persistence_was_not_applied() {
+        for (scope, holds) in [
+            (
+                crate::security::SessionScope::MediumRisk,
+                "medium risk only",
+            ),
+            (crate::security::SessionScope::HighRisk, "this run only"),
+        ] {
+            let (ack, decision) = answer_risk_gate_request(scope, "/allow brew --persist").await;
+            assert!(ack.contains(holds), "the scope reply stays: {ack}");
+            assert!(
+                ack.contains(
+                    "`--persist` asks for a persistent allow, which the risk gate does not save"
+                ),
+                "{ack}"
+            );
+            assert_eq!(decision, Decision::Persist);
+        }
+    }
+
+    /// `Y` means persist although the owner typed no flag. The risk gate note
+    /// names `Y`, because that is what the owner typed.
+    #[tokio::test]
+    async fn risk_gate_capital_y_says_persistence_was_not_applied() {
+        let (ack, decision) =
+            answer_risk_gate_request(crate::security::SessionScope::MediumRisk, "Y brew").await;
+        assert!(ack.contains("medium risk only"), "{ack}");
+        assert!(
+            ack.contains("`Y` asks for a persistent allow, which the risk gate does not save"),
+            "{ack}"
+        );
+        assert!(!ack.contains("--persist"), "no flag was typed: {ack}");
+        assert_eq!(decision, Decision::Persist);
+    }
+
+    /// A risk-gate answer that asked for nothing persistent carries no note.
+    #[tokio::test]
+    async fn risk_gate_plain_allow_carries_no_persistence_note() {
+        let (ack, decision) =
+            answer_risk_gate_request(crate::security::SessionScope::MediumRisk, "/allow brew")
+                .await;
+        assert!(!ack.contains("persistent"), "{ack}");
+        assert_eq!(decision, Decision::Session);
+    }
+
+    /// Reply to one pending unallowed-command request and return the reply
+    /// text and the decision the producer received.
+    async fn answer_shell_gate_request(reply: &str) -> (String, Decision) {
+        let security = supervised_only_echo();
+        let pending = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        security.set_pending(pending.clone());
+        let owners = vec!["owner1".to_string()];
+
+        let p = pending.clone();
+        let task = tokio::spawn(async move {
+            p.request_decision("brew", "brew --version", "telegram")
+                .await
+        });
+        await_pending(&pending, 1).await;
+        let ack = try_handle_reply(reply, &security, "owner1", &owners, "telegram", "chat-1")
+            .expect("recognised");
+        (ack, task.await.unwrap())
+    }
+
+    /// The ignored-flag note quotes the flag and the verb exactly as typed,
+    /// not a fixed `--persist` or `/approve`.
+    #[tokio::test]
+    async fn one_call_note_quotes_the_flag_and_verb_as_typed() {
+        for (reply, note) in [
+            ("ok brew -p", "`-p` was ignored: `ok` saves nothing"),
+            (
+                "/Approve brew --save",
+                "`--save` was ignored: `/Approve` saves nothing",
+            ),
+            (
+                "/ yes brew --persist",
+                "`--persist` was ignored: `/yes` saves nothing",
+            ),
+        ] {
+            let (ack, decision) = answer_shell_gate_request(reply).await;
+            assert!(ack.contains(note), "{reply:?} must say {note:?}: {ack}");
+            assert_eq!(decision, Decision::Once);
+        }
+    }
+
+    /// On the risk gate `/allow <name> --persist` grants a session or a run,
+    /// never a persistent allow, so a one-call reply must not suggest it as the
+    /// way to persist. The reply still says what was ignored.
+    #[tokio::test]
+    async fn risk_gate_one_call_reply_does_not_suggest_a_persistent_allow() {
+        for scope in [
+            crate::security::SessionScope::MediumRisk,
+            crate::security::SessionScope::HighRisk,
+        ] {
+            let (ack, decision) = answer_risk_gate_request(scope, "yes brew --persist").await;
+            assert!(
+                ack.contains("`--persist` was ignored: `yes` saves nothing"),
+                "{ack}"
+            );
+            assert!(!ack.contains("/allow brew --persist"), "{ack}");
+            assert!(!ack.contains("after a restart"), "{ack}");
+            assert_eq!(decision, Decision::Once);
+        }
+    }
+
+    /// The risk-gate note quotes the typed flag and the typed verb, including a
+    /// slash and a flag other than `--persist`.
+    #[tokio::test]
+    async fn risk_gate_persistence_note_quotes_what_was_typed() {
+        for (reply, note) in [
+            ("/allow brew -p", "`-p` asks for a persistent allow"),
+            ("/ Y brew", "`/Y` asks for a persistent allow"),
+        ] {
+            let (ack, decision) =
+                answer_risk_gate_request(crate::security::SessionScope::MediumRisk, reply).await;
+            assert!(ack.contains(note), "{reply:?} must say {note:?}: {ack}");
+            assert_eq!(decision, Decision::Persist);
+        }
     }
 
     #[tokio::test]

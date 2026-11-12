@@ -157,6 +157,22 @@ impl TuiProvisioner for ProviderProvisioner {
 
             let api_key = recv_text(&mut responses).await?;
 
+            // A removed login typed as the key is a placeholder, not a key. This
+            // branch has no validation step to catch it, so it aborts here
+            // before anything is saved.
+            if let Some(sentence) =
+                crate::providers::removed_login::removed_credential_refusal(&api_key)
+            {
+                send(
+                    &events,
+                    ProvisionEvent::Failed {
+                        error: sentence.to_string(),
+                    },
+                )
+                .await?;
+                return Ok(ProvisionOutcome::Aborted(sentence.to_string()));
+            }
+
             // The endpoint's cached models, under the same key `/model` reads
             // (`custom:<base url>`). When there are some, they are offered as a
             // Choose with a typed-name row last; with none, the name is typed.
@@ -436,8 +452,14 @@ impl TuiProvisioner for ProviderProvisioner {
                 // NOT sent to the validation endpoint — a subscription
                 // credential must not reach any host, not even the one that
                 // issued it — and the operator is told what to enter instead.
+                // A removed login typed as the key (`qwen-oauth`) is refused the
+                // same way: it is a placeholder, and the probe would otherwise
+                // let it through unless the host answered 401 or 403.
                 if let Some(sentence) =
                     crate::providers::setup_token_refusal(provider_name, Some(api_key.trim()))
+                        .or_else(|| {
+                            crate::providers::removed_login::removed_credential_refusal(&api_key)
+                        })
                 {
                     send(
                         &events,
@@ -1294,6 +1316,105 @@ mod tests {
             "the refused key must not be written: {:?}",
             config.api_key
         );
+    }
+
+    /// A removed login typed as the key (`qwen-oauth`, `minimax-oauth`) is a
+    /// placeholder, not a key. It is refused with the replacement, never
+    /// validated or saved, and re-entering a normal key goes through.
+    #[tokio::test]
+    async fn a_removed_login_credential_is_refused_and_a_normal_key_goes_through() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _key = VarGuard::unset("ANTHROPIC_API_KEY");
+        let _http_proxy = VarGuard::set("HTTP_PROXY", "http://127.0.0.1:1");
+        let _https_proxy = VarGuard::set("HTTPS_PROXY", "http://127.0.0.1:1");
+        let refusal = crate::providers::removed_login::removed_credential_refusal("qwen-oauth")
+            .expect("the fixture value is a removed login credential");
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let profile = scratch_profile(tmp.path());
+
+        let mut aborted_config = Config::default();
+        let t = drive(
+            &ProviderProvisioner::new(),
+            &mut aborted_config,
+            &profile,
+            vec![
+                Answer::Pick(PICK_TIER_RECOMMENDED),
+                Answer::Pick(pick_provider("anthropic")),
+                Answer::Text("qwen-oauth"),
+                Answer::Pick(1), // Abort setup
+            ],
+        )
+        .await;
+        assert!(t.aborted(), "got {:?}", t.outcome);
+        assert!(
+            t.messages().iter().any(|m| m.contains(refusal)),
+            "the operator must be told the replacement: {:?}",
+            t.messages()
+        );
+        assert!(
+            aborted_config.api_key.is_none(),
+            "the placeholder must not be written: {:?}",
+            aborted_config.api_key
+        );
+
+        let mut config = Config::default();
+        let t = drive(
+            &ProviderProvisioner::new(),
+            &mut config,
+            &profile,
+            vec![
+                Answer::Pick(PICK_TIER_RECOMMENDED),
+                Answer::Pick(pick_provider("anthropic")),
+                Answer::Text("qwen-oauth"),
+                Answer::Pick(0), // Re-enter
+                Answer::Text("sk-ant-api-provision-key"),
+                Answer::Pick(0), // default model
+            ],
+        )
+        .await;
+        assert!(t.configured(), "got {:?}", t.outcome);
+        assert_eq!(config.api_key.as_deref(), Some("sk-ant-api-provision-key"));
+    }
+
+    /// The custom-endpoint branch has no validation step, so the same refusal
+    /// aborts there: the placeholder is not saved.
+    #[tokio::test]
+    async fn a_removed_login_credential_is_refused_for_a_custom_endpoint() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let profile = scratch_profile(tmp.path());
+        let mut config = Config::default();
+        let refusal = crate::providers::removed_login::removed_credential_refusal("minimax-oauth")
+            .expect("the fixture value is a removed login credential");
+
+        let t = drive(
+            &ProviderProvisioner::new(),
+            &mut config,
+            &profile,
+            vec![
+                Answer::Pick(custom_tier()),
+                Answer::Text("http://localhost:1234"),
+                Answer::Text("minimax-oauth"),
+            ],
+        )
+        .await;
+
+        assert!(t.aborted(), "got {:?}", t.outcome);
+        assert!(
+            t.events.iter().any(|e| matches!(
+                e,
+                super::ProvisionEvent::Failed { error } if error.contains(refusal)
+            )),
+            "the failure must carry the replacement: {:?}",
+            t.events
+        );
+        assert!(config.api_key.is_none(), "{:?}", config.api_key);
+        assert_eq!(
+            config.default_provider,
+            Config::default().default_provider,
+            "nothing may be saved"
+        );
+        assert!(config.api_url.is_none(), "{:?}", config.api_url);
     }
 
     /// The gate consults the same oracle boot uses — including the
