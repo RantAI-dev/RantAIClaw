@@ -345,6 +345,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **`rustix` is updated to 1.1.6 and `chacha20` to 0.10.2.** `rustix` 1.1.5 is flagged by
+  RUSTSEC-2026-0486: its xattr functions marked unwritten bytes as initialized for zero-length
+  buffers. The default build reaches it through `crossterm` and `tempfile`. `chacha20` 0.10.0 was
+  yanked upstream, so the lockfile moves to 0.10.2, which is in range of its dependents. Only
+  `Cargo.lock` changes, and the `deny.toml` entry for the yanked `chacha20` version is gone.
+
 - **The MCP console API's inline-script rule reads flag clusters, attached values and the programs
   a package runner runs.** The rule compared whole arguments against the inline flags, so shapes
   like these were stored and would have run: a short-option cluster (`python -Sc '…'`,
