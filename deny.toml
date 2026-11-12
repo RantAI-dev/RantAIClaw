@@ -16,16 +16,6 @@ ignore = [
     # (checked 2026-11-08), so the yanked check passes. The exact pin
     # `arrayref = "=0.3.9"` in Cargo.toml guards against the 2026-08-20 supply-chain
     # incident, which is resolved upstream. Do not bump that pin.
-    # chacha20 0.10.0 was YANKED upstream (RustCrypto), flagged by cargo-deny's
-    # yanked check — NOT a RUSTSEC vulnerability. Two pull paths in the current
-    # lockfile: rand 0.10.3 (its default ChaCha RNG), which rantaiclaw depends on
-    # directly and which lopdf 0.42 (via pdf-extract) and russh 0.65 (directly,
-    # and via num-bigint) also pull, and ssh-cipher 0.3 (via ssh-key), which
-    # russh 0.65 pulls separately. crates.io bytes are immutable, so the yanked
-    # version is byte-identical to when it was published. A non-yanked 0.10.2 is
-    # in range, but moving the lockfile to it is deliberately deferred as a
-    # separate concern; REMOVE this entry when that bump lands.
-    "chacha20@0.10.0",
     # zip 8.6.0 is reached only through docx-rs 0.4.22 (latest release,
     # 2026-07-21), which requires zip ^8.6.0, behind the opt-in `kb-office`
     # feature. calamine 0.38.0 requires zip ^9 and is not on this path.
