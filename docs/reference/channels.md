@@ -354,23 +354,50 @@ is answered the same way. A reply that is none of those — a slash-less non-han
 
 Two relays answer approval replies, and they resolve a name differently:
 
-- **Tool approvals** resolve a request only by its handle or its exact tool name.
-  `/approve <handle>` and `/approve <tool>` answer the request; naming a command
-  (`/approve kubectl` against a pending `shell` request) resolves nothing, and the relay says so.
-  A `--persist` tail makes the reply no tool approval at all, so it resolves nothing.
+- **Tool approvals** resolve a request by its handle or its exact tool name, or, with a bare verb,
+  by the one request pending in this chat. `/approve <handle>` and `/approve <tool>` answer the
+  request; naming a command (`/approve kubectl` against a pending `shell` request) resolves
+  nothing, and the relay says so. A `--persist` tail makes the reply no tool approval at all, so
+  it resolves nothing.
 - **Shell approvals** resolve a request by the command's basename. `/approve brew` answers the
   pending `brew` request. When several are pending in one chat, a bare verb does not pick one:
   the reply lists them and asks for `/approve <name>`.
 
+The forms each relay accepts, read from the reply parsers. The slash is optional everywhere, and
+verbs are matched without regard to case. The one exception is `y` against `Y` followed by a
+target, where case decides the meaning: `y` is one call and `Y` asks for a persistent allow. `n` and
+`N` both deny, and a bare `Y` is the same as a bare `y`. In the table, `<target>` is a request handle or exact tool name for tool approvals and a
+command name for shell approvals, and `<flag>` is one of `--persist`, `--save`, `-p` or `persist`.
+
+| Reply | Tool approvals | Shell approvals |
+|---|---|---|
+| `approve <target>`, `approved <target>` | One call. A handle resolves from any chat; a tool name resolves only a request raised in this chat. | One call. |
+| `approve <target> <flag>`, `approved <target> <flag>` | Not accepted: resolves nothing. | One call. The flag is ignored and the reply says so. |
+| `yes <target>`, `ok <target>` | Not accepted. | One call. A flag is ignored and the reply says so. |
+| `y <target>` | Not accepted. | One call. A flag is not accepted. |
+| `allow <target>` | Not accepted. | The command is allowlisted in every chat until restart. With a flag it is also written to disk. Not on a risk-gate prompt, see below. |
+| `Y <target>` | Not accepted. | The persistent allowlist grant, as `allow <target> <flag>`. A flag is not accepted. Not on a risk-gate prompt, see below. |
+| `deny <target>`, `reject <target>` | Denies that request, with the same handle and chat rule. | Denies that request. |
+| `n <target>`, `N <target>` | Not accepted. | Denies that request. A flag is not accepted. |
+| `approve`, `approved`, `yes`, `y`, `Y`, `ok`, `allow` alone | One call, for the one request pending in this chat. | One call, for the one request pending in this chat. |
+| `deny`, `reject`, `no`, `n`, `N` alone | Denies the one request pending in this chat. | Denies the one request pending, from any chat. |
+
+A reply that names a target takes exactly one target and, for shell approvals, at most one flag;
+anything more is chat.
+A verb alone resolves a request only when exactly one qualifies: a grant counts only requests
+raised in the same chat (channel and reply target), and with two or more the reply lists them and
+resolves none. A request with no chat, such as a direct CLI run, is never granted by a bare verb;
+name it. Every grant needs an owner; a deny does not.
+
 An answer says what it covers. `/approve`, `y`, `yes`, `ok` and the other plain-yes verbs
-cover one call only, on both relays: nothing is allowlisted and nothing is held, so the same
-command asks again on the next call. A tool approval's reply reads "Approved `<tool>` for one call
-only"; a shell approval's reply reads "Approved `<command>` for one call only". `/allow <command>`
-is the wider grant: the basename is allowlisted in every chat until the daemon restarts, and the
+cover one call only, on whichever relay accepts them (see the table): nothing is allowlisted and
+nothing is held, so the same command asks again on the next call. A tool approval's reply reads
+"Approved `<tool>` for one call only"; a shell approval's reply reads "Approved `<command>` for
+one call only". `/allow <command>` is the wider grant: the basename is allowlisted in every chat until the daemon restarts, and the
 reply reads "allowed in every chat until restart". `/allow <command> --persist` also writes it to
 disk, so it survives a restart. `Y <command>` persists too. `/approve <command> --persist` still
-covers one call only: the reply says `--persist` was ignored and names `/allow <command> --persist`
-for the persistent grant. A risk-gate prompt answered with `/allow` or `Y` gives a medium-risk
+covers one call only: the reply says `--persist` was ignored and, for an unallowed command, names
+`/allow <command> --persist` for the persistent grant. A risk-gate prompt answered with `/allow` or `Y` gives a medium-risk
 session grant, or a grant for this run only at high risk; it does not change the allowlist and
 cannot be persisted.
 Deny needs no owner — stopping a pending action is always safe — while every kind of grant needs one,

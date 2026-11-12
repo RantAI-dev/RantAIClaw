@@ -767,6 +767,15 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
     }
 }
 
+/// Refuse a credential value that names a removed login, so setup never saves
+/// the placeholder as an API key. The error carries the replacement.
+fn refuse_removed_credential(credential: &str) -> Result<()> {
+    if let Some(refusal) = crate::providers::removed_login::removed_credential_refusal(credential) {
+        bail!("{refusal}");
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 pub async fn run_quick_setup(
     credential_override: Option<&str>,
@@ -779,6 +788,11 @@ pub async fn run_quick_setup(
     // this function would catch it. Refuse before anything is written.
     if let Some(refusal) = provider.and_then(crate::providers::removed_login_refusal) {
         bail!("{refusal}");
+    }
+    // The same login can arrive as the credential (`--api-key qwen-oauth`), a
+    // placeholder that would be stored as if it were a key.
+    if let Some(credential) = credential_override {
+        refuse_removed_credential(credential)?;
     }
 
     println!("{}", style(BANNER).cyan().bold());
@@ -2931,6 +2945,7 @@ pub(crate) fn setup_provider(
             style(&model).green()
         );
 
+        refuse_removed_credential(&api_key)?;
         return Ok((provider_name, api_key, model, None));
     }
 
@@ -3330,6 +3345,7 @@ pub(crate) fn setup_provider(
         style(&model).green()
     );
 
+    refuse_removed_credential(&api_key)?;
     Ok((provider_name.to_string(), api_key, model, provider_api_url))
 }
 
@@ -6536,6 +6552,52 @@ mod tests {
             !cfg_dir.exists(),
             "a refused name must not create the config directory"
         );
+    }
+
+    /// A removed login can also arrive as the credential: `--api-key
+    /// qwen-oauth` is a placeholder, not a key. Quick setup refuses it for any
+    /// provider, including `qwen` itself and the default, names the
+    /// replacement, and writes nothing. A normal key is still saved.
+    #[tokio::test]
+    async fn quick_setup_refuses_a_removed_login_credential_and_writes_nothing() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = TempDir::new().unwrap();
+        let _home = pin_home(&tmp);
+        let cfg_dir = tmp.path().join("cfg");
+        let _dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", &cfg_dir);
+        let _ws = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+
+        for (provider, credential) in [
+            (Some("qwen"), "qwen-oauth"),
+            (Some("openrouter"), "minimax-oauth"),
+            (None, "Qwen_Code"),
+        ] {
+            let err = run_quick_setup(Some(credential), provider, None, Some("sqlite"), false)
+                .await
+                .expect_err("a removed login credential must not be saved");
+            let expected = crate::providers::removed_login::removed_credential_refusal(credential)
+                .expect("the fixture value is a removed login credential");
+            assert!(
+                err.to_string().contains(expected),
+                "the error for {credential:?} must carry the replacement text, got {err}"
+            );
+            assert!(
+                !cfg_dir.exists(),
+                "a refused {credential:?} must not create the config directory"
+            );
+        }
+
+        let config = run_quick_setup(
+            Some("sk-plain-unit-key"),
+            Some("openrouter"),
+            None,
+            Some("sqlite"),
+            false,
+        )
+        .await
+        .expect("a normal key is still saved");
+        assert!(config.config_path.exists());
+        assert_eq!(config.api_key.as_deref(), Some("sk-plain-unit-key"));
     }
 
     #[tokio::test]
