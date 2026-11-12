@@ -148,8 +148,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `npx --loglevel silent node -e '…'`, `npm -C /tmp x -c '…'`); a candidate named like an
   interpreter and followed by an inline flag is refused even when it is the package's own argument.
   `npx -pc '…'` is refused too: only an exact `-p` is `--package`, and inside a cluster it is
-  `--parseable`. `npm exe` is read as `npm exec`. `-c` is read inside a cluster, `--ca` and `--cal`
-  are refused as a conservative reading of `--call`, and the `data:` scheme is read in any case.
+  `--parseable`. `npm exe` is read as `npm exec`. `-c` is read inside a cluster, `--c` and `--c=…`
+  are refused because npm resolves them to `--call`, `--ca` and `--cal` are refused as a
+  conservative reading of `--call`, and the `data:` scheme is read in any case.
   The candidate scan is bounded so a long argument list cannot make it expensive: an entry over 256
   programs in its chain, or a program given more than 256 arguments, is refused with a 400 that
   says the launch chain is too long or too complex to verify. A module that is a file
@@ -158,15 +159,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `perl -I/home/user/lib server.pl`, `python -Wignore::DeprecationWarning -m pkg` and
   `node -rdotenv/config server.js` are accepted, while `python -Wignore -c '…'` and
   `ruby -rx -e '…'` stay refused. A script's own flag that looks like an inline flag
-  (`node server.js -p 3000`) is still refused. A package's own argument whose last path segment is
-  `env` (`npx -y @modelcontextprotocol/server-filesystem /srv/data/env`) is read as a candidate
-  `env` that cannot be resolved, so the entry is refused too. That over-refusal is accepted.
-  `npm_config_*` environment variables, `npx --node-options=…`, debugger options such as
-  `--inspect`, `perl -d:Module;code`, `uv run`, `bun`, `php`, `pwsh` and modules that run code (`python -m timeit`)
-  are still not read: the rule is a best-effort guard at the console API's write boundary, not a
-  sandbox. Every refusal
-  answers **400** and writes nothing. No config key and no default changed, so the config schema
-  stays at version 40.
+  (`node server.js -p 3000`) is still refused. `node --inspect`, `--inspect-brk` and
+  `--inspect-wait` (with or without `=host:port`) are refused, on the command line and in
+  `NODE_OPTIONS`, because they open a debugger port that takes commands from whoever can reach it.
+  A runner's argument whose last path segment is `env` is no longer refused in two cases. In the
+  first, the arguments behind it are read in full and name no program, as in
+  `npx -y @modelcontextprotocol/server-filesystem /srv/data/env`. In the second, the arguments
+  behind it cannot be read and no `-S` or `NAME=value` word follows, as in
+  `npx --prefix /srv/app/env -y pkg`. Every plain word is still checked as a candidate of its own.
+  Any other `env` candidate is still read as `env`, because npx runs a binary it finds in the global
+  bin directory, and an argument list the guard cannot read is still refused when a `-S` or
+  `NAME=value` word follows (`npx -y env -S '${P} ${A} ${B}'`). `npm_config_*` environment variables, `npx --node-options=…`,
+  Python environment variables (`PYTHONWARNINGS` with a dotted category imports a module that can
+  run the program named by `BROWSER`), `perl -d:Module;code`, `uv run`, `bun`, `php`, `pwsh` and
+  modules that run code (`python -m timeit`) are still not read: the rule is a best-effort guard at
+  the console API's write boundary, not a sandbox. Every refusal answers **400** and writes nothing.
+  No config key and no default changed, so the config schema stays at version 40.
 - **The model-routes wizard no longer saves a route to a removed login, and the legacy-login sweep
   logs a removal it cannot make.** The wizard asked the provider factory whether a name was valid,
   and the factory still builds a provider for `copilot`, `openai-codex`, `qwen-code` and the
