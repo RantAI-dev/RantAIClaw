@@ -346,12 +346,13 @@ jobs:
     # every other Rust job; the rust-cache keyed `channel-features` keeps the
     # matrix-sdk tree warm so only the first run pays for its ~67 extra crates.
     #
-    # The test steps are skipped — not the job — when the change scope says
-    # no channel-feature file changed. The job still reports `success` then,
-    # and that is the only shape the merge gate accepts for it. Each step
-    # carries `!cancelled()` so a failing step does not stop the next one,
-    # because the two channels were independent jobs before the merge and
-    # one failure must not hide the other's result.
+    # Only the two filtered test steps are skipped — not the job and not the
+    # compile check — when the change scope says no channel-feature file
+    # changed. The job still reports `success` then, and that is the only
+    # shape the merge gate accepts for it. Each step carries `!cancelled()`
+    # so a failing step does not stop the next one, because the two channels
+    # were independent jobs before the merge and one failure must not hide
+    # the other's result.
     channel-features:
         name: Channel Features (Lark + Matrix)
         needs: [changes, fmt]
@@ -377,6 +378,23 @@ jobs:
               with:
                   key: channel-features
                   save-if: ${{ github.ref == 'refs/heads/main' }}
+            # `--lib` alone is not enough to claim the feature builds. Turning it
+            # on pulls `decancer`, whose `impl Add<Translation> for String` makes
+            # `String + &String` ambiguous — which broke two integration tests
+            # (`tests/kb/chunk_test.rs`) that no `--lib` run touches. Checking
+            # every target is what makes "builds with channel-matrix" true.
+            #
+            # No `channel_features_changed` condition, on purpose: `channel-matrix`
+            # is not a default feature, so this is the only compile of
+            # `src/channels/matrix.rs`, and that file depends on others the scope
+            # rule does not cover (`src/channels/traits.rs`, `src/channels/pairing.rs`,
+            # `src/security/pairing_store`, `tests/`). Skipping the check on a PR
+            # that touches only those would merge green and turn `main` red.
+            # It runs first so its result is the first one in the log; the test
+            # steps still run after it fails, because each carries `!cancelled()`.
+            - name: Check every target under channel-matrix
+              if: ${{ !cancelled() }}
+              run: cargo check --locked --features channel-lark,channel-matrix --all-targets
             # Both features are enabled for both filtered test runs: the point
             # of the job is that the two channels compile together, which is
             # the only combination a user can build.
@@ -386,14 +404,6 @@ jobs:
             - name: Build and test channel-matrix
               if: ${{ !cancelled() && (github.event_name == 'push' || needs.changes.outputs.channel_features_changed == 'true') }}
               run: bash scripts/ci/run_filtered_lib_tests.sh test --locked --features channel-lark,channel-matrix --lib channels::matrix
-            # `--lib` alone is not enough to claim the feature builds. Turning it
-            # on pulls `decancer`, whose `impl Add<Translation> for String` makes
-            # `String + &String` ambiguous — which broke two integration tests
-            # (`tests/kb/chunk_test.rs`) that no `--lib` run touches. Checking
-            # every target is what makes "builds with channel-matrix" true.
-            - name: Check every target under channel-matrix
-              if: ${{ !cancelled() && (github.event_name == 'push' || needs.changes.outputs.channel_features_changed == 'true') }}
-              run: cargo check --locked --features channel-lark,channel-matrix --all-targets
 
     features:
         name: Features (no-default, otel, kb-office)

@@ -164,16 +164,19 @@ while IFS= read -r file; do
   fi
 
   # `channel_features_changed` is the narrower flag: the files that can
-  # change what the channel-feature build compiles, or which filter the
-  # channel-features job runs. A pull request that touches none of them
-  # cannot change the outcome of that build, so the job's test steps are
-  # skipped by design.
+  # change the outcome of the two filtered channel test runs, or which
+  # filter the channel-features job runs. A pull request that touches none
+  # of them skips those two test steps by design. The flag filters only
+  # those two steps. The channel-matrix compile check in the same job runs
+  # on every Rust pull request, because `src/channels/matrix.rs` depends on
+  # files outside this set (`src/channels/traits.rs`,
+  # `src/channels/pairing.rs`, `src/security/pairing_store`, `tests/`).
   #
   # The set is not just "the Lark and Matrix modules". `channel-matrix` is
   # not a default feature, so a body under `#[cfg(feature = "channel-matrix")]`
   # is compiled by no other job — not lint, not test, not the feature
-  # matrix. A file carrying such a gate belongs in this set, or the Matrix
-  # build goes unchecked on that pull request.
+  # matrix. A file carrying such a gate belongs in this set, or its channel
+  # tests go unrun on that pull request.
   #
   # The explicit paths below cover the modules, the manifest and lockfile
   # that decide the feature set, the workflow that selects the job and the

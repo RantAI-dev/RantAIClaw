@@ -49,7 +49,7 @@ Use this with:
    - `test`, `msrv`, `channel-features`, `features`, `bench-compile` and `build` each need `[changes, fmt]` and run only when `rust_changed` is true and `fmt` succeeded. They do not wait for `lint`.
    - `test` runs `cargo test --locked --workspace -- --test-threads=1`. This includes the `agent_e2e` integration target, so there is no separate `e2e` job.
    - `msrv` checks every target at the declared minimum Rust version.
-   - `channel-features` is one job with three test and check steps. The steps run on every push and on a PR only when `channel_features_changed` is true. On a PR that does not touch channel code, the job reports success with those steps skipped.
+   - `channel-features` is one job with a compile check and two filtered test steps. The check (`cargo check --locked --features channel-lark,channel-matrix --all-targets`) runs first, on every Rust-changing PR and every push, and a failure blocks the gate. The two test steps run on every push and on a PR only when `channel_features_changed` is true. On a PR that does not touch channel code, the job reports success with the two test steps skipped.
    - `features` is one job with three sequential steps: `cargo check` for `no-default-features`, `observability-otel` and `kb-office`. It is not a matrix.
    - `bench-compile` runs `cargo bench --no-run --locked`.
    - `build` runs a `release-fast` smoke build and the binary-size guard.
@@ -68,7 +68,7 @@ Use this with:
 ### 2) Push to `main` (including after merge)
 
 1. Commit reaches `main`.
-2. `ci-run.yml` runs on `push`. `changes` diffs against the commit before the push, and the Rust stages follow the same `rust_changed` and `fmt` conditions as on a PR (no `ci:full` requirement). The only difference in which Rust stages run is that the `channel-features` test and check steps always run on a push.
+2. `ci-run.yml` runs on `push`. `changes` diffs against the commit before the push, and the Rust stages follow the same `rust_changed` and `fmt` conditions as on a PR (no `ci:full` requirement). The only difference in which Rust stages run is that the two `channel-features` test steps always run on a push.
 3. `sec-audit.yml` runs on `push` when `Cargo.toml`, `Cargo.lock`, `src/**`, `crates/**` or `deny.toml` changed.
 4. Path-filtered workflows run only if touched files match their filters.
 5. `CI Required Gate` computes overall push result.
@@ -108,7 +108,7 @@ Workflow: `.github/workflows/pub-release.yml`.
 ## Merge/Policy Notes
 
 1. Branch protection should require only `CI Required Gate` for the Rust pipeline, so internal stages can change without touching protection settings. The other checks safe to require today are `Intake Checks`, `Conventional Commit Title`, `Workflow Sanity (tabs)`, `Workflow Sanity (actionlint)`, `Security Audit` and `License & Supply Chain`, because each one reports on every pull request (see `docs/contributing/ci-map.md`).
-2. Every Rust stage runs on every Rust-changing PR and none is label-gated. The heavy stages wait for `fmt`, not for `lint`. The `channel-features` test steps skip on a PR that does not touch channel code, and the job still reports success. The gate reads all eight stages. `docs-quality` runs whenever docs change and the gate requires it.
+2. Every Rust stage runs on every Rust-changing PR and none is label-gated. The heavy stages wait for `fmt`, not for `lint`. The `channel-features` compile check runs on every such PR. Its two test steps skip on a PR that does not touch channel code, and the job still reports success. The gate reads all eight stages. `docs-quality` runs whenever docs change and the gate requires it.
 3. `sec-audit.yml` runs on PR (every PR), on push (Cargo paths only) and on a weekly schedule.
 4. Workflow-file changes are linted by `workflow-sanity.yml`, which has four jobs: tabs, `actionlint`, release tag ancestry and pinned sources. There is no maintainer-approval gate.
 5. Workflow-specific JavaScript helpers are organized under `.github/workflows/scripts/`.
@@ -150,7 +150,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-  A["Commit reaches main"] --> B["ci-run.yml (same stages as a PR; channel-features test steps always run)"]
+  A["Commit reaches main"] --> B["ci-run.yml (same stages as a PR; the two channel-features test steps always run)"]
   A --> C["sec-audit.yml"]
   A --> D["path-scoped workflows (if matched)"]
   N["Nightly schedule 03:23 UTC"] --> E["pub-docker-img.yml (builds main as edge)"]
