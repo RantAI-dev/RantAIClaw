@@ -7,7 +7,7 @@ Three numbers define this pillar: cold start, RAM, binary size. The install pipe
 ## What this pillar covers
 
 - One-line installer (`curl | bash`)
-- Docker image (`ghcr.io/rantai-dev/rantaiclaw:<tag>`)
+- Docker image (`ghcr.io/rantai-dev/rantaiclaw:<tag>` — `:latest` is the most recent release, `:edge` the nightly `main` build)
 - Multi-target release matrix (Linux x86_64 / aarch64 / armv7 · macOS x86_64 / aarch64 · Windows x86_64)
 - GLIBC 2.35 baseline (Ubuntu 22.04 LTS, Debian 12, RHEL 9 supported)
 - cosign keyless signing
@@ -120,7 +120,7 @@ a claim, not a status; where a row could not be settled by reading, it says so._
    verify-artifacts (sha256, archive-shape, smoke)
             │
             ▼
-   pub-docker-img → ghcr.io/rantai-dev/rantaiclaw:<tag>
+   pub-release.yml (publish) → ghcr.io/rantai-dev/rantaiclaw:<tag> + :latest
             │
             ▼
    GitHub Release publish (binaries + cosign bundle + SHA256SUMS)
@@ -139,7 +139,7 @@ a claim, not a status; where a row could not be settled by reading, it says so._
 curl -fsSL https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/install.sh | bash
 
 # Docker
-docker run --rm -it ghcr.io/rantai-dev/rantaiclaw:latest
+docker run --rm -it ghcr.io/rantai-dev/rantaiclaw:latest  # :latest = most recent release
 
 # Self-update (future)
 rantaiclaw update

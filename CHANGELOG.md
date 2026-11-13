@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The Docker `:latest` tag now names the most recent release, and `main` is published nightly as
+  `:edge`.** Until now every push to `main` built and published a Docker image, and `latest`
+  followed `main` — so `latest` named unreleased code, and `docker pull
+  ghcr.io/rantai-dev/rantaiclaw:latest` could install a commit that was never released. A release
+  moves `latest` now: `pub-release.yml`'s publish job tags the release image as `:vX.Y.Z`,
+  `:sha-<12>` and `:latest`, and a verification-only dry run never reaches that step. Until the
+  next release publishes it, the registry's `latest` still names the last `main` build from
+  before this change. `main` is no longer built on every push — it is built once per night and
+  published as `:edge` plus its `:sha-<12>` tag. `:edge` is unreleased code and can break, so
+  pull `:latest` for a released build and `:vX.Y.Z` to pin one. Every published image keeps its
+  `:sha-<12>` tag, and a Dockerfile change in a pull request is still smoke-built.
+
 - **The `webhook` catalog row now says what it is.** The row carried `under development`, so the
   console listed the webhook as locked and the TUI roster called it "not started", although the
   route ships and answers requests. The catalog gains a third support value, `served by the

@@ -36,7 +36,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 ### Non-Blocking but Important
 
 - `.github/workflows/pub-docker-img.yml` (`Docker`)
-    - Purpose: PR Docker smoke check on its build-input paths, and publish a multi-arch `latest`+`sha-<12>` image on every push to `main` (the `push` trigger is not path-scoped; only `pull_request` is). Manual dispatch triggers the same build + publish. There is no `v*` tag trigger on this workflow — the release Docker image for a tag is published by `pub-release.yml`'s `publish` job.
+    - Purpose: PR Docker smoke check on its build-input paths, and publish a multi-arch `edge`+`sha-<12>` image from a nightly build of `main` (daily 03:23 UTC). A manual dispatch on `main` runs the same build + publish; a dispatch from another branch publishes nothing. This workflow never publishes `latest` — that tag names the most recent release and is moved by `pub-release.yml`'s `publish` job, which is also where the release image for a `v*` tag is published. There is no `push` trigger and no `v*` tag trigger on this workflow.
 - `.github/workflows/sec-audit.yml` (`Security Audit`)
     - Purpose: dependency advisories (`rustsec/audit-check`, pinned SHA) and policy/license checks (`cargo deny`). Runs on PR + push to main + weekly Mon 06:00 UTC.
 - `.github/workflows/sec-codeql.yml` (`CodeQL Analysis`)
@@ -61,7 +61,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 ## Trigger Map
 
 - `CI`: push to `main`, PRs to `main`.
-- `Docker`: push to `main` (no path filter on the `push` trigger; only `pull_request` is path-scoped on Dockerfile build inputs), PRs to `main` when Dockerfile build inputs change, manual dispatch. No `v*` tag trigger.
+- `Docker`: nightly schedule (daily 03:23 UTC, builds `main` as `edge`), PRs to `main` when Dockerfile build inputs change (path-scoped), manual dispatch on `main`. No `push` trigger and no `v*` tag trigger.
 - `Release`: tag push (`v*`), weekly schedule (verification-only), manual dispatch (verification or publish).
 - `Security Audit`: push to `main` when Cargo paths change, PRs to `main` (no path filter), weekly schedule.
 - `CodeQL`: weekly schedule, manual dispatch.

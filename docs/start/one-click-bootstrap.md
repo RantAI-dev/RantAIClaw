@@ -125,7 +125,7 @@ workspace/config mounts remain writable inside the container.
 
 If you add `--skip-build`, bootstrap skips local image build. It first tries the local
 Docker tag (`RANTAICLAW_DOCKER_IMAGE`, default: `rantaiclaw-bootstrap:local`); if missing,
-it pulls `ghcr.io/rantai-dev/rantaiclaw:latest` and tags it locally before running.
+it pulls `ghcr.io/rantai-dev/rantaiclaw:latest` (the most recent release) and tags it locally before running.
 
 ### Quick onboarding (non-interactive)
 
