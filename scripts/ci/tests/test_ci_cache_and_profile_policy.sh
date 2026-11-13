@@ -2,10 +2,11 @@
 # Tests for the CI cache and profile policy in .github/workflows/ci-run.yml.
 #
 # The invariant: the merge-blocking CI workflow writes its Actions cache
-# from `main` only, and the compile-only bench job does not pay for the
-# release profile's fat LTO.
+# from `main` only, the compile-only bench job does not pay for the
+# release profile's fat LTO, and the channel-matrix compile check runs on
+# every Rust PR.
 #
-# Three policies and their wiring, nine assertions:
+# Four policies and their wiring, thirteen assertions:
 #
 #   1. every `Swatinem/rust-cache` use carries
 #      `save-if: ${{ github.ref == 'refs/heads/main' }}`, the number of
@@ -22,7 +23,19 @@
 #      untouched: the release profile keeps its settings. (four assertions)
 #   3. the workflow-level env sets `CARGO_PROFILE_DEV_DEBUG=line-tables-only`
 #      for the dev and test profiles. (one assertion)
-#   4. the workflow runs this self-test from a `run:` step — a policy
+#   4. in the `channel-features` job the step that runs `cargo check
+#      --locked --features channel-lark,channel-matrix --all-targets` has no
+#      `if:` or one that is only `!cancelled()` or `always()`, so no scope
+#      flag, event name or branch test can skip it on a PR, while the two
+#      filtered test steps keep their `channel_features_changed`
+#      condition. The check step also carries no `continue-on-error`
+#      (absent, or `false`), because its failure has to block the gate.
+#      `channel-matrix` is not a default feature, so this is the only
+#      compile of `src/channels/matrix.rs`, and the files it depends on (`src/channels/traits.rs`, `src/channels/pairing.rs`,
+#      `src/security/pairing_store`, `tests/`) sit outside the change-scope
+#      rule. A condition on the check would let a PR that breaks matrix
+#      merge green and turn `main` red. (four assertions)
+#   5. the workflow runs this self-test from a `run:` step — a policy
 #      nothing runs is not a policy. (one assertion)
 #
 # Plain bash, grep and awk: no YAML parser and no new dependency, so the
@@ -159,6 +172,22 @@ rust_cache_save_if_states() {
     ' "$WORKFLOW"
 }
 
+# The lines of one step of a job: from the `- name:` line whose value is
+# `step_name` up to the next list item at the same indentation. Comment
+# lines are dropped, so a comment that mentions a key is never read as the
+# key. Steps sit at 12 spaces in `ci-run.yml`.
+step_block() {
+    local job="$1" step_name="$2"
+    job_block "$job" | awk -v step_name="$step_name" '
+        /^[[:space:]]*#/ { next }
+        /^            - / {
+            if (in_step) { exit }
+            if ($0 == "            - name: " step_name) { in_step = 1 }
+        }
+        in_step { print }
+    '
+}
+
 # Assert that an env block carries `name` with exactly `expected`.
 assert_env_value() {
     local env_dump="$1" name="$2" expected="$3" label="$4"
@@ -216,6 +245,74 @@ fi
 printf '\n=== dev and test profiles carry less debug info ===\n'
 workflow_env="$(env_vars_at 0 <"$WORKFLOW")"
 assert_env_value "$workflow_env" "CARGO_PROFILE_DEV_DEBUG" "line-tables-only" "workflow env"
+
+printf '\n=== the channel-matrix compile check runs on every Rust PR ===\n'
+MATRIX_CHECK_STEP="Check every target under channel-matrix"
+MATRIX_CHECK_CMD="cargo check --locked --features channel-lark,channel-matrix --all-targets"
+check_step="$(step_block channel-features "$MATRIX_CHECK_STEP")"
+
+if printf '%s\n' "$check_step" | sed 's/^[[:space:]]*//' | grep -Fxq "run: ${MATRIX_CHECK_CMD}"; then
+    log_pass "channel-features step '${MATRIX_CHECK_STEP}' runs ${MATRIX_CHECK_CMD}"
+else
+    log_fail "channel-features has no step '${MATRIX_CHECK_STEP}' that runs ${MATRIX_CHECK_CMD}"
+fi
+
+# The check must run on every Rust PR, so its `if:` is either absent or
+# only keeps the step running after an earlier failure: `!cancelled()` or
+# `always()`. Any other condition (a scope flag, an event name, a branch)
+# can skip it on a PR and is reported by name. The `${{ }}` wrapper and the
+# whitespace around the expression do not count.
+if [ -z "$check_step" ]; then
+    log_fail "step '${MATRIX_CHECK_STEP}' is missing from the channel-features job"
+else
+    check_conditions="$(printf '%s\n' "$check_step" | sed -n 's/^[[:space:]]*if:[[:space:]]*//p' |
+        sed -e 's/^\${{[[:space:]]*//' -e 's/[[:space:]]*}}[[:space:]]*$//' -e 's/[[:space:]]*$//')"
+    bad_condition=""
+    while IFS= read -r condition; do
+        case "$condition" in
+            "" | '!cancelled()' | 'always()') ;;
+            *) bad_condition="$condition" ;;
+        esac
+    done <<<"$check_conditions"
+    if [ -z "$bad_condition" ]; then
+        log_pass "step '${MATRIX_CHECK_STEP}' has no condition that can skip it on a PR"
+    else
+        log_fail "step '${MATRIX_CHECK_STEP}' carries the condition '${bad_condition}', which can skip the compile check on a PR — only '!cancelled()' or 'always()' are allowed"
+    fi
+fi
+
+# `continue-on-error: true` would let a failing check leave the job green.
+# Only a missing key or an explicit `false` keeps the failure blocking.
+if [ -z "$check_step" ]; then
+    log_fail "step '${MATRIX_CHECK_STEP}' is missing, so its continue-on-error cannot be checked"
+else
+    coe_values="$(printf '%s\n' "$check_step" | sed -n 's/^[[:space:]]*continue-on-error:[[:space:]]*//p' |
+        sed -e 's/^\${{[[:space:]]*//' -e 's/[[:space:]]*}}[[:space:]]*$//' -e 's/[[:space:]]*$//')"
+    bad_coe=""
+    while IFS= read -r value; do
+        case "$value" in
+            "" | 'false') ;;
+            *) bad_coe="$value" ;;
+        esac
+    done <<<"$coe_values"
+    if [ -z "$bad_coe" ]; then
+        log_pass "step '${MATRIX_CHECK_STEP}' does not set continue-on-error, so its failure blocks the job"
+    else
+        log_fail "step '${MATRIX_CHECK_STEP}' sets continue-on-error: ${bad_coe}, so a failing compile check would not block the gate"
+    fi
+fi
+
+test_steps_filtered=0
+for test_step in "Build and test channel-lark" "Build and test channel-matrix"; do
+    if step_block channel-features "$test_step" | grep -E '^[[:space:]]*if:' | grep -q 'channel_features_changed'; then
+        test_steps_filtered=$((test_steps_filtered + 1))
+    fi
+done
+if [ "$test_steps_filtered" -eq 2 ]; then
+    log_pass "both filtered channel test steps still carry the channel_features_changed condition"
+else
+    log_fail "only ${test_steps_filtered} of 2 filtered channel test steps carry the channel_features_changed condition"
+fi
 
 printf '\n=== the self-test runs in CI ===\n'
 # Anchored on a `run:` key: a comment that mentions the script path is not
