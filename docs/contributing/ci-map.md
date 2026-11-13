@@ -13,7 +13,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - `.github/workflows/ci-run.yml` (`CI`)
     - Purpose: single consolidated Rust quality gate with internal stages.
         - `fmt` — `cargo fmt --all -- --check` on its own, so a formatting mistake is reported in seconds instead of behind the whole lint job. It needs no cargo cache (rustfmt compiles nothing) and it is what the heavy jobs wait for.
-        - `lint` — `cargo clippy --locked --all-targets -- -D clippy::correctness`, plus strict delta clippy on changed Rust lines (`scripts/ci/rust_strict_delta_gate.sh`). The format check used to live here too; it moved to the `fmt` job, so the lint job calls `scripts/ci/rust_quality_gate.sh --skip-fmt`.
+        - `lint` — one clippy run whose JSON both gates read: `cargo clippy --locked --all-targets --keep-going --message-format=json -- -D clippy::correctness` (`scripts/ci/run_clippy_json.sh`). The run used to happen twice — once in the quality gate and once in the strict delta gate — and the second one re-checked every target for findings the first had already produced. `scripts/ci/rust_quality_gate.sh --skip-fmt` reads that JSON and fails on any error-level finding (a compile error, or a correctness lint that no crate attribute lowered to a warning); `scripts/ci/rust_strict_delta_gate.sh` reads the same JSON and fails on any clippy warning on a line the branch changed. The format check used to live here too; it moved to the `fmt` job, so the lint job calls the quality gate with `--skip-fmt`.
         - `test` — `cargo test --locked --workspace -- --test-threads=1`. Not `nextest`: it was tried and the runner SIGTERM'd or hit the job cap on this codebase. `--test-threads=1` because many unit tests mutate process-global env behind per-file locks that do not serialize across modules. The `tests/agent_e2e.rs` integration target is auto-discovered by the root package, so it runs here; the separate `e2e` job that re-ran the same tests is gone.
         - `msrv` — `cargo check --all-targets` at the toolchain `Cargo.toml`'s `rust-version` field declares, read out of the manifest rather than pinned in the workflow so the job cannot defend a number the manifest no longer says.
         - `features` — one job, three checks in sequence: `no-default-features`, `observability-otel`, `kb-office`. Each step runs under `if: !cancelled()`, so a failing combination does not hide the other two — the property the old `fail-fast: false` matrix gave.
@@ -92,6 +92,17 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - Keep merge-blocking checks deterministic and reproducible (`--locked` where applicable).
 - Follow `docs/contributing/release-process.md` for verify-before-publish release cadence and tag discipline.
 - Keep merge-blocking rust quality policy aligned across `.github/workflows/ci-run.yml`, `dev/ci.sh`, and `.githooks/pre-push` (`./scripts/ci/rust_quality_gate.sh` + `./scripts/ci/rust_strict_delta_gate.sh`). The local script stays the complete gate: it formats unless `--skip-fmt` is passed, and only the CI lint job passes that flag, because the workflow runs the format check in the `fmt` job.
+- To reproduce the CI lint job locally, lint the crate once and hand the same JSON to both gates. `CLIPPY_JSON_FILE` and `CLIPPY_EXIT_CODE` describe that one run and have to be set together:
+
+  ```bash
+  out="$(mktemp)"
+  code=0
+  cargo clippy --locked --all-targets --keep-going --message-format=json -- -D clippy::correctness >"$out" || code=$?
+  CLIPPY_JSON_FILE="$out" CLIPPY_EXIT_CODE="$code" ./scripts/ci/rust_quality_gate.sh --skip-fmt
+  CLIPPY_JSON_FILE="$out" CLIPPY_EXIT_CODE="$code" ./scripts/ci/rust_strict_delta_gate.sh
+  ```
+
+  With `CLIPPY_JSON_FILE` unset, both gates run clippy themselves, so the plain `./scripts/ci/rust_quality_gate.sh` and `./scripts/ci/rust_strict_delta_gate.sh` calls keep working on their own.
 - Use `./scripts/ci/rust_strict_delta_gate.sh` (or `./dev/ci.sh lint-delta`) as the incremental strict merge gate for changed Rust lines.
 - Run full strict lint audits regularly via `./scripts/ci/rust_quality_gate.sh --strict` (for example through `./dev/ci.sh lint-strict`) and track cleanup in focused PRs.
 - Keep docs markdown gating incremental via `./scripts/ci/docs_quality_gate.sh` (block changed-line issues, report baseline issues separately).
