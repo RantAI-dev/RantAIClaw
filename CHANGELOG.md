@@ -119,6 +119,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A TUI approval prompt is answered only by a key pressed while its pane is on screen.** The
+  setup overlay, first-run wizard, list picker and info panel each replace the whole frame, the
+  approval pane included, but the answer keys were read before these four views saw a key. A
+  prompt that arrived while one of them was open, or was already waiting when it opened, could
+  therefore be answered without the operator seeing it: a `y` typed into a picker filter answered
+  "yes (session)" for a command never shown, the Esc that closes a picker denied the request and
+  cancelled the turn while the picker stayed open, and a `y` or `n` typed into a setup prompt, an
+  API key for instance, answered it. These four views now receive the answer keys (`y`, `n`, `F2`
+  and `Esc`), so a key pressed in one of them never answers the prompt, and the prompt stays
+  pending. Ctrl+C and Ctrl+D still quit from them. The login gate already received every key, so
+  its defect was only that it hid the pane with no notice. Every view that hides a waiting prompt now shows a one-line notice
+  on the last row of the screen, "Approval waiting, answer it once this view is closed." Closing
+  the view brings the pane back. The same condition decides what the frame draws and whether a key
+  can answer, so the two cannot disagree. `/allow` and `/deny` and the keys while the pane is on
+  screen are unchanged. The command preview in the pane is cut to one row ending in `…` when it
+  does not fit, where a long command used to wrap and push the row of answer keys out of the pane.
+  The cut keeps the start of the command, so the end of a long command is not shown in the pane.
+  The scrollback line written when the request arrived has the full command.
+
 - **The TUI approval prompt now shows when its answer keys are off, and no hint offers a key that is
   off.** An answer key counts only into an empty composer, but the composer is hidden while the
   prompt is up, so text left in it (a message typed before the prompt opened) made `y`, `F2` and
@@ -361,6 +380,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   warning stays until an org admin makes the package public for anonymous pulls.
 
 ### Security
+
+- **Answer keys act on an approval prompt only while its pane is on screen.** Before this change, a
+  `y` typed as the first letter of a picker filter, or a `y` or `n` typed into a setup prompt such
+  as an API key, answered a waiting approval prompt for a command the operator had never seen. A
+  session answer also added the command's basename to the session's runtime allowlist at the
+  unallowed-command prompt. At a risk gate it was a risk-scoped grant instead. See the Fixed entry
+  above for the rest.
 
 - **`rustix` is updated to 1.1.6 and `chacha20` to 0.10.2.** `rustix` 1.1.5 is flagged by
   RUSTSEC-2026-0486: its xattr functions marked unwritten bytes as initialized for zero-length
