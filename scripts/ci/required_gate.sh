@@ -27,6 +27,10 @@
 #   RUST_CHANGED               "true" when the diff touches Rust
 #   DOCS_ONLY                  "true" when the diff is documentation only
 #   DOCS_CHANGED               "true" when the diff touches documentation
+#   CHANGES_RESULT             result of the job that computes the scope values
+#                              listed here. They are empty when that job did
+#                              not finish, so the gate requires `success`
+#                              before it trusts any of them.
 #   CHANNEL_FEATURES_CHANGED   "true" when the diff can change what the
 #                              channel-feature build compiles
 #   IDENTITY_RESULT            result of each job, as GitHub reports it:
@@ -52,6 +56,7 @@ GATE_VARS=(
     DOCS_ONLY
     DOCS_CHANGED
     CHANNEL_FEATURES_CHANGED
+    CHANGES_RESULT
     IDENTITY_RESULT
     FMT_RESULT
     LINT_RESULT
@@ -84,6 +89,7 @@ run_gate() {
   local docs_changed="${DOCS_CHANGED:-false}"
   local channel_features_changed="${CHANNEL_FEATURES_CHANGED:-false}"
 
+  local changes_result="${CHANGES_RESULT:-skipped}"
   local identity_result="${IDENTITY_RESULT:-skipped}"
   local fmt_result="${FMT_RESULT:-skipped}"
   local lint_result="${LINT_RESULT:-skipped}"
@@ -96,6 +102,7 @@ run_gate() {
   local docs_result="${DOCS_RESULT:-skipped}"
 
   echo "event=${event_name} rust_changed=${rust_changed} docs_only=${docs_only} docs_changed=${docs_changed}"
+  echo "changes=${changes_result}"
   echo "identity=${identity_result}"
   echo "fmt=${fmt_result}"
   echo "lint=${lint_result}"
@@ -111,6 +118,16 @@ run_gate() {
   # non-Rust changes too, so an early return must not skip it.
   if [ "$identity_result" != "success" ]; then
     echo "Identity-strings gate did not pass (CLAUDE.md 9.1)."
+    return 1
+  fi
+
+  # Also before every fast path. rust_changed, docs_only and docs_changed are
+  # outputs of the `changes` job and are empty when it fails, is cancelled or
+  # is skipped. An empty rust_changed reads as "no Rust changed", so without
+  # this check a broken scope job would skip every Rust job and the gate
+  # would pass on the non-Rust fast path with nothing linted, tested or built.
+  if [ "$changes_result" != "success" ]; then
+    echo "Change-scope job did not pass; scope outputs cannot be trusted."
     return 1
   fi
 
@@ -271,6 +288,26 @@ workflow_jobs_running() {
     ' "$WORKFLOW_PATH" | sort -u
 }
 
+# Jobs listed in `ci-required`'s `needs:` whose result the gate deliberately
+# does not read. Every other job in `needs:` must be bound to a *_RESULT
+# variable (check 4b in check_workflow_agreement), so a job cannot become
+# advisory by being listed there and then ignored.
+#
+#   docs-only, non-rust  Echo-only jobs. Each prints one line when the scope
+#                        job picked its fast path. The decision they mirror
+#                        is taken by the gate from the `changes` result and
+#                        its outputs, and neither job does more than echo.
+#   lint-feedback        Posts a pull-request comment that summarises lint
+#                        and docs failures. It is a reporter, not a check:
+#                        the jobs it reports on are read by the gate
+#                        directly, and a failure to post a comment must not
+#                        block a merge.
+GATE_INFORMATIONAL_JOBS=(
+    docs-only
+    non-rust
+    lint-feedback
+)
+
 # The workflow and the gate must agree. Each problem prints one line and
 # counts as one failure.
 check_workflow_agreement() {
@@ -367,6 +404,22 @@ check_workflow_agreement() {
         fi
     done <<< "$cargo_jobs"
 
+    # 4b. every job in ci-required's needs list is either read by the gate or
+    #    on the informational list above. `needs:` alone only orders the
+    #    jobs: a job that is listed there and read nowhere looks mandatory
+    #    and is not.
+    while read -r id; do
+        [ -z "$id" ] && continue
+        if printf '%s\n' "$read_ids" | grep -qx -- "$id"; then
+            continue
+        fi
+        if printf '%s\n' "${GATE_INFORMATIONAL_JOBS[@]}" | grep -qx -- "$id"; then
+            continue
+        fi
+        echo "FAIL: ci-required needs '$id', but the gate neither reads its result nor lists it as informational"
+        failures=$((failures + 1))
+    done <<< "$needs_ids"
+
     # 5. the format check still exists somewhere in the workflow
     fmt_jobs="$(workflow_jobs_running 'cargo[[:space:]]+fmt')"
     if [ -z "$fmt_jobs" ]; then
@@ -404,7 +457,7 @@ if [ "${1:-}" = "--self-test" ]; then
   }
 
   pr_rust_green=(
-    EVENT_NAME=pull_request RUST_CHANGED=true IDENTITY_RESULT=success
+    EVENT_NAME=pull_request RUST_CHANGED=true CHANGES_RESULT=success IDENTITY_RESULT=success
     FMT_RESULT=success LINT_RESULT=success TEST_RESULT=success MSRV_RESULT=success
     CHANNEL_FEATURES_RESULT=success CHANNEL_FEATURES_CHANGED=true
     FEATURES_RESULT=success BENCH_COMPILE_RESULT=success BUILD_RESULT=success
@@ -453,10 +506,10 @@ if [ "${1:-}" = "--self-test" ]; then
     "${pr_rust_green[@]}" DOCS_CHANGED=true DOCS_RESULT=failure
   expect 1 "failing docs lint blocks a docs-only PR" \
     EVENT_NAME=pull_request DOCS_ONLY=true DOCS_CHANGED=true \
-    IDENTITY_RESULT=success DOCS_RESULT=failure
+    CHANGES_RESULT=success IDENTITY_RESULT=success DOCS_RESULT=failure
   expect 0 "a docs-only PR whose lint passed merges" \
     EVENT_NAME=pull_request DOCS_ONLY=true DOCS_CHANGED=true \
-    IDENTITY_RESULT=success DOCS_RESULT=success
+    CHANGES_RESULT=success IDENTITY_RESULT=success DOCS_RESULT=success
 
   # The identity gate is a merge gate on its own terms (CLAUDE.md 9.1), so
   # it blocks every path, including the two fast paths.
@@ -465,23 +518,50 @@ if [ "${1:-}" = "--self-test" ]; then
   expect 1 "a skipped identity gate blocks a Rust PR" \
     "${pr_rust_green[@]}" IDENTITY_RESULT=skipped
   expect 1 "a failing identity gate blocks a docs-only PR" \
-    EVENT_NAME=pull_request DOCS_ONLY=true IDENTITY_RESULT=failure
+    EVENT_NAME=pull_request DOCS_ONLY=true CHANGES_RESULT=success IDENTITY_RESULT=failure
   expect 1 "a failing identity gate blocks a non-Rust PR" \
-    EVENT_NAME=pull_request IDENTITY_RESULT=failure
+    EVENT_NAME=pull_request CHANGES_RESULT=success IDENTITY_RESULT=failure
 
   expect 0 "a non-Rust, non-docs PR merges" \
-    EVENT_NAME=pull_request IDENTITY_RESULT=success
+    EVENT_NAME=pull_request CHANGES_RESULT=success IDENTITY_RESULT=success
 
   expect 0 "a green push merges" \
-    EVENT_NAME=push RUST_CHANGED=true IDENTITY_RESULT=success FMT_RESULT=success \
+    EVENT_NAME=push RUST_CHANGED=true CHANGES_RESULT=success IDENTITY_RESULT=success FMT_RESULT=success \
     LINT_RESULT=success TEST_RESULT=success MSRV_RESULT=success \
     CHANNEL_FEATURES_RESULT=success CHANNEL_FEATURES_CHANGED=true \
     FEATURES_RESULT=success BENCH_COMPILE_RESULT=success BUILD_RESULT=success
   expect 1 "a failing channel-features blocks a push" \
-    EVENT_NAME=push RUST_CHANGED=true IDENTITY_RESULT=success FMT_RESULT=success \
+    EVENT_NAME=push RUST_CHANGED=true CHANGES_RESULT=success IDENTITY_RESULT=success FMT_RESULT=success \
     LINT_RESULT=success TEST_RESULT=success MSRV_RESULT=success \
     CHANNEL_FEATURES_RESULT=failure CHANNEL_FEATURES_CHANGED=true \
     FEATURES_RESULT=success BENCH_COMPILE_RESULT=success BUILD_RESULT=success
+
+  # The scope outputs (RUST_CHANGED, DOCS_ONLY, DOCS_CHANGED,
+  # CHANNEL_FEATURES_CHANGED) are empty when the `changes` job does not
+  # finish, and an empty RUST_CHANGED reads as "no Rust changed". Without a
+  # check on the job's own result, a broken scope job turned every Rust job
+  # into a skip and the gate into a pass. Every arm below must block, on
+  # the Rust path and on both fast paths.
+  expect 1 "a failed change-scope job blocks a PR whose scope outputs are empty" \
+    EVENT_NAME=pull_request CHANGES_RESULT=failure IDENTITY_RESULT=success
+  expect 1 "a cancelled change-scope job blocks a PR whose scope outputs are empty" \
+    EVENT_NAME=pull_request CHANGES_RESULT=cancelled IDENTITY_RESULT=success
+  expect 1 "a skipped change-scope job blocks a PR whose scope outputs are empty" \
+    EVENT_NAME=pull_request CHANGES_RESULT=skipped IDENTITY_RESULT=success
+  expect 1 "an absent change-scope result blocks a PR whose scope outputs are empty" \
+    EVENT_NAME=pull_request IDENTITY_RESULT=success
+  expect 1 "a failed change-scope job blocks a docs-only PR" \
+    EVENT_NAME=pull_request DOCS_ONLY=true DOCS_CHANGED=true CHANGES_RESULT=failure \
+    IDENTITY_RESULT=success DOCS_RESULT=success
+  expect 1 "a failed change-scope job blocks a Rust PR whose other jobs are green" \
+    "${pr_rust_green[@]}" CHANGES_RESULT=failure
+  expect 1 "a failed change-scope job blocks a green push" \
+    EVENT_NAME=push RUST_CHANGED=true CHANGES_RESULT=failure IDENTITY_RESULT=success \
+    FMT_RESULT=success LINT_RESULT=success TEST_RESULT=success MSRV_RESULT=success \
+    CHANNEL_FEATURES_RESULT=success CHANNEL_FEATURES_CHANGED=true \
+    FEATURES_RESULT=success BENCH_COMPILE_RESULT=success BUILD_RESULT=success
+  expect 0 "a PR with a green change-scope job and no Rust change takes the non-Rust fast path" \
+    EVENT_NAME=pull_request RUST_CHANGED=false CHANGES_RESULT=success IDENTITY_RESULT=success
 
   # The workflow and the gate must agree. A job the gate does not read is
   # advisory while looking mandatory, which is the bug this file was
