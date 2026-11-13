@@ -2532,11 +2532,7 @@ impl TuiApp {
                         // line printed only the basename, so a long
                         // command was approved without ever being shown
                         // in full anywhere.
-                        let line = format!(
-                            "🔒 awaiting decision on `{}` (press Y, F2, N or Esc)\n    {}",
-                            req.basename,
-                            req.full_command.replace('\n', "\n    ")
-                        );
+                        let line = approval_awaiting_line(&req);
                         let _ = self.context.append_system_message(&line);
                         self.scrollback_queue.push(("system".into(), line));
                         // Surface this request in the boxed prompt only when
@@ -5429,7 +5425,7 @@ impl TuiApp {
             // When an approval is pending, the composer row swaps for the styled
             // approval prompt — same height so the status bar stays put.
             if let Some(ref req) = pending_approval_snapshot {
-                render_approval_pane(req, frame, chunks[1]);
+                render_approval_pane(req, &context.input_buffer, frame, chunks[1]);
             } else {
                 render_input_pane(context, frame, chunks[1]);
             }
@@ -6734,6 +6730,72 @@ fn render_stream_preview_pane(
     frame.render_widget(paragraph, area);
 }
 
+/// The scrollback line written when an approval request arrives.
+///
+/// It names no answer key. The line is written once, when the request
+/// arrives, which may be while another prompt is still open and while the
+/// composer holds text, so a key list here could offer a key that is off by
+/// the time the operator reads it. The approval pane is the live guide: it
+/// shows which keys answer right now.
+fn approval_awaiting_line(req: &crate::security::PendingRequest) -> String {
+    format!(
+        "🔒 awaiting decision on `{}`\n    {}",
+        req.basename,
+        req.full_command.replace('\n', "\n    ")
+    )
+}
+
+/// The labels of the `y` and `F2` chips: what each answer grants, which
+/// depends on the gate that raised the request (see
+/// `resolve_pending_approval`, which carries the answer out).
+///
+/// - The unallowed-command gate: `y` allowlists the basename for the
+///   session, and `F2` also writes it to disk, which covers every later
+///   call of that command, not only this one.
+/// - The medium-risk gate: both keys give the same answer, a session grant
+///   for this basename at medium risk. Nothing is written to disk.
+/// - A high-risk command: both keys let this run proceed and hold nothing
+///   afterwards. Nothing is written to disk.
+fn approval_grant_labels(req: &crate::security::PendingRequest) -> (String, String) {
+    use crate::security::SessionScope;
+    match req.session_scope {
+        SessionScope::Command | SessionScope::None => (
+            "yes (session)".to_string(),
+            format!("always: any `{}`", req.basename),
+        ),
+        SessionScope::MediumRisk => (
+            "yes (session, medium risk)".to_string(),
+            "same, not saved".to_string(),
+        ),
+        SessionScope::HighRisk => (
+            "yes (this run only)".to_string(),
+            "same, not saved".to_string(),
+        ),
+    }
+}
+
+/// `text` on one row at most `columns` wide: newlines show as a marker, and a
+/// longer text is cut by display width and ends in an ellipsis.
+fn one_row_within(text: &str, columns: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let flat = text.replace('\n', " ⏎ ");
+    let width_of = |c: char| c.width().unwrap_or(0);
+    if flat.chars().map(width_of).sum::<usize>() <= columns {
+        return flat;
+    }
+    let mut cut = String::new();
+    let mut used = 0;
+    for c in flat.chars() {
+        if used + width_of(c) + 1 > columns {
+            break;
+        }
+        used += width_of(c);
+        cut.push(c);
+    }
+    cut.push('…');
+    cut
+}
+
 /// Rows the approval prompt takes in the layout: two border rows, the
 /// command preview and the row of action chips.
 ///
@@ -6759,13 +6821,19 @@ const APPROVAL_PANE_ROWS: u16 = 4;
 /// preview and the row of action chips):
 ///
 /// ```text
-/// ╭ 🔒 Approval needed · cd ────────────────────────────╮
+/// ╭ 🔒 Approval needed · cd · from tui ─────────────────╮
 /// │ cd /home/.../skills/stocks && .venv/bin/python …   │
-/// │ [Y] yes (session)  [F2] always  [N] no  [Esc] deny  │
+/// │ y yes (session)  F2 always: any `cd`  n no  Esc deny│
 /// ╰─────────────────────────────────────────────────────╯
 /// ```
+///
+/// An answer key counts only into an empty composer, and the composer is
+/// hidden while this pane is up. `composer` is what it holds. When it holds
+/// text the same two rows show that text and the way to clear it instead of
+/// the preview and the chips, and only `Esc`, which still denies, keeps a chip.
 fn render_approval_pane(
     req: &crate::security::PendingRequest,
+    composer: &str,
     frame: &mut ratatui::Frame,
     area: Rect,
 ) {
@@ -6773,20 +6841,6 @@ fn render_approval_pane(
     let muted = Color::Rgb(150, 150, 150);
     let key_bg = Color::Rgb(241, 196, 15);
     let key_fg = Color::Rgb(20, 20, 20);
-
-    // Compress the command preview to a single line — multi-line
-    // heredocs (e.g. the stocks skill's `python3 - <<'PY' ... PY`)
-    // blow out the 4-row pane and bury the action chips. The full
-    // command was already shown in the system-message scrollback line
-    // when the request landed, so this preview is just enough context
-    // for the user to decide.
-    let one_line = req.full_command.replace('\n', " ⏎ ");
-    let preview = if one_line.chars().count() > 200 {
-        let head: String = one_line.chars().take(197).collect();
-        format!("{head}…")
-    } else {
-        one_line
-    };
 
     fn chip(
         key: &str,
@@ -6807,27 +6861,74 @@ fn render_approval_pane(
         ]
     }
 
-    let mut chip_spans: Vec<Span<'static>> = Vec::new();
-    chip_spans.extend(chip("Y", "yes (session)", key_bg, key_fg, muted));
-    // Says what it grants. "always (persist)" reads as "this command";
-    // allowlisting one long `curl` invocation permits EVERY future `curl`.
-    // The key is `F2`: `Persist` writes to disk, so it must not be the
-    // result of a single stray letter, and no letterpress can produce a
-    // function key.
-    let always_label = format!("always: any `{}`", req.basename);
-    chip_spans.extend(chip("F2", &always_label, key_bg, key_fg, muted));
-    chip_spans.extend(chip("N", "no", key_bg, key_fg, muted));
-    chip_spans.extend(chip("Esc", "deny", key_bg, key_fg, muted));
+    let body = if composer.is_empty() {
+        // Compress the command preview to a single line — multi-line
+        // heredocs (e.g. the stocks skill's `python3 - <<'PY' ... PY`)
+        // blow out the 4-row pane and bury the action chips. The full
+        // command was already shown in the system-message scrollback line
+        // when the request landed, so this preview is just enough context
+        // for the user to decide.
+        let one_line = req.full_command.replace('\n', " ⏎ ");
+        let preview = if one_line.chars().count() > 200 {
+            let head: String = one_line.chars().take(197).collect();
+            format!("{head}…")
+        } else {
+            one_line
+        };
 
-    let body = vec![
-        Line::from(vec![
-            Span::styled(" ", Style::default()),
-            Span::styled(preview, Style::default().fg(Color::Rgb(220, 220, 220))),
-        ]),
-        Line::from(chip_spans),
-    ];
+        // The letters are lowercase because only the unmodified lowercase key
+        // is guaranteed to answer: `Shift+Y` does not answer and types into
+        // the composer.
+        let (yes_label, persist_label) = approval_grant_labels(req);
+        let mut chip_spans: Vec<Span<'static>> = Vec::new();
+        chip_spans.extend(chip("y", &yes_label, key_bg, key_fg, muted));
+        // The key is `F2`: `Persist` writes to disk at the unallowed-command
+        // gate, so it must not be the result of a single stray letter, and no
+        // letterpress can produce a function key. That gate's label says it
+        // covers every call of the command ("always: any `curl`") because
+        // allowlisting one long `curl` invocation permits every future
+        // `curl`. The risk gates write nothing, and their label says so.
+        chip_spans.extend(chip("F2", &persist_label, key_bg, key_fg, muted));
+        chip_spans.extend(chip("n", "no", key_bg, key_fg, muted));
+        chip_spans.extend(chip("Esc", "deny", key_bg, key_fg, muted));
 
-    let title = Line::from(vec![
+        vec![
+            Line::from(vec![
+                Span::styled(" ", Style::default()),
+                Span::styled(preview, Style::default().fg(Color::Rgb(220, 220, 220))),
+            ]),
+            Line::from(chip_spans),
+        ]
+    } else {
+        // Text in the composer turns `y`, `F2` and `n` off: the letters belong
+        // to the message being typed. The composer is hidden while the pane is
+        // up, so the pane shows the text that blocks the keys and the way to
+        // clear it. `Esc` still denies, so it keeps its chip. The command
+        // preview gives way to this: it is back as soon as the composer is
+        // empty, and the full command is in the scrollback.
+        const LABEL: &str = " composer: \"";
+        // Border columns, the label and the closing quote.
+        let used_columns = 2 + LABEL.chars().count() + 1;
+        let room = usize::from(area.width).saturating_sub(used_columns).max(1);
+        let shown = one_row_within(composer, room);
+
+        let mut guide_spans = vec![Span::styled(
+            " y/F2/n off: clear the text (Backspace, Ctrl+U) to answer. ",
+            Style::default().fg(muted),
+        )];
+        guide_spans.extend(chip("Esc", "deny", key_bg, key_fg, muted));
+
+        vec![
+            Line::from(vec![
+                Span::styled(LABEL, Style::default().fg(muted)),
+                Span::styled(shown, Style::default().fg(Color::Rgb(220, 220, 220))),
+                Span::styled("\"", Style::default().fg(muted)),
+            ]),
+            Line::from(guide_spans),
+        ]
+    };
+
+    let mut title_spans = vec![
         Span::raw(" "),
         Span::styled(
             "🔒 Approval needed",
@@ -6840,13 +6941,18 @@ fn render_approval_pane(
                 .fg(Color::Rgb(255, 255, 255))
                 .add_modifier(Modifier::BOLD),
         ),
-        // Where it came from. An approval arriving from a chat channel was
-        // indistinguishable from one the operator triggered locally.
-        Span::styled(
-            format!(" · from {} ", req.channel),
+    ];
+    // Where it came from. An approval arriving from a chat channel was
+    // indistinguishable from one the operator triggered locally. A request
+    // with no channel says nothing: a bare " · from " would dangle.
+    let channel = req.channel.trim();
+    if !channel.is_empty() {
+        title_spans.push(Span::styled(
+            format!(" · from {channel} "),
             Style::default().fg(muted),
-        ),
-    ]);
+        ));
+    }
+    let title = Line::from(title_spans);
 
     let para = Paragraph::new(body)
         .block(
@@ -16400,25 +16506,84 @@ mod approval_answer_tests {
         assert_eq!(f.app.context.input_buffer, "/allow gv1");
     }
 
-    /// The approval pane, rendered the way the layout renders it.
-    fn approval_pane_text(
+    /// The approval pane, rendered the way the layout renders it, as the
+    /// terminal buffer.
+    fn approval_pane_buffer(
         req: &crate::security::PendingRequest,
+        composer: &str,
         width: u16,
         height: u16,
-    ) -> String {
+    ) -> ratatui::buffer::Buffer {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
         term.draw(|f| {
             let area = f.area();
-            render_approval_pane(req, f, area);
+            render_approval_pane(req, composer, f, area);
         })
         .unwrap();
-        let buf = term.backend().buffer().clone();
+        term.backend().buffer().clone()
+    }
+
+    /// The approval pane as one string, row after row.
+    fn approval_pane_text(
+        req: &crate::security::PendingRequest,
+        composer: &str,
+        width: u16,
+        height: u16,
+    ) -> String {
+        let buf = approval_pane_buffer(req, composer, width, height);
         (0..height)
             .flat_map(|y| (0..width).map(move |x| (x, y)))
             .map(|(x, y)| buf[(x, y)].symbol().to_string())
             .collect()
+    }
+
+    /// The key labels the pane draws as chips: every run of cells with a
+    /// background colour. Only the chips carry one, so this is what the pane
+    /// offers as a key to press.
+    fn approval_pane_chip_keys(
+        req: &crate::security::PendingRequest,
+        composer: &str,
+        width: u16,
+        height: u16,
+    ) -> Vec<String> {
+        let buf = approval_pane_buffer(req, composer, width, height);
+        let mut keys = Vec::new();
+        for y in 0..height {
+            let mut run = String::new();
+            for x in 0..width {
+                let cell = &buf[(x, y)];
+                if cell.bg == ratatui::style::Color::Reset {
+                    if !run.trim().is_empty() {
+                        keys.push(run.trim().to_string());
+                    }
+                    run.clear();
+                } else {
+                    run.push_str(cell.symbol());
+                }
+            }
+            if !run.trim().is_empty() {
+                keys.push(run.trim().to_string());
+            }
+        }
+        keys
+    }
+
+    /// A pending request for the render tests.
+    fn pane_request(
+        channel: &str,
+        scope: crate::security::SessionScope,
+    ) -> crate::security::PendingRequest {
+        crate::security::PendingRequest {
+            id: uuid::Uuid::new_v4(),
+            basename: "curl".to_string(),
+            full_command: "curl https://example.com".to_string(),
+            channel: channel.to_string(),
+            reply_target: String::new(),
+            created_at: 0,
+            session_scope: scope,
+        }
     }
 
     /// The pane must show every answer key. An operator cannot use a key
@@ -16426,22 +16591,199 @@ mod approval_answer_tests {
     /// of chips has to fit in the rows the layout gives the pane.
     #[test]
     fn the_approval_pane_shows_the_persist_chord() {
-        let req = crate::security::PendingRequest {
-            id: uuid::Uuid::new_v4(),
-            basename: "curl".to_string(),
-            full_command: "curl https://example.com".to_string(),
-            channel: "tui".to_string(),
-            reply_target: String::new(),
-            created_at: 0,
-            session_scope: crate::security::SessionScope::None,
-        };
+        let req = pane_request("tui", crate::security::SessionScope::None);
 
-        let text = approval_pane_text(&req, 100, composer_area_rows(1, true));
+        let text = approval_pane_text(&req, "", 100, composer_area_rows(1, true));
 
         for expected in ["F2", "yes (session)", "no", "deny"] {
             assert!(
                 text.contains(expected),
                 "the pane must show `{expected}`: {text:?}"
+            );
+        }
+    }
+
+    /// With an empty composer the answer keys work, so the pane draws all
+    /// four chips. The letters are lowercase because only the unmodified
+    /// lowercase key is guaranteed to answer: a shifted letter types into
+    /// the composer instead.
+    #[test]
+    fn the_approval_pane_offers_the_lowercase_answer_keys_when_the_composer_is_empty() {
+        let req = pane_request("tui", crate::security::SessionScope::None);
+
+        let keys = approval_pane_chip_keys(&req, "", 100, composer_area_rows(1, true));
+
+        assert_eq!(keys, ["y", "F2", "n", "Esc"]);
+    }
+
+    /// Text in the composer turns `y`, `F2` and `n` off. The pane shows the
+    /// text that blocks them and the way out, and offers only `Esc`, the one
+    /// key that still answers.
+    #[test]
+    fn the_approval_pane_shows_the_composer_text_and_offers_only_esc_while_it_holds_text() {
+        let req = pane_request("tui", crate::security::SessionScope::None);
+        let height = composer_area_rows(1, true);
+
+        let text = approval_pane_text(&req, "half a message", 100, height);
+        let keys = approval_pane_chip_keys(&req, "half a message", 100, height);
+
+        assert!(
+            text.contains("half a message"),
+            "the pane must show the text that blocks the keys: {text:?}"
+        );
+        assert!(
+            text.contains("Backspace") && text.contains("Ctrl+U"),
+            "the pane must name the ways to clear the composer: {text:?}"
+        );
+        assert_eq!(
+            keys,
+            ["Esc"],
+            "only Esc answers while the composer holds text"
+        );
+        assert!(
+            !text.contains("yes (session)") && !text.contains("always:"),
+            "no answer chip may read as live: {text:?}"
+        );
+    }
+
+    /// A multi-line composer shows on one row, and a long one is cut by
+    /// display width, so a wide character at the cut cannot split.
+    #[test]
+    fn the_approval_pane_flattens_and_truncates_the_composer_text() {
+        let req = pane_request("tui", crate::security::SessionScope::None);
+        let height = composer_area_rows(1, true);
+
+        let multiline = approval_pane_text(&req, "first\nsecond", 100, height);
+        assert!(
+            multiline.contains("first ⏎ second"),
+            "a newline must show as a marker on one row: {multiline:?}"
+        );
+
+        let long = "é".repeat(500);
+        let text = approval_pane_text(&req, &long, 100, height);
+        assert!(text.contains('…'), "a long composer must be cut: {text:?}");
+        assert!(
+            text.contains("Backspace"),
+            "the way out must stay on screen with a long composer: {text:?}"
+        );
+
+        // Wide characters take two columns each, so a cut by character count
+        // would wrap the row and push the way out off the pane.
+        let wide = "世".repeat(200);
+        let text = approval_pane_text(&req, &wide, 80, height);
+        assert!(text.contains('…'), "a long composer must be cut: {text:?}");
+        assert!(
+            text.contains("Backspace") && text.contains("deny"),
+            "the way out must stay on screen with wide characters: {text:?}"
+        );
+    }
+
+    /// The medium-risk gate gives one answer for `y` and `F2`: a session
+    /// grant for medium-risk commands that writes nothing to disk.
+    #[test]
+    fn the_approval_pane_says_a_medium_risk_answer_is_a_session_grant_that_is_not_saved() {
+        let req = pane_request("tui", crate::security::SessionScope::MediumRisk);
+
+        let text = approval_pane_text(&req, "", 80, composer_area_rows(1, true));
+
+        assert!(
+            text.contains("yes (session, medium risk)"),
+            "the y chip must say the grant is for medium risk: {text:?}"
+        );
+        assert!(
+            text.contains("same, not saved"),
+            "the F2 chip must say it saves nothing: {text:?}"
+        );
+        assert!(
+            !text.contains("always:"),
+            "the risk gate has no allowlist entry to promise: {text:?}"
+        );
+        assert!(
+            text.contains("deny"),
+            "the chips must fit the pane at 80 columns: {text:?}"
+        );
+    }
+
+    /// A high-risk command holds nothing past this run, so neither chip may
+    /// say "session".
+    #[test]
+    fn the_approval_pane_says_a_high_risk_answer_covers_this_run_only() {
+        let req = pane_request("tui", crate::security::SessionScope::HighRisk);
+
+        let text = approval_pane_text(&req, "", 80, composer_area_rows(1, true));
+
+        assert!(
+            text.contains("yes (this run only)"),
+            "the y chip must say the grant covers this run: {text:?}"
+        );
+        assert!(
+            text.contains("same, not saved"),
+            "the F2 chip must say it saves nothing: {text:?}"
+        );
+        assert!(
+            !text.contains("session") && !text.contains("always:"),
+            "a high-risk answer holds nothing for the session: {text:?}"
+        );
+    }
+
+    /// The unallowed-command gate keeps its text: `y` allowlists the command
+    /// for the session and `F2` writes the allowlist entry to disk.
+    #[test]
+    fn the_approval_pane_keeps_the_allowlist_chips_for_the_command_gate() {
+        for scope in [
+            crate::security::SessionScope::Command,
+            crate::security::SessionScope::None,
+        ] {
+            let req = pane_request("tui", scope);
+
+            let text = approval_pane_text(&req, "", 100, composer_area_rows(1, true));
+
+            assert!(text.contains("yes (session)"), "{scope:?}: {text:?}");
+            assert!(text.contains("always: any `curl`"), "{scope:?}: {text:?}");
+        }
+    }
+
+    /// A request with no channel has nothing to say about where it came
+    /// from, so the title must not end on a dangling "from".
+    #[test]
+    fn the_approval_pane_title_omits_the_source_when_the_channel_is_empty() {
+        for channel in ["", "   "] {
+            let req = pane_request(channel, crate::security::SessionScope::None);
+
+            let text = approval_pane_text(&req, "", 100, composer_area_rows(1, true));
+
+            assert!(
+                !text.contains("from"),
+                "channel {channel:?} must leave no `from` in the title: {text:?}"
+            );
+        }
+    }
+
+    /// A request from a channel names it in the title.
+    #[test]
+    fn the_approval_pane_title_names_the_channel_a_request_came_from() {
+        let req = pane_request("telegram", crate::security::SessionScope::None);
+
+        let text = approval_pane_text(&req, "", 100, composer_area_rows(1, true));
+
+        assert!(text.contains("from telegram"), "{text:?}");
+    }
+
+    /// The line the scrollback gets when a request arrives is written once,
+    /// before any key state is known, so it must name no answer key: the
+    /// pane is the live guide and a stale list could offer a key that is off.
+    #[test]
+    fn the_awaiting_decision_line_names_the_request_and_no_answer_key() {
+        let req = pane_request("tui", crate::security::SessionScope::None);
+
+        let line = approval_awaiting_line(&req);
+
+        assert!(line.contains("`curl`"), "{line:?}");
+        assert!(line.contains("curl https://example.com"), "{line:?}");
+        for key in ["Y", "F2", "Esc", "press"] {
+            assert!(
+                !line.contains(key),
+                "the line must not list `{key}`: {line:?}"
             );
         }
     }
