@@ -137,14 +137,27 @@ Publish-mode guardrails:
 - Artifacts are verified before publish.
 
 The GHCR image is **not** a guardrail, and does not gate the release. `Pub
-Release` pushes `ghcr.io/<owner>/<repo>:<tag>` — and `:latest`, the tag that
-names the most recent release — from the same job, but *after* `Create GitHub
-Release`, and the push step carries `continue-on-error: true`.
+Release` pushes `ghcr.io/<owner>/<repo>:<tag>` — and, for the highest release,
+`:latest`, the tag that names the most recent release — from the same job, but
+*after* `Create GitHub Release`, and the push step carries `continue-on-error: true`.
 That ordering is deliberate: before v0.6.50 the multi-arch image build ran under
 QEMU and regularly exceeded the 90-minute job timeout, which cancelled the runner
 and left already-built, already-signed binaries unpublished. The release page now
 goes live the moment cosign finishes, and the image can take its time — or fail —
 without taking the release with it.
+
+Two things decide whether a run moves `:latest`. A publish-mode dispatch moves it
+even when the release stays a draft, because the dispatch `draft` input defaults to
+true and the image push does not look at it. A verification-only dry run
+(`publish_release=false`) never moves it. And an older tag never moves it: the
+`Compute Docker release tags` step lists the `v*` tags on origin and adds `:latest`
+only when the release tag is the highest one, so re-running the image push for
+v0.34.0-alpha after v0.35.0-alpha shipped gives the image its `:v0.34.0-alpha` and
+`:sha-<12>` tags and leaves `:latest` where it is. The order is by version, with
+a bare release above its own pre-releases (`v0.35.0` is above `v0.35.0-rc.1`, which
+is above `v0.35.0-alpha`). If the step cannot list the tags, origin does not list the
+release tag, or the decision fails, it leaves `:latest` out and prints a warning.
+`scripts/ci/release_latest_tag.sh --self-test` covers the order.
 
 The practical consequence is in step 6: a green `Publish Release` job does **not**
 mean the image was pushed.
@@ -303,8 +316,8 @@ Expected publish outputs:
 
    Anything other than `success` means the tag exists but the image does not.
    Re-run that step or push the image manually; the release itself is unaffected.
-   That same push is what moves `:latest`, so a failed step leaves `:latest`
-   pointing at the previous release.
+   That same push is what moves `:latest` when the release is the highest tag, so a
+   failed step leaves `:latest` pointing at the previous release.
 
    Reading GHCR directly needs a token with the `read:packages` scope. Without
    it both `ghcr.io/token` and the registry API answer 401/403 for a missing
