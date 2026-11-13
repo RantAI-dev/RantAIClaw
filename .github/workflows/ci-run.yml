@@ -89,12 +89,10 @@ jobs:
             # self-test reads the workflow as it is and fails this job
             # instead.
             #
-            # The limit is the one the self-tests above it share: this job
-            # is not a required check, so a red job here does not by itself
-            # turn `CI Required Gate` red — it makes the Rust jobs skip and
-            # the gate take its non-Rust fast path. The check guards `main`
-            # against a later regression, not the pull request that
-            # introduces one.
+            # A red step here fails this job, and `CI Required Gate` reads
+            # this job's result (`CHANGES_RESULT`) before it looks at the
+            # scope outputs, so a self-test that fails blocks the pull
+            # request that introduces the regression.
             - name: Self-test the CI cache and profile policy
               shell: bash
               run: bash ./scripts/ci/tests/test_ci_cache_and_profile_policy.sh
@@ -664,6 +662,7 @@ jobs:
                   DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
                   DOCS_CHANGED: ${{ needs.changes.outputs.docs_changed }}
                   CHANNEL_FEATURES_CHANGED: ${{ needs.changes.outputs.channel_features_changed }}
+                  CHANGES_RESULT: ${{ needs.changes.result }}
                   IDENTITY_RESULT: ${{ needs.identity.result }}
                   FMT_RESULT: ${{ needs.fmt.result }}
                   LINT_RESULT: ${{ needs.lint.result }}
