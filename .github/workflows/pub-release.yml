@@ -552,10 +552,17 @@ jobs:
                   username: ${{ github.actor }}
                   password: ${{ secrets.GITHUB_TOKEN }}
 
-            # A publish-mode run moves the `:latest` tag, whether or not the release is
-            # still a draft: this step lives in the `publish` job, whose `if:` is
-            # `needs.prepare.outputs.publish_release == 'true'`. A verification-only dry run
-            # (`publish_release=false`) never reaches this step, so it never moves `:latest`.
+            # A publish-mode run moves the `:latest` tag when the release is the highest `v*`
+            # tag, whether or not the release is still a draft: this step lives in the
+            # `publish` job, whose `if:` is `needs.prepare.outputs.publish_release == 'true'`.
+            # A verification-only dry run (`publish_release=false`) never reaches this step,
+            # so it never moves `:latest`. An older release (a retried push of v0.34.0-alpha
+            # after v0.35.0-alpha shipped) gets its version tag and `sha-<12>` only.
+            # The checkout is shallow, so the tag list comes from origin, as in `prepare`.
+            # The checked-out ref is the release tag, which may predate the decision script
+            # (a retry for an old tag), so the script is read from `GITHUB_SHA` instead: on a
+            # dispatch that is the dispatch ref's commit, on a tag push the tag's own commit.
+            # It is saved outside the workspace, which is the Docker build context.
             - name: Compute Docker release tags
               id: docker_meta
               shell: bash
@@ -566,7 +573,34 @@ jobs:
                   image="${REGISTRY}/${IMAGE_NAME}"
                   image="${image,,}"
                   sha_tag="${image}:sha-${GITHUB_SHA::12}"
-                  tags="${image}:${RELEASE_TAG},${sha_tag},${image}:latest"
+                  tags="${image}:${RELEASE_TAG},${sha_tag}"
+                  script_path="${RUNNER_TEMP}/release_latest_tag.sh"
+
+                  # Every fallback below leaves `:latest` out: the tag list or the decision
+                  # script cannot be read, origin does not list the release tag, or the script
+                  # fails. Leaving it out only ever narrows what this run publishes; it never
+                  # moves `:latest`, and it never fails the step, which runs before the GitHub
+                  # Release is created.
+                  if ! remote_tags="$(git ls-remote --tags origin 'refs/tags/v*')"; then
+                    echo "::warning::Could not list tags on origin, so :latest was left unchanged for ${RELEASE_TAG}."
+                  elif ! { git fetch --quiet --no-tags --depth=1 origin "$GITHUB_SHA" \
+                    && git show "FETCH_HEAD:scripts/ci/release_latest_tag.sh" > "$script_path"; }; then
+                    echo "::warning::Could not read scripts/ci/release_latest_tag.sh at ${GITHUB_SHA}, so :latest was left unchanged for ${RELEASE_TAG}."
+                  else
+                    # Drop peeled `^{}` lines and the `refs/tags/` prefix: one tag per line.
+                    tag_list="$(printf '%s\n' "$remote_tags" \
+                      | awk '$2 !~ /\^\{\}$/ { sub(/^refs\/tags\//, "", $2); print $2 }')"
+                    # The script adds the release tag to its own list, so an empty or partial
+                    # listing would read as "highest". Require origin to list the tag itself.
+                    if ! grep -qxF -- "$RELEASE_TAG" <<<"$tag_list"; then
+                      echo "::warning::Tag ${RELEASE_TAG} was not found in the tag list from origin, so :latest was left unchanged."
+                    elif ! decision="$(printf '%s\n' "$tag_list" | bash "$script_path" "$RELEASE_TAG")"; then
+                      echo "::warning::The :latest decision script failed, so :latest was left unchanged for ${RELEASE_TAG}."
+                    elif [[ "$decision" == "latest" ]]; then
+                      echo "${RELEASE_TAG} is the highest release tag; adding :latest."
+                      tags="${tags},${image}:latest"
+                    fi
+                  fi
                   echo "tags=${tags}" >> "$GITHUB_OUTPUT"
 
             # Render the install template with the actual release tag

@@ -101,6 +101,11 @@ jobs:
             - name: Every release tag is reachable from main
               run: ./scripts/ci/check_release_tag_ancestry.sh
 
+            # `pub-release.yml` asks this script whether a release may take the Docker
+            # `:latest` tag, so a wrong version order here moves `:latest` back.
+            - name: Self-test the `:latest` decision
+              run: ./scripts/ci/release_latest_tag.sh --self-test
+
     pinned-sources:
         name: Workflow Sanity (pinned sources)
         runs-on: ubuntu-latest

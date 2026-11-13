@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The Docker `:latest` tag moves only when the release is the highest version tag.** A release
+  used to move `:latest` on every publish, so re-running the publish for an older release, for
+  example to retry its image push after a newer release had shipped, pointed `:latest` back at the
+  older one. `pub-release.yml` now lists the `v*` tags on origin and adds `:latest` only when the
+  release tag is the highest by version, where a bare `v0.35.0` is above `v0.35.0-rc.1` and
+  `v0.35.0-alpha`. An older release still gets its `:vX.Y.Z` and `:sha-<12>` tags. If the tag list
+  cannot be read, the run leaves `:latest` unchanged and prints a warning.
+
 - **The Docker `:latest` tag now names the most recent release, and `main` is published nightly as
   `:edge`.** Until now every push to `main` built and published a Docker image, and `latest`
   followed `main` — so `latest` named unreleased code, and `docker pull
