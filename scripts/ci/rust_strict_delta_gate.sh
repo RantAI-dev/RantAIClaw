@@ -5,6 +5,39 @@ set -euo pipefail
 BASE_SHA="${BASE_SHA:-}"
 RUST_FILES_RAW="${RUST_FILES:-}"
 
+# Shared clippy run
+# ------------------
+# The CI lint job lints the crate once and hands the diagnostics to both lint
+# gates. When `CLIPPY_JSON_FILE` is set, this script reads that file instead
+# of running clippy itself; `CLIPPY_EXIT_CODE` carries the exit code of that
+# run. Both variables describe one clippy run and have to be set together: a
+# JSON file without its exit code would let a clippy failure with no parsable
+# diagnostic slip through, so the gate fails loudly instead of guessing.
+#
+# The check sits at the top, before anything is skipped, so a misconfigured
+# run fails the same way whatever the diff looks like.
+SHARED_CLIPPY_JSON=""
+SHARED_CLIPPY_EXIT=""
+if [ -n "${CLIPPY_JSON_FILE:-}" ]; then
+    if [ -z "${CLIPPY_EXIT_CODE:-}" ]; then
+        echo "rust_strict_delta_gate.sh: CLIPPY_JSON_FILE is set but CLIPPY_EXIT_CODE is not." >&2
+        echo "rust_strict_delta_gate.sh: both variables describe one clippy run and must be set together." >&2
+        exit 2
+    fi
+    case "${CLIPPY_EXIT_CODE:-}" in
+        *[!0-9]*)
+            echo "rust_strict_delta_gate.sh: CLIPPY_EXIT_CODE must be a decimal exit code, got '${CLIPPY_EXIT_CODE}'." >&2
+            exit 2
+            ;;
+    esac
+    if [ ! -r "$CLIPPY_JSON_FILE" ]; then
+        echo "rust_strict_delta_gate.sh: cannot read the clippy JSON file '${CLIPPY_JSON_FILE}'." >&2
+        exit 2
+    fi
+    SHARED_CLIPPY_JSON="$CLIPPY_JSON_FILE"
+    SHARED_CLIPPY_EXIT="${CLIPPY_EXIT_CODE:-}"
+fi
+
 if [ -z "$BASE_SHA" ] && git rev-parse --verify origin/main >/dev/null 2>&1; then
     BASE_SHA="$(git merge-base origin/main HEAD)"
 fi
@@ -61,10 +94,10 @@ fi
 echo "Strict delta linting changed Rust files: ${EXISTING_FILES[*]}"
 
 CHANGED_LINES_JSON_FILE="$(mktemp)"
-CLIPPY_JSON_FILE="$(mktemp)"
+OWN_CLIPPY_JSON_FILE="$(mktemp)"
 CLIPPY_STDERR_FILE="$(mktemp)"
 FILTERED_OUTPUT_FILE="$(mktemp)"
-trap 'rm -f "$CHANGED_LINES_JSON_FILE" "$CLIPPY_JSON_FILE" "$CLIPPY_STDERR_FILE" "$FILTERED_OUTPUT_FILE"' EXIT
+trap 'rm -f "$CHANGED_LINES_JSON_FILE" "$OWN_CLIPPY_JSON_FILE" "$CLIPPY_STDERR_FILE" "$FILTERED_OUTPUT_FILE"' EXIT
 
 python3 - "$BASE_SHA" "${EXISTING_FILES[@]}" >"$CHANGED_LINES_JSON_FILE" <<'PY'
 import json
@@ -130,24 +163,48 @@ for path in files:
 print(json.dumps(changed))
 PY
 
-set +e
-cargo clippy --quiet --locked --all-targets --keep-going --message-format=json -- -D warnings >"$CLIPPY_JSON_FILE" 2>"$CLIPPY_STDERR_FILE"
-CLIPPY_EXIT=$?
-set -e
+if [ -n "$SHARED_CLIPPY_JSON" ]; then
+    # The shared run lints the crate at the correctness level, so it exits 0
+    # on a crate that only has warnings. The early pass below therefore
+    # cannot be used here: a warning on a changed line has to block, and the
+    # exit code alone does not say whether such a warning exists. The filter
+    # runs either way.
+    #
+    # The filter reads warning and error levels the same way, so the shared
+    # run's levels do not change which findings block.
+    echo "Strict delta gate: reading shared clippy diagnostics from ${SHARED_CLIPPY_JSON}"
+    CLIPPY_JSON_INPUT="$SHARED_CLIPPY_JSON"
+    CLIPPY_EXIT="$SHARED_CLIPPY_EXIT"
+    CLIPPY_MODE="shared"
+else
+    set +e
+    cargo clippy --quiet --locked --all-targets --keep-going --message-format=json -- -D warnings >"$OWN_CLIPPY_JSON_FILE" 2>"$CLIPPY_STDERR_FILE"
+    CLIPPY_EXIT=$?
+    set -e
+    CLIPPY_JSON_INPUT="$OWN_CLIPPY_JSON_FILE"
+    CLIPPY_MODE="own"
 
-if [ "$CLIPPY_EXIT" -eq 0 ]; then
-    echo "Strict delta gate passed: no strict warnings/errors." 
-    exit 0
+    if [ "$CLIPPY_EXIT" -eq 0 ]; then
+        echo "Strict delta gate passed: no strict warnings/errors."
+        exit 0
+    fi
 fi
 
 set +e
-python3 - "$CLIPPY_JSON_FILE" "$CHANGED_LINES_JSON_FILE" >"$FILTERED_OUTPUT_FILE" <<'PY'
+python3 - "$CLIPPY_JSON_INPUT" "$CHANGED_LINES_JSON_FILE" "$CLIPPY_MODE" "$CLIPPY_EXIT" >"$FILTERED_OUTPUT_FILE" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 messages_file = sys.argv[1]
 changed_file = sys.argv[2]
+clippy_mode = sys.argv[3]
+try:
+    clippy_exit = int(sys.argv[4])
+except ValueError:
+    print("The shared clippy run has no usable exit code; the gate cannot judge it.")
+    sys.exit(2)
+shared_run = clippy_mode == "shared"
 
 with open(changed_file, "r", encoding="utf-8") as f:
     changed = json.load(f)
@@ -246,18 +303,26 @@ if blocking:
     print(f"Blocking strict lint issues: {len(blocking)}")
     sys.exit(1)
 
-if classified_count > 0:
-    print("No blocking strict lint issues on changed Rust lines.")
-    sys.exit(0)
-
-if unclassified:
+if unclassified and classified_count == 0:
     print("Strict lint exited non-zero with unclassified diagnostics; failing safe:")
     for entry in unclassified[:20]:
         print(f"  - {entry}")
     sys.exit(2)
 
-print("Strict lint exited non-zero without parsable diagnostics; failing safe.")
-sys.exit(2)
+# Nothing blocked. When nothing was classified either, the run produced no
+# diagnostic this gate could read. In the gate's own clippy run that means
+# clippy exited non-zero without a parsable diagnostic, so the gate fails
+# safe. In the shared run the exit code says which case this is: a clean
+# clippy run (exit 0) passes, anything else fails safe.
+if classified_count == 0 and (not shared_run or clippy_exit != 0):
+    print("Strict lint exited non-zero without parsable diagnostics; failing safe.")
+    sys.exit(2)
+
+if classified_count == 0:
+    print("Strict lint passed: no strict warnings/errors.")
+else:
+    print("No blocking strict lint issues on changed Rust lines.")
+sys.exit(0)
 PY
 FILTER_EXIT=$?
 set -e
