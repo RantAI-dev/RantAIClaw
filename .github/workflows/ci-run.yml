@@ -24,6 +24,7 @@ jobs:
             docs_only: ${{ steps.scope.outputs.docs_only }}
             docs_changed: ${{ steps.scope.outputs.docs_changed }}
             rust_changed: ${{ steps.scope.outputs.rust_changed }}
+            channel_features_changed: ${{ steps.scope.outputs.channel_features_changed }}
             docs_files: ${{ steps.scope.outputs.docs_files }}
             base_sha: ${{ steps.scope.outputs.base_sha }}
         steps:
@@ -82,8 +83,30 @@ jobs:
             - name: No personal identity data
               run: ./scripts/ci/check_identity_strings.sh --self-test
 
+    # The format check gets its own job so a formatting mistake is reported
+    # in seconds instead of behind the whole lint job. `rustfmt` compiles
+    # nothing, so this job needs no cargo cache — it is the cheapest Rust
+    # stage there is, and the heavy jobs wait for it rather than for clippy.
+    #
+    # The toolchain is the same 1.92.0 pin every other Rust job uses, so the
+    # rustfmt that runs here is the rustfmt the lint job used to run.
+    fmt:
+        name: Format (rustfmt)
+        needs: [changes]
+        if: needs.changes.outputs.rust_changed == 'true'
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+                  components: rustfmt
+            - name: Check formatting
+              run: cargo fmt --all -- --check
+
     lint:
-        name: Lint Gate (Format + Clippy + Strict Delta)
+        name: Lint Gate (Clippy + Strict Delta)
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
         runs-on: ubuntu-latest
@@ -97,8 +120,13 @@ jobs:
                   toolchain: 1.92.0
                   components: rustfmt, clippy
             - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+            # `--skip-fmt`: the format check runs in the `fmt` job above, so
+            # running it here as well would check every file twice. The
+            # script still formats when it is called without that flag — it
+            # is the complete local gate used by `dev/ci.sh` and
+            # `.githooks/pre-push`.
             - name: Run rust quality gate
-              run: ./scripts/ci/rust_quality_gate.sh
+              run: ./scripts/ci/rust_quality_gate.sh --skip-fmt
             - name: Run strict lint delta gate
               env:
                   BASE_SHA: ${{ needs.changes.outputs.base_sha }}
@@ -131,8 +159,8 @@ jobs:
 
     test:
         name: Test
-        needs: [changes, lint]
-        if: needs.changes.outputs.rust_changed == 'true' && needs.lint.result == 'success'
+        needs: [changes, fmt]
+        if: needs.changes.outputs.rust_changed == 'true' && needs.fmt.result == 'success'
         runs-on: ubuntu-latest
         # 45min: cargo test on the full workspace runs ~6,300 tests over
         # 32 binaries. Empirically takes 9–12 min when the cache is warm,
@@ -177,20 +205,11 @@ jobs:
               # Cross-module env-lock hygiene is the follow-up that lifts this.
               run: cargo test --locked --workspace -- --test-threads=1
 
-    # `channel-lark` gets its own job rather than a row in the `features` matrix
-    # below because that matrix only runs `cargo check`, which would not have
-    # caught the defects in `src/channels/lark.rs` — 1,774 lines including a
-    # hand-rolled websocket codec and an axum server that no CI job compiled
-    # until this job existed. (It also used to be the only one of the two that
-    # ran on a PR at all; the matrix is no longer label-gated.)
-    #
-    # It pulls only `prost`, so it is cheap. Verified building clean at f189422
-    # in ~3m. `channel-matrix` now has its own job below for the same reason.
     # `Cargo.toml` declares `rust-version`, and until this job existed nothing
-    # built at it: every other Rust job pins 1.92.0, the `channel-matrix` job
-    # 1.96.0 and the Dockerfile `rust:1.98-slim`. A declared MSRV that no build
-    # exercises is a claim, and this repository treats claims as things that get
-    # checked.
+    # built at it: every other Rust job pins 1.92.0, the `channel-features`
+    # job 1.96.0 and the Dockerfile `rust:1.98-slim`. A declared MSRV that no
+    # build exercises is a claim, and this repository treats claims as things
+    # that get checked.
     #
     # The toolchain is read out of `Cargo.toml` rather than pinned here on
     # purpose. Pinning it would mean the job tests a number that can silently
@@ -200,8 +219,8 @@ jobs:
     # compiles.
     msrv:
         name: MSRV (declared rust-version)
-        needs: [changes, lint]
-        if: needs.changes.outputs.rust_changed == 'true' && needs.lint.result == 'success'
+        needs: [changes, fmt]
+        if: needs.changes.outputs.rust_changed == 'true' && needs.fmt.result == 'success'
         runs-on: ubuntu-latest
         timeout-minutes: 30
         steps:
@@ -236,41 +255,37 @@ jobs:
             - name: Check every target at the declared MSRV
               run: cargo check --locked --all-targets
 
-    channel-lark:
-        name: Channel Lark (build + test)
-        needs: [changes, lint]
-        if: needs.changes.outputs.rust_changed == 'true' && needs.lint.result == 'success'
-        runs-on: ubuntu-latest
-        timeout-minutes: 25
-        steps:
-            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
-              with:
-                  toolchain: 1.92.0
-            - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-              with:
-                  key: channel-lark
-            - name: Build and test channel-lark
-              run: bash scripts/ci/run_filtered_lib_tests.sh test --locked --features channel-lark --lib channels::lark
-
-    # `channel-matrix` gets its own job for the same reason `channel-lark` does,
-    # and for a sharper one: until the pin moved to matrix-sdk 0.18 this channel
-    # could not be compiled at all (0.16 overflowed the rustc type-check
-    # recursion budget), so its 1,194 lines and 31 tests were checked by nothing
-    # and its test module carried a type error that had never been seen. A
-    # channel with no CI job is exactly how that rotted unnoticed.
+    # The two channel features get one job rather than a row in the
+    # `features` job below, because that job only runs `cargo check`, which
+    # would not have caught the defects in `src/channels/lark.rs` — 1,774
+    # lines including a hand-rolled websocket codec and an axum server that
+    # no CI job compiled until a job existed for it.
+    #
+    # Matrix gets the same treatment for a sharper reason: until the pin
+    # moved to matrix-sdk 0.18 this channel could not be compiled at all
+    # (0.16 overflowed the rustc type-check recursion budget), so its
+    # 1,194 lines and 31 tests were checked by nothing and its test module
+    # carried a type error that had never been seen. A channel with no CI
+    # job is exactly how that rotted unnoticed.
     #
     # Not `paths:`-filtered on purpose. A filtered job reports nothing on PRs
     # that miss the filter, and a required check that never reports leaves the
     # PR pending forever (#699). It runs on the same `rust_changed` condition as
-    # every other Rust job; the rust-cache keyed `channel-matrix` keeps the
+    # every other Rust job; the rust-cache keyed `channel-features` keeps the
     # matrix-sdk tree warm so only the first run pays for its ~67 extra crates.
-    channel-matrix:
-        name: Channel Matrix (build + test)
-        needs: [changes, lint]
-        if: needs.changes.outputs.rust_changed == 'true' && needs.lint.result == 'success'
+    #
+    # The test steps are skipped — not the job — when the change scope says
+    # no channel-feature file changed. The job still reports `success` then,
+    # and that is the only shape the merge gate accepts for it. Each step
+    # carries `!cancelled()` so a failing step does not stop the next one,
+    # because the two channels were independent jobs before the merge and
+    # one failure must not hide the other's result.
+    channel-features:
+        name: Channel Features (Lark + Matrix)
+        needs: [changes, fmt]
+        if: needs.changes.outputs.rust_changed == 'true' && needs.fmt.result == 'success'
         runs-on: ubuntu-latest
-        timeout-minutes: 35
+        timeout-minutes: 45
         steps:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
             # 1.96, not the 1.92.0 every other job pins: matrix-sdk 0.19 declares
@@ -288,57 +303,37 @@ jobs:
                   toolchain: 1.96.0
             - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
               with:
-                  key: channel-matrix
+                  key: channel-features
+            # Both features are enabled for both filtered test runs: the point
+            # of the job is that the two channels compile together, which is
+            # the only combination a user can build.
+            - name: Build and test channel-lark
+              if: ${{ !cancelled() && (github.event_name == 'push' || needs.changes.outputs.channel_features_changed == 'true') }}
+              run: bash scripts/ci/run_filtered_lib_tests.sh test --locked --features channel-lark,channel-matrix --lib channels::lark
             - name: Build and test channel-matrix
-              run: bash scripts/ci/run_filtered_lib_tests.sh test --locked --features channel-matrix --lib channels::matrix
+              if: ${{ !cancelled() && (github.event_name == 'push' || needs.changes.outputs.channel_features_changed == 'true') }}
+              run: bash scripts/ci/run_filtered_lib_tests.sh test --locked --features channel-lark,channel-matrix --lib channels::matrix
             # `--lib` alone is not enough to claim the feature builds. Turning it
             # on pulls `decancer`, whose `impl Add<Translation> for String` makes
             # `String + &String` ambiguous — which broke two integration tests
             # (`tests/kb/chunk_test.rs`) that no `--lib` run touches. Checking
             # every target is what makes "builds with channel-matrix" true.
             - name: Check every target under channel-matrix
-              run: cargo check --locked --features channel-matrix --all-targets
+              if: ${{ !cancelled() && (github.event_name == 'push' || needs.changes.outputs.channel_features_changed == 'true') }}
+              run: cargo check --locked --features channel-lark,channel-matrix --all-targets
 
     features:
-        name: Features (${{ matrix.name }})
-        needs: [changes, lint]
+        name: Features (no-default, otel, kb-office)
+        needs: [changes, fmt]
         # Was label-gated behind `ci:full`, which meant a feature combination
-        # only broke after merge. The no-default-features entries take ~60-80s.
-        # The entries that add one feature to the default set take about 2
-        # minutes with a warm cache, and longer on the first cold run. They run
-        # in parallel, still inside the `build` job's ~8 minutes, so requiring
-        # them costs no wall-clock.
-        if: needs.changes.outputs.rust_changed == 'true' && needs.lint.result == 'success'
+        # only broke after merge. The no-default-features check takes ~60-80s.
+        # The checks that add one feature to the default set take about 2
+        # minutes with a warm cache, and longer on the first cold run. They
+        # run in sequence in one job now, so they share one cache and one
+        # runner instead of three.
+        if: needs.changes.outputs.rust_changed == 'true' && needs.fmt.result == 'success'
         runs-on: ubuntu-latest
         timeout-minutes: 25
-        strategy:
-            fail-fast: false
-            matrix:
-                # `all-features` is still omitted, but no longer because of
-                # matrix-sdk: 0.18 type-checks at the default limit, and
-                # `channel-matrix` has its own job above. What `all-features`
-                # would additionally pull is the remaining opt-in set —
-                # `legacy-providers`, `rag-pdf`, `kb-ocr` — which is a
-                # separate cost question from this one. Re-adding it is a
-                # follow-up, not a side effect of the matrix pin bump.
-                #
-                # `--all-targets` on the two feature entries that have tests,
-                # benches or examples of their own: the library compiles fine
-                # under `--features <f>` but the targets built only with
-                # `--all-targets` (tests, benches, examples) are what the
-                # `features` matrix needs to defend. The `no-default-features`
-                # entry has no feature to verify with tests/benches/examples
-                # specific to that configuration, so it stays as is.
-                include:
-                    - name: no-default-features
-                      args: --no-default-features
-                      install_libudev: false
-                    - name: observability-otel
-                      args: --features observability-otel --all-targets
-                      install_libudev: false
-                    - name: kb-office
-                      args: --features kb-office --all-targets
-                      install_libudev: false
         steps:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
@@ -346,41 +341,51 @@ jobs:
                   toolchain: 1.92.0
             - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
               with:
-                  key: features-${{ matrix.name }}
-            - name: Install Linux system dependencies for all-features
-              if: matrix.install_libudev
-              run: |
-                  sudo apt-get update
-                  sudo apt-get install -y --no-install-recommends libudev-dev pkg-config
-            - name: Check feature combination
-              run: cargo check --locked ${{ matrix.args }}
+                  key: features
+            # `all-features` is still omitted, but no longer because of
+            # matrix-sdk: 0.18 type-checks at the default limit, and
+            # `channel-features` has its own job above. What `all-features`
+            # would additionally pull is the remaining opt-in set —
+            # `legacy-providers`, `rag-pdf`, `kb-ocr` — which is a
+            # separate cost question from this one. Re-adding it is a
+            # follow-up, not a side effect of the matrix pin bump.
+            #
+            # `--all-targets` on the two feature checks that have tests,
+            # benches or examples of their own: the library compiles fine
+            # under `--features <f>` but the targets built only with
+            # `--all-targets` (tests, benches, examples) are what these
+            # checks need to defend. The `no-default-features` check has no
+            # feature to verify with tests/benches/examples specific to that
+            # configuration, so it stays as is.
+            #
+            # `if: !cancelled()` on every step: these three used to be a
+            # matrix with `fail-fast: false`, so one failing combination did
+            # not hide the other two. The steps keep that property — a failing
+            # step does not stop the next one — and the job still fails if any
+            # step fails.
+            - name: Check no-default-features
+              if: ${{ !cancelled() }}
+              run: cargo check --locked --no-default-features
+            - name: Check observability-otel
+              if: ${{ !cancelled() }}
+              run: cargo check --locked --features observability-otel --all-targets
+            - name: Check kb-office
+              if: ${{ !cancelled() }}
+              run: cargo check --locked --features kb-office --all-targets
 
-    e2e:
-        name: E2E
-        needs: [changes, lint]
-        # Was push-only: an end-to-end regression was invisible until it was
-        # already on `main`. ~2.5 minutes, shorter than `test` and `build`, so
-        # it hides behind them.
-        if: needs.changes.outputs.rust_changed == 'true' && needs.lint.result == 'success'
-        runs-on: ubuntu-latest
-        timeout-minutes: 30
-        steps:
-            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
-              with:
-                  toolchain: 1.92.0
-            - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-            - name: Run integration / E2E tests
-              run: cargo test --test agent_e2e --locked --verbose
+    # The E2E job is gone: `tests/agent_e2e.rs` is an auto-discovered
+    # integration target of the root package, so the `test` job's
+    # `cargo test --locked --workspace` already runs it. The separate job
+    # only re-ran the same tests.
 
     bench-compile:
         name: Bench Compile
-        needs: [changes, lint]
+        needs: [changes, fmt]
         # The one stage that does cost something: ~11 minutes, which makes it
         # the critical path on a Rust PR (previously `build`, ~8). Paid because
         # benches live outside `--lib`/`--bin`, so nothing else notices when a
         # signature change stops them compiling — and `main` went red for it.
-        if: needs.changes.outputs.rust_changed == 'true' && needs.lint.result == 'success'
+        if: needs.changes.outputs.rust_changed == 'true' && needs.fmt.result == 'success'
         runs-on: ubuntu-latest
         timeout-minutes: 25
         steps:
@@ -394,8 +399,8 @@ jobs:
 
     build:
         name: Build (Smoke)
-        needs: [changes]
-        if: needs.changes.outputs.rust_changed == 'true'
+        needs: [changes, fmt]
+        if: needs.changes.outputs.rust_changed == 'true' && needs.fmt.result == 'success'
         runs-on: ubuntu-latest
         timeout-minutes: 20
 
@@ -533,13 +538,12 @@ jobs:
             [
                 changes,
                 identity,
+                fmt,
                 lint,
                 test,
                 msrv,
-                channel-lark,
-                channel-matrix,
+                channel-features,
                 features,
-                e2e,
                 bench-compile,
                 build,
                 docs-only,
@@ -553,7 +557,9 @@ jobs:
 
             # The decision table this job enforces, checked before it is used.
             # The gate used to be inlined here, which is how it came to run two
-            # jobs it never read.
+            # jobs it never read. The self-test also checks that the workflow
+            # and the gate agree, so a job that is added here without being
+            # read by the gate fails the job instead of turning advisory.
             - name: Self-test the gate
               run: ./scripts/ci/required_gate.sh --self-test
 
@@ -563,14 +569,14 @@ jobs:
                   RUST_CHANGED: ${{ needs.changes.outputs.rust_changed }}
                   DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
                   DOCS_CHANGED: ${{ needs.changes.outputs.docs_changed }}
+                  CHANNEL_FEATURES_CHANGED: ${{ needs.changes.outputs.channel_features_changed }}
                   IDENTITY_RESULT: ${{ needs.identity.result }}
+                  FMT_RESULT: ${{ needs.fmt.result }}
                   LINT_RESULT: ${{ needs.lint.result }}
                   TEST_RESULT: ${{ needs.test.result }}
                   MSRV_RESULT: ${{ needs.msrv.result }}
-                  CHANNEL_LARK_RESULT: ${{ needs.channel-lark.result }}
-                  CHANNEL_MATRIX_RESULT: ${{ needs.channel-matrix.result }}
+                  CHANNEL_FEATURES_RESULT: ${{ needs.channel-features.result }}
                   FEATURES_RESULT: ${{ needs.features.result }}
-                  E2E_RESULT: ${{ needs.e2e.result }}
                   BENCH_COMPILE_RESULT: ${{ needs.bench-compile.result }}
                   BUILD_RESULT: ${{ needs.build.result }}
                   DOCS_RESULT: ${{ needs.docs-quality.result }}

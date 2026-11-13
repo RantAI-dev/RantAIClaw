@@ -1,14 +1,41 @@
 #!/usr/bin/env bash
+#
+# The local Rust quality gate: format, clippy and the identity-string check.
+#
+# Usage:
+#   rust_quality_gate.sh [--strict] [--skip-fmt]
+#
+#   --strict    clippy denies every warning, not just the correctness group
+#   --skip-fmt  skip `cargo fmt --all -- --check`
+#
+# `--skip-fmt` exists because the CI workflow runs the format check in its
+# own cheap job (`fmt`), and running it here as well would check every file
+# twice. Without the flag this script is the complete local gate — it is
+# what `dev/ci.sh` and `.githooks/pre-push` call — so it formats first.
 
 set -euo pipefail
 
 MODE="correctness"
-if [ "${1:-}" = "--strict" ]; then
-    MODE="strict"
-fi
+SKIP_FMT=false
 
-echo "==> rust quality: cargo fmt --all -- --check"
-cargo fmt --all -- --check
+for arg in "$@"; do
+    case "$arg" in
+        --strict) MODE="strict" ;;
+        --skip-fmt) SKIP_FMT=true ;;
+        *)
+            echo "rust_quality_gate.sh: unknown argument '${arg}'" >&2
+            echo "usage: rust_quality_gate.sh [--strict] [--skip-fmt]" >&2
+            exit 2
+            ;;
+    esac
+done
+
+if [ "$SKIP_FMT" = "true" ]; then
+    echo "==> rust quality: cargo fmt skipped (--skip-fmt)"
+else
+    echo "==> rust quality: cargo fmt --all -- --check"
+    cargo fmt --all -- --check
+fi
 
 if [ "$MODE" = "strict" ]; then
     echo "==> rust quality: cargo clippy --locked --all-targets -- -D warnings"
