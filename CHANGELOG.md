@@ -119,6 +119,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The TUI approval prompt now shows when its answer keys are off, and no hint offers a key that is
+  off.** An answer key counts only into an empty composer, but the composer is hidden while the
+  prompt is up, so text left in it (a message typed before the prompt opened) made `y`, `F2` and
+  `n` do nothing with no sign of why, and the request waited unanswered. With text in the composer
+  the pane now shows that text on one row (newlines as a marker, cut to the pane width) and says
+  `y/F2/n off`, naming the way out: clear the text with Backspace or Ctrl+U, then answer. `Esc`
+  keeps its chip because it still denies. The chip letters are now lowercase `y` and `n`, because
+  only the unmodified key answers: `Shift+Y` types into the composer.
+  The chips at a risk gate now say what the answer grants. At medium risk `y` reads `yes (session,
+  medium risk)` and `F2` reads `same, not saved`. At high risk `y` reads `yes (this run only)`,
+  because that answer holds nothing afterwards, and `F2` reads `same, not saved`. The
+  unallowed-command prompt keeps `yes (session)` and `always: any <command>`. The pane title no
+  longer ends in a bare `from` when the request has no channel. The scrollback line written when a
+  request arrives no longer lists the answer keys. It is written once, possibly while the composer
+  holds text, so the pane is the live guide. Which key answers in which state is unchanged. No
+  config key or default changes, so the config schema stays at version 40.
+
 - **Two setup paths no longer accept a removed login (`copilot`, `openai-codex`/`codex`, the Qwen
   Code and MiniMax OAuth names) without naming the replacement.** A removed login name still builds
   a provider that refuses every request, so the build checks in these paths passed it and the
