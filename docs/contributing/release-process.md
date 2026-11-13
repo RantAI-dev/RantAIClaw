@@ -137,8 +137,9 @@ Publish-mode guardrails:
 - Artifacts are verified before publish.
 
 The GHCR image is **not** a guardrail, and does not gate the release. `Pub
-Release` pushes `ghcr.io/<owner>/<repo>:<tag>` from the same job, but *after*
-`Create GitHub Release`, and the push step carries `continue-on-error: true`.
+Release` pushes `ghcr.io/<owner>/<repo>:<tag>` — and `:latest`, the tag that
+names the most recent release — from the same job, but *after* `Create GitHub
+Release`, and the push step carries `continue-on-error: true`.
 That ordering is deliberate: before v0.6.50 the multi-arch image build ran under
 QEMU and regularly exceeded the 90-minute job timeout, which cancelled the runner
 and left already-built, already-signed binaries unpublished. The release page now
@@ -154,7 +155,9 @@ mean the image was pushed.
 
 1. Ensure required checks are green on latest `main`.
 2. Confirm no high-priority incidents or known regressions are open.
-3. Confirm installer and Docker workflows are healthy on recent `main` commits.
+3. Confirm installer and Docker workflows are healthy on recent `main` commits. The
+   Docker image of `main` is built nightly as `:edge`, so the latest `:edge` build
+   is what tells you whether `main` still builds.
 
 ### 2) Land the version bump on `main`
 
@@ -262,8 +265,8 @@ correct outcome.
 ### 5) Monitor publish run
 
 A tag push starts exactly two workflows: `Pub Release` and `Workflow Sanity`.
-`Pub Docker Img` is **not** one of them — its triggers are `push` to `main`,
-pull requests, and manual dispatch, so it never sees a tag ref. The release image
+`Pub Docker Img` is **not** one of them — its triggers are a nightly schedule,
+pull requests, and manual dispatch; there is no tag trigger. The release image
 comes from `Pub Release` itself; nothing is missing when `Pub Docker Img` stays
 quiet during a release.
 
@@ -300,6 +303,8 @@ Expected publish outputs:
 
    Anything other than `success` means the tag exists but the image does not.
    Re-run that step or push the image manually; the release itself is unaffected.
+   That same push is what moves `:latest`, so a failed step leaves `:latest`
+   pointing at the previous release.
 
    Reading GHCR directly needs a token with the `read:packages` scope. Without
    it both `ghcr.io/token` and the registry API answer 401/403 for a missing

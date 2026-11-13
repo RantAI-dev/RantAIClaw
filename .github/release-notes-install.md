@@ -101,7 +101,7 @@ rantaiclaw --version
 # Pull the exact release
 docker pull ghcr.io/rantai-dev/rantaiclaw:__VERSION__
 
-# Or :latest for the most recent release
+# Or :latest for the most recent release — only a release moves this tag
 docker pull ghcr.io/rantai-dev/rantaiclaw:latest
 
 # Run interactively with persistent config and workspace
@@ -110,6 +110,10 @@ docker run --rm -it \
   ghcr.io/rantai-dev/rantaiclaw:__VERSION__ \
   chat
 ```
+
+`:latest` is the most recent release. `:edge` is the most recent nightly build of
+`main` — unreleased code that can break, so use it only to try what `main` does
+today.
 
 </details>
 

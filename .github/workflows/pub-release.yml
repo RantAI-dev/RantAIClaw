@@ -552,6 +552,10 @@ jobs:
                   username: ${{ github.actor }}
                   password: ${{ secrets.GITHUB_TOKEN }}
 
+            # A publish-mode run moves the `:latest` tag, whether or not the release is
+            # still a draft: this step lives in the `publish` job, whose `if:` is
+            # `needs.prepare.outputs.publish_release == 'true'`. A verification-only dry run
+            # (`publish_release=false`) never reaches this step, so it never moves `:latest`.
             - name: Compute Docker release tags
               id: docker_meta
               shell: bash
@@ -562,7 +566,7 @@ jobs:
                   image="${REGISTRY}/${IMAGE_NAME}"
                   image="${image,,}"
                   sha_tag="${image}:sha-${GITHUB_SHA::12}"
-                  tags="${image}:${RELEASE_TAG},${sha_tag}"
+                  tags="${image}:${RELEASE_TAG},${sha_tag},${image}:latest"
                   echo "tags=${tags}" >> "$GITHUB_OUTPUT"
 
             # Render the install template with the actual release tag

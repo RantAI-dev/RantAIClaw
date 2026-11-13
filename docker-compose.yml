@@ -9,6 +9,8 @@
 
 services:
   rantaiclaw:
+    # :latest is the most recent release image — only a release moves this tag.
+    # :edge is the nightly build of main (unreleased, can break).
     image: ghcr.io/rantai-dev/rantaiclaw:latest
     # Or build locally:
     # build: .

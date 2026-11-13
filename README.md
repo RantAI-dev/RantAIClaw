@@ -85,10 +85,12 @@ persona, skills, MCP, login, knowledge). Pass `--skip-setup` / `-SkipSetup` (or 
 
 | Method | Command |
 |---|---|
-| Docker | `docker pull ghcr.io/rantai-dev/rantaiclaw:latest` |
+| Docker | `docker pull ghcr.io/rantai-dev/rantaiclaw:latest` (`:latest` is the most recent release; `:edge` is the nightly `main` build) |
 | Cargo | `cargo install --git https://github.com/RantAI-dev/RantAIClaw --locked` |
 | From source | `git clone … && cd RantAIClaw && ./bootstrap.sh --from-source` |
 | Manual | [Pick a release archive](https://github.com/RantAI-dev/RantAIClaw/releases/latest), verify against `SHA256SUMS`, extract, move into `PATH` |
+
+Until the next release is published, `:latest` still names the last image pushed to `main`; the release rule above applies from that release onward.
 
 Every release ships cosign-signed archives plus SBOMs (`rantaiclaw.cdx.json`,
 `rantaiclaw.spdx.json`). `rantaiclaw update` and `rantaiclaw ui install` **refuse**

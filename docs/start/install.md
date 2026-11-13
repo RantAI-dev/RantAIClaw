@@ -487,6 +487,16 @@ See [Cargo.toml](../../Cargo.toml) for the full feature list.
 
 ## Option D: Docker
 
+### Which tag to pull
+
+| Tag | What it is |
+|---|---|
+| `:latest` | The most recent **release** image. Only a release moves this tag. |
+| `:edge` | The most recent **nightly build of `main`**. Unreleased code — it can break. |
+| `:vX.Y.Z` | One specific release, pinned. |
+
+Until the next release is published, `:latest` still names the last build pushed to `main`, not a release; the table above applies from that release onward.
+
 ### Pull the official image
 
 ```bash
@@ -516,7 +526,7 @@ cd RantAIClaw
 ./bootstrap.sh --docker --interactive-onboard
 ```
 
-This builds a local image, mounts persistent volumes, and runs onboarding inside the container. Falls back to pulling `ghcr.io/rantai-dev/rantaiclaw:latest` if you pass `--skip-build`.
+This builds a local image, mounts persistent volumes, and runs onboarding inside the container. Falls back to pulling `ghcr.io/rantai-dev/rantaiclaw:latest` (the most recent release) if you pass `--skip-build`.
 
 Podman works too — set `RANTAICLAW_CONTAINER_CLI=podman` or just install only podman and the script auto-detects.
 
@@ -572,7 +582,7 @@ Advanced / build-tuning:
 |---|---|---|
 | `RANTAICLAW_RELEASE_BASE_URL` | `https://github.com/RantAI-dev/RantAIClaw/releases/latest/download` | Where to fetch archives + `SHA256SUMS` from |
 | `RANTAICLAW_REPO_URL` | `https://github.com/RantAI-dev/RantAIClaw.git` | Git URL for `--from-source` / `--docker` clones |
-| `RANTAICLAW_FALLBACK_IMAGE` | `ghcr.io/rantai-dev/rantaiclaw:latest` | Docker fallback image |
+| `RANTAICLAW_FALLBACK_IMAGE` | `ghcr.io/rantai-dev/rantaiclaw:latest` | Docker fallback image (`:latest` is the most recent release) |
 | `RANTAICLAW_INSTALL_DIR` | `~/.cargo/bin` (else `~/.local/bin`) | Where the binary lands |
 | `VERIFY_CHECKSUM` | `true` | Set to `false` to skip SHA256 verification |
 | `RANTAICLAW_SKIP_SETUP` | unset | Set to `1` to skip the default `rantaiclaw setup --force` run |
@@ -617,7 +627,7 @@ rm -rf ~/.rantaiclaw
 For Docker:
 
 ```bash
-docker rmi ghcr.io/rantai-dev/rantaiclaw:latest rantaiclaw-bootstrap:local
+docker rmi ghcr.io/rantai-dev/rantaiclaw:latest rantaiclaw-bootstrap:local  # :latest = most recent release
 rm -rf ~/.rantaiclaw-docker
 ```
 

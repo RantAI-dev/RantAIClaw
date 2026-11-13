@@ -14,9 +14,9 @@ Use this with:
 | --- | --- |
 | PR activity (`pull_request_target`) | `pr-intake-checks.yml`, `pr-labeler.yml`, `pr-title-lint.yml` |
 | PR activity (`pull_request`) | `ci-run.yml`, `sec-audit.yml` (no path filter on PRs); `pub-docker-img.yml` only when its Dockerfile paths change; `workflow-sanity.yml` on every PR (no path filter) |
-| Push to `main` | `ci-run.yml`, `sec-audit.yml` (path-scoped on Cargo paths), `pub-docker-img.yml` (no path filter on push), `workflow-sanity.yml` (path-scoped on workflow files) |
-| Tag push (`v*`) | `pub-release.yml` publish mode (publishes the GitHub Release and a multi-arch Docker image) |
-| Scheduled/manual | `pub-release.yml` verification mode, `sec-codeql.yml`, `sec-audit.yml`, `test-fuzz.yml` |
+| Push to `main` | `ci-run.yml`, `sec-audit.yml` (path-scoped on Cargo paths), `workflow-sanity.yml` (path-scoped on workflow files) |
+| Tag push (`v*`) | `pub-release.yml` publish mode (publishes the GitHub Release and a multi-arch Docker image, and moves `:latest`) |
+| Scheduled/manual | `pub-release.yml` verification mode, `pub-docker-img.yml` (nightly build of `main` as `:edge`), `sec-codeql.yml`, `sec-audit.yml`, `test-fuzz.yml` |
 
 ## Step-By-Step
 
@@ -69,8 +69,8 @@ Use this with:
 Workflow: `.github/workflows/pub-docker-img.yml`.
 
 - PR (Dockerfile build-input paths only): `pr-smoke` job builds + `docker run ... --version` smoke; no registry push.
-- Push to `main` (no path filter on the `push` trigger; only `pull_request` is path-scoped) + manual dispatch: `build` + `merge` jobs build multi-arch (`linux/amd64,linux/arm64`) and push to `ghcr.io/<owner>/<repo>`. Tag computation: `latest` + `sha-<12>` for `main`. There is no tag trigger on this workflow.
-- The release Docker image for a `v*` tag is published by `pub-release.yml`'s `publish` job, not by `pub-docker-img.yml`.
+- Nightly schedule (daily 03:23 UTC) + manual dispatch on `main`: `build` + `merge` jobs build multi-arch (`linux/amd64,linux/arm64`) and push to `ghcr.io/<owner>/<repo>`. Tag computation: `edge` + `sha-<12>`. `edge` is the most recent nightly build of `main`; this workflow never publishes `latest`. There is no `push` trigger and no tag trigger on this workflow.
+- The release Docker image for a `v*` tag, and the `latest` tag that names the most recent release, are published by `pub-release.yml`'s `publish` job, not by `pub-docker-img.yml`.
 
 ## Release Logic
 
@@ -126,18 +126,18 @@ flowchart TD
   A["Commit reaches main"] --> B["ci-run.yml (adds e2e stage on push)"]
   A --> C["sec-audit.yml"]
   A --> D["path-scoped workflows (if matched)"]
-  A --> E["pub-docker-img.yml (no path filter on push)"]
+  N["Nightly schedule 03:23 UTC"] --> E["pub-docker-img.yml (builds main as edge)"]
   T["Tag push v*"] --> R["pub-release.yml"]
   W["Manual/Scheduled release verify"] --> R
-  R --> R1["Artifacts + SBOM + checksums + signatures + GitHub Release + release Docker image"]
+  R --> R1["Artifacts + SBOM + checksums + signatures + GitHub Release + release Docker image (moves :latest)"]
   W --> R2["Verification build only (no GitHub Release publish)"]
-  E --> E1["Push ghcr image tags (latest + sha-12)"]
+  E --> E1["Push ghcr image tags (edge + sha-12)"]
 ```
 
 ## Quick Troubleshooting
 
 1. Unexpected skipped jobs: inspect `scripts/ci/detect_change_scope.sh` — the file's `rust-set` clause is the definition of what counts as a Rust change for `ci-run.yml`. A Rust stage skips only when the diff touched no Rust, workflow, gate-script, or `Cargo`/`clippy.toml`/`rustfmt.toml`/`.cargo/config.toml` path AND when `lint` did not fail upstream.
 2. Fork PR appears stalled: check whether Actions run approval is pending.
-3. Docker not published: confirm changed files match Docker build-input paths, or run workflow dispatch manually.
+3. Docker not published: a push to `main` no longer builds an image — `:edge` comes from the nightly run (or a manual dispatch on `main`). For a PR, confirm changed files match Docker build-input paths.
 4. PR title check failing: ensure title matches Conventional Commits (`feat|fix|chore|docs|refactor|perf|test|build|ci|style|revert`, optional scope, colon, summary).
 5. `bench-compile` failing but tests passing: a criterion target compiles only with `--no-run`; check `benches/agent_benchmarks.rs` for new deps that need `dev-dependencies`.
