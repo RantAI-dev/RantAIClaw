@@ -153,9 +153,10 @@ run_gate() {
   # now wait for, so a formatting mistake is reported as such instead of
   # hiding behind "tests did not pass".
   require_success "Format" "$fmt_result" || return 1
-  # Lint next: everything downstream of it still runs in parallel, but a lint
-  # failure skips the heavy jobs, so reporting "tests did not pass" for it
-  # would send the reader to the wrong log.
+  # Lint next: the heavy jobs do not wait for it (they wait for `fmt`), so a
+  # lint failure leaves their results green or red on their own merits, and
+  # reporting "tests did not pass" for it would send the reader to the wrong
+  # log.
   require_success "Lint" "$lint_result" || return 1
   require_success "Unit tests" "$test_result" || return 1
   require_success "MSRV check" "$msrv_result" || return 1

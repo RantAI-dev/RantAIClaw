@@ -25,7 +25,11 @@ module.exports = async ({ github, context, core }) => {
     ["summary why it matters", /- Why it matters:\s*\S+/m],
     ["summary what changed", /- What changed:\s*\S+/m],
     ["validation commands", /Commands and result summary:\s*[\s\S]*```/m],
-    ["security risk/mitigation", /- New permissions\/capabilities\?\s*\(`Yes\/No`\):\s*\S+/m],
+    // The template line carries the "(`Yes/No`)" hint and no colon, and a filled
+    // field usually drops the hint ("- New permissions/capabilities? No"), so the
+    // hint and the colon are optional. The answer itself is required, which keeps
+    // the unfilled template incomplete.
+    ["security risk/mitigation", /- New permissions\/capabilities\?\s*(?:\(`Yes\/No`\))?:?\s*(?:Yes|No)\b/i],
     ["privacy status", /- Data-hygiene status\s*\(`pass\|needs-follow-up`\):\s*\S+/m],
     ["rollback plan", /- Fast rollback command\/path:\s*\S+/m],
   ];
