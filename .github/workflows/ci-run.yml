@@ -192,8 +192,8 @@ jobs:
                   CLIPPY_EXIT_CODE: ${{ steps.clippy.outputs.exit_code }}
               run: ./scripts/ci/rust_strict_delta_gate.sh
             # Source-level guards. Cheap greps, no build — they belong here rather
-            # than in `features`, which is label-gated and would not run on the PRs
-            # that introduce these regressions.
+            # than in `features`, which builds non-default feature sets and has
+            # no reason to run these greps.
             - name: Provisioner probe hosts match their channel modules
               run: ./scripts/ci/check_provisioner_probe_hosts.sh
             - name: Channel config fields have runtime readers
@@ -607,10 +607,16 @@ jobs:
               if: steps.collect_links.outputs.count == '0'
               run: echo "No added links in changed docs lines. Link check skipped."
 
+    # Informational. It has to run when `fmt`, `lint` or `docs-quality` fails,
+    # because that is the case it reports: a job-level `if` without a status
+    # function gets an implicit `success()` and skips the job whenever a needed
+    # job fails. `!cancelled()` keeps it from posting on a cancelled run. The
+    # trigger is `pull_request`, so a fork gets a read-only token and the script
+    # downgrades the failed comment write to a warning.
     lint-feedback:
         name: Lint Feedback
-        if: github.event_name == 'pull_request'
-        needs: [changes, lint, docs-quality]
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        needs: [changes, fmt, lint, docs-quality]
         runs-on: ubuntu-latest
         permissions:
             contents: read
@@ -620,13 +626,13 @@ jobs:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
             - name: Post actionable lint failure summary
-              if: always()
               uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
               env:
+                  CHANGES_RESULT: ${{ needs.changes.result }}
                   RUST_CHANGED: ${{ needs.changes.outputs.rust_changed }}
                   DOCS_CHANGED: ${{ needs.changes.outputs.docs_changed }}
+                  FMT_RESULT: ${{ needs.fmt.result }}
                   LINT_RESULT: ${{ needs.lint.result }}
-                  LINT_DELTA_RESULT: ${{ needs.lint.result }}
                   DOCS_RESULT: ${{ needs.docs-quality.result }}
               with:
                   script: |

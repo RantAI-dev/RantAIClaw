@@ -55,7 +55,7 @@ Use this with:
    - `build` runs a `release-fast` smoke build and the binary-size guard.
 7. Fast-path jobs: `docs-only` runs when `docs_only` is true, and `non-rust` runs when the change is neither docs-only nor Rust.
 8. Docs path: `docs-quality` runs when `docs_changed` is true. It runs incremental markdownlint on changed lines, the CLI command and HTTP route doc-coverage checks, the channel maturity check, and an offline lychee check on added links.
-9. `lint-feedback` runs on PRs only. It reads the results of `lint` and `docs-quality` and posts an actionable failure comment if either failed.
+9. `lint-feedback` runs on PRs only. It reads the results of `fmt`, `lint` and `docs-quality`, runs even when one of them failed, and posts an actionable failure comment if any did.
 10. `CI Required Gate` runs `scripts/ci/required_gate.sh` and aggregates results to a final pass or fail. The gate checks in this order:
     - `identity` must be `success`.
     - `changes` must be `success`, because every scope output is empty when it did not finish.
