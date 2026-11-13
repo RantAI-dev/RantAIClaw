@@ -1071,6 +1071,13 @@ impl TuiApp {
         if self.pending_approval.is_none() || prequeued {
             return None;
         }
+        // The pane is the only place that names the answer keys. While a
+        // full-screen view covers it the operator cannot see the prompt, and
+        // the key belongs to that view: a `y` typed into a filter, or the Esc
+        // that closes a picker, must not answer it.
+        if !self.approval_pane_visible() {
+            return None;
+        }
         // Esc denies even with text in the composer — it dismisses rather
         // than types.
         if key.code == KeyCode::Esc && key.modifiers.is_empty() {
@@ -2526,7 +2533,7 @@ impl TuiApp {
                 match rx.try_recv() {
                     Ok(req) => {
                         // The FULL command goes here. The pane below
-                        // truncates its preview at 200 characters and
+                        // cuts its preview to the row width and
                         // justifies that by saying the whole thing was
                         // shown in scrollback — which was not true: this
                         // line printed only the basename, so a long
@@ -5362,104 +5369,185 @@ impl TuiApp {
     /// transient overlays (autocomplete dropdown, /help modal, streaming
     /// spinner).
     pub fn render(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+        terminal.draw(|frame| self.draw_frame(frame))?;
+        Ok(())
+    }
+
+    /// The full-screen view that owns the frame, if one is open. Priority
+    /// order matches the old alt-screen path: login gate > setup overlay >
+    /// first-run wizard > list picker > info panel.
+    ///
+    /// This is the one place that lists the views that replace the frame, and
+    /// both the draw path and [`Self::approval_pane_visible`] read it, so a
+    /// view added here hides the approval pane and takes the answer keys
+    /// without a second edit. The exhaustive `match` in
+    /// [`Self::draw_full_screen_view`] makes the compiler ask for its drawing.
+    fn full_screen_view(&self) -> Option<FullScreenView> {
+        if self.login_gate.is_some() {
+            Some(FullScreenView::LoginGate)
+        } else if self.setup_overlay.is_some() {
+            Some(FullScreenView::SetupOverlay)
+        } else if self.first_run_wizard.is_some() {
+            Some(FullScreenView::FirstRunWizard)
+        } else if self.list_picker.is_some() {
+            Some(FullScreenView::ListPicker)
+        } else if self.info_panel.is_some() {
+            Some(FullScreenView::InfoPanel)
+        } else {
+            None
+        }
+    }
+
+    /// Whether the approval pane is what the frame shows for a pending
+    /// prompt: no full-screen view has replaced it.
+    ///
+    /// An answer key counts only while this holds. A key pressed while a view
+    /// covers the pane belongs to that view, since the operator cannot see
+    /// the prompt it would answer.
+    fn approval_pane_visible(&self) -> bool {
+        self.full_screen_view().is_none()
+    }
+
+    /// Draw `view` over the whole frame. While an approval prompt waits, the
+    /// last row of the frame carries a one-line notice and the view gets the
+    /// rows above it, so the notice never overwrites the view's own footer.
+    /// A frame one row high has no room for a notice and gives the view the
+    /// row.
+    fn draw_full_screen_view(
+        &mut self,
+        view: FullScreenView,
+        frame: &mut ratatui::Frame,
+        area: Rect,
+    ) {
+        let notice_row = (self.pending_approval.is_some() && area.height >= 2).then(|| Rect {
+            y: area.y + area.height - 1,
+            height: 1,
+            ..area
+        });
+        let view_area = Rect {
+            height: area.height - u16::from(notice_row.is_some()),
+            ..area
+        };
+        match view {
+            FullScreenView::LoginGate => {
+                if let Some(gate) = self.login_gate.as_ref() {
+                    gate.render_fullscreen(frame, view_area);
+                }
+            }
+            FullScreenView::SetupOverlay => {
+                if let Some(overlay_state) = self.setup_overlay.as_mut() {
+                    overlay_state.render(frame, view_area);
+                }
+            }
+            FullScreenView::FirstRunWizard => {
+                if let Some(wizard) = self.first_run_wizard.as_mut() {
+                    wizard.render_fullscreen(frame, view_area);
+                }
+            }
+            FullScreenView::ListPicker => {
+                if let Some(picker) = self.list_picker.as_mut() {
+                    picker.render(frame, view_area);
+                }
+            }
+            FullScreenView::InfoPanel => {
+                if let Some(panel) = self.info_panel.as_ref() {
+                    panel.render(frame, view_area);
+                }
+            }
+        }
+        if let Some(row) = notice_row {
+            let text = one_row_within(
+                APPROVAL_WAITING_NOTICE,
+                usize::from(row.width).saturating_sub(1),
+            );
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!(" {text}"),
+                    Style::default()
+                        .fg(Color::Rgb(241, 196, 15))
+                        .add_modifier(Modifier::BOLD),
+                ))),
+                row,
+            );
+        }
+    }
+
+    /// Draw one frame: a full-screen view when one is open, otherwise the
+    /// chat layout with the composer or the approval pane.
+    fn draw_frame(&mut self, frame: &mut ratatui::Frame) {
+        let area = frame.area();
+
+        // Full-screen modals own the entire screen and clear their own area.
+        if let Some(view) = self.full_screen_view() {
+            self.draw_full_screen_view(view, frame, area);
+            return;
+        }
+
         let TuiApp {
             state,
             context,
             autocomplete,
             overlay,
-            list_picker,
-            info_panel,
-            stream_committed_chars,
             ..
         } = self;
-
-        let _ = stream_committed_chars; // kept on App for future re-introduction
         let pending_approval_snapshot = self.pending_approval.clone();
-        terminal.draw(|frame| {
-            let area = frame.area();
 
-            // Full-screen modals own the entire screen. Priority order matches
-            // the old alt-screen path: login gate > setup overlay > first-run
-            // wizard > list picker > info panel. Each clears its own area.
-            if let Some(gate) = self.login_gate.as_ref() {
-                gate.render_fullscreen(frame, area);
-                return;
-            }
-            if let Some(overlay_state) = self.setup_overlay.as_mut() {
-                overlay_state.render(frame, area);
-                return;
-            }
-            if let Some(wizard) = self.first_run_wizard.as_mut() {
-                wizard.render_fullscreen(frame, area);
-                return;
-            }
-            if let Some(picker) = list_picker.as_mut() {
-                picker.render(frame, area);
-                return;
-            }
-            if let Some(panel) = info_panel.as_ref() {
-                panel.render(frame, area);
-                return;
-            }
+        // Base chat layout (fullscreen): a scrollable chat pane on top, the
+        // composer (dynamic 1..=6 text rows, `needed_composer_rows`), and
+        // the status bar pinned at the very bottom.
+        let inner_w = area.width.saturating_sub(2).max(1);
+        // Remember the wrap width so Up/Down key handling moves the caret by
+        // the same visual rows the renderer draws.
+        context.last_composer_width = inner_w;
+        let text_rows = needed_composer_rows(&context.input_buffer, inner_w);
+        let composer_rows = composer_area_rows(text_rows, pending_approval_snapshot.is_some());
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(1),                // 0: chat pane
+                Constraint::Length(composer_rows), // 1: composer / approval prompt
+                Constraint::Length(1),             // 2: status bar
+            ])
+            .split(area);
 
-            // Base chat layout (fullscreen): a scrollable chat pane on top, the
-            // composer (dynamic 1..=6 text rows, `needed_composer_rows`), and
-            // the status bar pinned at the very bottom.
-            let inner_w = area.width.saturating_sub(2).max(1);
-            // Remember the wrap width so Up/Down key handling moves the caret by
-            // the same visual rows the renderer draws.
-            context.last_composer_width = inner_w;
-            let text_rows = needed_composer_rows(&context.input_buffer, inner_w);
-            let composer_rows = composer_area_rows(text_rows, pending_approval_snapshot.is_some());
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Min(1),                // 0: chat pane
-                    Constraint::Length(composer_rows), // 1: composer / approval prompt
-                    Constraint::Length(1),             // 2: status bar
-                ])
-                .split(area);
+        render_chat_pane(state, context, frame, chunks[0]);
 
-            render_chat_pane(state, context, frame, chunks[0]);
+        // When an approval is pending, the composer row swaps for the styled
+        // approval prompt — same height so the status bar stays put.
+        if let Some(ref req) = pending_approval_snapshot {
+            render_approval_pane(req, &context.input_buffer, frame, chunks[1]);
+        } else {
+            render_input_pane(context, frame, chunks[1]);
+        }
+        render_status_pane(context, state, frame, chunks[2]);
 
-            // When an approval is pending, the composer row swaps for the styled
-            // approval prompt — same height so the status bar stays put.
-            if let Some(ref req) = pending_approval_snapshot {
-                render_approval_pane(req, &context.input_buffer, frame, chunks[1]);
-            } else {
-                render_input_pane(context, frame, chunks[1]);
+        // /help modal overlays the chat pane but leaves the composer usable.
+        if let Some(content) = overlay.as_ref() {
+            render_overlay_pane(content, frame, area);
+        }
+
+        // Slash-command dropdown, anchored just above the composer.
+        if autocomplete.is_visible() {
+            let input_area = chunks[1];
+            let space_above = input_area.y.saturating_sub(area.y);
+            let max_rows: u16 = 8;
+            let desired = (max_rows + 2).min(area.height.saturating_sub(1));
+            let popup_height = desired.min(space_above.max(input_area.height));
+            if popup_height >= 3 {
+                let popup_y = if space_above >= popup_height {
+                    input_area.y - popup_height
+                } else {
+                    input_area.y
+                };
+                let popup_area = Rect {
+                    x: input_area.x,
+                    y: popup_y,
+                    width: input_area.width,
+                    height: popup_height,
+                };
+                autocomplete.render(frame, popup_area);
             }
-            render_status_pane(context, state, frame, chunks[2]);
-
-            // /help modal overlays the chat pane but leaves the composer usable.
-            if let Some(content) = overlay.as_ref() {
-                render_overlay_pane(content, frame, area);
-            }
-
-            // Slash-command dropdown, anchored just above the composer.
-            if autocomplete.is_visible() {
-                let input_area = chunks[1];
-                let space_above = input_area.y.saturating_sub(area.y);
-                let max_rows: u16 = 8;
-                let desired = (max_rows + 2).min(area.height.saturating_sub(1));
-                let popup_height = desired.min(space_above.max(input_area.height));
-                if popup_height >= 3 {
-                    let popup_y = if space_above >= popup_height {
-                        input_area.y - popup_height
-                    } else {
-                        input_area.y
-                    };
-                    let popup_area = Rect {
-                        x: input_area.x,
-                        y: popup_y,
-                        width: input_area.width,
-                        height: popup_height,
-                    };
-                    autocomplete.render(frame, popup_area);
-                }
-            }
-        })?;
-        Ok(())
+        }
     }
 
     /// True when a full-screen modal (login gate, list picker, info panel,
@@ -5467,12 +5555,7 @@ impl TuiApp {
     /// owns keyboard input — used to gate paste-burst coalescing so a modal's
     /// own key handling isn't shadowed.
     fn modal_active(&self) -> bool {
-        self.login_gate.is_some()
-            || self.list_picker.is_some()
-            || self.info_panel.is_some()
-            || self.autocomplete.is_visible()
-            || self.setup_overlay.is_some()
-            || self.first_run_wizard.is_some()
+        self.full_screen_view().is_some() || self.autocomplete.is_visible()
     }
 
     /// Resolve a mouse position to a selection anchor, using the chat-pane
@@ -6796,6 +6879,21 @@ fn one_row_within(text: &str, columns: usize) -> String {
     cut
 }
 
+/// A view that replaces the whole frame, the approval pane included. See
+/// [`TuiApp::full_screen_view`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FullScreenView {
+    LoginGate,
+    SetupOverlay,
+    FirstRunWizard,
+    ListPicker,
+    InfoPanel,
+}
+
+/// The line a full-screen view carries while an approval prompt waits behind
+/// it. The pane that names the answer keys is not on screen then.
+const APPROVAL_WAITING_NOTICE: &str = "Approval waiting, answer it once this view is closed.";
+
 /// Rows the approval prompt takes in the layout: two border rows, the
 /// command preview and the row of action chips.
 ///
@@ -6868,13 +6966,11 @@ fn render_approval_pane(
         // command was already shown in the system-message scrollback line
         // when the request landed, so this preview is just enough context
         // for the user to decide.
-        let one_line = req.full_command.replace('\n', " ⏎ ");
-        let preview = if one_line.chars().count() > 200 {
-            let head: String = one_line.chars().take(197).collect();
-            format!("{head}…")
-        } else {
-            one_line
-        };
+        //
+        // The preview is cut to the row, because a preview that wraps pushes
+        // the chip row out of the pane and no answer key is left on screen.
+        // The cut keeps the start of the command and drops the tail.
+        let preview = one_row_within(&req.full_command, usize::from(area.width).saturating_sub(3));
 
         // The letters are lowercase because only the unmodified lowercase key
         // is guaranteed to answer: `Shift+Y` does not answer and types into
@@ -15750,7 +15846,7 @@ mod approval_answer_tests {
         shown_id: uuid::Uuid,
         /// One handle per blocked call, in the order the requests were made.
         handles: Vec<tokio::task::JoinHandle<Decision>>,
-        _dir: tempfile::TempDir,
+        dir: tempfile::TempDir,
     }
 
     impl ApprovalFixture {
@@ -15866,7 +15962,7 @@ mod approval_answer_tests {
             req_rx,
             shown_id: shown.id,
             handles,
-            _dir: dir,
+            dir,
         }
     }
 
@@ -16803,5 +16899,469 @@ mod approval_answer_tests {
             6,
             "four text rows plus two border rows"
         );
+    }
+
+    /// The five full-screen views that replace the whole frame, the pane
+    /// included.
+    #[derive(Clone, Copy, Debug)]
+    enum FullScreenViewUnderTest {
+        ListPicker,
+        InfoPanel,
+        SetupOverlay,
+        FirstRunWizard,
+        LoginGate,
+    }
+
+    const FULL_SCREEN_VIEWS: [FullScreenViewUnderTest; 5] = [
+        FullScreenViewUnderTest::ListPicker,
+        FullScreenViewUnderTest::InfoPanel,
+        FullScreenViewUnderTest::SetupOverlay,
+        FullScreenViewUnderTest::FirstRunWizard,
+        FullScreenViewUnderTest::LoginGate,
+    ];
+
+    /// Open `view` on `app`. The setup overlay carries a text prompt, so a
+    /// letter typed into it has somewhere to land.
+    fn open_full_screen_view(
+        app: &mut TuiApp,
+        view: FullScreenViewUnderTest,
+        profile_root: &std::path::Path,
+    ) {
+        match view {
+            FullScreenViewUnderTest::ListPicker => {
+                app.list_picker = Some(crate::tui::widgets::ListPicker::new(
+                    crate::tui::widgets::ListPickerKind::Session,
+                    "Resume Session",
+                    vec![crate::tui::widgets::ListPickerItem {
+                        key: "session_a".to_string(),
+                        primary: "session_a".to_string(),
+                        secondary: String::new(),
+                        disabled: false,
+                    }],
+                    None,
+                    "No past sessions to resume.",
+                ));
+            }
+            FullScreenViewUnderTest::InfoPanel => {
+                app.info_panel = Some(crate::tui::widgets::InfoPanel::new("Details"));
+            }
+            FullScreenViewUnderTest::SetupOverlay => {
+                let mut overlay = crate::tui::SetupOverlayState::new("Setup");
+                overlay.handle_event(crate::onboard::provision::ProvisionEvent::Prompt {
+                    id: "api_key".into(),
+                    label: "API key".into(),
+                    default: None,
+                    secret: false,
+                });
+                app.setup_overlay = Some(overlay);
+            }
+            FullScreenViewUnderTest::FirstRunWizard => {
+                app.first_run_wizard =
+                    Some(crate::tui::FirstRunWizard::new(crate::profile::Profile {
+                        name: "default".to_string(),
+                        root: profile_root.to_path_buf(),
+                    }));
+            }
+            FullScreenViewUnderTest::LoginGate => {
+                app.login_gate = Some(crate::tui::LoginGateState::new(None));
+            }
+        }
+    }
+
+    /// Press `code` with no modifiers.
+    async fn press(app: &mut TuiApp, code: KeyCode) {
+        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+            .await
+            .unwrap();
+    }
+
+    /// While a full-screen view hides the pane, an answer key is a key for
+    /// that view. A `y` typed into a picker filter once answered the prompt
+    /// for a command the operator had never seen.
+    #[tokio::test]
+    async fn answer_keys_typed_into_a_full_screen_view_do_not_answer_the_prompt() {
+        for view in FULL_SCREEN_VIEWS {
+            let mut f = fixture_with(&["curl"]).await;
+            let root = f.dir.path().to_path_buf();
+            open_full_screen_view(&mut f.app, view, &root);
+
+            for code in [
+                KeyCode::Char('y'),
+                KeyCode::Char('n'),
+                KeyCode::Char('Y'),
+                KeyCode::Char('N'),
+                KeyCode::F(2),
+            ] {
+                press(&mut f.app, code).await;
+            }
+
+            assert!(
+                f.approvals.is_pending(f.shown_id),
+                "{view:?}: the request must still be waiting for an answer"
+            );
+            assert!(
+                f.app.pending_approval.is_some(),
+                "{view:?}: the prompt must stay open"
+            );
+            let (allowlist, on_disk) = f.allowlist();
+            assert!(
+                allowlist.is_empty() && !on_disk,
+                "{view:?}: nothing may be granted: {allowlist:?}"
+            );
+            assert!(
+                f.req_rx.try_recv().is_err(),
+                "{view:?}: no turn request (cancel) may be sent"
+            );
+        }
+    }
+
+    /// The picker gets the filter text, Esc closes it without denying, and
+    /// once it is closed the pane is back and `y` answers again.
+    #[tokio::test]
+    async fn a_list_picker_over_a_prompt_takes_every_key_and_the_prompt_survives_its_close() {
+        let mut f = fixture_with(&["curl"]).await;
+        let root = f.dir.path().to_path_buf();
+        open_full_screen_view(&mut f.app, FullScreenViewUnderTest::ListPicker, &root);
+
+        press(&mut f.app, KeyCode::Char('y')).await;
+        assert_eq!(
+            f.app.list_picker.as_ref().map(|p| p.query.clone()),
+            Some("y".to_string()),
+            "the `y` belongs to the picker filter"
+        );
+        assert!(f.approvals.is_pending(f.shown_id));
+
+        press(&mut f.app, KeyCode::Esc).await;
+        assert!(f.app.list_picker.is_none(), "Esc closes the picker");
+        assert!(
+            f.approvals.is_pending(f.shown_id),
+            "closing the picker must not deny the prompt"
+        );
+        assert!(
+            f.req_rx.try_recv().is_err(),
+            "closing the picker must not cancel the turn"
+        );
+
+        press(&mut f.app, KeyCode::Char('y')).await;
+        assert_eq!(f.decision().await, Decision::Session);
+    }
+
+    /// Same for the info panel: Esc closes it and leaves the prompt open.
+    #[tokio::test]
+    async fn an_info_panel_over_a_prompt_takes_every_key_and_the_prompt_survives_its_close() {
+        let mut f = fixture_with(&["curl"]).await;
+        let root = f.dir.path().to_path_buf();
+        open_full_screen_view(&mut f.app, FullScreenViewUnderTest::InfoPanel, &root);
+
+        press(&mut f.app, KeyCode::Char('n')).await;
+        assert!(f.app.info_panel.is_some());
+        assert!(f.approvals.is_pending(f.shown_id));
+
+        press(&mut f.app, KeyCode::Esc).await;
+        assert!(f.app.info_panel.is_none(), "Esc closes the panel");
+        assert!(
+            f.approvals.is_pending(f.shown_id),
+            "closing the panel must not deny the prompt"
+        );
+        assert!(f.req_rx.try_recv().is_err());
+
+        press(&mut f.app, KeyCode::Char('n')).await;
+        assert_eq!(f.decision().await, Decision::Deny);
+    }
+
+    /// A `y` or `n` typed into a setup prompt, an API key for instance, is
+    /// text for that prompt.
+    #[tokio::test]
+    async fn letters_typed_into_a_setup_prompt_land_in_the_prompt() {
+        let mut f = fixture_with(&["curl"]).await;
+        let root = f.dir.path().to_path_buf();
+        open_full_screen_view(&mut f.app, FullScreenViewUnderTest::SetupOverlay, &root);
+
+        press(&mut f.app, KeyCode::Char('y')).await;
+        press(&mut f.app, KeyCode::Char('n')).await;
+
+        assert_eq!(
+            f.app.setup_overlay.as_ref().map(|o| o.input().to_string()),
+            Some("yn".to_string())
+        );
+        assert!(f.approvals.is_pending(f.shown_id));
+        assert!(f.req_rx.try_recv().is_err());
+    }
+
+    /// The login gate takes the keys as password characters.
+    #[tokio::test]
+    async fn letters_typed_into_the_login_gate_land_in_the_password_field() {
+        let mut f = fixture_with(&["curl"]).await;
+        let root = f.dir.path().to_path_buf();
+        open_full_screen_view(&mut f.app, FullScreenViewUnderTest::LoginGate, &root);
+
+        press(&mut f.app, KeyCode::Char('y')).await;
+        press(&mut f.app, KeyCode::Char('n')).await;
+
+        assert_eq!(
+            f.app.login_gate.as_ref().map(|g| g.input.clone()),
+            Some("yn".to_string())
+        );
+        assert!(f.approvals.is_pending(f.shown_id));
+    }
+
+    /// A prompt that arrives while a view is open is not answered by the
+    /// next key: the pane is not on screen yet, so the operator has not seen
+    /// it.
+    #[tokio::test]
+    async fn a_prompt_that_arrives_behind_a_view_is_not_answered_by_the_next_key() {
+        let mut f = fixture_with(&["curl"]).await;
+        let root = f.dir.path().to_path_buf();
+        // Retire the first prompt, then open a view and let a new one arrive.
+        for req in f.approvals.list() {
+            let _ = f.approvals.resolve(req.id, Decision::Deny);
+        }
+        f.app.pending_approval = None;
+        for handle in f.handles.drain(..) {
+            handle.await.expect("the blocked call unblocks");
+        }
+        open_full_screen_view(&mut f.app, FullScreenViewUnderTest::ListPicker, &root);
+
+        let id = uuid::Uuid::new_v4();
+        let approvals = f.approvals.clone();
+        let late = tokio::spawn(async move {
+            approvals
+                .request_decision_in_scope(
+                    id,
+                    "wget".to_string(),
+                    "wget https://example.com".to_string(),
+                    "tui",
+                    String::new(),
+                    crate::security::SessionScope::None,
+                )
+                .await
+        });
+        for _ in 0..500 {
+            if f.approvals.is_pending(id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        f.app.drain_events();
+        assert!(
+            f.app.pending_approval.is_some(),
+            "the prompt opens behind the picker"
+        );
+
+        press(&mut f.app, KeyCode::Char('y')).await;
+
+        assert!(
+            f.approvals.is_pending(id),
+            "the first key after the prompt arrived must not answer it"
+        );
+        assert_eq!(
+            f.app.list_picker.as_ref().map(|p| p.query.clone()),
+            Some("y".to_string())
+        );
+        let _ = f.approvals.resolve(id, Decision::Deny);
+        late.await.expect("the late call unblocks");
+    }
+
+    /// Type `command` into the composer and press Enter until a picker
+    /// opens, the way an operator reaches `/model`.
+    async fn open_picker_through_the_composer(app: &mut TuiApp, command: &str) {
+        for c in command.chars() {
+            press(app, KeyCode::Char(c)).await;
+        }
+        for _ in 0..3 {
+            if app.list_picker.is_some() {
+                break;
+            }
+            press(app, KeyCode::Enter).await;
+        }
+        assert!(
+            app.list_picker.is_some(),
+            "`{command}` must open a picker (composer: {:?})",
+            app.context.input_buffer
+        );
+    }
+
+    /// A picker opened over a prompt that was already waiting takes the
+    /// answer keys, as in the other order. `/model` empties the composer
+    /// before it opens the picker, so the composer holds nothing that could
+    /// stop an answer key: only the open picker does.
+    #[tokio::test]
+    async fn a_picker_opened_over_a_waiting_prompt_takes_the_answer_keys() {
+        let mut f = fixture_with(&["curl"]).await;
+        open_picker_through_the_composer(&mut f.app, "/model").await;
+        press(&mut f.app, KeyCode::Char('y')).await;
+        press(&mut f.app, KeyCode::Char('n')).await;
+        press(&mut f.app, KeyCode::F(2)).await;
+
+        assert_eq!(
+            f.app.list_picker.as_ref().map(|p| p.query.clone()),
+            Some("yn".to_string()),
+            "the letters belong to the picker filter"
+        );
+        assert!(f.approvals.is_pending(f.shown_id));
+        assert!(f.req_rx.try_recv().is_err());
+
+        press(&mut f.app, KeyCode::Esc).await;
+        assert!(f.app.list_picker.is_none());
+        assert!(f.approvals.is_pending(f.shown_id));
+        assert_eq!(
+            f.app.context.input_buffer, "",
+            "the composer is empty once the picker is closed"
+        );
+        press(&mut f.app, KeyCode::Char('y')).await;
+        assert_eq!(f.decision().await, Decision::Session);
+    }
+
+    /// The frame `draw_frame` draws for `app`, one string per row.
+    fn frame_rows(app: &mut TuiApp, width: u16, height: u16) -> Vec<String> {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        term.draw(|f| app.draw_frame(f)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The approval pane is drawn exactly when `approval_pane_visible` says
+    /// so. The key path reads the predicate and the draw path reads the
+    /// view, so a view that replaced the pane without being counted by the
+    /// predicate would let a key answer a prompt the operator cannot see.
+    #[tokio::test]
+    async fn the_approval_pane_is_drawn_exactly_when_the_answer_keys_are_live() {
+        let mut f = fixture_with(&["curl"]).await;
+        let root = f.dir.path().to_path_buf();
+
+        let rows = frame_rows(&mut f.app, 120, 30).join("\n");
+        assert!(f.app.approval_pane_visible());
+        assert!(rows.contains("yes (session)"), "control: pane drawn");
+
+        for view in FULL_SCREEN_VIEWS {
+            let mut f = fixture_with(&["curl"]).await;
+            open_full_screen_view(&mut f.app, view, &root);
+
+            let rows = frame_rows(&mut f.app, 120, 30).join("\n");
+
+            assert_eq!(
+                rows.contains("yes (session)"),
+                f.app.approval_pane_visible(),
+                "{view:?}: the pane and the answer keys must agree"
+            );
+            assert!(
+                !f.app.approval_pane_visible(),
+                "{view:?}: a full-screen view hides the pane"
+            );
+        }
+    }
+
+    /// A view that hides a waiting prompt says so on the last row, and the
+    /// pane that names the keys is not drawn there.
+    #[tokio::test]
+    async fn a_view_over_a_waiting_prompt_says_a_prompt_waits() {
+        for view in FULL_SCREEN_VIEWS {
+            let mut f = fixture_with(&["curl"]).await;
+            let root = f.dir.path().to_path_buf();
+            open_full_screen_view(&mut f.app, view, &root);
+
+            let rows = frame_rows(&mut f.app, 120, 30);
+
+            assert!(
+                rows[29].contains(APPROVAL_WAITING_NOTICE),
+                "{view:?}: the last row must carry the notice: {:?}",
+                rows[29]
+            );
+            assert_eq!(
+                rows.iter()
+                    .filter(|r| r.contains(APPROVAL_WAITING_NOTICE))
+                    .count(),
+                1,
+                "{view:?}: the notice is one line"
+            );
+
+            f.app.pending_approval = None;
+            let rows = frame_rows(&mut f.app, 120, 30).join("\n");
+            assert!(
+                !rows.contains(APPROVAL_WAITING_NOTICE),
+                "{view:?}: no prompt waits, so no notice"
+            );
+        }
+    }
+
+    /// The notice takes a row only when the frame has one to spare, and a
+    /// narrow frame cuts it instead of wrapping.
+    #[tokio::test]
+    async fn the_waiting_notice_fits_small_terminals() {
+        for view in FULL_SCREEN_VIEWS {
+            for (width, height) in [(30, 0), (30, 1), (30, 2), (30, 3), (12, 12)] {
+                let mut f = fixture_with(&["curl"]).await;
+                let root = f.dir.path().to_path_buf();
+                open_full_screen_view(&mut f.app, view, &root);
+
+                let rows = frame_rows(&mut f.app, width, height);
+
+                assert_eq!(rows.len(), usize::from(height));
+                if height == 1 {
+                    assert!(
+                        !rows[0].contains("Approval waiting"),
+                        "{view:?}: one row belongs to the view"
+                    );
+                }
+                if height >= 2 {
+                    let last = rows.last().unwrap();
+                    assert!(
+                        last.trim_start().starts_with("Approval"),
+                        "{view:?} at {width}x{height}: {last:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A command long enough to wrap used to push the chip row out of the
+    /// pane, which left no answer key on screen. The preview is one row that
+    /// ends in an ellipsis, and the chips stay.
+    #[test]
+    fn a_long_command_preview_is_one_row_and_the_chips_stay() {
+        let mut req = pane_request("tui", crate::security::SessionScope::None);
+        req.full_command = format!("curl https://example.com/{}", "a".repeat(175));
+        assert_eq!(req.full_command.chars().count(), 200);
+
+        for width in [80u16, 140] {
+            let rows: Vec<String> = {
+                let buf = approval_pane_buffer(&req, "", width, APPROVAL_PANE_ROWS);
+                (0..APPROVAL_PANE_ROWS)
+                    .map(|y| {
+                        (0..width)
+                            .map(|x| buf[(x, y)].symbol().to_string())
+                            .collect()
+                    })
+                    .collect()
+            };
+
+            let preview = rows[1].trim_matches('│').trim();
+            assert!(
+                preview.starts_with("curl https://example.com/"),
+                "width {width}: the start of the command stays: {preview:?}"
+            );
+            assert!(
+                preview.ends_with('…'),
+                "width {width}: the cut is marked: {preview:?}"
+            );
+            assert!(
+                rows[2].contains("yes (session)") && rows[2].contains("Esc"),
+                "width {width}: the chip row must be on screen: {:?}",
+                rows[2]
+            );
+            assert_eq!(
+                approval_pane_chip_keys(&req, "", width, APPROVAL_PANE_ROWS),
+                ["y", "F2", "n", "Esc"],
+                "width {width}"
+            );
+        }
     }
 }
