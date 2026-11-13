@@ -6,13 +6,26 @@
 # set rust_changed=true; a docs-only change must keep rust_changed=false
 # and set docs_only=true.
 #
+# The second invariant is the narrower `channel_features_changed` flag: it
+# is true exactly for the files that can change what the channel-feature
+# build compiles or which filter the channel-features job runs. A pull
+# request that touches none of them skips the channel-feature test steps
+# by design, so a false negative here would silently drop that coverage.
+# That set is not only the named paths: a file whose content carries a
+# `channel-lark` / `channel-matrix` cargo-feature gate belongs to it too,
+# because `channel-matrix` is not a default feature and no other job
+# compiles such a body. The flag also has to fail closed: with no
+# resolvable base commit there is no diff to classify, so every scope that
+# can skip a check stays "changed" and runs.
+#
 # The test builds a throwaway git repository so it does not depend on the
 # caller's working tree. For each case it:
 #
 #   1. resets HEAD back to BASE_SHA (a clean tree);
 #   2. makes a single file change and commits it;
 #   3. runs the script with GITHUB_OUTPUT, EVENT_NAME and BASE_SHA set;
-#   4. reads the rust_changed / docs_only values out of the output file;
+#   4. reads the rust_changed / docs_only / channel_features_changed values
+#      out of the output file;
 #   5. asserts them against the expected values.
 #
 # Cases cover both the newly added paths (must be Rust changes) and the
@@ -77,6 +90,7 @@ trap 'rm -rf "$REPO_DIR"' EXIT
 
     mkdir -p \
         src \
+        src/channels \
         tests \
         scripts/ci \
         docs \
@@ -90,6 +104,19 @@ trap 'rm -rf "$REPO_DIR"' EXIT
     # diff's empty tree at BASE_SHA. `git diff` of an untracked directory
     # would not surface anything.
     : > src/lib.rs
+    : > src/channels/lark.rs
+    : > src/channels/matrix.rs
+    : > src/channels/mod.rs
+    : > src/channels/telegram.rs
+    # A file that carries a channel-feature gate but sits outside the
+    # script's explicit path list, so the content rule is what puts it in
+    # the channel-feature scope. It carries the gate in the initial commit
+    # so the base-side lookup finds it too.
+    cat > src/channels/factory.rs <<'GATE'
+#[cfg(feature = "channel-matrix")]
+mod matrix_channel {
+}
+GATE
     : > tests/lib.rs
     : > scripts/ci/empty.sh
     : > docs/x.md
@@ -97,6 +124,9 @@ trap 'rm -rf "$REPO_DIR"' EXIT
     : > benches/empty.rs
     : > benches/README.md
     : > examples/empty.rs
+    : > Cargo.toml
+    : > Cargo.lock
+    : > .github/workflows/ci-run.yml
     : > .github/workflows/empty.yml
     : > .cargo/config.toml
     : > clippy.toml
@@ -114,16 +144,26 @@ BASE_SHA="$(git -C "$REPO_DIR" rev-parse HEAD)"
 # the script. Reads the requested key out of the captured GITHUB_OUTPUT
 # file. The script also writes several other keys, so callers can ask for
 # any of them.
+#
+# Optional third argument: the base SHA the script diffs against. It
+# defaults to the fixture's base commit; an unresolvable value drives the
+# script into its fail-closed branch.
+# Optional fourth argument: content that replaces the file wholesale
+# instead of the append the normal case makes.
 run_case() {
     local file="$1"
     local key="$2"
+    local base="${3:-$BASE_SHA}"
+    local replace="${4:-}"
 
     (
         cd "$REPO_DIR"
         git reset --hard "$BASE_SHA" >/dev/null 2>&1
         mkdir -p "$(dirname "$file")"
-        # Append when present (preserves the placeholder), create otherwise.
-        if [ -f "$file" ]; then
+        if [ -n "$replace" ]; then
+            printf '%s\n' "$replace" > "$file"
+        elif [ -f "$file" ]; then
+            # Append when present (preserves the placeholder), create otherwise.
             printf '\ncase-edit\n' >> "$file"
         else
             printf 'case-edit\n' > "$file"
@@ -137,7 +177,7 @@ run_case() {
 
     (
         cd "$REPO_DIR"
-        BASE_SHA="$BASE_SHA" \
+        BASE_SHA="$base" \
         EVENT_NAME="pull_request" \
         GITHUB_OUTPUT="$output" \
         bash "$SCRIPT" >/dev/null
@@ -171,6 +211,50 @@ assert_docs_only() {
         log_pass "$file → docs_only=$expected"
     else
         log_fail "$file → docs_only=$expected (got '$actual')"
+    fi
+}
+
+assert_channel_features_changed() {
+    local file="$1"
+    local expected="$2"
+    local actual
+    actual="$(run_case "$file" "channel_features_changed")"
+    if [ "$actual" = "$expected" ]; then
+        log_pass "$file → channel_features_changed=$expected"
+    else
+        log_fail "$file → channel_features_changed=$expected (got '$actual')"
+    fi
+}
+
+# The same flag, but the changed file's content is replaced instead of
+# appended to. Used for a file that carried a feature gate at the base
+# commit and lost it at HEAD.
+assert_channel_features_changed_with_content() {
+    local file="$1"
+    local content="$2"
+    local expected="$3"
+    local actual
+    actual="$(run_case "$file" "channel_features_changed" "" "$content")"
+    if [ "$actual" = "$expected" ]; then
+        log_pass "$file → channel_features_changed=$expected (content replaced)"
+    else
+        log_fail "$file → channel_features_changed=$expected (got '$actual', content replaced)"
+    fi
+}
+
+# The script must fail closed when the base commit does not resolve: there
+# is no diff to classify, so every scope that can skip a check has to stay
+# "changed" and run.
+assert_fail_closed_base() {
+    local base="$1"
+    local file="$2"
+    local actual_channel actual_rust
+    actual_channel="$(run_case "$file" "channel_features_changed" "$base")"
+    actual_rust="$(run_case "$file" "rust_changed" "$base")"
+    if [ "$actual_channel" = "true" ] && [ "$actual_rust" = "true" ]; then
+        log_pass "unresolvable BASE_SHA → channel_features_changed=true, rust_changed=true"
+    else
+        log_fail "unresolvable BASE_SHA → channel_features_changed=true, rust_changed=true (got channel_features_changed='$actual_channel', rust_changed='$actual_rust')"
     fi
 }
 
@@ -212,6 +296,46 @@ assert_rust_changed "benches/README.md" "false"
 assert_docs_only "benches/README.md" "true"
 assert_rust_changed "examples/README.md" "false"
 assert_docs_only "examples/README.md" "true"
+
+printf '\n=== channel-feature scope flag ===\n'
+# The set the channel-features job depends on: the Lark and Matrix channel
+# modules and their directories, the channel factory, the manifest and
+# lockfile that decide the feature set, the workflow that selects the job
+# and the CI scripts it calls. Everything else cannot change what that
+# build compiles, so its test steps are skipped by design.
+assert_channel_features_changed "src/channels/lark.rs" "true"
+assert_channel_features_changed "src/channels/matrix.rs" "true"
+assert_channel_features_changed "src/channels/mod.rs" "true"
+assert_channel_features_changed "Cargo.toml" "true"
+assert_channel_features_changed "Cargo.lock" "true"
+assert_channel_features_changed ".github/workflows/ci-run.yml" "true"
+assert_channel_features_changed "scripts/ci/empty.sh" "true"
+
+printf '\n=== files outside the channel-feature scope ===\n'
+assert_channel_features_changed "src/lib.rs" "false"
+assert_channel_features_changed "src/channels/telegram.rs" "false"
+assert_channel_features_changed "docs/x.md" "false"
+assert_channel_features_changed ".github/workflows/pr-labeler.yml" "false"
+
+printf '\n=== channel-feature scope: a file carrying a feature gate ===\n'
+# `src/channels/factory.rs` is not one of the script's explicit paths, but
+# it carries a `#[cfg(feature = "channel-matrix")]` gate, so the content
+# rule puts it in the channel-feature scope. `channel-matrix` is not a
+# default feature, so no other job compiles that body.
+assert_channel_features_changed "src/channels/factory.rs" "true"
+
+printf '\n=== channel-feature scope: a gate removed at HEAD ===\n'
+# The file carried the gate at the base commit and lost it at HEAD. That
+# still changes what the channel-feature build compiles, so the base-side
+# lookup has to see it.
+assert_channel_features_changed_with_content "src/channels/factory.rs" "no feature gate here" "true"
+
+printf '\n=== fail closed on an unresolvable base commit ===\n'
+# With no resolvable base commit there is no diff to classify, so every
+# scope that can skip a check has to stay "changed" and run. `src/lib.rs`
+# would be false under a resolvable base, so this case pins the fail-closed
+# branch and not the ordinary classification.
+assert_fail_closed_base "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" "src/lib.rs"
 
 # --- summary -----------------------------------------------------------------
 
