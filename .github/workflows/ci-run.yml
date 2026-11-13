@@ -15,6 +15,18 @@ permissions:
 
 env:
     CARGO_TERM_COLOR: always
+    # `line-tables-only` keeps line numbers, so a panic backtrace still
+    # points at a source line, and drops the type and variable information
+    # that makes the linked test binaries large. The `test` profile inherits
+    # `debug` from `dev` in cargo, so this one variable covers both. The
+    # `build` job is unaffected: it builds `--profile release-fast`, which
+    # inherits `release`, not `dev`.
+    #
+    # This invalidates every rust-cache key once: the action hashes every
+    # environment variable whose name starts with `CARGO` into its key, so
+    # every cache in this workflow is cold on the first run after this lands
+    # and warm from then on.
+    CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
     changes:
@@ -66,6 +78,26 @@ jobs:
             - name: Self-test the shared clippy JSON gates
               shell: bash
               run: bash ./scripts/ci/tests/test_clippy_json_gates.sh
+
+            # Same shape as the self-tests above: the cache policy and the
+            # profile overrides are the parts of this workflow nobody reads
+            # once they are written. A rust-cache that saves on a pull
+            # request fills the 10 GB Actions cache quota and evicts the
+            # `main` entries that matter, and a bench job that inherits the
+            # release profile's fat LTO pays for a compile-only check — both
+            # regressions are silent, and the CI result stays green. The
+            # self-test reads the workflow as it is and fails this job
+            # instead.
+            #
+            # The limit is the one the self-tests above it share: this job
+            # is not a required check, so a red job here does not by itself
+            # turn `CI Required Gate` red — it makes the Rust jobs skip and
+            # the gate take its non-Rust fast path. The check guards `main`
+            # against a later regression, not the pull request that
+            # introduces one.
+            - name: Self-test the CI cache and profile policy
+              shell: bash
+              run: bash ./scripts/ci/tests/test_ci_cache_and_profile_policy.sh
 
             - name: Detect docs-only changes
               id: scope
@@ -128,7 +160,14 @@ jobs:
               with:
                   toolchain: 1.92.0
                   components: rustfmt, clippy
+            # The cache is restored on every run and written only on a push
+            # to `main`. A cache that every pull request writes into is what
+            # fills the 10 GB Actions cache quota and evicts the `main`
+            # entries that matter; a pull request keeps its cache hits, it
+            # just stops creating new ones.
             - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+              with:
+                  save-if: ${{ github.ref == 'refs/heads/main' }}
             # One clippy run for both lint gates. The quality gate and the
             # strict delta gate used to lint the crate separately, and the
             # second run re-checked every target for findings the first one
@@ -198,6 +237,8 @@ jobs:
               with:
                   toolchain: 1.92.0
             - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+              with:
+                  save-if: ${{ github.ref == 'refs/heads/main' }}
             - name: Free up runner disk space
               # `cargo test --locked --workspace` links ~32 debug test binaries,
               # each carrying the full rantaiclaw lib + heavy deps (matrix-sdk,
@@ -227,6 +268,15 @@ jobs:
               # time was ~5s, so running serially costs well under the job cap.
               # Cross-module env-lock hygiene is the follow-up that lifts this.
               run: cargo test --locked --workspace -- --test-threads=1
+
+            # The free-disk step above prints `df -h /` before and after it
+            # reclaims the preinstalled toolchains; this one prints the disk
+            # the test binaries actually left behind. One run's numbers are
+            # not proof that the reclaim step can go, so that step stays —
+            # the measurement is what a later change has to argue from.
+            - name: Report disk usage after the tests
+              if: always()
+              run: df -h /
 
     # `Cargo.toml` declares `rust-version`, and until this job existed nothing
     # built at it: every other Rust job pins 1.92.0, the `channel-features`
@@ -270,6 +320,7 @@ jobs:
             - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
               with:
                   key: msrv-${{ steps.declared.outputs.version }}
+                  save-if: ${{ github.ref == 'refs/heads/main' }}
 
             # `--all-targets`, not `--lib`: the binary crate root recompiles the
             # library as a second crate, and tests and benches use APIs the lib
@@ -327,6 +378,7 @@ jobs:
             - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
               with:
                   key: channel-features
+                  save-if: ${{ github.ref == 'refs/heads/main' }}
             # Both features are enabled for both filtered test runs: the point
             # of the job is that the two channels compile together, which is
             # the only combination a user can build.
@@ -365,6 +417,7 @@ jobs:
             - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
               with:
                   key: features
+                  save-if: ${{ github.ref == 'refs/heads/main' }}
             # `all-features` is still omitted, but no longer because of
             # matrix-sdk: 0.18 type-checks at the default limit, and
             # `channel-features` has its own job above. What `all-features`
@@ -411,12 +464,28 @@ jobs:
         if: needs.changes.outputs.rust_changed == 'true' && needs.fmt.result == 'success'
         runs-on: ubuntu-latest
         timeout-minutes: 25
+        # `Cargo.toml` declares no `[profile.bench]`, so the bench profile
+        # inherits `[profile.release]`: opt-level "z", fat LTO, one codegen
+        # unit. Those are the right settings for a shipped binary and the
+        # wrong ones for a job that only has to prove the bench targets
+        # compile and link — the fat LTO is most of this job's runtime.
+        # `cargo bench --no-run` never runs a benchmark, so an unoptimized
+        # build changes nothing the job measures.
+        #
+        # Job env only: `Cargo.toml` is untouched, so the release profile and
+        # every release build keep their settings.
+        env:
+            CARGO_PROFILE_BENCH_LTO: "false"
+            CARGO_PROFILE_BENCH_OPT_LEVEL: "0"
+            CARGO_PROFILE_BENCH_CODEGEN_UNITS: "16"
         steps:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
             - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+              with:
+                  save-if: ${{ github.ref == 'refs/heads/main' }}
             - name: Verify benchmarks compile
               run: cargo bench --no-run --locked
 
@@ -433,6 +502,8 @@ jobs:
               with:
                   toolchain: 1.92.0
             - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+              with:
+                  save-if: ${{ github.ref == 'refs/heads/main' }}
             - name: Build binary (smoke check)
               run: cargo build --profile release-fast --locked --verbose
             - name: Check binary size
