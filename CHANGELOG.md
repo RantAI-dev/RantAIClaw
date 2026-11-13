@@ -493,6 +493,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fix is close. The advisory is accepted in `deny.toml` and the audit workflow, for review by
   2026-12-15.
 
+- **The lockfile now carries quinn-proto 0.11.19 and quinn-udp 0.5.16, which clears RUSTSEC-2026-0523,
+  RUSTSEC-2026-0524 and RUSTSEC-2026-0538.** Both crates are optional dependencies of reqwest's
+  `http3` feature, which no build enables, so no shipped binary changes. The update also drops the
+  Windows-only entries that only quinn-udp 0.5.14 referenced.
+
 ## [0.34.0-alpha] — 2026-11-05
 
 The hardening release. A caller can no longer borrow a stored credential for a host the
