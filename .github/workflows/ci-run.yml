@@ -58,6 +58,15 @@ jobs:
               shell: bash
               run: bash ./scripts/ci/tests/test_bootstrap_prebuilt_tamper.sh
 
+            # Same shape as the self-tests above: the lint job reads one
+            # shared clippy JSON file in two gates, and a gate that stops
+            # reading it fails open instead of failing the job. The self-test
+            # drives both gates over JSON fixtures — no Rust toolchain — so a
+            # regression fails the job instead of weakening the lint gate.
+            - name: Self-test the shared clippy JSON gates
+              shell: bash
+              run: bash ./scripts/ci/tests/test_clippy_json_gates.sh
+
             - name: Detect docs-only changes
               id: scope
               shell: bash
@@ -120,16 +129,30 @@ jobs:
                   toolchain: 1.92.0
                   components: rustfmt, clippy
             - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+            # One clippy run for both lint gates. The quality gate and the
+            # strict delta gate used to lint the crate separately, and the
+            # second run re-checked every target for findings the first one
+            # had already produced. This run keeps the JSON; the gates below
+            # decide what blocks.
+            - name: Run clippy once (shared by both gates)
+              id: clippy
+              shell: bash
+              run: ./scripts/ci/run_clippy_json.sh "$RUNNER_TEMP/clippy.json" >> "$GITHUB_OUTPUT"
             # `--skip-fmt`: the format check runs in the `fmt` job above, so
             # running it here as well would check every file twice. The
             # script still formats when it is called without that flag — it
             # is the complete local gate used by `dev/ci.sh` and
             # `.githooks/pre-push`.
             - name: Run rust quality gate
+              env:
+                  CLIPPY_JSON_FILE: ${{ steps.clippy.outputs.path }}
+                  CLIPPY_EXIT_CODE: ${{ steps.clippy.outputs.exit_code }}
               run: ./scripts/ci/rust_quality_gate.sh --skip-fmt
             - name: Run strict lint delta gate
               env:
                   BASE_SHA: ${{ needs.changes.outputs.base_sha }}
+                  CLIPPY_JSON_FILE: ${{ steps.clippy.outputs.path }}
+                  CLIPPY_EXIT_CODE: ${{ steps.clippy.outputs.exit_code }}
               run: ./scripts/ci/rust_strict_delta_gate.sh
             # Source-level guards. Cheap greps, no build — they belong here rather
             # than in `features`, which is label-gated and would not run on the PRs
