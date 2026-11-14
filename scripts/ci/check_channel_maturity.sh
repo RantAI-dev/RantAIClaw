@@ -113,13 +113,13 @@ fi
 # One check per axis. A single combined count would pass while one axis grew a
 # second copy and the other lost one.
 for label in "under development" "not yet verified" "served by the gateway"; do
-  label_defs="$(grep -rnF "\"$label\"" src/ --include='*.rs' | wc -l | tr -d ' ')"
+  label_defs="$(grep -rnF "\"$label\"" src/ --include='*.rs' | wc -l | tr -d ' ' || true)"
   if [ "$label_defs" -ne 1 ]; then
     echo "ERROR: the string \"$label\" appears $label_defs times in src/."
     echo "       Each label is defined exactly once, in ChannelSupport::label() or"
     echo "       ChannelVerification::label(), and rendered from there. A second"
     echo "       copy is the drift this gate exists for:"
-    grep -rnF "\"$label\"" src/ --include='*.rs'
+    grep -rnF "\"$label\"" src/ --include='*.rs' || true
     fail=1
   fi
 done
