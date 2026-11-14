@@ -1,8 +1,8 @@
 use rantaiclaw::kb::KbConfig;
 
-use crate::kb::kb::common::ENV_LOCK;
+use crate::kb::common::ENV_LOCK;
 
-// Process-wide guard lives in `crate::kb::kb::common::ENV_LOCK` so every
+// Process-wide guard lives in `crate::kb::common::ENV_LOCK` so every
 // test module in this binary serializes against the SAME mutex. Per-file
 // statics only serialize within their own module — cross-module tests
 // (config + embed + retrieve) all mutate `KB_*`/`OPENROUTER_API_KEY` and

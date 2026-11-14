@@ -8,7 +8,7 @@
 //! - 7.5 format_context_for_prompt (wiremock)
 //!
 //! Tests that mutate `OPENROUTER_API_KEY` serialize on `ENV_LOCK` from
-//! `tests/kb/common.rs` and intentionally hold the guard across `.await`
+//! `tests/it/kb/common.rs` and intentionally hold the guard across `.await`
 //! to keep env mutation single-threaded — see the rationale in
 //! `embed_test.rs` / `rerank_test.rs`.
 
@@ -27,14 +27,14 @@ use rantaiclaw::kb::{
     Chunk, ChunkId, Document, DocumentId, KbConfig, KbGroup, KbGroupSummary, KbResult, SearchResult,
 };
 
-// Process-wide env-mutation lock lives in `crate::kb::kb::common::ENV_LOCK`
+// Process-wide env-mutation lock lives in `crate::kb::common::ENV_LOCK`
 // so every test module in this binary serializes against the SAME mutex.
 // The query_expansion_tests and contextual_tests modules
 // all mutate `OPENROUTER_API_KEY` and `KB_OPENROUTER_CHAT_URL` — a per-file
 // or per-module lock would only serialize within its own scope, letting
 // cross-module tests race on shared env state. Re-export under this file's
 // scope so the nested test modules can keep using `super::ENV_LOCK`.
-pub(crate) use crate::kb::kb::common::ENV_LOCK;
+pub(crate) use crate::kb::common::ENV_LOCK;
 
 // ---- Task 7.1: RRF ---------------------------------------------------
 

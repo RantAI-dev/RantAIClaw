@@ -8,8 +8,8 @@
 //!
 //! Headless mode (`--non-interactive`) is the only branch we test from
 //! the CLI surface; the interactive prompts are covered by lower-level
-//! section unit tests (`tests/onboard_*_section.rs`) and by the
-//! orchestrator dispatch tests in `tests/setup_orchestration.rs`.
+//! section unit tests (`tests/it/onboard_*_section.rs`) and by the
+//! orchestrator dispatch tests in `tests/it/setup_orchestration.rs`.
 //!
 //! Spec: `docs/superpowers/specs/2026-04-27-onboarding-depth-v2-design.md`,
 //!       §"End-to-end smoke" + §"Acceptance criteria".

@@ -35,7 +35,7 @@ which are themselves tuned to match the TypeScript baseline:
 | RRF `k`                          | `60`                        | Cormack/Clarke 2009 standard.                            |
 | Min similarity                   | `0.30`                      | Hard floor; mirrors TS `retriever.ts`.                   |
 
-The parity test in `tests/kb/parity_test.rs` constructs
+The parity test in `tests/it/kb/parity_test.rs` constructs
 `Retriever::new(cfg, store, embedder)` without `with_reranker`, so the
 rerank stage is bypassed even when `KB_RERANK_ENABLED=true` in the env.
 This isolates the "pure hybrid retrieval" recall before any rerank

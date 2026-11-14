@@ -123,9 +123,10 @@ struct Harness {
     _tmp: TempDir,
     // Hold the global env-mutation lock for the harness's life so other
     // tests wait until our HTTP I/O finishes. The lock is a
-    // `tokio::sync::Mutex`, so the guard can be held across awaits; its
-    // `!Send` type is fine because `#[tokio::test]` uses a `current_thread`
-    // runtime, so the future never migrates threads.
+    // `tokio::sync::Mutex`, so the guard can be held across awaits.
+    // `tokio::sync::MutexGuard` is `Send` (unlike `std::sync::MutexGuard`),
+    // and `#[tokio::test]`'s default `current_thread` runtime does not
+    // require the test future to be `Send` either way.
     _lock_guard: tokio::sync::MutexGuard<'static, ()>,
 }
 

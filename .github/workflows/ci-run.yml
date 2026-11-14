@@ -384,7 +384,7 @@ jobs:
             # `--lib` alone is not enough to claim the feature builds. Turning it
             # on pulls `decancer`, whose `impl Add<Translation> for String` makes
             # `String + &String` ambiguous — which broke two integration tests
-            # (`tests/kb/chunk_test.rs`) that no `--lib` run touches. Checking
+            # (`tests/it/kb/chunk_test.rs`) that no `--lib` run touches. Checking
             # every target is what makes "builds with channel-matrix" true.
             #
             # No `channel_features_changed` condition, on purpose: `channel-matrix`
@@ -460,10 +460,12 @@ jobs:
               if: ${{ !cancelled() }}
               run: cargo check --locked --features kb-office --all-targets
 
-    # The E2E job is gone: `tests/agent_e2e.rs` is an auto-discovered
-    # integration target of the root package, so the `test` job's
-    # `cargo test --locked --workspace` already runs it. The separate job
-    # only re-ran the same tests.
+    # The E2E job is gone: the integration tests are one binary, `it`,
+    # declared in `Cargo.toml` with `autotests = false` and one `[[test]]`
+    # entry, and `tests/agent_e2e.rs` is now its module `agent_e2e` at
+    # `tests/it/agent_e2e.rs`. The `test` job's
+    # `cargo test --locked --workspace` therefore already runs it; the
+    # separate job only re-ran the same tests.
 
     bench-compile:
         name: Bench Compile

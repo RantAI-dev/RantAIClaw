@@ -4,7 +4,7 @@
 //! Tasks 8.3 / 8.4 will append CohereReranker / VllmReranker tests.
 //!
 //! Tests that mutate `OPENROUTER_API_KEY` serialize on `ENV_LOCK` from
-//! `tests/kb/common.rs` — see the rationale in `embed_test.rs`.
+//! `tests/it/kb/common.rs` — see the rationale in `embed_test.rs`.
 
 #![allow(clippy::await_holding_lock)]
 
@@ -14,7 +14,7 @@ use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use crate::kb::kb::common::ENV_LOCK;
+use crate::kb::common::ENV_LOCK;
 
 #[allow(dead_code)]
 struct EnvGuard(Vec<&'static str>);

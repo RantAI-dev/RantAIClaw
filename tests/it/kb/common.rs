@@ -7,7 +7,7 @@
 //! variables are process-global. The binary's one shared lock
 //! ([`crate::common::ENV_LOCK`]) is what serializes them, and re-exporting it
 //! here keeps the KB call sites reading `super::common::ENV_LOCK` /
-//! `crate::kb::kb::common::ENV_LOCK`.
+//! `crate::kb::common::ENV_LOCK`.
 //!
 //! The lock is a `tokio::sync::Mutex`, so an async test holds the guard
 //! across an `.await` with `.lock().await` and a sync test takes it with

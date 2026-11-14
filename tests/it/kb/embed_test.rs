@@ -23,9 +23,9 @@ use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-use crate::kb::kb::common::ENV_LOCK;
+use crate::kb::common::ENV_LOCK;
 
-// Shared env-mutation lock lives in `crate::kb::kb::common::ENV_LOCK` —
+// Shared env-mutation lock lives in `crate::kb::common::ENV_LOCK` —
 // every test module in this binary serializes against the SAME mutex
 // so cross-module tests don't race on `KB_*` / `OPENROUTER_API_KEY`.
 

@@ -15,13 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Cargo.toml` (`autotests = false` plus one `[[test]]` entry), so the suite links once and the
   test compile step no longer pays for 44 copies of the library. Run one file's tests with
   `cargo test --test it <file>::` — for example `cargo test --test it schema_drift::`. The
-  tests, their assertions and their names are unchanged apart from the `it::<file>::` prefix
-  the single binary adds. Two `snapshots` directories exist afterwards: `tests/it/snapshots/`
-  holds insta's snapshots, whose file names carry the `it__` prefix insta derives from the new
-  module path, and `tests/snapshots/` still holds the six `persona_*.snap` files, which a local
-  helper reads through the manifest path and which therefore keep their old names and
-  location. Because the suite now shares one process, the per-file process-global locks became
-  one shared lock for the whole binary.
+  tests and their assertions are unchanged. The tests in the 43 non-KB files gain the module
+  prefix of the file they live in — `schema_drift::…`. The KB tests are the exception: they
+  print exactly as they did before, because the file module `kb` carries the same name the old
+  `tests/kb.rs` crate root's inner `kb` module had. The shared helper's own unit test,
+  `common::tests::acquire_points_config_dir_at_the_guards_tempdir` in `tests/it/common/mod.rs`,
+  also prints without a file prefix, as it did before. Two `snapshots`
+  directories exist afterwards: `tests/it/snapshots/` holds insta's snapshots, whose file names
+  carry the `it__` prefix insta derives from the new module path, and `tests/snapshots/`
+  still holds the six `persona_*.snap` files, which a local helper reads through the manifest
+  path and which therefore keep their old names and location. Because the suite now shares
+  one process, the per-file process-global locks became one shared lock for the whole binary.
 
 - **The binary links the library instead of compiling a second copy of it.** `src/main.rs` used to
   declare 33 of the library's modules again, so the binary compiled its own copy of almost the

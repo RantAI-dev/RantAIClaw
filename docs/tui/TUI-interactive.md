@@ -322,7 +322,7 @@ The picker today hard-codes Persona + Channels. Make it iterate `available()` an
 - Modify: `src/tui/commands/setup.rs`
 - Modify: `src/tui/app.rs` — replace hard-coded `CHANNEL_TYPES` with registry filter on `category() == Channel`.
 
-- [ ] **Step 1: Test (extends `tests/tui_setup_overlay.rs`):**
+- [ ] **Step 1: Test (extends `tests/it/tui_setup_overlay.rs`):**
 
 ```rust
 #[test]
