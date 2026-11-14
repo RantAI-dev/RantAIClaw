@@ -18,18 +18,13 @@
 
 pub mod admin;
 
-// Four of the module's ten external symbols live in the CLI surface, so they
-// keep their `crate::channels::` path.
 pub use admin::doctor_channels;
-// `main.rs` declares its own `mod channels`, so the binary reaches these
-// through `channels::` while the library target does not use them — which the
-// lib-only lint pass reads as an unused import. The binary's use is real; the
-// allow is about which target is being compiled, not about dead code.
+// The binary reaches the channel administration surface through
+// `rantaiclaw::channels::…`, so these four are part of the module's public
+// surface. The rest stay crate-internal.
+pub use admin::{announce_daemon_reload, channel_roster, handle_command, reload_managed_daemon};
 #[allow(unused_imports)]
-pub(crate) use admin::{
-    announce_daemon_reload, channel_roster, handle_command, reload_managed_daemon,
-    reload_managed_daemon_non_blocking, systemd_restart_args,
-};
+pub(crate) use admin::{reload_managed_daemon_non_blocking, systemd_restart_args};
 pub mod approval_relay;
 pub mod auto_start_state;
 pub mod cli;
@@ -611,7 +606,7 @@ pub(crate) struct ChannelRuntimeContext {
 /// `scripts/ci/check_channel_maturity.sh` instead of trusted.
 ///
 /// Rows stay on one line: that gate parses them.
-pub(crate) const CHANNEL_CATALOG: [(&str, &str, ChannelSupport, ChannelVerification); 17] = [
+pub const CHANNEL_CATALOG: [(&str, &str, ChannelSupport, ChannelVerification); 17] = [
     (
         "telegram",
         "Telegram",
@@ -916,7 +911,7 @@ fn dm_detection_for(key: &str) -> bool {
 /// A gateway-served row ([`ChannelSupport::GatewayServed`], the `webhook`)
 /// renders the ordinary configured line, because the gateway is serving it. The
 /// special case below is keyed on `UnderDevelopment` alone.
-pub(crate) fn channel_roster_note(
+pub fn channel_roster_note(
     configured: bool,
     support: ChannelSupport,
     verification: ChannelVerification,
@@ -1003,7 +998,7 @@ pub(crate) fn catalog_key_for_provisioner(name: &str) -> &str {
 /// channel. The single check every setup, pairing and cron surface refusing a
 /// locked channel shares, so "is this a channel" and "is it locked" are asked
 /// together exactly once.
-pub(crate) fn locked_channel_key_for_provisioner(name: &str) -> Option<&str> {
+pub fn locked_channel_key_for_provisioner(name: &str) -> Option<&str> {
     let key = catalog_key_for_provisioner(name);
     if channel_catalog_keys().contains(&key)
         && !NON_CHANNEL_CATALOG_KEYS.contains(&key)

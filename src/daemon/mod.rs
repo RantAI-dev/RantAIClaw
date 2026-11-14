@@ -563,7 +563,7 @@ fn spawn_gateway_supervisor(
 /// fall back to Ctrl+C only, rather than refusing to start the daemon.
 /// Wait for SIGTERM/SIGINT (Ctrl-C). Shared so the standalone `gateway` command
 /// can drive a graceful-drain token the same way the daemon does.
-pub(crate) async fn shutdown_signal() {
+pub async fn shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};

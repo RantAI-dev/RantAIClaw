@@ -1730,10 +1730,7 @@ fn is_clawhub_managed_skill(dir: &Path, slug: &str) -> bool {
 
 /// Handle the `skills` CLI command
 #[allow(clippy::too_many_lines)]
-pub(crate) fn handle_command(
-    command: crate::SkillCommands,
-    config: &crate::config::Config,
-) -> Result<()> {
+pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Config) -> Result<()> {
     let workspace_dir = &config.workspace_dir;
     match command {
         crate::SkillCommands::List => {

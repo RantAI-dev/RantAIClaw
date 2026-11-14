@@ -237,7 +237,7 @@ pub(crate) fn pair_channel(
 /// `tokio::task::spawn_blocking`. CLI/TUI/headless callers live in their own
 /// process and can wait for the outcome; the in-daemon gateway uses
 /// `reload_managed_daemon_non_blocking` instead.
-pub(crate) fn announce_daemon_reload() {
+pub fn announce_daemon_reload() {
     match maybe_restart_managed_daemon_service(true) {
         Ok(true) => {
             println!("🔄 Detected running managed daemon service; reloaded automatically.");
@@ -268,7 +268,7 @@ pub(crate) fn announce_daemon_reload() {
 /// For callers running **inside** the daemon (the gateway), the blocking call
 /// would deadlock against the daemon's own SIGTERM and get SIGKILLed; use
 /// [`reload_managed_daemon_non_blocking`] instead.
-pub(crate) fn reload_managed_daemon() -> Result<bool> {
+pub fn reload_managed_daemon() -> Result<bool> {
     maybe_restart_managed_daemon_service(true)
 }
 
@@ -603,7 +603,7 @@ mod approval_owners_warning_tests {
 /// Canonical channel roster: `(display label, configured?, support,
 /// verification)` for every channel type in a stable order, derived from
 /// [`CHANNEL_CATALOG`] rather than maintained beside it.
-pub(crate) fn channel_roster(
+pub fn channel_roster(
     config: &Config,
 ) -> Vec<(
     &'static str,
@@ -656,7 +656,7 @@ pub(crate) fn channel_remove_guidance(name: &str, config: &Config) -> String {
     }
 }
 
-pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Config) -> Result<()> {
+pub async fn handle_command(command: crate::ChannelCommands, config: &Config) -> Result<()> {
     match command {
         // Dispatched in `main.rs`, which owns the async runtime these need, so
         // they never reach this match. They used to `bail!` with that routing
