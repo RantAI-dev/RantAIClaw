@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use directories::UserDirs;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 #[cfg(unix)]
@@ -55,11 +55,22 @@ const REMOVED_PROXY_SERVICE_KEYS: &[(&str, &str)] = &[(
 )];
 
 static RUNTIME_PROXY_CONFIG: OnceLock<RwLock<ProxyConfig>> = OnceLock::new();
-/// Proxy env vars THIS process authored via `apply_to_process_env`. On a config
-/// reload, `apply_env_overrides` must not mistake a var it wrote itself for a
+/// The value a generic proxy env var held BEFORE this process first wrote it:
+/// the uppercase key and its lowercase spelling. `None` means the operator had
+/// no such variable.
+#[derive(Clone)]
+struct ProxyVarOriginals {
+    uppercase: Option<String>,
+    lowercase: Option<String>,
+}
+/// Proxy env vars THIS process authored via `apply_to_process_env`, with the
+/// value each held before this process wrote it. On a config reload,
+/// `apply_env_overrides` must not mistake a var it wrote itself for a
 /// user-supplied proxy signal — re-reading the `HTTP_PROXY` it had just written
-/// flipped a `[proxy] enabled = false` config back to `true` every reload.
-static PROXY_AUTHORED_VARS: OnceLock<RwLock<HashSet<&'static str>>> = OnceLock::new();
+/// flipped a `[proxy] enabled = false` config back to `true` every reload — and
+/// a clear must give the operator's own variable back instead of removing it.
+static PROXY_AUTHORED_VARS: OnceLock<RwLock<HashMap<&'static str, ProxyVarOriginals>>> =
+    OnceLock::new();
 static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Client>>> =
     OnceLock::new();
 
@@ -1472,11 +1483,21 @@ impl ProxyConfig {
     /// the new proxies.
     pub fn apply_to_process_env(&self) {
         for (key, value) in self.process_env_assignments() {
+            // Track what we are about to write so a reload does not read it back
+            // as a user proxy signal, and so `clear_authored_process_env` can
+            // undo our own writes without touching a user's HTTP_PROXY. This
+            // runs BEFORE the write, so what the variable holds at this point is
+            // the operator's own value — the one a later reload reads as their
+            // signal, and the one a clear gives back. That undo is guaranteed
+            // only for a key we write a value to: a removal write captures
+            // nothing, so an operator who set only the lowercase spelling sees
+            // that spelling removed here and it is not restored later.
+            if value.is_some() {
+                capture_proxy_var_original(key);
+            } else {
+                forget_proxy_var_original(key);
+            }
             set_proxy_env_pair(key, value.as_deref());
-            // Track which vars we wrote so a reload does not read them back as a
-            // user proxy signal, and so `clear_authored_process_env` can undo
-            // exactly our own writes without touching a user's HTTP_PROXY.
-            mark_proxy_var_authored(key, value.is_some());
         }
     }
 
@@ -1485,15 +1506,15 @@ impl ProxyConfig {
     /// moves away from `Environment`, so a disabled proxy stops proxying without
     /// wiping a proxy var the operator set in their own shell.
     pub fn clear_authored_process_env() {
-        let authored: Vec<&'static str> = {
+        let authored: Vec<(&'static str, ProxyVarOriginals)> = {
             let lock = proxy_authored_vars();
             let mut guard = lock
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard.drain().collect()
         };
-        for key in authored {
-            clear_proxy_env_pair(key);
+        for (key, originals) in authored {
+            restore_proxy_env_pair(key, &originals);
         }
     }
 
@@ -1522,7 +1543,9 @@ impl ProxyConfig {
     pub fn clear_process_env() {
         for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"] {
             clear_proxy_env_pair(key);
-            mark_proxy_var_authored(key, false);
+            // The operator asked for these variables to be gone: forget what
+            // they held, so a later clear does not put them back.
+            forget_proxy_var_original(key);
         }
     }
 
@@ -1638,21 +1661,53 @@ fn clear_proxy_env_pair(key: &str) {
     std::env::remove_var(key.to_ascii_lowercase());
 }
 
-fn proxy_authored_vars() -> &'static RwLock<HashSet<&'static str>> {
-    PROXY_AUTHORED_VARS.get_or_init(|| RwLock::new(HashSet::new()))
+/// Put back what the generic proxy env vars held before this process wrote
+/// them: the operator's own value, or nothing at all when they had none.
+fn restore_proxy_env_pair(key: &str, originals: &ProxyVarOriginals) {
+    match &originals.uppercase {
+        Some(value) => std::env::set_var(key, value),
+        None => std::env::remove_var(key),
+    }
+    let lowercase_key = key.to_ascii_lowercase();
+    match &originals.lowercase {
+        Some(value) => std::env::set_var(&lowercase_key, value),
+        None => std::env::remove_var(&lowercase_key),
+    }
 }
 
-/// Record (or clear) that this process authored the proxy env var `key`.
-fn mark_proxy_var_authored(key: &'static str, authored: bool) {
+fn proxy_authored_vars() -> &'static RwLock<HashMap<&'static str, ProxyVarOriginals>> {
+    PROXY_AUTHORED_VARS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Remember what the generic proxy env var `key` held before this process
+/// first wrote it.
+///
+/// Called BEFORE the write, so the value the variable holds at that moment is
+/// the operator's own. That value is what a later reload reads as their proxy
+/// signal and what a clear restores. The first capture wins: a later write
+/// must not replace the operator's original with the value this process wrote.
+fn capture_proxy_var_original(key: &'static str) {
     let lock = proxy_authored_vars();
     let mut guard = lock
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if authored {
-        guard.insert(key);
-    } else {
-        guard.remove(key);
-    }
+    let lowercase_key = key.to_ascii_lowercase();
+    guard.entry(key).or_insert_with(|| ProxyVarOriginals {
+        uppercase: std::env::var(key).ok(),
+        lowercase: std::env::var(&lowercase_key).ok(),
+    });
+}
+
+/// Forget what the generic proxy env var held before this process wrote it.
+///
+/// The operator asked for the variable to be gone, so a later clear must not
+/// put it back.
+fn forget_proxy_var_original(key: &str) {
+    let lock = proxy_authored_vars();
+    let mut guard = lock
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.remove(key);
 }
 
 /// Whether the generic proxy env var `key` currently holds a value THIS process
@@ -1660,19 +1715,33 @@ fn mark_proxy_var_authored(key: &'static str, authored: bool) {
 fn proxy_var_was_authored(key: &str) -> bool {
     proxy_authored_vars()
         .read()
-        .map(|set| set.contains(key))
+        .map(|map| map.contains_key(key))
         .unwrap_or(false)
 }
 
-/// Read a proxy URL from the explicit `RANTAICLAW_*` var, else the generic var —
-/// but skip the generic var when we authored it ourselves, so a self-written
-/// value cannot be mistaken for a user signal that resurrects a disabled proxy.
-fn read_user_proxy_var(explicit: &str, generic: &'static str) -> Option<String> {
+/// The value the operator's shell held for the generic proxy env var `key`
+/// before this process first wrote it. `None` when the operator had no such
+/// variable. Only meaningful for a key this process authored.
+fn proxy_var_original(key: &str) -> Option<String> {
+    proxy_authored_vars().read().ok().and_then(|map| {
+        map.get(key)
+            .and_then(|originals| originals.uppercase.clone())
+    })
+}
+
+/// Read a proxy URL from the explicit `RANTAICLAW_*` var, else the generic var.
+///
+/// The generic var is read as the OPERATOR's value: when this process authored
+/// the key, what is in the environment now is the process's own write, so the
+/// remembered original is the user's signal. That keeps a self-written value
+/// from resurrecting a disabled proxy, and keeps a reload from reading the
+/// operator's own variable as ours and clearing it away.
+fn read_user_proxy_var(explicit: &str, generic: &str) -> Option<String> {
     if let Ok(value) = std::env::var(explicit) {
         return Some(value);
     }
     if proxy_var_was_authored(generic) {
-        return None;
+        return proxy_var_original(generic);
     }
     std::env::var(generic).ok()
 }
@@ -5338,10 +5407,11 @@ impl Config {
             self.proxy.enabled = enabled;
         }
 
-        // Proxy URLs: RANTAICLAW_* wins, then generic *PROXY vars — but never a
-        // generic var we authored ourselves (see `read_user_proxy_var`), so the
-        // proxy env we wrote last apply cannot be read back as a user signal and
-        // resurrect a disabled proxy.
+        // Proxy URLs: RANTAICLAW_* wins, then generic *PROXY vars — but a generic
+        // var we authored ourselves is read as the operator's original value
+        // (see `read_user_proxy_var`), so the proxy env we wrote last apply
+        // cannot be read back as a user signal and resurrect a disabled proxy,
+        // and the operator's own variable is not mistaken for ours.
         let mut proxy_url_overridden = false;
         if let Some(proxy_url) = read_user_proxy_var("RANTAICLAW_HTTP_PROXY", "HTTP_PROXY") {
             self.proxy.http_proxy = normalize_proxy_url_option(Some(&proxy_url));
@@ -9277,6 +9347,188 @@ level = "full"
 
         clear_proxy_env_test_vars();
         ProxyConfig::clear_authored_process_env();
+    }
+
+    /// A reload must not take the operator's own proxy variable with it.
+    ///
+    /// The operator's shell sets `HTTP_PROXY`; the process writes it back and
+    /// remembers the key as its own. The next load in the same process (the
+    /// daemon's hot reload, the cron reload, the console config write, the TUI
+    /// reload) must still read the OPERATOR's value: the variable the process
+    /// wrote back holds the same string, and reading it as "ours" is what made
+    /// the proxy fall back to the file's `enabled = false` and then removed the
+    /// operator's variable from the process environment.
+    #[test]
+    async fn an_operator_proxy_variable_survives_a_second_load() {
+        let _env_guard = env_override_lock().await;
+        // Forget what an earlier test authored (which gives its value back),
+        // then clear the variables themselves.
+        ProxyConfig::clear_authored_process_env();
+        clear_proxy_env_test_vars();
+
+        let _g_http_proxy =
+            crate::test_env::EnvGuard::set("HTTP_PROXY", "http://operator-proxy.invalid:8080");
+
+        // The file says the proxy is off; the environment scope is what lets
+        // the process publish it to the process environment at all.
+        let mut config = Config::default();
+        config.proxy.scope = ProxyScope::Environment;
+        config.apply_env_overrides();
+        assert!(
+            config.proxy.enabled,
+            "the operator's HTTP_PROXY is a proxy signal and turns the proxy on"
+        );
+
+        // A reload reads the file again and re-applies the environment, so it
+        // starts from the file's `enabled = false`.
+        let mut reloaded = Config::default();
+        reloaded.proxy.scope = ProxyScope::Environment;
+        reloaded.apply_env_overrides();
+        assert!(
+            reloaded.proxy.enabled,
+            "a reload must still read the operator's proxy signal"
+        );
+        assert_eq!(
+            std::env::var("HTTP_PROXY").as_deref(),
+            Ok("http://operator-proxy.invalid:8080"),
+            "a reload must not remove the operator's own HTTP_PROXY"
+        );
+
+        ProxyConfig::clear_authored_process_env();
+        clear_proxy_env_test_vars();
+    }
+
+    /// Clearing the proxy gives the operator's variable back instead of
+    /// removing it: the process owns only what it wrote.
+    #[test]
+    async fn clearing_a_proxy_restores_the_operator_variable() {
+        let _env_guard = env_override_lock().await;
+        ProxyConfig::clear_authored_process_env();
+        clear_proxy_env_test_vars();
+
+        let _g_http_proxy =
+            crate::test_env::EnvGuard::set("HTTP_PROXY", "http://operator-proxy.invalid:8080");
+        // The operator's other spelling, with a value of its own: the pair is
+        // restored per spelling, not per key.
+        let _g_http_proxy_lower = crate::test_env::EnvGuard::set(
+            "http_proxy",
+            "http://operator-proxy-lowercase.invalid:8080",
+        );
+
+        let mut config = Config::default();
+        config.proxy.scope = ProxyScope::Environment;
+        config.apply_env_overrides();
+        assert!(
+            config.proxy.enabled,
+            "a proxy URL from the operator's environment enables the proxy"
+        );
+
+        // The operator disables the proxy explicitly. The explicit flag keeps
+        // `enabled` false even though a proxy URL was read.
+        let _g_disabled = crate::test_env::EnvGuard::set("RANTAICLAW_PROXY_ENABLED", "false");
+        let mut reloaded = Config::default();
+        reloaded.proxy.scope = ProxyScope::Environment;
+        reloaded.apply_env_overrides();
+        assert!(
+            !reloaded.proxy.enabled,
+            "the explicit flag disables the proxy"
+        );
+        assert_eq!(
+            std::env::var("HTTP_PROXY").as_deref(),
+            Ok("http://operator-proxy.invalid:8080"),
+            "the operator's HTTP_PROXY must be back, not removed"
+        );
+        assert_eq!(
+            std::env::var("http_proxy").as_deref(),
+            Ok("http://operator-proxy-lowercase.invalid:8080"),
+            "the operator's http_proxy must be back, not removed"
+        );
+
+        ProxyConfig::clear_authored_process_env();
+        clear_proxy_env_test_vars();
+    }
+
+    /// The regression the bookkeeping was added for: a value THIS process wrote,
+    /// over an operator who had set nothing, never turns a disabled proxy back
+    /// on, and the variable the process authored goes away again.
+    #[test]
+    async fn a_proxy_the_process_authored_is_still_cleared() {
+        let _env_guard = env_override_lock().await;
+        ProxyConfig::clear_authored_process_env();
+        clear_proxy_env_test_vars();
+
+        // No operator variable: the process authors HTTP_PROXY itself.
+        let mut config = Config::default();
+        config.proxy.enabled = true;
+        config.proxy.scope = ProxyScope::Environment;
+        config.proxy.http_proxy = Some("http://proxy.invalid:8080".into());
+        config.apply_env_overrides();
+        assert_eq!(
+            std::env::var("HTTP_PROXY").as_deref(),
+            Ok("http://proxy.invalid:8080"),
+            "the enabled proxy writes HTTP_PROXY"
+        );
+
+        // The operator disables the proxy: the variable this process authored
+        // goes away, and the proxy does not come back on its own.
+        let mut reloaded = Config::default();
+        reloaded.proxy.scope = ProxyScope::Environment;
+        reloaded.apply_env_overrides();
+        assert!(
+            !reloaded.proxy.enabled,
+            "a proxy this process authored must not resurrect itself on reload"
+        );
+        assert!(
+            std::env::var("HTTP_PROXY").is_err(),
+            "the proxy env this process authored is cleared on disable"
+        );
+        assert!(
+            std::env::var("http_proxy").is_err(),
+            "the lowercase spelling this process authored is cleared too"
+        );
+
+        ProxyConfig::clear_authored_process_env();
+        clear_proxy_env_test_vars();
+    }
+
+    /// The explicit `RANTAICLAW_*` variable still wins — over the generic one
+    /// and over the operator's value the process remembered.
+    #[test]
+    async fn the_explicit_rantaiclaw_proxy_variable_still_wins() {
+        let _env_guard = env_override_lock().await;
+        ProxyConfig::clear_authored_process_env();
+        clear_proxy_env_test_vars();
+
+        let _g_explicit = crate::test_env::EnvGuard::set(
+            "RANTAICLAW_HTTP_PROXY",
+            "http://explicit-proxy.invalid:8080",
+        );
+        let _g_generic =
+            crate::test_env::EnvGuard::set("HTTP_PROXY", "http://generic-proxy.invalid:8080");
+
+        let mut config = Config::default();
+        config.proxy.scope = ProxyScope::Environment;
+        config.apply_env_overrides();
+        assert_eq!(
+            config.proxy.http_proxy.as_deref(),
+            Some("http://explicit-proxy.invalid:8080"),
+            "the explicit RANTAICLAW_HTTP_PROXY wins over the generic HTTP_PROXY"
+        );
+
+        // A reload: the process has authored HTTP_PROXY by now, so what the
+        // bookkeeping remembers is the operator's original (the generic value).
+        // The explicit variable still wins over it.
+        let mut reloaded = Config::default();
+        reloaded.proxy.scope = ProxyScope::Environment;
+        reloaded.apply_env_overrides();
+        assert_eq!(
+            reloaded.proxy.http_proxy.as_deref(),
+            Some("http://explicit-proxy.invalid:8080"),
+            "the explicit RANTAICLAW_HTTP_PROXY still wins after a reload"
+        );
+
+        ProxyConfig::clear_authored_process_env();
+        clear_proxy_env_test_vars();
     }
 
     #[test]
