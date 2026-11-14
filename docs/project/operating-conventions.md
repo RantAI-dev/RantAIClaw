@@ -119,7 +119,7 @@ When a future cut needs a new index, table, or DDL change:
 Two integration tests sit between schema changes and the release
 button:
 
-1. **`tests/schema_drift.rs`** — snapshot tests over the
+1. **`tests/it/schema_drift.rs`** — snapshot tests over the
    `Config` JSON Schema and the sessions.db DDL. Any field rename,
    type change, new field, removed field, or DDL drift fails these
    tests with a "you changed the schema" message. The maintainer's
@@ -130,7 +130,7 @@ button:
      "where's the migration?"
    - Bump `CURRENT_VERSION` in the relevant `migrations.rs` module.
    - Add the `migrate_vN` + chain arm + unit test.
-2. **`tests/config_migration_roundtrip.rs`** — serialises
+2. **`tests/it/config_migration_roundtrip.rs`** — serialises
    `Config::default()`, strips `schema_version`, runs `migrate()`,
    and asserts the post-migration TOML still deserialises into
    `Config`. If a new required field lacks both `#[serde(default)]`

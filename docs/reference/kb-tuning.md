@@ -99,8 +99,8 @@ latency) than the previous one.
 ```bash
 # From the rantaiclaw worktree root
 set -a && source ../../../../.env && set +a  # provides OPENROUTER_API_KEY + KB_*
-cargo test --features kb --release --test kb \
-  -- --ignored rag_golden_parity --nocapture
+cargo test --features kb --release --test it \
+  kb::parity_test::rag_golden_parity -- --ignored --nocapture
 ```
 
 Expected runtime: ~4-5 minutes (ingest ~3 min, retrieval ~1 min) for

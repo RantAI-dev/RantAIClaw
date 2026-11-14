@@ -47,7 +47,7 @@ Use this with:
    - `fmt` (needs `changes`; runs when `rust_changed` is true) runs `cargo fmt --all -- --check`.
    - `lint` (needs only `changes`; runs when `rust_changed` is true) runs clippy once, feeds the JSON to the quality gate (`--skip-fmt`) and to the strict delta gate on changed lines, then runs the source-level guards and doc-coverage checks.
    - `test`, `msrv`, `channel-features`, `features`, `bench-compile` and `build` each need `[changes, fmt]` and run only when `rust_changed` is true and `fmt` succeeded. They do not wait for `lint`.
-   - `test` runs `cargo test --locked --workspace -- --test-threads=1`. This includes the `agent_e2e` integration target, so there is no separate `e2e` job.
+   - `test` runs `cargo test --locked --workspace -- --test-threads=1`. This includes the single `it` integration binary, which holds every former `tests/*.rs` file as a module (`tests/it/agent_e2e.rs` runs as `it::agent_e2e`), so there is no separate `e2e` job.
    - `msrv` checks every target at the declared minimum Rust version.
    - `channel-features` is one job with a compile check and two filtered test steps. The check (`cargo check --locked --features channel-lark,channel-matrix --all-targets`) runs first, on every Rust-changing PR and every push, and a failure blocks the gate. The two test steps run on every push and on a PR only when `channel_features_changed` is true. On a PR that does not touch channel code, the job reports success with the two test steps skipped.
    - `features` is one job with three sequential steps: `cargo check` for `no-default-features`, `observability-otel` and `kb-office`. It is not a matrix.

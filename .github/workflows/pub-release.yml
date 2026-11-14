@@ -183,9 +183,12 @@ jobs:
             - name: Schema-drift snapshots + migration round-trip
               run: |
                   export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
-                  cargo test --locked \
-                    --test schema_drift \
-                    --test config_migration_roundtrip
+                  # The integration tests live in ONE binary (`it`), and
+                  # `cargo test` accepts only ONE positional filter — so
+                  # each module filter is its own invocation. Without the
+                  # module filter the whole binary would run.
+                  cargo test --locked --test it schema_drift::
+                  cargo test --locked --test it config_migration_roundtrip::
             - name: Per-store migration unit tests
               run: |
                   export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"

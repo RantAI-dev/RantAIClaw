@@ -14,6 +14,11 @@ readme = "README.md"
 keywords = ["ai", "agent", "cli", "assistant", "chatbot"]
 categories = ["command-line-utilities", "api-bindings"]
 rust-version = "1.91"
+# The integration tests live in ONE binary (`tests/it/main.rs`), declared
+# explicitly below. Cargo's auto-discovery of `tests/*.rs` is off, so a
+# stray file under `tests/` can never become a second integration binary
+# that links the whole library again.
+autotests = false
 
 [dependencies]
 # Exact pin from the 2026-08-20 supply-chain incident, resolved upstream. Do not bump it
@@ -316,3 +321,12 @@ harness = false
 name = "kb_retrieval"
 harness = false
 required-features = ["kb"]
+
+# The single integration test binary. Every former `tests/<name>.rs` file is
+# a module of it, so the suite links the library and its dependency tree
+# once instead of once per file. Run one file's tests with
+# `cargo test --test it <file>::` (for example `cargo test --test it
+# schema_drift::`).
+[[test]]
+name = "it"
+path = "tests/it/main.rs"

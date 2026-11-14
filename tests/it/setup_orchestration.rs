@@ -1,0 +1,236 @@
+#![allow(clippy::field_reassign_with_default)]
+
+//! Wave 3 integration tests — orchestrator over the canonical setup-section list.
+//!
+//! Plan: `docs/superpowers/plans/2026-04-27-onboarding-depth-v2.md`,
+//! Wave 3 step 3.12.
+//!
+//! These tests exercise the public crate API of `crate::onboard::wizard`:
+//!   * `canonical_section_order()` — returns the 5 wired sections in order;
+//!   * `run_setup(profile, &mut config, topic, force, non_interactive)` —
+//!     iterates / dispatches and bails cleanly in headless mode.
+//!
+//! Headless / `non_interactive: true` is the test-friendly mode: every
+//! section is asked for `headless_hint()` and skipped, so we get to assert
+//! sequencing without dialoguer prompts.
+//!
+//! All tests redirect `$HOME` to a `tempfile::TempDir`; we serialize via the
+//! binary's one shared env-mutation lock because
+//! `std::env::set_var("HOME", ...)` is process-global and Cargo runs tests
+//! in parallel by default. (Same pattern the other leaf tests use.)
+
+use rantaiclaw::config::Config;
+use rantaiclaw::onboard::wizard;
+use rantaiclaw::profile::ProfileManager;
+use tempfile::TempDir;
+
+use crate::common::ENV_LOCK;
+
+fn with_home<F: FnOnce()>(f: F) {
+    let _guard = ENV_LOCK.blocking_lock();
+    let tmp = TempDir::new().expect("tempdir");
+    let prev_home = std::env::var_os("HOME");
+    let prev_profile = std::env::var_os("RANTAICLAW_PROFILE");
+    std::env::set_var("HOME", tmp.path());
+    std::env::remove_var("RANTAICLAW_PROFILE");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    if let Some(h) = prev_home {
+        std::env::set_var("HOME", h);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    if let Some(p) = prev_profile {
+        std::env::set_var("RANTAICLAW_PROFILE", p);
+    } else {
+        std::env::remove_var("RANTAICLAW_PROFILE");
+    }
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
+    }
+}
+
+#[test]
+fn setup_runs_all_sections_in_canonical_order() {
+    let order = wizard::canonical_section_order();
+    // `knowledge` is appended when the `kb` feature is on (the default build,
+    // incl. CI's `--workspace`); keep the expectation feature-aware so the
+    // test tracks `canonical_sections()` under either build.
+    let mut expected = vec![
+        "provider",
+        "approvals",
+        "channels",
+        "persona",
+        "skills",
+        "mcp",
+        "login",
+    ];
+    if cfg!(feature = "kb") {
+        expected.push("knowledge");
+    }
+    assert_eq!(
+        order, expected,
+        "canonical section order changed — update spec + tests together",
+    );
+}
+
+#[test]
+fn setup_skips_already_configured_sections_without_force() {
+    with_home(|| {
+        let profile = ProfileManager::ensure_default().unwrap();
+        let mut config = Config::default();
+
+        // Pre-configure provider so it should be skipped.
+        config.default_provider = Some("openrouter".to_string());
+        config.api_key = Some("sk-test".to_string());
+        config.default_model = Some("openai/gpt-4o-mini".to_string());
+
+        let report = wizard::run_setup(&profile, &mut config, None, false, true)
+            .expect("non-interactive run should succeed");
+
+        assert!(
+            report.skipped.contains(&"provider".to_string()),
+            "provider should have been skipped (already configured): {:?}",
+            report,
+        );
+        // The other 4 sections are not configured, so they should be visited.
+        for s in ["channels", "persona", "skills", "mcp"] {
+            assert!(
+                report.visited.contains(&s.to_string()),
+                "expected {s} to be visited (not configured): {:?}",
+                report,
+            );
+        }
+    });
+}
+
+#[test]
+fn setup_force_reruns_already_configured_sections() {
+    with_home(|| {
+        let profile = ProfileManager::ensure_default().unwrap();
+        let mut config = Config::default();
+        config.default_provider = Some("openrouter".to_string());
+        config.api_key = Some("sk-test".to_string());
+
+        let report = wizard::run_setup(&profile, &mut config, None, /*force*/ true, true)
+            .expect("force run should succeed");
+
+        assert!(
+            report.visited.contains(&"provider".to_string()),
+            "force should re-run provider section: {:?}",
+            report,
+        );
+        assert!(
+            report.skipped.is_empty(),
+            "force should bypass all skips: {:?}",
+            report,
+        );
+    });
+}
+
+#[test]
+fn setup_with_topic_runs_only_one_section() {
+    with_home(|| {
+        let profile = ProfileManager::ensure_default().unwrap();
+        let mut config = Config::default();
+
+        let report = wizard::run_setup(
+            &profile,
+            &mut config,
+            Some("persona".to_string()),
+            false,
+            true,
+        )
+        .expect("topic run should succeed");
+
+        assert_eq!(report.visited, vec!["persona".to_string()]);
+        assert!(report.skipped.is_empty());
+    });
+}
+
+#[test]
+fn setup_with_unknown_topic_errors_with_valid_topic_list() {
+    with_home(|| {
+        let profile = ProfileManager::ensure_default().unwrap();
+        let mut config = Config::default();
+
+        let err = wizard::run_setup(
+            &profile,
+            &mut config,
+            Some("doesnotexist".to_string()),
+            false,
+            true,
+        )
+        .expect_err("unknown topic must error");
+
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("unknown") || msg.contains("invalid"),
+            "error should call out unknown topic: {msg}"
+        );
+        // The error must enumerate the valid topics so the user can recover.
+        for s in [
+            "provider",
+            "approvals",
+            "channels",
+            "persona",
+            "skills",
+            "mcp",
+            "login",
+        ] {
+            assert!(msg.contains(s), "error should list valid topic {s}: {msg}",);
+        }
+    });
+}
+
+// The "setup stops at the first failing section (and does not visit later
+// sections)" property is covered by the unit test
+// `wizard::tests::section_sweep_stops_at_first_failure_and_skips_later_sections`,
+// which injects a stub failing section — something this integration test cannot
+// do (no canonical section fails in headless mode; they emit a hint and return
+// Ok). The former test here asserted only `!err.is_empty()` on the unknown-topic
+// path, duplicating `setup_with_unknown_topic_errors_with_valid_topic_list`
+// below without exercising a mid-sweep failure, so it was removed.
+
+#[test]
+fn onboard_alias_dispatches_to_setup_with_no_topic() {
+    // The legacy `Commands::Onboard` arm in main.rs is a thin wrapper that
+    // calls `wizard::run_setup(profile, &mut config, None, false, false)`.
+    // Here we assert the orchestrator entry point exists and is callable
+    // with `topic=None`; in headless mode it visits every section the
+    // way the legacy alias would.
+    with_home(|| {
+        let profile = ProfileManager::ensure_default().unwrap();
+        let mut config = Config::default();
+        let report = wizard::run_setup(&profile, &mut config, None, false, true)
+            .expect("legacy-equivalent dispatch should succeed");
+        // No topic + non-interactive ⇒ every section produces an outcome
+        // (visited or skipped). 7 core sections + `knowledge` when the `kb`
+        // feature is on (the default/CI build).
+        let expected_sections = if cfg!(feature = "kb") { 8 } else { 7 };
+        assert_eq!(
+            report.visited.len() + report.skipped.len(),
+            expected_sections
+        );
+    });
+}
+
+// ── Banner snapshots ────────────────────────────────────────────────
+
+#[test]
+fn welcome_banner_snapshot() {
+    // The banner embeds `env!("CARGO_PKG_VERSION")`; redact it so the snapshot
+    // doesn't drift on every release bump (it had been pinned to v0.5.0).
+    let banner = console::strip_ansi_codes(&rantaiclaw::onboard::ui::render_welcome_banner())
+        .replace(env!("CARGO_PKG_VERSION"), "X.Y.Z");
+    insta::assert_snapshot!("setup_welcome_banner", banner);
+}
+
+#[test]
+fn completion_banner_snapshot() {
+    let banner = console::strip_ansi_codes(&rantaiclaw::onboard::ui::render_completion_banner(&[
+        "rantaiclaw doctor — verify the install",
+        "rantaiclaw chat   — start a session",
+    ]))
+    .into_owned();
+    insta::assert_snapshot!("setup_completion_banner", banner);
+}

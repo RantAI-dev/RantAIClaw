@@ -1,0 +1,254 @@
+//! Integration tests for `src/doctor/` — the trait, runner, renderers,
+//! and a mockito-backed provider ping.
+//!
+//! Snapshot tests are pinned via [`insta`]. Update them with
+//! `cargo insta review` when output format changes intentionally.
+
+// Mutex held across .await is intentional — serializes mockito's global state
+// across tests. The field-reassign pattern in `ctx_with_provider` is clearer
+// than a struct literal given the optional api_key.
+#![allow(clippy::await_holding_lock, clippy::field_reassign_with_default)]
+
+use std::sync::Mutex;
+
+use rantaiclaw::config::Config;
+use rantaiclaw::doctor::checks::policy::{diagnose_allowlist, AllowlistDiagnosis};
+use rantaiclaw::doctor::checks::provider::ProviderPingCheck;
+use rantaiclaw::doctor::report::{render, render_brief, render_json, render_text, DoctorFormat};
+use rantaiclaw::doctor::{run_all_detailed, CheckResult, DoctorCheck, DoctorContext, Severity};
+use rantaiclaw::profile::Profile;
+use tempfile::TempDir;
+
+/// `mockito::Server::new_async` mutates global state; serialize the few
+/// tests that drive it.
+///
+/// This lock stays LOCAL to this file on purpose: mockito's global server
+/// registry is the only state it guards, and no other module in this binary
+/// touches mockito. The binary's shared `crate::common::ENV_LOCK` guards
+/// process-global *environment* state, which mockito does not touch.
+static MOCKITO_LOCK: Mutex<()> = Mutex::new(());
+
+fn fixture_results() -> Vec<CheckResult> {
+    vec![
+        CheckResult::ok("config.schema", "config schema is valid"),
+        CheckResult::warn("policy.allowlist", "allowlist is empty")
+            .with_hint("run: rantaiclaw setup approvals"),
+        CheckResult::fail("provider.ping", "401 unauthorized")
+            .with_category("live")
+            .with_hint("re-enter API key with: rantaiclaw setup provider"),
+        CheckResult::info("daemon.registration", "init system not detected (skipped)")
+            .with_category("system"),
+    ]
+}
+
+fn ctx_with_provider(
+    provider: &str,
+    api_key: Option<&str>,
+    offline: bool,
+) -> (DoctorContext, TempDir) {
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = Config::default();
+    cfg.default_provider = Some(provider.to_string());
+    cfg.api_key = api_key.map(str::to_string);
+    // The daemon's state file sits next to the config file. Point the config
+    // path at the temp dir so a check that reads it (the scheduler check)
+    // reads this test's file, never the operator's own.
+    cfg.config_path = tmp.path().join("config.toml");
+    let profile = Profile {
+        name: "test".into(),
+        root: tmp.path().to_path_buf(),
+    };
+    (
+        DoctorContext {
+            profile,
+            config: cfg,
+            offline,
+        },
+        tmp,
+    )
+}
+
+#[tokio::test]
+async fn provider_ping_succeeds_on_mock_endpoint() {
+    // Poison-tolerant: if one mockito test panics while holding the lock, the
+    // rest must still run instead of cascading into spurious "poisoned" failures.
+    let _guard = MOCKITO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut server = mockito::Server::new_async().await;
+    let mock = server
+        .mock("GET", "/models")
+        .with_status(200)
+        .with_body("[]")
+        .create_async()
+        .await;
+
+    let url = format!("{}/models", server.url());
+    let check = ProviderPingCheck::with_endpoint(url);
+    let (ctx, _tmp) = ctx_with_provider("openrouter", Some("test-key"), false);
+    let result = check.run(&ctx).await;
+    mock.assert_async().await;
+    assert_eq!(result.severity, Severity::Ok, "msg: {}", result.message);
+}
+
+#[tokio::test]
+async fn provider_ping_fails_on_401() {
+    // Poison-tolerant: if one mockito test panics while holding the lock, the
+    // rest must still run instead of cascading into spurious "poisoned" failures.
+    let _guard = MOCKITO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut server = mockito::Server::new_async().await;
+    let _mock = server
+        .mock("GET", "/models")
+        .with_status(401)
+        .with_body(r#"{"error":"unauthorized"}"#)
+        .create_async()
+        .await;
+
+    let url = format!("{}/models", server.url());
+    let check = ProviderPingCheck::with_endpoint(url);
+    let (ctx, _tmp) = ctx_with_provider("openrouter", Some("bad-key"), false);
+    let result = check.run(&ctx).await;
+    assert_eq!(result.severity, Severity::Fail);
+    assert!(result.message.contains("401"));
+    assert!(result.hint.is_some());
+}
+
+#[tokio::test]
+async fn provider_ping_skips_when_offline() {
+    let check = ProviderPingCheck::default();
+    let (ctx, _tmp) = ctx_with_provider("openrouter", Some("k"), true);
+    let result = check.run(&ctx).await;
+    assert_eq!(result.severity, Severity::Info);
+}
+
+#[test]
+fn allowlist_diagnose_reads_what_the_writer_writes() {
+    // Pin the seam between the doctor helper and the on-disk writer. The old
+    // version read a top-level `commands = [...]` array the writer never
+    // produced, so every real install came back empty. The new helper reads
+    // `[command_allowlist].patterns`; we build the file with the real writer
+    // so this test catches a regression in either direction.
+    use rantaiclaw::approval::policy_writer::{self, PolicyPreset};
+    use rantaiclaw::profile::Profile;
+
+    let tmp = TempDir::new().unwrap();
+    let profile = Profile {
+        name: "test".into(),
+        root: tmp.path().to_path_buf(),
+    };
+    policy_writer::write_policy_files(&profile, PolicyPreset::Smart, true).unwrap();
+    let allowlist = profile.policy_dir().join("command_allowlist.toml");
+    let diag = diagnose_allowlist(&allowlist);
+    assert!(
+        matches!(diag, AllowlistDiagnosis::Healthy { count } if count > 0),
+        "writer-built allowlist must report a positive count, got {diag:?}"
+    );
+}
+
+// ── Renderer snapshots ─────────────────────────────────────────────
+
+#[test]
+fn report_text_renders_correctly() {
+    let rendered = render_text(&fixture_results(), &[], false);
+    insta::assert_snapshot!("doctor_text", rendered);
+}
+
+#[test]
+fn report_brief_renders_correctly() {
+    let rendered = render_brief(&fixture_results(), &[]);
+    insta::assert_snapshot!("doctor_brief", rendered);
+}
+
+#[test]
+fn report_json_renders_correctly() {
+    let rendered = render_json(&fixture_results(), &[]);
+    insta::assert_json_snapshot!("doctor_json", rendered);
+}
+
+#[test]
+fn render_dispatches_to_text() {
+    let s = render(&fixture_results(), &[], DoctorFormat::Text);
+    assert!(s.contains("RantaiClaw Doctor"));
+}
+
+#[test]
+fn render_dispatches_to_brief() {
+    let s = render(&fixture_results(), &[], DoctorFormat::Brief);
+    assert!(s.starts_with("doctor:"));
+}
+
+// `doctor` and `doctor models` answer different questions — one reads local
+// configuration and runtime state, the other asks providers over the network
+// which models they serve. Reading a green `doctor` as "my model works" is the
+// confusion this text exists to prevent, so the text is asserted rather than
+// left to whoever edits the renderer next.
+#[test]
+fn text_report_says_it_does_not_probe_providers() {
+    let s = render(&fixture_results(), &[], DoctorFormat::Text);
+    assert!(
+        s.contains("configuration and runtime health"),
+        "the header should say what this command covers: {s}"
+    );
+    assert!(
+        s.contains("does not ask a provider"),
+        "the report should disclaim provider probing: {s}"
+    );
+    assert!(
+        s.contains("rantaiclaw doctor models"),
+        "the report should name the command that does probe providers: {s}"
+    );
+}
+
+#[test]
+fn render_dispatches_to_json() {
+    let s = render(&fixture_results(), &[], DoctorFormat::Json);
+    let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+    assert_eq!(v["summary"]["total"], 4);
+}
+
+#[tokio::test]
+async fn run_all_detailed_reports_skipped_live_checks() {
+    // Brief mode must skip the three live checks and name them, rather than
+    // silently omitting them (which made the console imply an all-green gateway).
+    let (ctx, _tmp) = ctx_with_provider("openai", Some("sk-test"), true);
+    let run = run_all_detailed(ctx, true).await;
+
+    let mut skipped = run.skipped.clone();
+    skipped.sort();
+    // Unchanged by the scheduler check: it reads a local file, so it is not a
+    // `live` check and brief mode still runs it.
+    assert_eq!(
+        skipped,
+        vec![
+            "channels.auth".to_string(),
+            "mcp.startup".to_string(),
+            "provider.ping".to_string(),
+        ]
+    );
+    // None of the skipped checks appear in the results.
+    for name in ["provider.ping", "channels.auth", "mcp.startup"] {
+        assert!(
+            run.results.iter().all(|r| r.name != name),
+            "skipped check {name} must not be in results"
+        );
+    }
+}
+
+/// The scheduler diagnosis `doctor`'s help promises has a check behind it, and
+/// the check runs at every door — brief mode is the console's mode, and a
+/// check that only ran in the full CLI would leave the console with the gap.
+#[tokio::test]
+async fn run_all_detailed_runs_the_scheduler_check_in_brief_mode() {
+    let (ctx, _tmp) = ctx_with_provider("openai", Some("sk-test"), true);
+    let run = run_all_detailed(ctx, true).await;
+
+    let scheduler = run
+        .results
+        .iter()
+        .find(|r| r.name == "daemon.scheduler")
+        .expect("the scheduler check must run in brief mode");
+    assert_eq!(scheduler.category, "system");
+    assert!(
+        scheduler.message.contains("daemon not running"),
+        "no state file in the temp dir means the daemon is not running: {}",
+        scheduler.message
+    );
+}
