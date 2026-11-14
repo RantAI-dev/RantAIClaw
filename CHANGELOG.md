@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The binary links the library instead of compiling a second copy of it.** `src/main.rs` used to
+  declare 33 of the library's modules again, so the binary compiled its own copy of almost the
+  whole tree and the tree was built twice per profile. The binary now reaches library code only
+  through `rantaiclaw::`, so the source compiles once per profile and build and test time drop.
+  Every `static`, `OnceLock` and `LazyLock` in the tree used to exist twice in the running
+  binary, so state reached through `crate::` and state reached through `rantaiclaw::` lived in
+  separate registries and caches; they are now one. The commands, flags, help text, exit codes and
+  output are unchanged.
+
 - **The Docker `:latest` tag moves only when the release is the highest version tag.** A release
   used to move `:latest` on every publish, so re-running the publish for an older release, for
   example to retry its image push after a newer release had shipped, pointed `:latest` back at the

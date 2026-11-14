@@ -72,59 +72,13 @@ fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     Ok(t)
 }
 
-mod agent;
-mod approval;
-mod channels;
-mod cli_style;
-mod config;
-mod cost;
-mod cron;
-mod daemon;
-mod doctor;
-mod gateway;
-mod health;
-mod heartbeat;
-mod identity;
-mod integrations;
-// Compile the KB modules as part of the binary crate too — required so
-// `crate::kb::axi::api::router()` returns a router parameterized with the
-// binary's `crate::gateway::AppState` (which is a distinct nominal type
-// from `rantaiclaw::gateway::AppState` even though the source is shared).
-// Gated on the `kb` feature so non-KB builds skip the whole subtree.
-#[cfg(feature = "kb")]
-mod kb;
-mod mcp;
-mod memory;
-mod migration;
-mod multimodal;
-mod observability;
-mod onboard;
-mod persona {
-    pub use rantaiclaw::persona::*;
-}
-mod profile {
-    pub use rantaiclaw::profile::*;
-}
-mod providers;
-mod runtime;
-mod security;
-mod service;
-mod services;
+// The binary reaches the library through `rantaiclaw::` only: it declares no
+// module that `src/lib.rs` also declares, so the tree compiles once per profile
+// and every `static` exists once. `webui` is the one module that lives only
+// here.
 mod webui;
-mod sessions {
-    pub use rantaiclaw::sessions::*;
-}
-#[cfg(feature = "remote-install")]
-mod remote;
-mod skills;
-mod tasks;
-#[cfg(test)]
-mod test_env;
-mod tools;
-mod tunnel;
-mod util;
 
-use config::Config;
+use rantaiclaw::Config;
 
 /// `RantaiClaw` - Zero overhead. Zero compromise. 100% Rust.
 #[derive(Parser, Debug)]
@@ -145,22 +99,6 @@ struct Cli {
 
     #[command(subcommand)]
     command: Option<Commands>,
-}
-
-#[derive(Subcommand, Debug)]
-enum ServiceCommands {
-    /// Install daemon service unit for auto-start and restart
-    Install,
-    /// Start daemon service
-    Start,
-    /// Stop daemon service
-    Stop,
-    /// Restart daemon service to apply latest config
-    Restart,
-    /// Check daemon service status
-    Status,
-    /// Uninstall daemon service unit
-    Uninstall,
 }
 
 #[derive(Subcommand, Debug)]
@@ -421,7 +359,7 @@ Examples:
         service_init: String,
 
         #[command(subcommand)]
-        service_command: ServiceCommands,
+        service_command: rantaiclaw::ServiceCommands,
     },
 
     /// Run diagnostics for configuration, channels, daemon and scheduler state.
@@ -480,7 +418,7 @@ Examples:
   rantaiclaw cron update <task-id> --expression '0 8 * * *' --tz Europe/London")]
     Cron {
         #[command(subcommand)]
-        cron_command: CronCommands,
+        cron_command: rantaiclaw::CronCommands,
     },
 
     /// Manage provider model catalogs
@@ -519,7 +457,7 @@ Examples:
     )]
     Channel {
         #[command(subcommand)]
-        channel_command: ChannelCommands,
+        channel_command: rantaiclaw::ChannelCommands,
     },
 
     /// Manage per-role channel permissions (owners + the non-owner "guest"
@@ -551,13 +489,13 @@ Targets: owner | tool | command (aliases: owners, tools, commands, cmd).")]
     /// Browse 50+ integrations
     Integrations {
         #[command(subcommand)]
-        integration_command: Option<IntegrationCommands>,
+        integration_command: Option<rantaiclaw::IntegrationCommands>,
     },
 
     /// Manage skills (user-defined capabilities)
     Skills {
         #[command(subcommand)]
-        skill_command: SkillCommands,
+        skill_command: rantaiclaw::SkillCommands,
     },
 
     /// (removed) Manage provider subscription authentication profiles
@@ -623,7 +561,7 @@ Examples:
   rantaiclaw memory clear --category conversation --yes")]
     Memory {
         #[command(subcommand)]
-        memory_command: MemoryCommands,
+        memory_command: rantaiclaw::MemoryCommands,
     },
 
     /// Manage configuration
@@ -822,7 +760,7 @@ Examples:
   rantaiclaw --profile work profile current")]
     Profile {
         #[command(subcommand)]
-        cmd: profile::commands::ProfileCommand,
+        cmd: rantaiclaw::profile::commands::ProfileCommand,
     },
 
     /// Knowledge Base axi-cli surface (search, ingest, list, drift, re-embed).
@@ -849,112 +787,6 @@ enum ConfigCommands {
     Schema,
     /// Show the active configuration as JSON, with all secrets redacted
     Show,
-}
-
-#[derive(Subcommand, Debug)]
-enum CronCommands {
-    /// List all scheduled tasks
-    List,
-    /// Add a new scheduled task
-    Add {
-        /// Cron expression
-        expression: String,
-        /// Optional IANA timezone (e.g. America/Los_Angeles)
-        #[arg(long)]
-        tz: Option<String>,
-        /// Command to run
-        command: String,
-        /// Create an AGENT job (the positional is the prompt, not a shell command).
-        #[arg(long)]
-        agent: bool,
-        /// Model override for an agent job (ignored for shell jobs).
-        #[arg(long)]
-        model: Option<String>,
-    },
-    /// Add a one-shot scheduled task at an RFC3339 timestamp
-    AddAt {
-        /// One-shot timestamp in RFC3339 format
-        at: String,
-        /// Command to run
-        command: String,
-        /// Create an AGENT job (the positional is the prompt, not a shell command).
-        #[arg(long)]
-        agent: bool,
-        /// Model override for an agent job (ignored for shell jobs).
-        #[arg(long)]
-        model: Option<String>,
-    },
-    /// Add a fixed-interval scheduled task
-    AddEvery {
-        /// Interval in milliseconds
-        every_ms: u64,
-        /// Command to run
-        command: String,
-        /// Create an AGENT job (the positional is the prompt, not a shell command).
-        #[arg(long)]
-        agent: bool,
-        /// Model override for an agent job (ignored for shell jobs).
-        #[arg(long)]
-        model: Option<String>,
-    },
-    /// Add a one-shot delayed task (e.g. "30m", "2h", "1d")
-    Once {
-        /// Delay duration
-        delay: String,
-        /// Command to run
-        command: String,
-        /// Create an AGENT job (the positional is the prompt, not a shell command).
-        #[arg(long)]
-        agent: bool,
-        /// Model override for an agent job (ignored for shell jobs).
-        #[arg(long)]
-        model: Option<String>,
-    },
-    /// Remove a scheduled task
-    Remove {
-        /// Task ID
-        id: String,
-    },
-    /// Update a scheduled task
-    Update {
-        /// Task ID
-        id: String,
-        /// New cron expression
-        #[arg(long)]
-        expression: Option<String>,
-        /// New IANA timezone
-        #[arg(long)]
-        tz: Option<String>,
-        /// New command to run
-        #[arg(long)]
-        command: Option<String>,
-        /// New job name
-        #[arg(long)]
-        name: Option<String>,
-    },
-    /// Pause a scheduled task
-    Pause {
-        /// Task ID
-        id: String,
-    },
-    /// Resume a paused task
-    Resume {
-        /// Task ID
-        id: String,
-    },
-    /// Force-run a scheduled task now and record the run.
-    Run {
-        /// Job id
-        id: String,
-    },
-    /// Show recent run history for a scheduled task.
-    Runs {
-        /// Job id
-        id: String,
-        /// Max rows to show.
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
-    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1006,80 +838,6 @@ enum DoctorFormat {
     Json,
     /// One-liner summary, e.g. `doctor: 6/8 ok, 1 warn, 1 fail`.
     Brief,
-}
-
-#[derive(Subcommand, Debug)]
-enum ChannelCommands {
-    /// List configured channels
-    List,
-    /// Start all configured channels — foreground
-    Start,
-    /// Run all configured channels in the foreground until Ctrl-C.
-    ///
-    /// Alias of `start` with a louder, friendlier startup banner so users
-    /// arriving from the TUI's "configure channels" flow see clear stop
-    /// instructions. Background it from your shell: `nohup rantaiclaw
-    /// channels run > out.log 2>&1 &` or via systemd-run / tmux / screen.
-    Run,
-    /// Run health checks for configured channels
-    Doctor,
-    /// Add a new channel (currently redirects to `onboard` — see long help)
-    #[command(long_about = "\
-Add a channel configuration.
-
-NOTE: CLI `channel add` is not yet implemented. It prints the requested type \
-and directs you to the interactive setup. Configure channels with:
-  rantaiclaw onboard          # guided channel setup (recommended)
-or edit the active profile's `config.toml` directly.
-
-Channel types: telegram, discord, slack, mattermost, webhook, \
-imessage, matrix, signal, whatsapp, whatsapp_web, linq, nextcloud_talk, \
-email, irc, lark, dingtalk, qq.")]
-    Add {
-        /// Channel type. Channel types: telegram, discord, slack,
-        /// mattermost, webhook, imessage, matrix, signal, whatsapp,
-        /// whatsapp_web, linq, nextcloud_talk, email, irc, lark, dingtalk, qq.
-        channel_type: String,
-    },
-    /// Remove a channel (currently redirects to config edit — see long help)
-    #[command(long_about = "\
-Remove a channel configuration.
-
-NOTE: CLI `channel remove` is not yet implemented. It directs you to edit \
-the active profile's `config.toml` directly (delete the channel's \
-[channels_config.<name>] section) or re-run `rantaiclaw onboard`.")]
-    Remove {
-        /// Channel name to remove
-        name: String,
-    },
-    /// Bind a Telegram identity (username or numeric user ID) into allowlist
-    BindTelegram {
-        /// Telegram identity to allow (username without '@' or numeric user ID)
-        identity: String,
-    },
-    /// Remove a Telegram identity (or the `*` wildcard) from the allowlist
-    UnbindTelegram {
-        /// Telegram identity to remove (username without '@', numeric user ID, or `*`)
-        identity: String,
-    },
-    /// Issue an on-demand pairing code (no daemon restart needed).
-    ///
-    /// Mints a time-windowed, multi-claim code into the shared store. A running
-    /// channel validates it on the next `/bind`/`/claim` message — no restart.
-    Pair {
-        /// Channel surface the code is scoped to (telegram, discord, …).
-        #[arg(long, default_value = "telegram")]
-        channel: String,
-        /// Validity window in minutes.
-        #[arg(long, default_value_t = 15)]
-        ttl: i64,
-        /// Maximum number of claims within the window (default: unlimited).
-        #[arg(long)]
-        max_uses: Option<u32>,
-        /// Disallow `/claim` (owner) with this code — chat-only `/bind`.
-        #[arg(long)]
-        no_owner: bool,
-    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1164,124 +922,6 @@ enum PersonalityCommands {
     },
 }
 
-#[derive(Subcommand, Debug)]
-enum SkillCommands {
-    /// List installed skills
-    List,
-    /// Show metadata for a single installed skill (CLI parity for TUI `/skill <name>`)
-    Show {
-        /// Skill name (case-insensitive)
-        name: String,
-    },
-    /// Enable a skill that was previously disabled (writes
-    /// `[skills.entries.<name>] enabled = true`).
-    Enable {
-        /// Skill name (case-insensitive; matches the name shown by `skills list`).
-        name: String,
-    },
-    /// Disable a skill so it is not loaded into the agent's context (writes
-    /// `[skills.entries.<name>] enabled = false`).
-    Disable {
-        /// Skill name (case-insensitive; matches the name shown by `skills list`).
-        name: String,
-    },
-    /// Install a skill from a GitHub URL or local path
-    Install {
-        /// GitHub URL or local path
-        source: String,
-    },
-    /// Remove an installed skill
-    Remove {
-        /// Skill name
-        name: String,
-    },
-    /// Re-pull installed ClawHub skill(s) at their latest version.
-    /// With `--all`, updates every installed skill. With a slug, updates
-    /// just that one. Local-path / git skills are skipped (you can `git pull`
-    /// or re-install those manually).
-    Update {
-        /// Specific skill slug to update; omit with `--all` to update every skill.
-        slug: Option<String>,
-        /// Update every installed skill.
-        #[arg(long)]
-        all: bool,
-    },
-    /// Show ClawHub metadata + security scan for a skill *before* installing.
-    /// Hits ClawHub's public API; no install side-effect.
-    Inspect {
-        /// ClawHub skill slug.
-        slug: String,
-    },
-    /// Install missing binary dependencies declared by a skill's
-    /// `metadata.clawdbot.install[]` recipes (brew/npm/uv/go/download).
-    /// Picks the preferred recipe based on what's available on this host.
-    /// Closes the OpenClaw-parity gap where rantaiclaw could detect
-    /// missing bins but couldn't fix them.
-    InstallDeps {
-        /// Skill name. Omit with --all to fix every gated skill that has recipes.
-        slug: Option<String>,
-        /// Run install-deps for every skill whose requires aren't met.
-        #[arg(long)]
-        all: bool,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum MemoryCommands {
-    /// List memory entries with optional filters
-    List {
-        #[arg(long)]
-        category: Option<String>,
-        #[arg(long)]
-        session: Option<String>,
-        #[arg(long, default_value = "50")]
-        limit: usize,
-        #[arg(long, default_value = "0")]
-        offset: usize,
-    },
-    /// Get a specific memory entry by key
-    Get { key: String },
-    /// Store a memory entry
-    Add {
-        key: String,
-        content: String,
-        #[arg(long, default_value = "core")]
-        category: String,
-    },
-    /// Search memory entries by keyword
-    Recall {
-        query: String,
-        #[arg(long, default_value = "5")]
-        limit: usize,
-    },
-    /// Re-embed memories the current embedding model cannot use
-    Reindex,
-    /// Show memory backend statistics and health
-    Stats,
-    /// Clear memories by category, by key, or clear all
-    Clear {
-        /// Delete a single entry by key (supports prefix match)
-        #[arg(long)]
-        key: Option<String>,
-        #[arg(long)]
-        category: Option<String>,
-        /// Skip confirmation prompt
-        #[arg(long)]
-        yes: bool,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum IntegrationCommands {
-    /// List all integrations grouped by category (default)
-    List,
-    /// Show details about a specific integration
-    Info {
-        /// Integration name
-        name: String,
-    },
-}
-
 /// Whether the command is one of the profile-management commands.
 ///
 /// The profile commands are the way out of a bad profile selection (a list,
@@ -1300,7 +940,7 @@ fn is_profile_command(command: Option<&Commands>) -> bool {
 fn daemon_refusal(command: Option<&Commands>, error: anyhow::Error) -> anyhow::Error {
     if matches!(command, Some(Commands::Daemon { .. })) {
         eprintln!("Error: {error:#}");
-        std::process::exit(gateway::EX_CONFIG_EXIT_CODE);
+        std::process::exit(rantaiclaw::gateway::EX_CONFIG_EXIT_CODE);
     }
     error
 }
@@ -1316,7 +956,7 @@ fn daemon_refusal(command: Option<&Commands>, error: anyhow::Error) -> anyhow::E
 fn config_load_refusal(command: Option<&Commands>, error: anyhow::Error) -> anyhow::Error {
     if error.chain().any(|cause| {
         cause
-            .downcast_ref::<config::PersistentConfigError>()
+            .downcast_ref::<rantaiclaw::config::PersistentConfigError>()
             .is_some()
     }) {
         return daemon_refusal(command, error);
@@ -1334,7 +974,7 @@ async fn main() -> Result<()> {
     // directory.
     #[cfg(feature = "kb")]
     {
-        if let Some(code) = crate::kb::extract::child::child_exit_code_if_invoked() {
+        if let Some(code) = rantaiclaw::kb::extract::child::child_exit_code_if_invoked() {
             std::process::exit(code);
         }
     }
@@ -1429,7 +1069,7 @@ async fn main() -> Result<()> {
     // before Config::load_or_init so `profile create` on a fresh install
     // does not hit a half-initialised config flow.
     if let Some(Commands::Profile { cmd }) = cli.command {
-        return profile::commands::run(cmd);
+        return rantaiclaw::profile::commands::run(cmd);
     }
 
     // Lifecycle commands also short-circuit before Config::load_or_init.
@@ -1587,10 +1227,12 @@ async fn main() -> Result<()> {
         // does not commit to it yet — refuse before either path below loads or
         // touches config.toml, interactive or not.
         if let Some(ref topic_name) = topic {
-            if let Some(locked_key) = channels::locked_channel_key_for_provisioner(topic_name) {
+            if let Some(locked_key) =
+                rantaiclaw::channels::locked_channel_key_for_provisioner(topic_name)
+            {
                 eprintln!(
                     "✗ \"{locked_key}\" is {} and cannot be set up yet.",
-                    channels::ChannelSupport::UnderDevelopment.label()
+                    rantaiclaw::channels::ChannelSupport::UnderDevelopment.label()
                 );
                 std::process::exit(1);
             }
@@ -1603,12 +1245,12 @@ async fn main() -> Result<()> {
             // that are SetupSections (provider, channels, persona, …).
             if let Some(ref topic_name) = topic {
                 if let Some(provisioner) =
-                    onboard::provision::provisioner_for_with_force(topic_name, force)
+                    rantaiclaw::onboard::provision::provisioner_for_with_force(topic_name, force)
                 {
                     // Headless provisioner — runs on a dedicated async task,
                     // prints events to stdout, waits for Done/Fail/timeout.
                     let mut config = Config::load_or_init().await?;
-                    let profile = profile::ProfileManager::active()?;
+                    let profile = rantaiclaw::profile::ProfileManager::active()?;
                     let needs_daemon_reload =
                         run_provisioner_headless(provisioner.as_ref(), &mut config, &profile)
                             .await?;
@@ -1617,7 +1259,11 @@ async fn main() -> Result<()> {
                         // Reload the managed daemon so the just-saved channel is
                         // live — after the save (the daemon re-reads config.toml).
                         // Blocking (shells out); run off the async worker.
-                        match tokio::task::spawn_blocking(channels::reload_managed_daemon).await {
+                        match tokio::task::spawn_blocking(
+                            rantaiclaw::channels::reload_managed_daemon,
+                        )
+                        .await
+                        {
                             Ok(Ok(true)) => {
                                 println!(
                                     "🔄 Reloaded the running daemon to apply the new channel."
@@ -1645,12 +1291,12 @@ async fn main() -> Result<()> {
             // used to overwrite the real file (provider keys, channel tokens, MCP
             // servers, paired_tokens) with defaults — setup became a config eraser.
             let mut config = Config::load_or_init().await?;
-            let profile = profile::ProfileManager::active()?;
+            let profile = rantaiclaw::profile::ProfileManager::active()?;
 
             let mut owned_config = config.clone();
             let profile_for_task = profile.clone();
             let report = tokio::task::spawn_blocking(move || {
-                let r = onboard::wizard::run_setup(
+                let r = rantaiclaw::onboard::wizard::run_setup(
                     &profile_for_task,
                     &mut owned_config,
                     topic,
@@ -1681,7 +1327,7 @@ async fn main() -> Result<()> {
             // configured. The sections that work headless still ran, so this
             // is not "setup did nothing" — but exit 0 would read as "setup
             // finished", which it did not.
-            let summary = onboard::wizard::blocked_summary(&report.blocked);
+            let summary = rantaiclaw::onboard::wizard::blocked_summary(&report.blocked);
             if !summary.is_empty() {
                 eprint!("{summary}");
             }
@@ -1755,11 +1401,11 @@ async fn main() -> Result<()> {
             bail!("--channels-only does not accept --force");
         }
         let config = if channels_only {
-            onboard::run_channels_repair_wizard().await
+            rantaiclaw::onboard::run_channels_repair_wizard().await
         } else if interactive {
-            onboard::run_wizard(force).await
+            rantaiclaw::onboard::run_wizard(force).await
         } else {
-            onboard::run_quick_setup(
+            rantaiclaw::onboard::run_quick_setup(
                 api_key.as_deref(),
                 provider.as_deref(),
                 model.as_deref(),
@@ -1780,8 +1426,8 @@ async fn main() -> Result<()> {
     // `SecurityPolicy` actually honours the preset. Without that step
     // the preset switch was cosmetic (v0.6.49 bug).
     if let Some(Commands::Autonomy { preset }) = &cli.command {
-        use approval::policy_writer::{self, PolicyPreset};
-        let profile = profile::ProfileManager::active()?;
+        use rantaiclaw::approval::policy_writer::{self, PolicyPreset};
+        let profile = rantaiclaw::profile::ProfileManager::active()?;
         match preset.as_deref().map(str::trim) {
             None | Some("") => {
                 // The runtime approval gate reads `config.autonomy.level`, not the
@@ -1790,24 +1436,29 @@ async fn main() -> Result<()> {
                 let enforced = Config::load_or_init().await?.autonomy.level;
                 const W: usize = 9;
                 let current = policy_writer::read_active_preset(&profile.policy_dir());
-                cli_style::section("autonomy");
+                rantaiclaw::cli_style::section("autonomy");
                 // The preset is whatever the marker says — the same helper
                 // `status` uses, so the two surfaces cannot disagree.
-                cli_style::field(
+                rantaiclaw::cli_style::field(
                     "Preset",
                     W,
-                    &cli_style::autonomy_preset_text(&profile.policy_dir()),
+                    &rantaiclaw::cli_style::autonomy_preset_text(&profile.policy_dir()),
                 );
-                cli_style::field("Enforced", W, &format!("{enforced:?}  (config.toml)"));
+                rantaiclaw::cli_style::field(
+                    "Enforced",
+                    W,
+                    &format!("{enforced:?}  (config.toml)"),
+                );
                 // The drift note is the helper's words, so `status` warns in
                 // exactly the same words when it shows the same state.
-                if let Some(note) = cli_style::autonomy_drift_note(&profile.policy_dir(), enforced)
+                if let Some(note) =
+                    rantaiclaw::cli_style::autonomy_drift_note(&profile.policy_dir(), enforced)
                 {
-                    println!("  {}", cli_style::warn(&note));
+                    println!("  {}", rantaiclaw::cli_style::warn(&note));
                 }
-                cli_style::section("presets");
+                rantaiclaw::cli_style::section("presets");
                 for p in PolicyPreset::ALL {
-                    cli_style::status_row(
+                    rantaiclaw::cli_style::status_row(
                         current == Some(p),
                         p.label(),
                         8,
@@ -1817,7 +1468,7 @@ async fn main() -> Result<()> {
                 println!();
                 println!(
                     "  {}",
-                    cli_style::dim(
+                    rantaiclaw::cli_style::dim(
                         "switch: rantaiclaw autonomy <preset>  ·  TUI: Shift+Tab or /autonomy"
                     )
                 );
@@ -1861,7 +1512,7 @@ async fn main() -> Result<()> {
     // The subscription logins are gone, so the files an earlier RantaiClaw
     // wrote for them are swept on every start. The sweep is idempotent and
     // logs one line per file it actually removed.
-    crate::config::legacy_logins::remove_legacy_login_files(&config);
+    rantaiclaw::config::legacy_logins::remove_legacy_login_files(&config);
 
     match cli.command {
         None
@@ -1885,7 +1536,7 @@ async fn main() -> Result<()> {
             // is `AsyncBufRead + Unpin + Send`, so the future carrying it can
             // run on the multi-threaded runtime.
             let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
-            Box::pin(agent::run(
+            Box::pin(rantaiclaw::agent::run(
                 config,
                 message,
                 provider,
@@ -1913,12 +1564,14 @@ async fn main() -> Result<()> {
             let shutdown = tokio_util::sync::CancellationToken::new();
             let shutdown_trigger = shutdown.clone();
             tokio::spawn(async move {
-                daemon::shutdown_signal().await;
+                rantaiclaw::daemon::shutdown_signal().await;
                 shutdown_trigger.cancel();
             });
             // Standalone `gateway` command: no daemon supervisor to signal, so
             // no readiness Notify.
-            match gateway::run_gateway(&host, port, config, shutdown, None, None, None).await {
+            match rantaiclaw::gateway::run_gateway(&host, port, config, shutdown, None, None, None)
+                .await
+            {
                 // A configuration-driven startup error exits EX_CONFIG so a
                 // systemd unit with RestartPreventExitStatus=78 does not
                 // restart it. The fatal set: an unknown tunnel provider or a
@@ -1930,9 +1583,12 @@ async fn main() -> Result<()> {
                 // backend, and an unknown `[runtime] kind. A missing API key,
                 // a missing credential and a DNS lookup failure are NOT
                 // fatal: they are retried.
-                Err(e) if gateway::startup_exit_code(&e) == gateway::EX_CONFIG_EXIT_CODE => {
+                Err(e)
+                    if rantaiclaw::gateway::startup_exit_code(&e)
+                        == rantaiclaw::gateway::EX_CONFIG_EXIT_CODE =>
+                {
                     eprintln!("Error: {e:#}");
-                    std::process::exit(gateway::EX_CONFIG_EXIT_CODE);
+                    std::process::exit(rantaiclaw::gateway::EX_CONFIG_EXIT_CODE);
                 }
                 // Everything else keeps today's propagation: exit 1.
                 other => other,
@@ -1947,7 +1603,7 @@ async fn main() -> Result<()> {
             } else {
                 info!("🧠 Starting RantaiClaw Daemon on {host}:{port}");
             }
-            match daemon::run(config, host, port).await {
+            match rantaiclaw::daemon::run(config, host, port).await {
                 // A gateway startup error that follows from the config alone
                 // surfaced by the daemon supervisor exits EX_CONFIG so a
                 // systemd unit with RestartPreventExitStatus=78 leaves it
@@ -1962,9 +1618,12 @@ async fn main() -> Result<()> {
                 // fatal: the supervisor retries them. AddrInUse after the
                 // retry budget stays exit 1, so systemd keeps retrying a port
                 // conflict.
-                Err(e) if gateway::startup_exit_code(&e) == gateway::EX_CONFIG_EXIT_CODE => {
+                Err(e)
+                    if rantaiclaw::gateway::startup_exit_code(&e)
+                        == rantaiclaw::gateway::EX_CONFIG_EXIT_CODE =>
+                {
                     eprintln!("Error: {e:#}");
-                    std::process::exit(gateway::EX_CONFIG_EXIT_CODE);
+                    std::process::exit(rantaiclaw::gateway::EX_CONFIG_EXIT_CODE);
                 }
                 // Everything else keeps today's propagation: exit 1.
                 other => other,
@@ -1974,28 +1633,36 @@ async fn main() -> Result<()> {
         Some(Commands::Status) => {
             const W: usize = 10;
             const CH_W: usize = 14;
-            cli_style::title("RantaiClaw", env!("CARGO_PKG_VERSION"));
-            cli_style::field("workspace", W, &config.workspace_dir.display().to_string());
-            cli_style::field("config", W, &config.config_path.display().to_string());
+            rantaiclaw::cli_style::title("RantaiClaw", env!("CARGO_PKG_VERSION"));
+            rantaiclaw::cli_style::field(
+                "workspace",
+                W,
+                &config.workspace_dir.display().to_string(),
+            );
+            rantaiclaw::cli_style::field("config", W, &config.config_path.display().to_string());
 
-            cli_style::section("config");
+            rantaiclaw::cli_style::section("config");
             let provider = config.default_provider.as_deref().unwrap_or("openrouter");
             let model = config
                 .default_model
                 .as_deref()
                 .filter(|m| !m.trim().is_empty())
                 .unwrap_or("(not set — run `rantaiclaw setup provider`)");
-            cli_style::field("Provider", W, &format!("{provider} · {model}"));
-            cli_style::field("Observ.", W, &config.observability.backend.to_string());
+            rantaiclaw::cli_style::field("Provider", W, &format!("{provider} · {model}"));
+            rantaiclaw::cli_style::field("Observ.", W, &config.observability.backend.to_string());
             // Show the preset, not just the level: Manual and Smart are both
             // `Supervised` and differ only in `always_ask`, so the level alone
             // can't say whether a shell command will prompt. The preset comes
             // from the on-disk marker through the same helper `autonomy` uses,
             // so the two surfaces cannot disagree — and a profile that never
             // chose a preset reads as unset, not as the config's default.
-            let policy_dir = profile::ProfileManager::active()?.policy_dir();
-            cli_style::field("Autonomy", W, &cli_style::autonomy_preset_text(&policy_dir));
-            cli_style::field(
+            let policy_dir = rantaiclaw::profile::ProfileManager::active()?.policy_dir();
+            rantaiclaw::cli_style::field(
+                "Autonomy",
+                W,
+                &rantaiclaw::cli_style::autonomy_preset_text(&policy_dir),
+            );
+            rantaiclaw::cli_style::field(
                 "Enforced",
                 W,
                 &format!("{:?}  (config.toml)", config.autonomy.level),
@@ -2005,11 +1672,13 @@ async fn main() -> Result<()> {
             // failed best-effort marker write. Say so here — the model is
             // already protected (`preset_for_prompt` names no preset on a
             // mismatch); the operator gets the same note `autonomy` prints.
-            if let Some(note) = cli_style::autonomy_drift_note(&policy_dir, config.autonomy.level) {
-                println!("  {}", cli_style::warn(&note));
+            if let Some(note) =
+                rantaiclaw::cli_style::autonomy_drift_note(&policy_dir, config.autonomy.level)
+            {
+                println!("  {}", rantaiclaw::cli_style::warn(&note));
             }
-            cli_style::field("Runtime", W, &config.runtime.kind.to_string());
-            cli_style::field(
+            rantaiclaw::cli_style::field("Runtime", W, &config.runtime.kind.to_string());
+            rantaiclaw::cli_style::field(
                 "Heartbeat",
                 W,
                 &if config.heartbeat.enabled {
@@ -2019,22 +1688,24 @@ async fn main() -> Result<()> {
                 },
             );
             let effective_memory_backend =
-                memory::effective_memory_backend_name(&config.memory.backend);
-            cli_style::field("Memory", W, &effective_memory_backend);
+                rantaiclaw::memory::effective_memory_backend_name(&config.memory.backend);
+            rantaiclaw::cli_style::field("Memory", W, &effective_memory_backend);
 
-            cli_style::section("channels");
-            cli_style::status_row(true, "CLI", CH_W, "always");
-            for (name, configured, support, verification) in channels::channel_roster(&config) {
-                cli_style::status_row(
+            rantaiclaw::cli_style::section("channels");
+            rantaiclaw::cli_style::status_row(true, "CLI", CH_W, "always");
+            for (name, configured, support, verification) in
+                rantaiclaw::channels::channel_roster(&config)
+            {
+                rantaiclaw::cli_style::status_row(
                     configured,
                     name,
                     CH_W,
-                    &channels::channel_roster_note(configured, support, verification),
+                    &rantaiclaw::channels::channel_roster_note(configured, support, verification),
                 );
             }
 
-            cli_style::section("security");
-            cli_style::field(
+            rantaiclaw::cli_style::section("security");
+            rantaiclaw::cli_style::field(
                 "Workspace",
                 W,
                 if config.autonomy.workspace_only {
@@ -2043,8 +1714,12 @@ async fn main() -> Result<()> {
                     "unrestricted"
                 },
             );
-            cli_style::field("Commands", W, &config.autonomy.allowed_commands.join(", "));
-            cli_style::field(
+            rantaiclaw::cli_style::field(
+                "Commands",
+                W,
+                &config.autonomy.allowed_commands.join(", "),
+            );
+            rantaiclaw::cli_style::field(
                 "Actions/hr",
                 W,
                 &config.autonomy.max_actions_per_hour.to_string(),
@@ -2053,7 +1728,7 @@ async fn main() -> Result<()> {
             // This line used to print a dollar figure from
             // `autonomy.max_cost_per_day_cents`, under a security heading, for a
             // limit nothing checked.
-            cli_style::field(
+            rantaiclaw::cli_style::field(
                 "Tokens/day",
                 W,
                 &if config.cost.enabled {
@@ -2083,13 +1758,15 @@ async fn main() -> Result<()> {
             .ok()
             .flatten();
             if let Some(line) = version_line {
-                println!("\n  {}", cli_style::warn(&format!("⚠  {line}")));
+                println!("\n  {}", rantaiclaw::cli_style::warn(&format!("⚠  {line}")));
             }
 
             Ok(())
         }
 
-        Some(Commands::Cron { cron_command }) => cron::handle_command(cron_command, &config),
+        Some(Commands::Cron { cron_command }) => {
+            rantaiclaw::cron::handle_command(cron_command, &config)
+        }
 
         Some(Commands::Models { model_command }) => match model_command {
             ModelCommands::Refresh {
@@ -2103,7 +1780,7 @@ async fn main() -> Result<()> {
                         // The sweep is deliberately always a live refresh: an
                         // operator asking for every provider is asking for the
                         // current truth, not a cache replay.
-                        doctor::refresh_all_model_catalogs(&config_for_refresh, true)
+                        rantaiclaw::doctor::refresh_all_model_catalogs(&config_for_refresh, true)
                     } else {
                         // The outcome is discarded here on purpose: `models
                         // refresh` exists to hand back a usable catalog, and a
@@ -2111,8 +1788,12 @@ async fn main() -> Result<()> {
                         // prints which case it hit. Only `doctor models` needs
                         // to grade the outcome, because only it claims to have
                         // verified anything.
-                        onboard::run_models_refresh(&config_for_refresh, provider.as_deref(), force)
-                            .map(|_| ())
+                        rantaiclaw::onboard::run_models_refresh(
+                            &config_for_refresh,
+                            provider.as_deref(),
+                            force,
+                        )
+                        .map(|_| ())
                     }
                 })
                 .await
@@ -2121,7 +1802,7 @@ async fn main() -> Result<()> {
             ModelCommands::List { provider } => {
                 let config_for_list = config.clone();
                 tokio::task::spawn_blocking(move || {
-                    onboard::list_models(&config_for_list, provider.as_deref())
+                    rantaiclaw::onboard::list_models(&config_for_list, provider.as_deref())
                 })
                 .await
                 .map_err(|e| anyhow::anyhow!("models list task failed: {e}"))?
@@ -2129,7 +1810,7 @@ async fn main() -> Result<()> {
         },
 
         Some(Commands::Providers) => {
-            let providers = providers::list_providers();
+            let providers = rantaiclaw::providers::list_providers();
             let current = config
                 .default_provider
                 .as_deref()
@@ -2166,13 +1847,13 @@ async fn main() -> Result<()> {
             service_init,
         }) => {
             let init_system = service_init.parse()?;
-            // `service::handle_command` shells out synchronously — `systemctl
+            // `rantaiclaw::service::handle_command` shells out synchronously — `systemctl
             // restart` blocks up to the unit's TimeoutStopSec (30s). Run it off
             // the async worker so it doesn't stall the runtime, mirroring `ui`.
-            let is_status = matches!(service_command, ServiceCommands::Status);
+            let is_status = matches!(service_command, rantaiclaw::ServiceCommands::Status);
             let service_config = config.clone();
             let service_outcome = tokio::task::spawn_blocking(move || {
-                service::handle_command(&service_command, &service_config, init_system)
+                rantaiclaw::service::handle_command(&service_command, &service_config, init_system)
             })
             .await
             .map_err(|e| anyhow::anyhow!("service command panicked: {e}"))?;
@@ -2193,7 +1874,7 @@ async fn main() -> Result<()> {
                 .ok()
                 .flatten()
                 {
-                    println!("\n  {}", cli_style::warn(&format!("⚠  {line}")));
+                    println!("\n  {}", rantaiclaw::cli_style::warn(&format!("⚠  {line}")));
                 }
             }
             service_outcome
@@ -2223,7 +1904,11 @@ async fn main() -> Result<()> {
             }) => {
                 let config_for_models = config.clone();
                 tokio::task::spawn_blocking(move || {
-                    doctor::run_models(&config_for_models, provider.as_deref(), use_cache)
+                    rantaiclaw::doctor::run_models(
+                        &config_for_models,
+                        provider.as_deref(),
+                        use_cache,
+                    )
                 })
                 .await
                 .map_err(|e| anyhow::anyhow!("doctor models task failed: {e}"))?
@@ -2231,7 +1916,7 @@ async fn main() -> Result<()> {
             None => {
                 use rantaiclaw::doctor::report::{render, DoctorFormat as RenderFormat};
                 let lib_config = rantaiclaw::Config::load_or_init().await?;
-                let profile = profile::ProfileManager::active()
+                let profile = rantaiclaw::profile::ProfileManager::active()
                     .map_err(|e| anyhow::anyhow!("could not resolve active profile: {e}"))?;
                 let ctx = rantaiclaw::doctor::DoctorContext {
                     profile,
@@ -2258,8 +1943,8 @@ async fn main() -> Result<()> {
         },
 
         Some(Commands::Channel { channel_command }) => match channel_command {
-            ChannelCommands::Start => Box::pin(run_channels_until_signal(config)).await,
-            ChannelCommands::Run => {
+            rantaiclaw::ChannelCommands::Start => Box::pin(run_channels_until_signal(config)).await,
+            rantaiclaw::ChannelCommands::Run => {
                 // Friendly banner so users arriving from the TUI's wizard
                 // know exactly what they ran and how to stop it. The actual
                 // supervisor is the same `start_channels_with_cancellation` path the daemon
@@ -2277,8 +1962,10 @@ async fn main() -> Result<()> {
                 println!("        (or `systemd-run --user --unit=rantaiclaw-channels rantaiclaw channels run`)");
                 Box::pin(run_channels_until_signal(config)).await
             }
-            ChannelCommands::Doctor => channels::doctor_channels(config).await,
-            other => channels::handle_command(other, &config).await,
+            rantaiclaw::ChannelCommands::Doctor => {
+                rantaiclaw::channels::doctor_channels(config).await
+            }
+            other => rantaiclaw::channels::handle_command(other, &config).await,
         },
 
         Some(Commands::Permissions {
@@ -2287,12 +1974,14 @@ async fn main() -> Result<()> {
 
         Some(Commands::Integrations {
             integration_command,
-        }) => integrations::handle_command(
-            integration_command.unwrap_or(IntegrationCommands::List),
+        }) => rantaiclaw::integrations::handle_command(
+            integration_command.unwrap_or(rantaiclaw::IntegrationCommands::List),
             &config,
         ),
 
-        Some(Commands::Skills { skill_command }) => skills::handle_command(skill_command, &config),
+        Some(Commands::Skills { skill_command }) => {
+            rantaiclaw::skills::handle_command(skill_command, &config)
+        }
 
         Some(Commands::Session { cmd }) => match cmd {
             SessionCommands::List { limit, source } => {
@@ -2309,7 +1998,7 @@ async fn main() -> Result<()> {
 
         Some(Commands::Insights) => rantaiclaw::sessions::cli::insights(),
 
-        Some(Commands::Usage) => crate::cost::cli::usage(&config),
+        Some(Commands::Usage) => rantaiclaw::cost::cli::usage(&config),
 
         Some(Commands::Personality { cmd }) => match cmd {
             PersonalityCommands::Show => rantaiclaw::persona::cli::show(),
@@ -2369,7 +2058,7 @@ async fn main() -> Result<()> {
                     // branch, so the REPL reader is unused. Any
                     // `AsyncBufRead + Unpin + Send` works.
                     let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
-                    let response = Box::pin(agent::loop_::run(
+                    let response = Box::pin(rantaiclaw::agent::loop_::run(
                         config.clone(),
                         Some(msg),
                         None,
@@ -2399,14 +2088,14 @@ async fn main() -> Result<()> {
         }
 
         Some(Commands::Memory { memory_command }) => {
-            memory::cli::handle_command(memory_command, &config).await
+            rantaiclaw::memory::cli::handle_command(memory_command, &config).await
         }
 
         Some(Commands::Auth { auth_args }) => handle_auth_command_removed(&auth_args),
 
         Some(Commands::Config { config_command }) => match config_command {
             ConfigCommands::Schema => {
-                let schema = schemars::schema_for!(config::Config);
+                let schema = schemars::schema_for!(rantaiclaw::Config);
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&schema).expect("failed to serialize JSON Schema")
@@ -2420,9 +2109,9 @@ async fn main() -> Result<()> {
                 // exactly as `GET /config` does. The in-memory config holds
                 // decrypted plaintext secrets, so redaction MUST run before print.
                 let mut cfg = config.clone();
-                gateway::config_api::redact_config_secrets(&mut cfg);
+                rantaiclaw::gateway::config_api::redact_config_secrets(&mut cfg);
                 let mut val = serde_json::to_value(&cfg)?;
-                gateway::config_api::redact_secrets_in_json(&mut val);
+                rantaiclaw::gateway::config_api::redact_secrets_in_json(&mut val);
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&val).expect("failed to serialize config JSON")
@@ -2517,23 +2206,23 @@ fn run_completions<W: Write>(shell: CompletionShell, writer: &mut W) -> Result<(
 /// backoff window stops immediately rather than waiting it out. Only the CLI
 /// entrypoint never sent one. This is the same three-line wiring the standalone
 /// `gateway` command and the daemon already use, via the same shared
-/// `daemon::shutdown_signal`.
-async fn run_channels_until_signal(config: config::Config) -> Result<()> {
+/// `rantaiclaw::daemon::shutdown_signal`.
+async fn run_channels_until_signal(config: rantaiclaw::Config) -> Result<()> {
     let shutdown = tokio_util::sync::CancellationToken::new();
     let shutdown_trigger = shutdown.clone();
     tokio::spawn(async move {
-        daemon::shutdown_signal().await;
+        rantaiclaw::daemon::shutdown_signal().await;
         info!("Shutdown signal received; stopping channel listeners");
         shutdown_trigger.cancel();
     });
-    channels::start_channels_with_cancellation(config, shutdown, None, None, None).await
+    rantaiclaw::channels::start_channels_with_cancellation(config, shutdown, None, None, None).await
 }
 
 async fn handle_permissions_command(
     permissions_command: PermissionsCommands,
     config: Config,
 ) -> Result<()> {
-    use approval::permissions::{self, Op, Target};
+    use rantaiclaw::approval::permissions::{self, Op, Target};
 
     // `Show` just renders; `Add`/`Remove` mutate then persist.
     let (op, target_str, value) = match permissions_command {
@@ -2571,7 +2260,7 @@ async fn handle_permissions_command(
     println!("   Saved to {}", updated.config_path.display());
     // `announce_daemon_reload` shells out (`systemctl`/`launchctl`/`rc-service`)
     // synchronously; keep it off the async worker.
-    tokio::task::spawn_blocking(channels::announce_daemon_reload)
+    tokio::task::spawn_blocking(rantaiclaw::channels::announce_daemon_reload)
         .await
         .map_err(|e| anyhow::anyhow!("daemon reload panicked: {e}"))?;
     Ok(())
@@ -2596,6 +2285,82 @@ mod tests {
     #[cfg(feature = "tui")]
     use super::boot_model_label;
     use super::{headless_choice, unusable_provider_after_headless_setup, HeadlessChoice};
+
+    /// The binary's test target cannot share the library's `test_env::ENV_LOCK`:
+    /// that module is `#[cfg(test)]`-only and `tempfile` is a dev-dependency,
+    /// so the binary's test binary is a separate process that cannot link it.
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Set (or clear) an env var and put the previous value back on drop, so a
+    /// panicking test does not leak the override into the next one.
+    #[must_use = "the override is reverted the moment this guard is dropped; bind it to a named local"]
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        /// Set `key` to `value` for the guard's lifetime.
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, prev }
+        }
+
+        /// Ensure `key` is UNSET for the guard's lifetime (restoring any prior
+        /// value on drop).
+        fn unset(key: &'static str) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(prev) => std::env::set_var(self.key, prev),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    /// Unset every credential variable a test must not inherit from the
+    /// developer's own shell, restoring them all on drop.
+    struct CredentialEnvScrub(#[allow(dead_code)] Vec<EnvGuard>);
+
+    impl CredentialEnvScrub {
+        fn new() -> Self {
+            Self(
+                [
+                    "RANTAICLAW_API_KEY",
+                    "API_KEY",
+                    "OPENAI_API_KEY",
+                    "ANTHROPIC_API_KEY",
+                    "ANTHROPIC_OAUTH_TOKEN",
+                    "OPENROUTER_API_KEY",
+                    "GROQ_API_KEY",
+                    "OLLAMA_API_KEY",
+                    "GEMINI_API_KEY",
+                    "GOOGLE_API_KEY",
+                    "DASHSCOPE_API_KEY",
+                    "MINIMAX_API_KEY",
+                    "AWS_ACCESS_KEY_ID",
+                    "AWS_SECRET_ACCESS_KEY",
+                    "AWS_SESSION_TOKEN",
+                    "QWEN_OAUTH_TOKEN",
+                    "QWEN_OAUTH_REFRESH_TOKEN",
+                    "QWEN_OAUTH_RESOURCE_URL",
+                    "MINIMAX_OAUTH_TOKEN",
+                    "MINIMAX_OAUTH_REFRESH_TOKEN",
+                    "XDG_CONFIG_HOME",
+                ]
+                .into_iter()
+                .map(EnvGuard::unset)
+                .collect(),
+            )
+        }
+    }
 
     /// The status bar's boot label must match the `provider:model` spelling the
     /// `/model` path stores, so the picker can find the active model.
@@ -2653,11 +2418,11 @@ mod tests {
     /// with no key, so an installer saw exit 0 for an agent that cannot send.
     #[tokio::test]
     async fn a_keyless_remote_provider_is_refused_headlessly() {
-        let _env = crate::test_env::ENV_LOCK.lock().await;
-        let _scrub = crate::test_env::CredentialEnvScrub::new();
-        let _a = crate::test_env::EnvGuard::unset("RANTAICLAW_API_KEY");
-        let _b = crate::test_env::EnvGuard::unset("API_KEY");
-        let _c = crate::test_env::EnvGuard::unset("OPENAI_API_KEY");
+        let _env = ENV_LOCK.lock().await;
+        let _scrub = CredentialEnvScrub::new();
+        let _a = EnvGuard::unset("RANTAICLAW_API_KEY");
+        let _b = EnvGuard::unset("API_KEY");
+        let _c = EnvGuard::unset("OPENAI_API_KEY");
 
         let reason =
             unusable_provider_after_headless_setup("provider", &config_with_provider("openai"))
@@ -2671,11 +2436,11 @@ mod tests {
     /// reads `ProviderInfo::local`, the documented source of truth.
     #[tokio::test]
     async fn a_local_provider_needs_no_key() {
-        let _env = crate::test_env::ENV_LOCK.lock().await;
-        let _scrub = crate::test_env::CredentialEnvScrub::new();
-        let _a = crate::test_env::EnvGuard::unset("RANTAICLAW_API_KEY");
-        let _b = crate::test_env::EnvGuard::unset("API_KEY");
-        let _c = crate::test_env::EnvGuard::unset("OLLAMA_API_KEY");
+        let _env = ENV_LOCK.lock().await;
+        let _scrub = CredentialEnvScrub::new();
+        let _a = EnvGuard::unset("RANTAICLAW_API_KEY");
+        let _b = EnvGuard::unset("API_KEY");
+        let _c = EnvGuard::unset("OLLAMA_API_KEY");
 
         assert!(unusable_provider_after_headless_setup(
             "provider",
@@ -2689,8 +2454,8 @@ mod tests {
     /// the one question and gets a real answer in both directions.
     #[tokio::test]
     async fn bedrock_is_judged_on_the_credentials_it_actually_uses() {
-        let _env = crate::test_env::ENV_LOCK.lock().await;
-        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _env = ENV_LOCK.lock().await;
+        let _scrub = CredentialEnvScrub::new();
 
         for name in ["bedrock", "aws-bedrock"] {
             assert!(
@@ -2700,9 +2465,8 @@ mod tests {
             );
         }
 
-        let _id = crate::test_env::EnvGuard::set("AWS_ACCESS_KEY_ID", "AKIAEXAMPLEPLACEHOLDER");
-        let _secret =
-            crate::test_env::EnvGuard::set("AWS_SECRET_ACCESS_KEY", "neutral-aws-secret-value");
+        let _id = EnvGuard::set("AWS_ACCESS_KEY_ID", "AKIAEXAMPLEPLACEHOLDER");
+        let _secret = EnvGuard::set("AWS_SECRET_ACCESS_KEY", "neutral-aws-secret-value");
 
         for name in ["bedrock", "aws-bedrock"] {
             assert!(
@@ -2717,10 +2481,10 @@ mod tests {
     /// keeps the outcome its own plan gave it.
     #[tokio::test]
     async fn other_provisioners_are_not_judged_on_provider_credentials() {
-        let _env = crate::test_env::ENV_LOCK.lock().await;
-        let _scrub = crate::test_env::CredentialEnvScrub::new();
-        let _a = crate::test_env::EnvGuard::unset("RANTAICLAW_API_KEY");
-        let _b = crate::test_env::EnvGuard::unset("API_KEY");
+        let _env = ENV_LOCK.lock().await;
+        let _scrub = CredentialEnvScrub::new();
+        let _a = EnvGuard::unset("RANTAICLAW_API_KEY");
+        let _b = EnvGuard::unset("API_KEY");
 
         assert!(unusable_provider_after_headless_setup(
             "telegram",
@@ -2832,7 +2596,7 @@ mod tests {
     /// `CHANNEL_CATALOG`.
     #[test]
     fn channel_help_names_the_same_kinds_as_the_catalog() {
-        let catalog: Vec<String> = crate::channels::CHANNEL_CATALOG
+        let catalog: Vec<String> = rantaiclaw::channels::CHANNEL_CATALOG
             .iter()
             .map(|(key, _, _, _)| (*key).to_string())
             .collect();
@@ -3080,7 +2844,7 @@ fn unusable_provider_after_headless_setup(
     provisioner_name: &str,
     config: &Config,
 ) -> Option<String> {
-    if provisioner_name != onboard::provision::provider::PROVIDER_NAME {
+    if provisioner_name != rantaiclaw::onboard::provision::provider::PROVIDER_NAME {
         return None;
     }
     let name = config.default_provider.as_deref()?;
@@ -3099,11 +2863,11 @@ fn unusable_provider_after_headless_setup(
 }
 
 async fn run_provisioner_headless(
-    provisioner: &dyn onboard::provision::TuiProvisioner,
+    provisioner: &dyn rantaiclaw::onboard::provision::TuiProvisioner,
     config: &mut Config,
-    profile: &profile::Profile,
+    profile: &rantaiclaw::profile::Profile,
 ) -> Result<bool> {
-    use onboard::provision::{ProvisionEvent, ProvisionIo};
+    use rantaiclaw::onboard::provision::{ProvisionEvent, ProvisionIo};
 
     let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(32);
     let (response_tx, response_rx) = tokio::sync::mpsc::channel(8);
@@ -3193,7 +2957,9 @@ async fn run_provisioner_headless(
                         String::new()
                     };
                     let _ = response_tx
-                        .send(onboard::provision::ProvisionResponse::Text(value))
+                        .send(rantaiclaw::onboard::provision::ProvisionResponse::Text(
+                            value,
+                        ))
                         .await;
                 }
                 ProvisionEvent::Choose {
@@ -3205,18 +2971,18 @@ async fn run_provisioner_headless(
                             eprintln!(
                                 "[headless] choose '{label}' ({id}) — multi-select, selecting nothing"
                             );
-                            onboard::provision::ProvisionResponse::Selection(Vec::new())
+                            rantaiclaw::onboard::provision::ProvisionResponse::Selection(Vec::new())
                         }
                         HeadlessChoice::TakeFirst => {
                             eprintln!("[headless] choose '{label}' ({id}) — taking option 0");
-                            onboard::provision::ProvisionResponse::Selection(vec![0])
+                            rantaiclaw::onboard::provision::ProvisionResponse::Selection(vec![0])
                         }
                         HeadlessChoice::Cancel => {
                             eprintln!(
                                 "[headless] choose '{label}' ({id}) asked again — cancelling; \
                                  an unattended run has no new answer to give"
                             );
-                            onboard::provision::ProvisionResponse::Cancelled
+                            rantaiclaw::onboard::provision::ProvisionResponse::Cancelled
                         }
                     };
                     let _ = response_tx.send(response).await;
@@ -3250,13 +3016,13 @@ async fn run_provisioner_headless(
             // Nothing was configured, so nothing gets installed — the skill
             // would otherwise be left behind as a false "channel is set up"
             // signal for a provisioner that bailed on a missing field.
-            Ok(onboard::provision::ProvisionOutcome::Aborted(reason)) => {
+            Ok(rantaiclaw::onboard::provision::ProvisionOutcome::Aborted(reason)) => {
                 eprintln!("\n⏹️  provisioner stopped, nothing saved: {reason}");
                 anyhow::bail!("`setup {prov_name}` configured nothing: {reason}");
             }
             // A configured multi-user channel is the point at which the
             // owner needs to be able to manage permissions from chat.
-            Ok(onboard::provision::ProvisionOutcome::Configured) => {
+            Ok(rantaiclaw::onboard::provision::ProvisionOutcome::Configured) => {
                 if let Some(reason) = unusable_provider_after_headless_setup(&prov_name, config) {
                     anyhow::bail!("{reason}");
                 }
@@ -3264,8 +3030,11 @@ async fn run_provisioner_headless(
                     println!("\n✅ {summary}");
                     let _ = std::io::stdout().flush();
                 }
-                let finalize =
-                    onboard::provision::finalize_channel(provisioner_category, profile, config);
+                let finalize = rantaiclaw::onboard::provision::finalize_channel(
+                    provisioner_category,
+                    profile,
+                    config,
+                );
                 if let Some(guidance) = finalize.owner_guidance {
                     eprintln!("\n🔐 {guidance}");
                 }

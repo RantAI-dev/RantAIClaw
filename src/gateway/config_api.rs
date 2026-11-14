@@ -182,7 +182,7 @@ async fn get_config(
 /// non-secret look-alikes: `secrets` (a config section), `max_tokens` and
 /// other counts ending in the plural `_tokens`, and
 /// `rate_limit_max_keys` / `idempotency_max_keys` (counts ending in `_keys`).
-pub(crate) fn redact_secrets_in_json(v: &mut serde_json::Value) {
+pub fn redact_secrets_in_json(v: &mut serde_json::Value) {
     fn is_secret_key(k: &str) -> bool {
         let k = k.to_ascii_lowercase();
         k.ends_with("_token")           // bot_token, access_token, verify_token, verification_token, …
@@ -230,7 +230,7 @@ pub(crate) fn redact_secrets_in_json(v: &mut serde_json::Value) {
 
 /// Clear every secret field before a Config is serialized into an API response.
 /// Keep in sync with the encrypt/decrypt lists in config::schema.
-pub(crate) fn redact_config_secrets(cfg: &mut crate::config::Config) {
+pub fn redact_config_secrets(cfg: &mut crate::config::Config) {
     cfg.api_key = None;
     // Per-provider keys are the same credential class as `api_key` and are
     // decrypted in memory — clear the whole map so none leak in the response.

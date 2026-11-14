@@ -9,7 +9,7 @@
 use console::style;
 
 /// Program title line, e.g. `RantaiClaw  v0.10.0-alpha`.
-pub(crate) fn title(name: &str, version: &str) {
+pub fn title(name: &str, version: &str) {
     println!(
         "{}  {}",
         style(name).bold(),
@@ -19,22 +19,22 @@ pub(crate) fn title(name: &str, version: &str) {
 
 /// Dim uppercase heading string (no surrounding blank line). Used by `section`
 /// and by String-building renderers that can't call `println!` directly.
-pub(crate) fn heading(name: &str) -> String {
+pub fn heading(name: &str) -> String {
     style(name.to_uppercase()).dim().bold().to_string()
 }
 
 /// Dim uppercase section header, preceded by a blank line.
-pub(crate) fn section(name: &str) {
+pub fn section(name: &str) {
     println!("\n{}", heading(name));
 }
 
 /// Two-column field row: dim label left-padded to `width`, then the value.
-pub(crate) fn field(label: &str, width: usize, value: &str) {
+pub fn field(label: &str, width: usize, value: &str) {
     println!("  {}  {}", style(format!("{label:<width$}")).dim(), value);
 }
 
 /// Status dot — green filled `●` when active, dim hollow `○` when not.
-pub(crate) fn dot(active: bool) -> String {
+pub fn dot(active: bool) -> String {
     if active {
         style("●").green().to_string()
     } else {
@@ -43,17 +43,17 @@ pub(crate) fn dot(active: bool) -> String {
 }
 
 /// Status row: `  ● Name            note` — dot, name padded to `width`, dim note.
-pub(crate) fn status_row(active: bool, name: &str, width: usize, note: &str) {
+pub fn status_row(active: bool, name: &str, width: usize, note: &str) {
     println!("  {} {:<width$} {}", dot(active), name, style(note).dim());
 }
 
 /// Dim secondary text (e.g. hints, timestamps).
-pub(crate) fn dim(s: &str) -> String {
+pub fn dim(s: &str) -> String {
     style(s).dim().to_string()
 }
 
 /// Yellow warning text.
-pub(crate) fn warn(s: &str) -> String {
+pub fn warn(s: &str) -> String {
     style(s).yellow().to_string()
 }
 
@@ -65,7 +65,7 @@ pub(crate) fn warn(s: &str) -> String {
 /// default", so a config-derived value puts the surfaces back to
 /// disagreeing: a fresh profile with the shipped `always_ask` reads as
 /// Manual even though nothing chose Manual.
-pub(crate) fn autonomy_preset_text(policy_dir: &std::path::Path) -> String {
+pub fn autonomy_preset_text(policy_dir: &std::path::Path) -> String {
     match crate::approval::policy_writer::read_active_preset(policy_dir) {
         Some(preset) => format!("{} ({})", preset.label(), preset.id()),
         None => "not provisioned — run `rantaiclaw setup approvals`".to_string(),
@@ -80,7 +80,7 @@ pub(crate) fn autonomy_preset_text(policy_dir: &std::path::Path) -> String {
 /// words for the same state. The model never sees this text — model-facing
 /// code goes through `preset_for_prompt`, which resolves the same drift by
 /// naming no preset at all.
-pub(crate) fn autonomy_drift_note(
+pub fn autonomy_drift_note(
     policy_dir: &std::path::Path,
     enforced: crate::security::AutonomyLevel,
 ) -> Option<String> {

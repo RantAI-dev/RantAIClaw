@@ -4960,19 +4960,23 @@ fn channel_remove_guidance_names_the_resolved_config_path() {
     );
 }
 
-/// The two CLI declarations of `channel add`/`channel remove` (the library
-/// enum in `lib.rs` and the binary's own enum in `main.rs`) must stay
-/// word-for-word identical, and neither may name `~/.rantaiclaw/config.toml`:
+/// `channel add`/`channel remove` must not name `~/.rantaiclaw/config.toml`:
 /// with profiles the active config can live anywhere, so guidance pointing at
-/// a fixed path sends the operator to a file the daemon does not read.
+/// a fixed path sends the operator to a file the daemon does not read. Both
+/// must point at the active profile's `config.toml` instead.
+///
+/// The CLI enums used to be declared twice (the library's in `lib.rs` and a
+/// second copy in `main.rs`) and this test also compared the two word for
+/// word. Plan 676 deleted the binary's copy — the binary renders the library
+/// enum — so one declaration is left to check.
 #[test]
-fn channel_add_and_remove_long_help_match_across_the_two_cli_declarations() {
-    /// Slice the `ChannelCommands` enum body out of a CLI source file. The
-    /// body ends at the first column-0 `}`, which is where both enums close.
+fn channel_add_and_remove_long_help_names_the_profile_config() {
+    /// Slice the `ChannelCommands` enum body out of `lib.rs`. The body ends
+    /// at the first column-0 `}`, which is where the enum closes.
     fn enum_body(src: &str) -> &str {
         let start = src
             .find("enum ChannelCommands")
-            .expect("the enum is declared in both files");
+            .expect("the enum is declared in lib.rs");
         let end = src[start..]
             .find("\n}\n")
             .expect("the enum body closes at a column-0 brace")
@@ -4992,40 +4996,24 @@ fn channel_add_and_remove_long_help_match_across_the_two_cli_declarations() {
         &body[start..end]
     }
 
-    let lib = enum_body(include_str!("../lib.rs"));
-    let main = enum_body(include_str!("../main.rs"));
+    let cli = enum_body(include_str!("../lib.rs"));
 
     assert!(
-        !lib.contains("~/.rantaiclaw/config.toml"),
-        "the library CLI must not name a fixed config path: {lib}"
-    );
-    assert!(
-        !main.contains("~/.rantaiclaw/config.toml"),
-        "the binary CLI must not name a fixed config path: {main}"
+        !cli.contains("~/.rantaiclaw/config.toml"),
+        "the CLI must not name a fixed config path: {cli}"
     );
 
     const ADD: &str = "Add a channel configuration.";
     const REMOVE: &str = "Remove a channel configuration.";
-    assert_eq!(
-        long_about(lib, ADD),
-        long_about(main, ADD),
-        "`channel add` long help must be identical in both CLI declarations"
-    );
-    assert_eq!(
-        long_about(lib, REMOVE),
-        long_about(main, REMOVE),
-        "`channel remove` long help must be identical in both CLI declarations"
-    );
-
     assert!(
-        long_about(lib, ADD).contains("the active profile's `config.toml`"),
+        long_about(cli, ADD).contains("the active profile's `config.toml`"),
         "`channel add` help must point at the profile in use: {}",
-        long_about(lib, ADD)
+        long_about(cli, ADD)
     );
     assert!(
-        long_about(lib, REMOVE).contains("the active profile's `config.toml`"),
+        long_about(cli, REMOVE).contains("the active profile's `config.toml`"),
         "`channel remove` help must point at the profile in use: {}",
-        long_about(lib, REMOVE)
+        long_about(cli, REMOVE)
     );
 }
 
@@ -12669,6 +12657,12 @@ fn count_unquoted(line: &str, needle: char) -> usize {
 /// the decomposition started. Ten modules now exist where one did; without this
 /// a later extraction can widen the API by accident, one `pub use` at a time.
 ///
+/// Plan 676 widened the surface deliberately, not by accident: the binary no
+/// longer compiles `src/channels/` as its own crate, so the symbols its CLI
+/// renders (`channel_roster_note`, `locked_channel_key_for_provisioner`) and
+/// the four admin functions it dispatches are reachable from outside the
+/// module. `status` and the `setup`/`channel` gates need them.
+///
 /// Channel types (`pub use telegram::TelegramChannel`, …) and the `Channel` /
 /// `SendMessage` traits are deliberately not counted: they were public before
 /// and are the module's type surface, not its call surface.
@@ -12711,8 +12705,10 @@ fn channels_module_public_surface_is_the_documented_ten() {
 
     let expected = vec![
         "build_system_prompt_with_mode".to_string(),
+        "channel_roster_note".to_string(),
         "channel_supports_announce_delivery".to_string(),
         "doctor_channels".to_string(),
+        "locked_channel_key_for_provisioner".to_string(),
         "start_channels_with_cancellation".to_string(),
     ];
     assert_eq!(
@@ -12721,9 +12717,10 @@ fn channels_module_public_surface_is_the_documented_ten() {
          side effect of an extraction — update this list deliberately."
     );
 
-    // The remaining external symbols are `pub(crate)` because `main.rs` compiles
-    // this tree as its own crate: `handle_command`, `channel_roster`,
-    // `announce_daemon_reload`, `reload_managed_daemon`, `build_configured_channels`.
+    // The remaining external symbols the binary dispatches are `pub` re-exports
+    // of `admin::` now (`handle_command`, `channel_roster`,
+    // `announce_daemon_reload`, `reload_managed_daemon`); the gateway still
+    // reaches `build_configured_channels` crate-internally.
     for crate_level in [
         "announce_daemon_reload",
         "channel_roster",

@@ -41,17 +41,19 @@ use serde::{Deserialize, Serialize};
 pub mod agent;
 pub mod approval;
 pub mod channels;
-pub(crate) mod cli_style;
+#[doc(hidden)]
+pub mod cli_style;
 pub mod config;
-pub(crate) mod cost;
-pub(crate) mod cron;
+#[doc(hidden)]
+pub mod cost;
+pub mod cron;
 pub mod daemon;
 pub mod doctor;
 pub mod gateway;
 pub(crate) mod health;
 pub(crate) mod heartbeat;
 pub(crate) mod identity;
-pub(crate) mod integrations;
+pub mod integrations;
 #[cfg(feature = "kb")]
 pub mod kb;
 pub mod lifecycle;
@@ -69,7 +71,7 @@ pub mod providers;
 pub mod remote;
 pub mod runtime;
 pub mod security;
-pub(crate) mod service;
+pub mod service;
 pub(crate) mod services;
 pub mod sessions;
 pub mod skills;
@@ -95,7 +97,7 @@ pub const AUTH_COMMAND_REMOVED_EXIT_CODE: i32 = 1;
 
 /// Service management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum ServiceCommands {
+pub enum ServiceCommands {
     /// Install daemon service unit for auto-start and restart
     Install,
     /// Start daemon service
@@ -112,17 +114,19 @@ pub(crate) enum ServiceCommands {
 
 /// Channel management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum ChannelCommands {
-    /// List all configured channels
+pub enum ChannelCommands {
+    /// List configured channels
     List,
-    /// Start all configured channels (handled in main.rs for async)
+    /// Start all configured channels — foreground
     Start,
-    /// Run all configured channels in the foreground until Ctrl-C
-    /// (handled in main.rs for async). v0.6.53+ alias of `start` with
-    /// a friendlier banner and explicit backgrounding tips for users
-    /// arriving from the TUI's channel wizard.
+    /// Run all configured channels in the foreground until Ctrl-C.
+    ///
+    /// Alias of `start` with a louder, friendlier startup banner so users
+    /// arriving from the TUI's "configure channels" flow see clear stop
+    /// instructions. Background it from your shell: `nohup rantaiclaw
+    /// channels run > out.log 2>&1 &` or via systemd-run / tmux / screen.
     Run,
-    /// Run health checks for configured channels (handled in main.rs for async)
+    /// Run health checks for configured channels
     Doctor,
     /// Add a new channel (currently redirects to `onboard` — see long help)
     #[command(long_about = "\
@@ -154,32 +158,11 @@ the active profile's `config.toml` directly (delete the channel's \
         name: String,
     },
     /// Bind a Telegram identity (username or numeric user ID) into allowlist
-    #[command(long_about = "\
-Bind a Telegram identity into the allowlist.
-
-Adds a Telegram username (without the '@' prefix) or numeric user \
-ID to the channel allowlist so the agent will respond to messages \
-from that identity.
-
-Examples:
-  rantaiclaw channel bind-telegram rantaiclaw_user
-  rantaiclaw channel bind-telegram 123456789")]
     BindTelegram {
         /// Telegram identity to allow (username without '@' or numeric user ID)
         identity: String,
     },
     /// Remove a Telegram identity (or the `*` wildcard) from the allowlist
-    #[command(long_about = "\
-Remove a Telegram identity from the allowlist.
-
-Removes a username (without the '@' prefix), a numeric user ID, or the \
-`*` wildcard so the agent stops responding to that identity. Pass `*` \
-to lock an open allowlist down to its explicit entries.
-
-Examples:
-  rantaiclaw channel unbind-telegram rantaiclaw_user
-  rantaiclaw channel unbind-telegram 123456789
-  rantaiclaw channel unbind-telegram '*'")]
     UnbindTelegram {
         /// Telegram identity to remove (username without '@', numeric user ID, or `*`)
         identity: String,
@@ -206,10 +189,10 @@ Examples:
 
 /// Skills management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum SkillCommands {
-    /// List all installed skills
+pub enum SkillCommands {
+    /// List installed skills
     List,
-    /// Show metadata for a single installed skill
+    /// Show metadata for a single installed skill (CLI parity for TUI `/skill <name>`)
     Show {
         /// Skill name (case-insensitive)
         name: String,
@@ -226,36 +209,42 @@ pub(crate) enum SkillCommands {
         /// Skill name (case-insensitive; matches the name shown by `skills list`).
         name: String,
     },
-    /// Install a new skill from a URL or local path
+    /// Install a skill from a GitHub URL or local path
     Install {
-        /// Source URL or local path
+        /// GitHub URL or local path
         source: String,
     },
     /// Remove an installed skill
     Remove {
-        /// Skill name to remove
+        /// Skill name
         name: String,
     },
-    /// Re-pull installed ClawHub skill(s) at their latest version
+    /// Re-pull installed ClawHub skill(s) at their latest version.
+    /// With `--all`, updates every installed skill. With a slug, updates
+    /// just that one. Local-path / git skills are skipped (you can `git pull`
+    /// or re-install those manually).
     Update {
-        /// Specific skill slug to update; omit with --all
+        /// Specific skill slug to update; omit with `--all` to update every skill.
         slug: Option<String>,
-        /// Update every installed skill
+        /// Update every installed skill.
         #[arg(long)]
         all: bool,
     },
-    /// Show ClawHub metadata + security scan for a skill before installing
+    /// Show ClawHub metadata + security scan for a skill *before* installing.
+    /// Hits ClawHub's public API; no install side-effect.
     Inspect {
-        /// ClawHub skill slug
+        /// ClawHub skill slug.
         slug: String,
     },
-    /// Install missing binary dependencies for a skill using its declared
-    /// `metadata.clawdbot.install[]` recipes. Picks the preferred recipe
-    /// based on host availability (brew → uv → npm → go → download).
+    /// Install missing binary dependencies declared by a skill's
+    /// `metadata.clawdbot.install[]` recipes (brew/npm/uv/go/download).
+    /// Picks the preferred recipe based on what's available on this host.
+    /// Closes the OpenClaw-parity gap where rantaiclaw could detect
+    /// missing bins but couldn't fix them.
     InstallDeps {
-        /// Specific skill name to install deps for; omit with --all
+        /// Skill name. Omit with --all to fix every gated skill that has recipes.
         slug: Option<String>,
-        /// Install deps for every gated skill that has install recipes
+        /// Run install-deps for every skill whose requires aren't met.
         #[arg(long)]
         all: bool,
     },
@@ -263,20 +252,10 @@ pub(crate) enum SkillCommands {
 
 /// Cron subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum CronCommands {
+pub enum CronCommands {
     /// List all scheduled tasks
     List,
     /// Add a new scheduled task
-    #[command(long_about = "\
-Add a new recurring scheduled task.
-
-Uses standard 5-field cron syntax: 'min hour day month weekday'. \
-Times are evaluated in UTC by default; use --tz with an IANA \
-timezone name to override.
-
-Examples:
-  rantaiclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York
-  rantaiclaw cron add '*/30 * * * *' 'Check system health'")]
     Add {
         /// Cron expression
         expression: String,
@@ -293,14 +272,6 @@ Examples:
         model: Option<String>,
     },
     /// Add a one-shot scheduled task at an RFC3339 timestamp
-    #[command(long_about = "\
-Add a one-shot task that fires at a specific UTC timestamp.
-
-The timestamp must be in RFC 3339 format (e.g. 2025-01-15T14:00:00Z).
-
-Examples:
-  rantaiclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder'
-  rantaiclaw cron add-at 2025-12-31T23:59:00Z 'Happy New Year!'")]
     AddAt {
         /// One-shot timestamp in RFC3339 format
         at: String,
@@ -314,14 +285,6 @@ Examples:
         model: Option<String>,
     },
     /// Add a fixed-interval scheduled task
-    #[command(long_about = "\
-Add a task that repeats at a fixed interval.
-
-Interval is specified in milliseconds. For example, 60000 = 1 minute.
-
-Examples:
-  rantaiclaw cron add-every 60000 'Ping heartbeat'     # every minute
-  rantaiclaw cron add-every 3600000 'Hourly report'    # every hour")]
     AddEvery {
         /// Interval in milliseconds
         every_ms: u64,
@@ -335,16 +298,6 @@ Examples:
         model: Option<String>,
     },
     /// Add a one-shot delayed task (e.g. "30m", "2h", "1d")
-    #[command(long_about = "\
-Add a one-shot task that fires after a delay from now.
-
-Accepts human-readable durations: s (seconds), m (minutes), \
-h (hours), d (days).
-
-Examples:
-  rantaiclaw cron once 30m 'Run backup in 30 minutes'
-  rantaiclaw cron once 2h 'Follow up on deployment'
-  rantaiclaw cron once 1d 'Daily check'")]
     Once {
         /// Delay duration
         delay: String,
@@ -363,15 +316,6 @@ Examples:
         id: String,
     },
     /// Update a scheduled task
-    #[command(long_about = "\
-Update one or more fields of an existing scheduled task.
-
-Only the fields you specify are changed; others remain unchanged.
-
-Examples:
-  rantaiclaw cron update <task-id> --expression '0 8 * * *'
-  rantaiclaw cron update <task-id> --tz Europe/London --name 'Morning check'
-  rantaiclaw cron update <task-id> --command 'Updated message'")]
     Update {
         /// Task ID
         id: String,
@@ -418,39 +362,27 @@ Examples:
 pub enum MemoryCommands {
     /// List memory entries with optional filters
     List {
-        /// Filter by category (core, daily, conversation, or custom name)
         #[arg(long)]
         category: Option<String>,
-        /// Filter by session ID
         #[arg(long)]
         session: Option<String>,
-        /// Maximum number of entries to display
         #[arg(long, default_value = "50")]
         limit: usize,
-        /// Number of entries to skip (for pagination)
         #[arg(long, default_value = "0")]
         offset: usize,
     },
     /// Get a specific memory entry by key
-    Get {
-        /// Memory key to look up
-        key: String,
-    },
+    Get { key: String },
     /// Store a memory entry
     Add {
-        /// Key to store it under
         key: String,
-        /// The information to remember
         content: String,
-        /// Category: core (default), daily, conversation, or a custom name
         #[arg(long, default_value = "core")]
         category: String,
     },
     /// Search memory entries by keyword
     Recall {
-        /// Keywords or phrase to search for
         query: String,
-        /// Maximum number of results
         #[arg(long, default_value = "5")]
         limit: usize,
     },
@@ -463,7 +395,6 @@ pub enum MemoryCommands {
         /// Delete a single entry by key (supports prefix match)
         #[arg(long)]
         key: Option<String>,
-        /// Only clear entries in this category
         #[arg(long)]
         category: Option<String>,
         /// Skip confirmation prompt
@@ -474,7 +405,7 @@ pub enum MemoryCommands {
 
 /// Integration subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum IntegrationCommands {
+pub enum IntegrationCommands {
     /// List all integrations grouped by category (default)
     List,
     /// Show details about a specific integration

@@ -68,7 +68,7 @@ fn make_ui_work_dir() -> Result<PathBuf> {
 
 /// Default install location: `~/.rantaiclaw/ui` (shared across profiles).
 fn default_dir() -> PathBuf {
-    crate::profile::paths::rantaiclaw_root().join("ui")
+    rantaiclaw::profile::paths::rantaiclaw_root().join("ui")
 }
 
 /// True when `bin --version` runs successfully — a cheap availability probe.
@@ -787,8 +787,7 @@ pub(crate) fn probe_and_format_version_status(
 /// against PID reuse). Err with a manual instruction if it cannot be safely stopped.
 fn stop_stale_gateway(gw_port: u16, dir: &Path) -> Result<()> {
     // `webui` is a binary-crate module and `lifecycle` is only compiled into the
-    // lib crate (unlike `config`, which the binary re-declares), so reach it via
-    // the `rantaiclaw` lib crate rather than `crate::`.
+    // lib crate, so reach it via the `rantaiclaw` lib crate rather than `crate::`.
     use rantaiclaw::lifecycle::process as proc;
 
     // 1. PID recorded in <dir>/.run (`gateway=<pid>`), if ui start launched it.
@@ -858,13 +857,14 @@ fn start_fresh_gateway(
 /// when the profile can't be resolved, the store write fails, or `/pair`
 /// rejects the code.
 fn mint_and_pair(gateway_url: &str) -> Option<String> {
-    let root = crate::profile::ProfileManager::active().ok()?.root;
+    let root = rantaiclaw::profile::ProfileManager::active().ok()?.root;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
         .as_secs() as i64;
     let code =
-        crate::security::pairing_store::mint(&root, "gateway", 120, Some(1), false, now).ok()?;
+        rantaiclaw::security::pairing_store::mint(&root, "gateway", 120, Some(1), false, now)
+            .ok()?;
     pair_token(gateway_url, &code)
 }
 
@@ -925,7 +925,10 @@ fn run_file(dir: &Path) -> PathBuf {
     dir.join(".run")
 }
 
-pub fn handle_command(command: &crate::UiCommands, config: &crate::config::Config) -> Result<()> {
+pub fn handle_command(
+    command: &crate::UiCommands,
+    config: &rantaiclaw::config::Config,
+) -> Result<()> {
     match command {
         crate::UiCommands::Install {
             dir,
@@ -1245,7 +1248,7 @@ fn start(
     gateway: Option<String>,
     token: Option<String>,
     host: Option<String>,
-    config: &crate::config::Config,
+    config: &rantaiclaw::config::Config,
 ) -> Result<()> {
     let dir = dir.unwrap_or_else(default_dir);
     if !dir.join("server.js").exists() {
@@ -1332,7 +1335,7 @@ fn start(
     let gw_log = dir.join("gateway.log");
     let mut gateway_pid: Option<u32> = None;
     let gw_present = port_open(&gw_host, gw_port);
-    let disk_fp = crate::config::fingerprint::fingerprint_file(&config.config_path);
+    let disk_fp = rantaiclaw::config::fingerprint::fingerprint_file(&config.config_path);
     let action = decide_gateway_action(
         gw_present,
         if gw_present {
