@@ -255,9 +255,9 @@ In scope (this spike, behind `--features kb-ocr`, non-default):
   `use_ocr_pipeline=true` through `OllamaOcrExtractor` when `kb-ocr` is on;
   unchanged (still the typed error) when it's off.
 - `Cargo.toml` — `kb-ocr = ["kb"]`, no new deps, not in `default`.
-- Tests: `tests/kb/extract_test.rs` (`OllamaOcrExtractor` against a
+- Tests: `tests/it/kb/extract_test.rs` (`OllamaOcrExtractor` against a
   `wiremock` mock — success + 5xx-surfaces-as-`KbError::Extraction`),
-  `tests/kb/file_test.rs` (the pre-existing
+  `tests/it/kb/file_test.rs` (the pre-existing
   `process_pdf_with_ocr_pipeline_flag_returns_not_implemented_error` test
   split into an unguarded non-`kb-ocr` variant and a `kb-ocr` variant
   asserting the updated PDF message).

@@ -191,7 +191,8 @@ Run the release gates locally before opening it — these are what
 `verify-update-cycle` runs, and they are cheap:
 
 ```bash
-cargo test --locked --test schema_drift --test config_migration_roundtrip
+cargo test --locked --test it schema_drift::
+cargo test --locked --test it config_migration_roundtrip::
 cargo test --locked --lib config::migrations
 cargo test --locked --lib sessions::migrations
 ```

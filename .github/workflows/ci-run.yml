@@ -223,11 +223,12 @@ jobs:
         if: needs.changes.outputs.rust_changed == 'true' && needs.fmt.result == 'success'
         runs-on: ubuntu-latest
         # 45min: cargo test on the full workspace runs ~6,300 tests over
-        # 32 binaries. Empirically takes 9–12 min when the cache is warm,
-        # but the cold cache + cross-binary recompile in the May-2026
-        # runner image has pushed total Test-step time past 25 min on
-        # back-to-back runs. 45 min leaves headroom for transient
-        # runner-image slowness without masking a true deadlock.
+        # three test binaries — the library, the binary and the single
+        # integration binary (`tests/it/main.rs`). Empirically takes 9–12 min
+        # when the cache is warm, but the cold cache + cross-binary
+        # recompile in the May-2026 runner image has pushed total Test-step
+        # time past 25 min on back-to-back runs. 45 min leaves headroom for
+        # transient runner-image slowness without masking a true deadlock.
         timeout-minutes: 45
         steps:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -238,13 +239,15 @@ jobs:
               with:
                   save-if: ${{ github.ref == 'refs/heads/main' }}
             - name: Free up runner disk space
-              # `cargo test --locked --workspace` links ~32 debug test binaries,
-              # each carrying the full rantaiclaw lib + heavy deps (matrix-sdk,
-              # russh, aws-lc, …). Their combined `target/` has intermittently
-              # exhausted the ubuntu-latest disk ("No space left on device",
-              # plus an ld SIGBUS on a full disk), failing the Test job on some
-              # main pushes. Reclaim the preinstalled toolchains we don't use
-              # (~25 GB) so the build has ample headroom.
+              # `cargo test --locked --workspace` links three debug test binaries
+              # (the library, the binary, and the single integration binary
+              # `tests/it/main.rs`), each carrying the full rantaiclaw lib +
+              # heavy deps (matrix-sdk, russh, aws-lc, …). Their combined
+              # `target/` has intermittently exhausted the ubuntu-latest disk
+              # ("No space left on device", plus an ld SIGBUS on a full
+              # disk), failing the Test job on some main pushes. Reclaim the
+              # preinstalled toolchains we don't use (~25 GB) so the build
+              # has ample headroom.
               run: |
                   df -h /
                   sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
@@ -381,7 +384,7 @@ jobs:
             # `--lib` alone is not enough to claim the feature builds. Turning it
             # on pulls `decancer`, whose `impl Add<Translation> for String` makes
             # `String + &String` ambiguous — which broke two integration tests
-            # (`tests/kb/chunk_test.rs`) that no `--lib` run touches. Checking
+            # (`tests/it/kb/chunk_test.rs`) that no `--lib` run touches. Checking
             # every target is what makes "builds with channel-matrix" true.
             #
             # No `channel_features_changed` condition, on purpose: `channel-matrix`
@@ -457,10 +460,12 @@ jobs:
               if: ${{ !cancelled() }}
               run: cargo check --locked --features kb-office --all-targets
 
-    # The E2E job is gone: `tests/agent_e2e.rs` is an auto-discovered
-    # integration target of the root package, so the `test` job's
-    # `cargo test --locked --workspace` already runs it. The separate job
-    # only re-ran the same tests.
+    # The E2E job is gone: the integration tests are one binary, `it`,
+    # declared in `Cargo.toml` with `autotests = false` and one `[[test]]`
+    # entry, and `tests/agent_e2e.rs` is now its module `agent_e2e` at
+    # `tests/it/agent_e2e.rs`. The `test` job's
+    # `cargo test --locked --workspace` therefore already runs it; the
+    # separate job only re-ran the same tests.
 
     bench-compile:
         name: Bench Compile

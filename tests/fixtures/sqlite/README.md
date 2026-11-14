@@ -1,7 +1,7 @@
 # SQLite store fixtures
 
 Three database files written by the build before the rusqlite 0.40 move: `main` at `d269efaf`, rusqlite 0.37
-with its bundled SQLite. They are read by `tests/sqlite_old_files_open.rs`, which checks that the current build
+with its bundled SQLite. They are read by `tests/it/sqlite_old_files_open.rs`, which checks that the current build
 opens and reads them unchanged.
 
 | File | Written through | Holds |
