@@ -49,10 +49,27 @@ fail=0
 # a row rustfmt wrapped over four lines reads the same as a row that fits on
 # one. Requiring a formatting shape here would make `cargo fmt` and this gate
 # disagree, and the one that loses that argument is always the gate.
-catalog_block="$(awk '/^pub\(crate\) const CHANNEL_CATALOG/,/^\];/' "$CATALOG_SRC" \
+#
+# The declaration line is matched under either visibility, `pub` or
+# `pub(crate)`: which one applies is a caller's concern, not part of what this
+# gate checks. Keep the space after the `?` group, not inside it — gawk fails
+# to match `pub(crate)` when it sits inside.
+catalog_block="$(awk '/^pub(\(crate\))? const CHANNEL_CATALOG/,/^\];/' "$CATALOG_SRC" \
   | sed -E 's://.*::' \
   | tr '\n' ' ' \
   | sed -E 's/[[:space:]]+/ /g')"
+
+# An empty block means the declaration moved, was renamed, or its visibility
+# word drifted out of the pattern above. Say so here rather than letting `set
+# -euo pipefail` end the script silently inside the `opened=` pipeline below,
+# which is where an empty block used to abort with no output at all.
+if [ -z "$catalog_block" ]; then
+  echo "ERROR: no CHANNEL_CATALOG declaration found in $CATALOG_SRC."
+  echo "       Looked for a line starting 'pub const CHANNEL_CATALOG' or"
+  echo "       'pub(crate) const CHANNEL_CATALOG', through to the closing '];'."
+  echo "       A declaration this gate cannot find is a catalog it cannot check."
+  exit 1
+fi
 rows="$(grep -oE '\( *"[a-z_]+", *"[^"]+", *ChannelSupport::[A-Za-z]+, *ChannelVerification::[A-Za-z]+,? *\)' <<<"$catalog_block" \
   | tr -s ' ' || true)"
 
@@ -60,7 +77,13 @@ rows="$(grep -oE '\( *"[a-z_]+", *"[^"]+", *ChannelSupport::[A-Za-z]+, *ChannelV
 # be skipped in silence — a hyphenated key like `whatsapp-web` simply vanished
 # from a gate whose own header says it is fail-closed. Count the rows the
 # catalog actually opens and refuse a mismatch before comparing anything.
-opened="$(grep -oE '\( *"[^"]+", *"[^"]+", *ChannelSupport::' <<<"$catalog_block" | wc -l | tr -d ' ')"
+# `|| true` so a block with no readable row at all — both counts land at 0 and
+# the mismatch check below passes — reaches the "could not parse" error
+# instead of aborting the script here in silence, the same reason `rows=` and
+# `matched=` already carry it. A block that has rows the opened-row regex
+# reads but the strict row regex does not (a hyphenated key) is the other
+# shape: opened and matched disagree, and the mismatch error fires.
+opened="$(grep -oE '\( *"[^"]+", *"[^"]+", *ChannelSupport::' <<<"$catalog_block" | wc -l | tr -d ' ' || true)"
 matched="$(grep -c . <<<"$rows" || true)"
 if [ "$opened" != "$matched" ]; then
   echo "ERROR: $CATALOG_SRC has $opened catalog row(s) but only $matched parsed."
