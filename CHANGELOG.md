@@ -139,6 +139,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A config reload no longer removes a proxy variable the operator set in their own shell.** With
+  `[proxy] scope = "environment"` and the proxy URL coming from the operator's shell, the process
+  wrote the variable back and remembered the key as its own. The next load in the same process read
+  that key as "not a user signal", fell back to the file's `enabled = false`, and cleared the
+  variable — so the operator's `HTTP_PROXY` was removed from the process environment, and every
+  child process (the shell tool) lost it too. The bookkeeping now remembers the value each
+  variable held before the process first wrote it: a later load reads that remembered value as the
+  operator's signal, and clearing the proxy puts the operator's own variable back instead of
+  removing it. Because that remembered value is the signal every load reads, a proxy URL from the
+  operator's shell now keeps precedence over one written in `config.toml` on every load, where the
+  file used to win from the second load on. A variable the process wrote itself, over an operator
+  who had set nothing, is still removed and still never turns a disabled proxy back on. The daemon
+  hot-reload, the cron reload, the console config write and the TUI reload all go through this path.
+  The proxy tool's own "remove the proxy variables from this process" action still removes them, and
+  forgets what they held, so a later clear does not bring them back. No config key and no default
+  changed, so the config schema stays at version 40.
+
 - **A TUI approval prompt is answered only by a key pressed while its pane is on screen.** The
   setup overlay, first-run wizard, list picker and info panel each replace the whole frame, the
   approval pane included, but the answer keys were read before these four views saw a key. A
