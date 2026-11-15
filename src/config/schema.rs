@@ -9132,8 +9132,12 @@ level = "full"
         crate::test_env::ENV_LOCK.lock().await
     }
 
-    fn clear_proxy_env_test_vars() {
-        for key in [
+    /// Unset every proxy variable a test must not inherit from the developer's
+    /// own shell, and give the previous value back when the returned guards
+    /// drop — so a test that panics does not leave the operator's proxy
+    /// variables cleared for the next one.
+    fn clear_proxy_env_test_vars() -> Vec<crate::test_env::EnvGuard> {
+        [
             "RANTAICLAW_PROXY_ENABLED",
             "RANTAICLAW_HTTP_PROXY",
             "RANTAICLAW_HTTPS_PROXY",
@@ -9149,9 +9153,10 @@ level = "full"
             "https_proxy",
             "all_proxy",
             "no_proxy",
-        ] {
-            std::env::remove_var(key);
-        }
+        ]
+        .into_iter()
+        .map(crate::test_env::EnvGuard::unset)
+        .collect()
     }
 
     // ── Env overrides must not be persisted by save() ───────────
@@ -9316,8 +9321,8 @@ level = "full"
     #[test]
     async fn disabled_proxy_stays_disabled_across_reload() {
         let _env_guard = env_override_lock().await;
-        clear_proxy_env_test_vars();
         ProxyConfig::clear_authored_process_env();
+        let _proxy_env = clear_proxy_env_test_vars();
 
         // 1. An enabled proxy applies its URL to the process env (authoring
         //    HTTP_PROXY) so requests are proxied.
@@ -9345,7 +9350,6 @@ level = "full"
             "the proxy env we authored is cleared on disable"
         );
 
-        clear_proxy_env_test_vars();
         ProxyConfig::clear_authored_process_env();
     }
 
@@ -9364,7 +9368,7 @@ level = "full"
         // Forget what an earlier test authored (which gives its value back),
         // then clear the variables themselves.
         ProxyConfig::clear_authored_process_env();
-        clear_proxy_env_test_vars();
+        let _proxy_env = clear_proxy_env_test_vars();
 
         let _g_http_proxy =
             crate::test_env::EnvGuard::set("HTTP_PROXY", "http://operator-proxy.invalid:8080");
@@ -9395,7 +9399,6 @@ level = "full"
         );
 
         ProxyConfig::clear_authored_process_env();
-        clear_proxy_env_test_vars();
     }
 
     /// Clearing the proxy gives the operator's variable back instead of
@@ -9404,7 +9407,7 @@ level = "full"
     async fn clearing_a_proxy_restores_the_operator_variable() {
         let _env_guard = env_override_lock().await;
         ProxyConfig::clear_authored_process_env();
-        clear_proxy_env_test_vars();
+        let _proxy_env = clear_proxy_env_test_vars();
 
         let _g_http_proxy =
             crate::test_env::EnvGuard::set("HTTP_PROXY", "http://operator-proxy.invalid:8080");
@@ -9445,7 +9448,6 @@ level = "full"
         );
 
         ProxyConfig::clear_authored_process_env();
-        clear_proxy_env_test_vars();
     }
 
     /// The regression the bookkeeping was added for: a value THIS process wrote,
@@ -9455,7 +9457,7 @@ level = "full"
     async fn a_proxy_the_process_authored_is_still_cleared() {
         let _env_guard = env_override_lock().await;
         ProxyConfig::clear_authored_process_env();
-        clear_proxy_env_test_vars();
+        let _proxy_env = clear_proxy_env_test_vars();
 
         // No operator variable: the process authors HTTP_PROXY itself.
         let mut config = Config::default();
@@ -9488,7 +9490,6 @@ level = "full"
         );
 
         ProxyConfig::clear_authored_process_env();
-        clear_proxy_env_test_vars();
     }
 
     /// The explicit `RANTAICLAW_*` variable still wins — over the generic one
@@ -9497,7 +9498,7 @@ level = "full"
     async fn the_explicit_rantaiclaw_proxy_variable_still_wins() {
         let _env_guard = env_override_lock().await;
         ProxyConfig::clear_authored_process_env();
-        clear_proxy_env_test_vars();
+        let _proxy_env = clear_proxy_env_test_vars();
 
         let _g_explicit = crate::test_env::EnvGuard::set(
             "RANTAICLAW_HTTP_PROXY",
@@ -9528,7 +9529,6 @@ level = "full"
         );
 
         ProxyConfig::clear_authored_process_env();
-        clear_proxy_env_test_vars();
     }
 
     #[test]
@@ -11308,7 +11308,7 @@ default_model = "legacy-model"
     async fn env_override_temperature_out_of_range_ignored() {
         let _env_guard = env_override_lock().await;
         // Clean up any leftover env vars from other tests
-        std::env::remove_var("RANTAICLAW_TEMPERATURE");
+        let _g_temperature_clear = crate::test_env::EnvGuard::unset("RANTAICLAW_TEMPERATURE");
 
         let mut config = Config::default();
         let original_temp = config.default_temperature;
@@ -11366,11 +11366,12 @@ default_model = "legacy-model"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::set_var("WEB_SEARCH_ENABLED", "false");
-        std::env::set_var("WEB_SEARCH_PROVIDER", "brave");
-        std::env::set_var("WEB_SEARCH_MAX_RESULTS", "7");
-        std::env::set_var("WEB_SEARCH_TIMEOUT_SECS", "20");
-        std::env::set_var("BRAVE_API_KEY", "brave-test-key");
+        let _g_web_search_enabled = crate::test_env::EnvGuard::set("WEB_SEARCH_ENABLED", "false");
+        let _g_web_search_provider = crate::test_env::EnvGuard::set("WEB_SEARCH_PROVIDER", "brave");
+        let _g_web_search_max_results =
+            crate::test_env::EnvGuard::set("WEB_SEARCH_MAX_RESULTS", "7");
+        let _g_web_search_timeout = crate::test_env::EnvGuard::set("WEB_SEARCH_TIMEOUT_SECS", "20");
+        let _g_brave_api_key = crate::test_env::EnvGuard::set("BRAVE_API_KEY", "brave-test-key");
 
         config.apply_env_overrides();
 
@@ -11382,12 +11383,6 @@ default_model = "legacy-model"
             config.web_search.brave_api_key.as_deref(),
             Some("brave-test-key")
         );
-
-        std::env::remove_var("WEB_SEARCH_ENABLED");
-        std::env::remove_var("WEB_SEARCH_PROVIDER");
-        std::env::remove_var("WEB_SEARCH_MAX_RESULTS");
-        std::env::remove_var("WEB_SEARCH_TIMEOUT_SECS");
-        std::env::remove_var("BRAVE_API_KEY");
     }
 
     #[test]
@@ -11451,16 +11446,17 @@ default_model = "legacy-model"
     #[test]
     async fn env_override_proxy_scope_services() {
         let _env_guard = env_override_lock().await;
-        clear_proxy_env_test_vars();
+        let _proxy_env = clear_proxy_env_test_vars();
 
         let mut config = Config::default();
-        std::env::set_var("RANTAICLAW_PROXY_ENABLED", "true");
-        std::env::set_var("RANTAICLAW_HTTP_PROXY", "http://127.0.0.1:7890");
-        std::env::set_var(
+        let _g_proxy_enabled = crate::test_env::EnvGuard::set("RANTAICLAW_PROXY_ENABLED", "true");
+        let _g_http_proxy =
+            crate::test_env::EnvGuard::set("RANTAICLAW_HTTP_PROXY", "http://127.0.0.1:7890");
+        let _g_proxy_services = crate::test_env::EnvGuard::set(
             "RANTAICLAW_PROXY_SERVICES",
             "provider.openai, tool.http_request",
         );
-        std::env::set_var("RANTAICLAW_PROXY_SCOPE", "services");
+        let _g_proxy_scope = crate::test_env::EnvGuard::set("RANTAICLAW_PROXY_SCOPE", "services");
 
         config.apply_env_overrides();
 
@@ -11473,8 +11469,6 @@ default_model = "legacy-model"
         assert!(config.proxy.should_apply_to_service("provider.openai"));
         assert!(config.proxy.should_apply_to_service("tool.http_request"));
         assert!(!config.proxy.should_apply_to_service("provider.anthropic"));
-
-        clear_proxy_env_test_vars();
     }
 
     /// `NO_PROXY` must be published before the proxies it exempts from.
@@ -11525,14 +11519,18 @@ default_model = "legacy-model"
     #[test]
     async fn env_override_proxy_scope_environment_applies_process_env() {
         let _env_guard = env_override_lock().await;
-        clear_proxy_env_test_vars();
+        let _proxy_env = clear_proxy_env_test_vars();
 
         let mut config = Config::default();
-        std::env::set_var("RANTAICLAW_PROXY_ENABLED", "true");
-        std::env::set_var("RANTAICLAW_PROXY_SCOPE", "environment");
-        std::env::set_var("RANTAICLAW_HTTP_PROXY", "http://127.0.0.1:7890");
-        std::env::set_var("RANTAICLAW_HTTPS_PROXY", "http://127.0.0.1:7891");
-        std::env::set_var("RANTAICLAW_NO_PROXY", "localhost,127.0.0.1");
+        let _g_proxy_enabled = crate::test_env::EnvGuard::set("RANTAICLAW_PROXY_ENABLED", "true");
+        let _g_proxy_scope =
+            crate::test_env::EnvGuard::set("RANTAICLAW_PROXY_SCOPE", "environment");
+        let _g_http_proxy =
+            crate::test_env::EnvGuard::set("RANTAICLAW_HTTP_PROXY", "http://127.0.0.1:7890");
+        let _g_https_proxy =
+            crate::test_env::EnvGuard::set("RANTAICLAW_HTTPS_PROXY", "http://127.0.0.1:7891");
+        let _g_no_proxy =
+            crate::test_env::EnvGuard::set("RANTAICLAW_NO_PROXY", "localhost,127.0.0.1");
 
         config.apply_env_overrides();
 
@@ -11548,8 +11546,6 @@ default_model = "legacy-model"
         assert!(std::env::var("NO_PROXY")
             .ok()
             .is_some_and(|value| value.contains("localhost")));
-
-        clear_proxy_env_test_vars();
     }
 
     fn runtime_proxy_cache_contains(cache_key: &str) -> bool {

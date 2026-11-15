@@ -1809,8 +1809,8 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
 
-        std::env::set_var("RANTAICLAW_CONFIG_DIR", root);
-        std::env::remove_var("RANTAICLAW_WORKSPACE");
+        let _config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", root);
+        let _workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
 
         {
             let mut seed = crate::config::Config::load_or_init().await.unwrap();
@@ -1858,8 +1858,6 @@ mod tests {
             owners.contains(&"+9999999999".to_string()),
             "owners: {owners:?}"
         );
-
-        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
     }
 
     #[test]

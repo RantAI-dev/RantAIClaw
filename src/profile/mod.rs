@@ -601,9 +601,8 @@ mod profile_root_tests {
     async fn profile_paths_match_the_global_layout() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().expect("temp home");
-        let prev = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
-        std::env::remove_var("RANTAICLAW_PROFILE");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let _profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
         let profile = ProfileManager::ensure_default().expect("profile");
         let name = profile.name.clone();
         assert_eq!(profile.root, paths::profile_dir(&name));
@@ -611,10 +610,6 @@ mod profile_root_tests {
         assert_eq!(profile.persona_dir(), paths::persona_dir(&name));
         assert_eq!(profile.policy_dir(), paths::policy_dir(&name));
         assert_eq!(profile.sessions_db_path(), paths::sessions_db(&name));
-        match prev {
-            Some(p) => std::env::set_var("HOME", p),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     /// The reproduction: the daemon was serving the profile the MARKER named
@@ -647,10 +642,8 @@ mod profile_root_tests {
 
         let _env = crate::test_env::ENV_LOCK.blocking_lock();
         let tmp = tempfile::tempdir().expect("temp home");
-        let prev_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
-        let prev_profile = std::env::var_os("RANTAICLAW_PROFILE");
-        std::env::remove_var("RANTAICLAW_PROFILE");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let _profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
         // No config-dir override in this test: an override that pins the
         // config refuses a profile switch, because the switch would move the
         // per-profile stores and leave the config behind.
@@ -695,14 +688,6 @@ mod profile_root_tests {
             );
             let _ = HandoffOutcome::NotRunning; // variant exhaustiveness guard
         }));
-        match prev_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
-        match prev_profile {
-            Some(p) => std::env::set_var("RANTAICLAW_PROFILE", p),
-            None => std::env::remove_var("RANTAICLAW_PROFILE"),
-        }
         if let Err(e) = result {
             std::panic::resume_unwind(e);
         }
@@ -733,10 +718,8 @@ mod profile_root_tests {
 
         let _env = crate::test_env::ENV_LOCK.blocking_lock();
         let tmp = tempfile::tempdir().expect("temp home");
-        let prev_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
-        let prev_profile = std::env::var_os("RANTAICLAW_PROFILE");
-        std::env::remove_var("RANTAICLAW_PROFILE");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let _profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
         // No config-dir override in this test: an override that pins the
         // config refuses a profile switch, because the switch would move the
         // per-profile stores and leave the config behind.
@@ -769,14 +752,6 @@ mod profile_root_tests {
             );
             let _ = HandoffOutcome::NotRunning; // variant exhaustiveness guard
         }));
-        match prev_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
-        match prev_profile {
-            Some(p) => std::env::set_var("RANTAICLAW_PROFILE", p),
-            None => std::env::remove_var("RANTAICLAW_PROFILE"),
-        }
         if let Err(e) = result {
             std::panic::resume_unwind(e);
         }

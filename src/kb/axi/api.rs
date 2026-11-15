@@ -1696,7 +1696,10 @@ mod tests {
 
     #[test]
     fn resolve_key_empty_when_no_key_and_no_openrouter_env() {
-        std::env::remove_var("OPENROUTER_API_KEY");
+        // `resolve_key` reads `OPENROUTER_API_KEY`, and another test may write
+        // it — so the crate lock is held for the whole read.
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let _openrouter = crate::test_env::EnvGuard::unset("OPENROUTER_API_KEY");
         assert!(crate::kb::config::KbConfig::resolve_key("").is_empty());
     }
 

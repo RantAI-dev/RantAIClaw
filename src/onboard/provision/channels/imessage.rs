@@ -205,6 +205,9 @@ mod tests {
     /// no file on any macOS system and the check could only ever fail.
     #[test]
     fn imessage_probe_path_matches_the_channel_path() {
+        // Both sides resolve `HOME` separately, so another test's `HOME` can
+        // land between the two reads and make them differ. Hold the lock.
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
         let probe = chat_db_path();
         let channel_path = directories::UserDirs::new()
             .map(|u| u.home_dir().join("Library/Messages/chat.db"))

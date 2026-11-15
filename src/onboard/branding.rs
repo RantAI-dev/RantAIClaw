@@ -408,14 +408,12 @@ mod tests {
 
     #[test]
     fn no_color_disables_escapes() {
-        let prev = std::env::var_os("NO_COLOR");
-        std::env::set_var("NO_COLOR", "1");
+        // `NO_COLOR` is read by the renderer, and another test may write it —
+        // so the crate lock is held for the whole read.
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let _no_color = crate::test_env::EnvGuard::set("NO_COLOR", "1");
         let inv = Inventory::minimal("Rantaiclaw", None);
         let s = render_splash_at_width(&inv, 100);
-        match prev {
-            Some(v) => std::env::set_var("NO_COLOR", v),
-            None => std::env::remove_var("NO_COLOR"),
-        }
         assert!(!s.contains("\x1b["), "NO_COLOR splash had ANSI: {s:?}");
     }
 

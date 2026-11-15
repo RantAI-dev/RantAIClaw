@@ -1743,23 +1743,20 @@ allowed_users = ["*"]
     /// (it ignores the env), but the purity test SETS the var and the others
     /// assert the no-key shape, so an ambient value on a dev/CI machine would
     /// still perturb them.
+    ///
+    /// The fields drop in declaration order, so the environment is restored
+    /// while the lock is still held: the lock comes last.
     struct V18EnvGuard {
+        _env: crate::test_env::EnvGuard,
         _lock: tokio::sync::MutexGuard<'static, ()>,
-        prev: Option<std::ffi::OsString>,
     }
     impl V18EnvGuard {
         fn scrubbed() -> Self {
             let lock = crate::test_env::ENV_LOCK.blocking_lock();
-            let prev = std::env::var_os("KB_EMBEDDING_API_KEY");
-            std::env::remove_var("KB_EMBEDDING_API_KEY");
-            Self { _lock: lock, prev }
-        }
-    }
-    impl Drop for V18EnvGuard {
-        fn drop(&mut self) {
-            match self.prev.take() {
-                Some(v) => std::env::set_var("KB_EMBEDDING_API_KEY", v),
-                None => std::env::remove_var("KB_EMBEDDING_API_KEY"),
+            let env = crate::test_env::EnvGuard::unset("KB_EMBEDDING_API_KEY");
+            Self {
+                _env: env,
+                _lock: lock,
             }
         }
     }
@@ -1771,10 +1768,9 @@ allowed_users = ["*"]
         // var must NOT change the migration output (with no file key, no table
         // is injected).
         let _guard = V18EnvGuard::scrubbed();
-        std::env::set_var("KB_EMBEDDING_API_KEY", "rantaiclaw_test_key");
+        let _g_key = crate::test_env::EnvGuard::set("KB_EMBEDDING_API_KEY", "rantaiclaw_test_key");
         let mut v = parse("schema_version = 17\n");
         migrate(&mut v).unwrap();
-        std::env::remove_var("KB_EMBEDDING_API_KEY");
         assert!(
             v.get("knowledge").is_none(),
             "v18 must ignore the env key — it is handled at load, not in the migration"

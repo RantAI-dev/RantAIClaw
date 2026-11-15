@@ -5467,8 +5467,11 @@ mod tests {
         // channels/config) that mutate the same process-global env.
         let _g = crate::test_env::ENV_LOCK.blocking_lock();
         let home = tempfile::tempdir().unwrap();
-        let prev_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", home.path());
+        // The guard restores the original HOME rather than unsetting it —
+        // removing it strips HOME from the whole test process, and every later
+        // test that reads the environment (e.g. shell_preserves_path_and_home)
+        // fails.
+        let _home = crate::test_env::HomeGuard::set(home.path());
 
         // Resolve the same profile root the handler will, and mint a "gateway"
         // code into its store. The handler consumes against the real wall clock,
@@ -5494,14 +5497,6 @@ mod tests {
             state.pairing.is_authenticated(&token),
             "issued token must authenticate against the guard"
         );
-
-        // Restore the original HOME rather than unsetting it — removing it
-        // strips HOME from the whole test process, and every later test that
-        // reads the environment (e.g. shell_preserves_path_and_home) fails.
-        match prev_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[derive(Default)]

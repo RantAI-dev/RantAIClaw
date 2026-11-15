@@ -615,8 +615,10 @@ mod tests {
     /// the parent holds.
     #[tokio::test]
     async fn the_reader_sees_no_environment() {
-        // A value the parent holds and the child must not see.
-        std::env::set_var(PROBE_VAR, "secret-marker");
+        // The parent holds a value the child must not see: the write goes
+        // through the crate guard, so the crate lock is held while it is set.
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _probe = crate::test_env::EnvGuard::set(PROBE_VAR, "secret-marker");
         let extraction = extract_test_document(
             "env",
             &[],
@@ -625,7 +627,6 @@ mod tests {
         )
         .await
         .expect("the reader answers");
-        std::env::remove_var(PROBE_VAR);
         assert!(
             extraction.text.contains("probe=<absent>"),
             "{}",

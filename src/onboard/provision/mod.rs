@@ -147,27 +147,13 @@ mod core_skill_hook_tests {
     use super::*;
     use crate::profile::Profile;
 
-    /// `Profile::skills_dir()` resolves through the global home on every call
-    /// and ignores `Profile::root`, so `HOME` is the only lever that isolates
-    /// this — and it must outlive the assertions.
-    struct HomeGuard(Option<std::ffi::OsString>);
-
-    impl HomeGuard {
-        fn set(path: &std::path::Path) -> Self {
-            let prev = std::env::var_os("HOME");
-            std::env::set_var("HOME", path);
-            Self(prev)
-        }
-    }
-
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            match self.0.take() {
-                Some(prev) => std::env::set_var("HOME", prev),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-    }
+    // `Profile::skills_dir()` resolves through the global home on every call
+    // and ignores `Profile::root`, so `HOME` is the only lever that isolates
+    // this — and it must outlive the assertions.
+    //
+    // The crate guard restores the previous value on drop, so a panicking
+    // assertion cannot leak the override into the next test.
+    use crate::test_env::HomeGuard;
 
     fn scratch_profile(tmp: &std::path::Path) -> Profile {
         Profile {

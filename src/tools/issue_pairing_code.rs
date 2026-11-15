@@ -215,15 +215,6 @@ impl Tool for IssuePairingCodeTool {
 mod tests {
     use super::*;
 
-    /// Restore the pre-test HOME instead of unsetting it — `remove_var` strips
-    /// HOME from the whole test process and breaks every later env-reading test.
-    fn restore_home(prev: Option<std::ffi::OsString>) {
-        match prev {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
-    }
-
     #[tokio::test]
     async fn readonly_blocks_minting() {
         // can_act() fails first, before any pairing work — no HOME/env setup.
@@ -245,8 +236,7 @@ mod tests {
     async fn mint_returns_code_in_output() {
         let _g = crate::test_env::ENV_LOCK.lock().await;
         let tmp = tempfile::TempDir::new().unwrap();
-        let prev_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
 
         // A code is only minted for a channel this config actually runs.
         let mut config = Config::default();
@@ -270,16 +260,13 @@ mod tests {
         assert!(res.output.contains("/claim"), "{}", res.output);
         assert!(res.output.contains("/bind"), "{}", res.output);
         assert!(res.output.contains("telegram"), "{}", res.output);
-
-        restore_home(prev_home);
     }
 
     #[tokio::test]
     async fn no_owner_flag_omits_claim_owner_line() {
         let _g = crate::test_env::ENV_LOCK.lock().await;
         let tmp = tempfile::TempDir::new().unwrap();
-        let prev_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
 
         // A code is only minted for a channel this config actually runs.
         let mut config = Config::default();
@@ -301,16 +288,13 @@ mod tests {
             "chat-only invite should be flagged: {}",
             res.output
         );
-
-        restore_home(prev_home);
     }
 
     #[tokio::test]
     async fn missing_channel_is_rejected() {
         let _g = crate::test_env::ENV_LOCK.lock().await;
         let tmp = tempfile::TempDir::new().unwrap();
-        let prev_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
 
         let tool = IssuePairingCodeTool::new(
             Arc::new(SecurityPolicy::default()),
@@ -319,8 +303,6 @@ mod tests {
         let res = tool.execute(json!({"ttl_minutes": 10})).await.unwrap();
         assert!(!res.success);
         assert!(res.error.unwrap_or_default().contains("missing `channel`"));
-
-        restore_home(prev_home);
     }
 
     /// D-5. On a host that runs WhatsApp Web, a `whatsapp` code has no
@@ -330,8 +312,7 @@ mod tests {
     async fn a_whatsapp_code_is_refused_only_where_whatsapp_web_is_what_runs() {
         let _g = crate::test_env::ENV_LOCK.lock().await;
         let tmp = tempfile::TempDir::new().unwrap();
-        let prev_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
 
         let mut web_only = Config::default();
         web_only.channels_config.whatsapp_web = Some(crate::config::schema::WhatsAppWebConfig {
@@ -358,8 +339,6 @@ mod tests {
                 .await
                 .unwrap();
 
-        restore_home(prev_home);
-
         assert!(
             !refused.success,
             "a code no listener accepts must be refused: {}",
@@ -383,8 +362,7 @@ mod tests {
     async fn a_locked_channel_is_refused_but_gateway_still_mints() {
         let _g = crate::test_env::ENV_LOCK.lock().await;
         let tmp = tempfile::TempDir::new().unwrap();
-        let prev_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
 
         let tool = IssuePairingCodeTool::new(
             Arc::new(SecurityPolicy::default()),
@@ -392,8 +370,6 @@ mod tests {
         );
         let refused = tool.execute(json!({"channel": "irc"})).await.unwrap();
         let minted = tool.execute(json!({"channel": "gateway"})).await.unwrap();
-
-        restore_home(prev_home);
 
         assert!(
             !refused.success,

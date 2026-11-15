@@ -213,21 +213,11 @@ mod tests {
         ctx
     }
 
-    /// Restore the pre-test HOME instead of unsetting it — `remove_var` strips
-    /// HOME from the whole test process and breaks every later env-reading test.
-    fn restore_home(prev: Option<std::ffi::OsString>) {
-        match prev {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
-    }
-
     #[test]
     fn default_shows_a_code() {
         let _g = crate::test_env::ENV_LOCK.blocking_lock();
         let tmp = tempfile::TempDir::new().unwrap();
-        let prev_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
         let mut ctx = test_context();
 
         match PairCommand.execute("", &mut ctx).unwrap() {
@@ -253,8 +243,6 @@ mod tests {
             }
             other => panic!("expected SensitiveMessage, got {other:?}"),
         }
-
-        restore_home(prev_home);
     }
 
     /// The channel argument was accepted verbatim, so a typo minted a code
@@ -290,8 +278,7 @@ mod tests {
     fn no_owner_flag_is_chat_only() {
         let _g = crate::test_env::ENV_LOCK.blocking_lock();
         let tmp = tempfile::TempDir::new().unwrap();
-        let prev_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
         let mut ctx = test_context();
 
         match PairCommand
@@ -304,8 +291,6 @@ mod tests {
             }
             other => panic!("expected Message, got {other:?}"),
         }
-
-        restore_home(prev_home);
     }
 
     #[test]
@@ -340,8 +325,7 @@ mod tests {
     fn pair_refuses_whatsapp_only_where_whatsapp_web_is_what_runs() {
         let _g = crate::test_env::ENV_LOCK.blocking_lock();
         let tmp = tempfile::TempDir::new().unwrap();
-        let prev_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
 
         let mut web_only = crate::config::Config::default();
         web_only.channels_config.whatsapp_web = Some(crate::config::schema::WhatsAppWebConfig {
@@ -365,7 +349,6 @@ mod tests {
         let mut minted_ctx = test_context();
         minted_ctx.running_whatsapp_surface = with_cloud.channels_config.running_whatsapp_surface();
         let minted = PairCommand.execute("whatsapp", &mut minted_ctx).unwrap();
-        restore_home(prev_home);
 
         match refused {
             CommandResult::Message(m) => assert!(
@@ -409,8 +392,7 @@ mod tests {
         // tempdir, not the real `~/.rantaiclaw/profiles/default/`.
         let _g = crate::test_env::ENV_LOCK.blocking_lock();
         let tmp = tempfile::TempDir::new().unwrap();
-        let prev_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
 
         let mut ctx = test_context();
         assert!(matches!(
@@ -421,7 +403,5 @@ mod tests {
             PairCommand.execute("gateway", &mut ctx).unwrap(),
             CommandResult::SensitiveMessage { .. }
         ));
-
-        restore_home(prev_home);
     }
 }

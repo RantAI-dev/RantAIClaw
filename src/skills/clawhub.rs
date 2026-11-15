@@ -1627,18 +1627,15 @@ mod tests {
     #[test]
     fn non_https_non_loopback_base_url_is_rejected() {
         let _guard = crate::test_env::ENV_LOCK.blocking_lock();
-        let prev = std::env::var(CLAWHUB_BASE_URL_ENV).ok();
-        std::env::set_var(CLAWHUB_BASE_URL_ENV, "http://evil.example/api/v1");
+        let _base_url_evil =
+            crate::test_env::EnvGuard::set(CLAWHUB_BASE_URL_ENV, "http://evil.example/api/v1");
         assert!(ensure_base_url_safe().is_err());
-        std::env::set_var(CLAWHUB_BASE_URL_ENV, "http://127.0.0.1:8080/api/v1");
+        let _base_url_loopback =
+            crate::test_env::EnvGuard::set(CLAWHUB_BASE_URL_ENV, "http://127.0.0.1:8080/api/v1");
         assert!(ensure_base_url_safe().is_ok()); // loopback allowed for tests
-        std::env::set_var(CLAWHUB_BASE_URL_ENV, "https://clawhub.ai/api/v1");
+        let _base_url_https =
+            crate::test_env::EnvGuard::set(CLAWHUB_BASE_URL_ENV, "https://clawhub.ai/api/v1");
         assert!(ensure_base_url_safe().is_ok());
-        // restore
-        match prev {
-            Some(v) => std::env::set_var(CLAWHUB_BASE_URL_ENV, v),
-            None => std::env::remove_var(CLAWHUB_BASE_URL_ENV),
-        }
     }
 
     #[tokio::test]

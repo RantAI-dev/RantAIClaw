@@ -133,21 +133,9 @@ mod tests {
     fn with_home<F: FnOnce()>(f: F) {
         let _guard = crate::test_env::ENV_LOCK.blocking_lock();
         let tmp = TempDir::new().expect("tempdir");
-        let prev_home = std::env::var_os("HOME");
-        let prev_profile = std::env::var_os("RANTAICLAW_PROFILE");
-        std::env::set_var("HOME", tmp.path());
-        std::env::remove_var("RANTAICLAW_PROFILE");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let _profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-        if let Some(h) = prev_home {
-            std::env::set_var("HOME", h);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        if let Some(p) = prev_profile {
-            std::env::set_var("RANTAICLAW_PROFILE", p);
-        } else {
-            std::env::remove_var("RANTAICLAW_PROFILE");
-        }
         if let Err(e) = result {
             std::panic::resume_unwind(e);
         }

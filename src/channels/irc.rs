@@ -1576,8 +1576,8 @@ nickname = "bot"
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
 
-        std::env::set_var("RANTAICLAW_CONFIG_DIR", root);
-        std::env::remove_var("RANTAICLAW_WORKSPACE");
+        let _config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", root);
+        let _workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
 
         // Seed a config with an irc section so apply_pairing has a target.
         {
@@ -1620,8 +1620,6 @@ nickname = "bot"
         assert!(users.contains(&"alice".to_string()), "users: {users:?}");
         let owners = &config.channels_config.approval_owners;
         assert!(owners.contains(&"alice".to_string()), "owners: {owners:?}");
-
-        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
     }
 
     // ── Helpers ─────────────────────────────────────────────

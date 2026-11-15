@@ -223,8 +223,11 @@ mod tests {
 
     #[test]
     fn from_env_with_keys_overrides_key_fields_only() {
-        std::env::remove_var("KB_EMBEDDING_API_KEY");
-        std::env::remove_var("KB_EXTRACT_VISION_API_KEY");
+        // The env keys are read by `from_env_with_keys`, and another test may
+        // write them — so the crate lock is held for the whole read.
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let _embedding = crate::test_env::EnvGuard::unset("KB_EMBEDDING_API_KEY");
+        let _vision = crate::test_env::EnvGuard::unset("KB_EXTRACT_VISION_API_KEY");
         let cfg = KbConfig::from_env_with_keys(Some("cfg-embed"), None).unwrap();
         assert_eq!(cfg.embedding_api_key, "cfg-embed");
         assert_eq!(cfg.extract_vision_api_key, ""); // None + no env → empty (resolver fallback applies later)

@@ -264,7 +264,7 @@ mod tests {
     async fn wildcard_owner_is_refused() {
         let _g = crate::test_env::ENV_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
-        std::env::set_var("RANTAICLAW_CONFIG_DIR", tmp.path());
+        let _config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", tmp.path());
         let tool = tool_in(&tmp);
         let res = tool
             .execute(json!({"action": "add", "target": "owner", "value": "*"}))
@@ -295,7 +295,7 @@ mod tests {
     async fn add_show_remove_roundtrip() {
         let _g = crate::test_env::ENV_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
-        std::env::set_var("RANTAICLAW_CONFIG_DIR", tmp.path());
+        let _config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", tmp.path());
         let tool = tool_in(&tmp);
 
         let added = tool
@@ -319,15 +319,13 @@ mod tests {
             .unwrap();
         assert!(removed.success);
         assert!(removed.output.contains("Removed owner"));
-
-        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
     }
 
     #[tokio::test]
     async fn missing_value_is_rejected() {
         let _g = crate::test_env::ENV_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
-        std::env::set_var("RANTAICLAW_CONFIG_DIR", tmp.path());
+        let _config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", tmp.path());
         let tool = tool_in(&tmp);
 
         let res = tool
@@ -336,15 +334,13 @@ mod tests {
             .unwrap();
         assert!(!res.success);
         assert!(res.error.unwrap_or_default().contains("missing `value`"));
-
-        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
     }
 
     #[tokio::test]
     async fn refuses_to_remove_last_owner() {
         let _g = crate::test_env::ENV_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
-        std::env::set_var("RANTAICLAW_CONFIG_DIR", tmp.path());
+        let _config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", tmp.path());
         let tool = tool_in(&tmp);
 
         // One owner present → removing it must be refused.
@@ -367,21 +363,17 @@ mod tests {
             .await
             .unwrap();
         assert!(ok.success, "{:?}", ok.error);
-
-        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
     }
 
     #[tokio::test]
     async fn unknown_action_is_rejected() {
         let _g = crate::test_env::ENV_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
-        std::env::set_var("RANTAICLAW_CONFIG_DIR", tmp.path());
+        let _config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", tmp.path());
         let tool = tool_in(&tmp);
 
         let res = tool.execute(json!({"action": "frobnicate"})).await.unwrap();
         assert!(!res.success);
         assert!(res.error.unwrap_or_default().contains("unknown action"));
-
-        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
     }
 }

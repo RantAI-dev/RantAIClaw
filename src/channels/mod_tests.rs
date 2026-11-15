@@ -5704,8 +5704,7 @@ fn each_whatsapp_transport_finds_only_its_own_allowlist() {
 async fn channel_pair_refuses_whatsapp_only_where_whatsapp_web_is_what_runs() {
     let _guard = crate::test_env::ENV_LOCK.lock().await;
     let tmp = tempfile::TempDir::new().unwrap();
-    let prev_home = std::env::var_os("HOME");
-    std::env::set_var("HOME", tmp.path());
+    let _home = crate::test_env::HomeGuard::set(tmp.path());
 
     let mut web_only = Config::default();
     web_only.channels_config.whatsapp_web = Some(crate::config::schema::WhatsAppWebConfig {
@@ -5735,13 +5734,6 @@ async fn channel_pair_refuses_whatsapp_only_where_whatsapp_web_is_what_runs() {
     let minted = admin::handle_command(pair(), &with_cloud).await;
     let stored_after_mint = store.as_ref().is_ok_and(|path| path.exists());
 
-    // Restored before asserting, so a failure here cannot leave HOME pointing
-    // at a deleted directory for every later test.
-    match prev_home {
-        Some(h) => std::env::set_var("HOME", h),
-        None => std::env::remove_var("HOME"),
-    }
-
     let err = refused.expect_err("a code no listener accepts must be refused, not minted");
     assert!(
         err.to_string().contains("whatsapp_web"),
@@ -5763,8 +5755,7 @@ async fn channel_pair_refuses_whatsapp_only_where_whatsapp_web_is_what_runs() {
 async fn channel_pair_refuses_a_locked_channel_but_not_gateway() {
     let _guard = crate::test_env::ENV_LOCK.lock().await;
     let tmp = tempfile::TempDir::new().unwrap();
-    let prev_home = std::env::var_os("HOME");
-    std::env::set_var("HOME", tmp.path());
+    let _home = crate::test_env::HomeGuard::set(tmp.path());
 
     // A supported channel mints only when it is configured; without a Telegram
     // section the not-configured refusal would trip on the `usable` case.
@@ -5791,11 +5782,6 @@ async fn channel_pair_refuses_a_locked_channel_but_not_gateway() {
     let usable_result = admin::handle_command(usable, &config).await;
     let gateway_result = admin::handle_command(gateway, &config).await;
 
-    match prev_home {
-        Some(h) => std::env::set_var("HOME", h),
-        None => std::env::remove_var("HOME"),
-    }
-
     let err = locked_result.expect_err("a locked channel must be refused");
     assert!(
         err.to_string()
@@ -5813,8 +5799,7 @@ async fn channel_pair_refuses_a_locked_channel_but_not_gateway() {
 async fn channel_pair_refuses_an_unknown_surface_and_leaves_the_store_empty() {
     let _guard = crate::test_env::ENV_LOCK.lock().await;
     let tmp = tempfile::TempDir::new().unwrap();
-    let prev_home = std::env::var_os("HOME");
-    std::env::set_var("HOME", tmp.path());
+    let _home = crate::test_env::HomeGuard::set(tmp.path());
 
     let config = Config::default();
     let result = admin::handle_command(
@@ -5829,11 +5814,6 @@ async fn channel_pair_refuses_an_unknown_surface_and_leaves_the_store_empty() {
     .await;
     let store = admin::pairing_profile_root().map(|root| root.join("pairing_codes.json"));
     let stored = store.as_ref().is_ok_and(|path| path.exists());
-
-    match prev_home {
-        Some(h) => std::env::set_var("HOME", h),
-        None => std::env::remove_var("HOME"),
-    }
 
     let err = result.expect_err("an unknown surface must be refused, not minted");
     assert!(
@@ -5851,8 +5831,7 @@ async fn channel_pair_refuses_an_unknown_surface_and_leaves_the_store_empty() {
 async fn channel_pair_refuses_a_catalog_channel_that_is_not_configured() {
     let _guard = crate::test_env::ENV_LOCK.lock().await;
     let tmp = tempfile::TempDir::new().unwrap();
-    let prev_home = std::env::var_os("HOME");
-    std::env::set_var("HOME", tmp.path());
+    let _home = crate::test_env::HomeGuard::set(tmp.path());
 
     let config = Config::default();
     let result = admin::handle_command(
@@ -5867,11 +5846,6 @@ async fn channel_pair_refuses_a_catalog_channel_that_is_not_configured() {
     .await;
     let store = admin::pairing_profile_root().map(|root| root.join("pairing_codes.json"));
     let stored = store.as_ref().is_ok_and(|path| path.exists());
-
-    match prev_home {
-        Some(h) => std::env::set_var("HOME", h),
-        None => std::env::remove_var("HOME"),
-    }
 
     let err = result
         .expect_err("an unconfigured channel must be refused, not minted")
@@ -5891,8 +5865,7 @@ async fn channel_pair_refuses_a_catalog_channel_that_is_not_configured() {
 async fn the_issue_pairing_code_tool_refuses_unknown_and_unconfigured_surfaces() {
     let _guard = crate::test_env::ENV_LOCK.lock().await;
     let tmp = tempfile::TempDir::new().unwrap();
-    let prev_home = std::env::var_os("HOME");
-    std::env::set_var("HOME", tmp.path());
+    let _home = crate::test_env::HomeGuard::set(tmp.path());
 
     let tool = crate::tools::issue_pairing_code::IssuePairingCodeTool::new(
         Arc::new(crate::security::SecurityPolicy::default()),
@@ -5906,11 +5879,6 @@ async fn the_issue_pairing_code_tool_refuses_unknown_and_unconfigured_surfaces()
         .execute(serde_json::json!({"channel": "telegram"}))
         .await
         .unwrap();
-
-    match prev_home {
-        Some(h) => std::env::set_var("HOME", h),
-        None => std::env::remove_var("HOME"),
-    }
 
     assert!(
         !unknown.success,
@@ -5944,16 +5912,10 @@ async fn the_issue_pairing_code_tool_refuses_unknown_and_unconfigured_surfaces()
 async fn channel_pair_mints_for_a_configured_channel() {
     let _guard = crate::test_env::ENV_LOCK.lock().await;
     let tmp = tempfile::TempDir::new().unwrap();
-    let prev_home = std::env::var_os("HOME");
-    std::env::set_var("HOME", tmp.path());
+    let _home = crate::test_env::HomeGuard::set(tmp.path());
 
     let (config, _cfg_path) = telegram_config_in(&tmp, &[]);
     let code = admin::pair_channel("telegram", &config, 15, None, true);
-
-    match prev_home {
-        Some(h) => std::env::set_var("HOME", h),
-        None => std::env::remove_var("HOME"),
-    }
 
     let code = code.expect("a configured channel must mint");
     assert!(!code.is_empty(), "the minted code must be non-empty");
