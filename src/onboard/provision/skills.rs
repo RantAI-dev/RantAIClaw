@@ -208,30 +208,16 @@ mod tests {
     use super::*;
     use crate::onboard::provision::traits::ProvisionResponse;
 
-    /// Restores `HOME` on drop.
-    ///
-    /// `Profile::skills_dir()` resolves through `profile::paths`, which reads
-    /// the home directory on every call and ignores `Profile::root` — so
-    /// overriding `HOME` is the only way to keep this test off the developer's
-    /// real profile tree, and the override has to outlive the assertions.
-    struct HomeGuard(Option<std::ffi::OsString>);
-
-    impl HomeGuard {
-        fn set(path: &std::path::Path) -> Self {
-            let prev = std::env::var_os("HOME");
-            std::env::set_var("HOME", path);
-            Self(prev)
-        }
-    }
-
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            match self.0.take() {
-                Some(prev) => std::env::set_var("HOME", prev),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-    }
+    // Restores `HOME` on drop.
+    //
+    // `Profile::skills_dir()` resolves through `profile::paths`, which reads
+    // the home directory on every call and ignores `Profile::root` — so
+    // overriding `HOME` is the only way to keep this test off the developer's
+    // real profile tree, and the override has to outlive the assertions.
+    //
+    // The crate guard restores the previous value on drop, so a panicking
+    // assertion cannot leak the override into the next test.
+    use crate::test_env::HomeGuard;
 
     /// Drive `run` to completion, answering every question with `Skip`
     /// (index 1) so the starter pack never installs.

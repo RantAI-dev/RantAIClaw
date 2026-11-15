@@ -757,36 +757,10 @@ mod tests {
     use crate::config::Config;
     use crate::onboard::provision::test_support::{drive, scratch_profile, Answer};
 
-    /// Save an env var's previous value and restore it on drop, so a
-    /// panicking assert doesn't leak state into the next test. Only
-    /// meaningful while `test_env::ENV_LOCK` is held.
-    struct VarGuard {
-        key: &'static str,
-        prev: Option<std::ffi::OsString>,
-    }
-
-    impl VarGuard {
-        fn unset(key: &'static str) -> Self {
-            let prev = std::env::var_os(key);
-            std::env::remove_var(key);
-            Self { key, prev }
-        }
-
-        fn set(key: &'static str, value: &str) -> Self {
-            let prev = std::env::var_os(key);
-            std::env::set_var(key, value);
-            Self { key, prev }
-        }
-    }
-
-    impl Drop for VarGuard {
-        fn drop(&mut self) {
-            match self.prev.take() {
-                Some(v) => std::env::set_var(self.key, v),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
+    // Save an env var's previous value and restore it on drop, so a
+    // panicking assert doesn't leak state into the next test. Only
+    // meaningful while `test_env::ENV_LOCK` is held.
+    use crate::test_env::EnvGuard as VarGuard;
 
     // Tier 0 picker index, and provider rows derived from the shared table —
     // a hardcoded row index silently repoints these tests at a different

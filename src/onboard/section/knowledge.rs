@@ -170,7 +170,10 @@ mod tests {
 
     #[test]
     fn is_already_configured_true_when_config_has_key() {
-        std::env::remove_var("KB_EMBEDDING_API_KEY");
+        // `is_already_configured` reads `KB_EMBEDDING_API_KEY`, and another test
+        // may write it — so the crate lock is held for the whole read.
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let _embedding = crate::test_env::EnvGuard::unset("KB_EMBEDDING_API_KEY");
         let mut config = crate::config::Config::default();
         config.knowledge.embedding_api_key = Some("k".into());
         assert!(KnowledgeSection.is_already_configured(&dummy_profile(), &config));
@@ -178,7 +181,8 @@ mod tests {
 
     #[test]
     fn is_already_configured_false_when_empty() {
-        std::env::remove_var("KB_EMBEDDING_API_KEY");
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let _embedding = crate::test_env::EnvGuard::unset("KB_EMBEDDING_API_KEY");
         let config = crate::config::Config::default();
         assert!(!KnowledgeSection.is_already_configured(&dummy_profile(), &config));
     }

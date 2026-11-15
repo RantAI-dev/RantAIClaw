@@ -1240,34 +1240,11 @@ mod tests {
         )
     }
 
-    /// RAII guard that restores an environment variable to its original state on drop,
-    /// ensuring cleanup even if the test panics.
-    struct EnvGuard {
-        key: &'static str,
-        original: Option<String>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let original = std::env::var(key).ok();
-            std::env::set_var(key, value);
-            Self { key, original }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.original {
-                Some(val) => std::env::set_var(self.key, val),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
-
     #[tokio::test(flavor = "current_thread")]
     async fn shell_does_not_leak_api_key() {
-        let _g1 = EnvGuard::set("API_KEY", "sk-test-secret-12345");
-        let _g2 = EnvGuard::set("RANTAICLAW_API_KEY", "sk-test-secret-67890");
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _g1 = crate::test_env::EnvGuard::set("API_KEY", "sk-test-secret-12345");
+        let _g2 = crate::test_env::EnvGuard::set("RANTAICLAW_API_KEY", "sk-test-secret-xyz");
 
         let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
         let result = tool
@@ -1280,17 +1257,19 @@ mod tests {
             "API_KEY leaked to shell command output"
         );
         assert!(
-            !result.output.contains("sk-test-secret-67890"),
+            !result.output.contains("sk-test-secret-xyz"),
             "RANTAICLAW_API_KEY leaked to shell command output"
         );
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn shell_forwards_functional_tooling_env_but_not_secrets() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
         // A functional pointer (KUBECONFIG) must now reach the command so tools
         // like kubectl work; a secret (API_KEY) must still be stripped.
-        let _kube = EnvGuard::set("KUBECONFIG", "/tmp/rantaiclaw-test-kubeconfig-marker");
-        let _secret = EnvGuard::set("API_KEY", "sk-test-secret-should-not-leak");
+        let _kube =
+            crate::test_env::EnvGuard::set("KUBECONFIG", "/tmp/rantaiclaw-test-kubeconfig-marker");
+        let _secret = crate::test_env::EnvGuard::set("API_KEY", "sk-test-secret-should-not-leak");
 
         let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
         let result = tool

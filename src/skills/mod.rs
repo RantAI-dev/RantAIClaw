@@ -2357,41 +2357,7 @@ fn set_enabled_and_report(config: &crate::config::Config, name: &str, enabled: b
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::{Mutex, OnceLock};
-
-    fn open_skills_env_lock() -> &'static Mutex<()> {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        ENV_LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    struct EnvVarGuard {
-        key: &'static str,
-        original: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn unset(key: &'static str) -> Self {
-            let original = std::env::var(key).ok();
-            std::env::remove_var(key);
-            Self { key, original }
-        }
-
-        fn set(key: &'static str, value: &str) -> Self {
-            let original = std::env::var(key).ok();
-            std::env::set_var(key, value);
-            Self { key, original }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            if let Some(value) = &self.original {
-                std::env::set_var(self.key, value);
-            } else {
-                std::env::remove_var(self.key);
-            }
-        }
-    }
+    use std::sync::Mutex;
 
     /// Isolated fake-profile + workspace harness for tests that exercise
     /// `load_skills_with_config`/`load_skills_with_status`, which call
@@ -2400,14 +2366,17 @@ mod tests {
     /// Holds `crate::test_env::ENV_LOCK` for its entire lifetime — keep the
     /// returned harness alive for the whole test body — so no other test
     /// thread can observe or clobber these vars concurrently; both vars are
-    /// restored on drop (same save/restore pattern as `EnvVarGuard`).
+    /// restored on drop by the crate guards.
+    ///
+    /// The fields drop in declaration order, so the environment is restored
+    /// while the lock is still held: the lock comes last.
     struct FakeProfileEnv {
-        _lock: tokio::sync::MutexGuard<'static, ()>,
-        _home: EnvVarGuard,
-        _profile: EnvVarGuard,
+        _home: crate::test_env::EnvGuard,
+        _profile: crate::test_env::EnvGuard,
         // Kept alive only so the backing directory isn't deleted early;
         // never read again after `new()` computes `workspace_dir` from it.
         _tempdir: tempfile::TempDir,
+        _lock: tokio::sync::MutexGuard<'static, ()>,
     }
 
     impl FakeProfileEnv {
@@ -2419,14 +2388,14 @@ mod tests {
         fn new() -> (Self, PathBuf) {
             let lock = crate::test_env::ENV_LOCK.blocking_lock();
             let tempdir = tempfile::tempdir().unwrap();
-            let home = EnvVarGuard::set("HOME", &tempdir.path().to_string_lossy());
-            let profile = EnvVarGuard::unset("RANTAICLAW_PROFILE");
+            let home = crate::test_env::EnvGuard::set("HOME", tempdir.path());
+            let profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
             let workspace_dir = tempdir.path().join("workspace");
             let harness = Self {
-                _lock: lock,
                 _home: home,
                 _profile: profile,
                 _tempdir: tempdir,
+                _lock: lock,
             };
             (harness, workspace_dir)
         }
@@ -3091,14 +3060,12 @@ description = "Bare minimum"
 
     #[test]
     fn load_skills_with_config_reads_open_skills_dir_without_network() {
-        let _env_guard = open_skills_env_lock().lock().unwrap();
-        let _enabled_guard = EnvVarGuard::unset("RANTAICLAW_OPEN_SKILLS_ENABLED");
-        let _dir_guard = EnvVarGuard::unset("RANTAICLAW_OPEN_SKILLS_DIR");
-        // Pin `HOME` too: `load_skills_with_config` reads the active
-        // profile's skills dir (root 1). Acquired AFTER the open-skills
-        // lock to match the order `remove_out_of_root_path_is_rejected`
-        // uses — taking these two in opposite orders can deadlock.
+        // Pin `HOME` first: `load_skills_with_config` reads the active
+        // profile's skills dir (root 1), and `FakeProfileEnv::new()` takes
+        // the crate `ENV_LOCK` for the rest of the test.
         let (_env, _unused_ws) = FakeProfileEnv::new();
+        let _enabled_guard = crate::test_env::EnvGuard::unset("RANTAICLAW_OPEN_SKILLS_ENABLED");
+        let _dir_guard = crate::test_env::EnvGuard::unset("RANTAICLAW_OPEN_SKILLS_DIR");
 
         let dir = tempfile::tempdir().unwrap();
         let workspace_dir = dir.path().join("workspace");
@@ -3130,14 +3097,12 @@ description = "Bare minimum"
         // A remote open-skills entry with the SAME name as a local/bundled
         // skill must never shadow or duplicate it — local skills load first
         // and win the dedup (Step 1).
-        let _env_guard = open_skills_env_lock().lock().unwrap();
-        let _enabled_guard = EnvVarGuard::unset("RANTAICLAW_OPEN_SKILLS_ENABLED");
-        let _dir_guard = EnvVarGuard::unset("RANTAICLAW_OPEN_SKILLS_DIR");
-        // Pin `HOME` too: `load_skills_with_config` reads the active
-        // profile's skills dir (root 1). Acquired AFTER the open-skills
-        // lock to match the order `remove_out_of_root_path_is_rejected`
-        // uses — taking these two in opposite orders can deadlock.
+        // Pin `HOME` first: `load_skills_with_config` reads the active
+        // profile's skills dir (root 1), and `FakeProfileEnv::new()` takes
+        // the crate `ENV_LOCK` for the rest of the test.
         let (_env, _unused_ws) = FakeProfileEnv::new();
+        let _enabled_guard = crate::test_env::EnvGuard::unset("RANTAICLAW_OPEN_SKILLS_ENABLED");
+        let _dir_guard = crate::test_env::EnvGuard::unset("RANTAICLAW_OPEN_SKILLS_DIR");
 
         let dir = tempfile::tempdir().unwrap();
         let workspace_dir = dir.path().join("workspace");
@@ -3503,19 +3468,13 @@ description = "Bare minimum"
 
     #[test]
     fn remove_out_of_root_path_is_rejected() {
-        // Recover from poisoning rather than `.unwrap()`: this mutex is
-        // shared with `load_skills_with_config_reads_open_skills_dir_without_network`,
-        // a pre-existing test that is non-hermetic on this box (reads the
-        // real `$HOME` profile) and can itself panic while holding the lock.
-        // That test's brokenness is out of scope for this plan; this test
-        // must not spuriously fail just because it ran second.
-        let _env_guard = open_skills_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _enabled_guard = EnvVarGuard::unset("RANTAICLAW_OPEN_SKILLS_ENABLED");
-        let _dir_guard = EnvVarGuard::unset("RANTAICLAW_OPEN_SKILLS_DIR");
-
+        // `FakeProfileEnv::new()` takes the crate `ENV_LOCK` (the one lock for
+        // the whole crate) and holds it for the rest of the test, so the
+        // open-skills variables are only touched while it is held.
         let (_env, workspace_dir) = FakeProfileEnv::new();
+        let _enabled_guard = crate::test_env::EnvGuard::unset("RANTAICLAW_OPEN_SKILLS_ENABLED");
+        let _dir_guard = crate::test_env::EnvGuard::unset("RANTAICLAW_OPEN_SKILLS_DIR");
+
         fs::create_dir_all(workspace_dir.join("skills")).unwrap();
 
         // A skill loaded from the flat open-skills repo has `location` set
@@ -3792,7 +3751,8 @@ description = "Bare minimum"
             MockClawhubFile::hashed("SKILL.md", &skill_md),
             MockClawhubFile::hashed("run.sh", &run_sh),
         ]);
-        let _clawhub = EnvVarGuard::set(crate::skills::clawhub::CLAWHUB_BASE_URL_ENV, &base);
+        let _clawhub =
+            crate::test_env::EnvGuard::set(crate::skills::clawhub::CLAWHUB_BASE_URL_ENV, &base);
 
         run_clawhub_install(&workspace_dir, "demo").expect("a fully hashed manifest must install");
 
@@ -3821,7 +3781,8 @@ description = "Bare minimum"
             MockClawhubFile::hashed("SKILL.md", &skill_md),
             MockClawhubFile::raw_sha("run.sh", b"#!/bin/sh\n", ""),
         ]);
-        let _clawhub = EnvVarGuard::set(crate::skills::clawhub::CLAWHUB_BASE_URL_ENV, &base);
+        let _clawhub =
+            crate::test_env::EnvGuard::set(crate::skills::clawhub::CLAWHUB_BASE_URL_ENV, &base);
 
         let err = run_clawhub_install(&workspace_dir, "demo")
             .expect_err("a file listed with an empty sha256 must refuse the install");
@@ -3866,7 +3827,8 @@ description = "Bare minimum"
                 sha256: None,
             },
         ]);
-        let _clawhub = EnvVarGuard::set(crate::skills::clawhub::CLAWHUB_BASE_URL_ENV, &base);
+        let _clawhub =
+            crate::test_env::EnvGuard::set(crate::skills::clawhub::CLAWHUB_BASE_URL_ENV, &base);
 
         let err = run_clawhub_install(&workspace_dir, "demo")
             .expect_err("a file listed without a sha256 key must refuse the install");
@@ -3903,7 +3865,8 @@ description = "Bare minimum"
             MockClawhubFile::hashed("SKILL.md", &skill_md),
             MockClawhubFile::raw_sha("SKILL.toml", &skill_toml, ""),
         ]);
-        let _clawhub = EnvVarGuard::set(crate::skills::clawhub::CLAWHUB_BASE_URL_ENV, &base);
+        let _clawhub =
+            crate::test_env::EnvGuard::set(crate::skills::clawhub::CLAWHUB_BASE_URL_ENV, &base);
 
         let err = run_clawhub_install(&workspace_dir, "demo")
             .expect_err("an unhashed SKILL.toml must refuse the install");
@@ -3936,7 +3899,8 @@ description = "Bare minimum"
             MockClawhubFile::hashed("SKILL.md", &skill_md),
             MockClawhubFile::raw_sha("run.sh", b"#!/bin/sh\n", "abc123"),
         ]);
-        let _clawhub = EnvVarGuard::set(crate::skills::clawhub::CLAWHUB_BASE_URL_ENV, &base);
+        let _clawhub =
+            crate::test_env::EnvGuard::set(crate::skills::clawhub::CLAWHUB_BASE_URL_ENV, &base);
 
         let err = run_clawhub_install(&workspace_dir, "demo")
             .expect_err("a truncated sha256 must refuse the install");
@@ -3973,7 +3937,8 @@ description = "Bare minimum"
             MockClawhubFile::hashed("SKILL.md", &skill_md),
             MockClawhubFile::raw_sha("run.sh", &run_sh, &zeros),
         ]);
-        let _clawhub = EnvVarGuard::set(crate::skills::clawhub::CLAWHUB_BASE_URL_ENV, &base);
+        let _clawhub =
+            crate::test_env::EnvGuard::set(crate::skills::clawhub::CLAWHUB_BASE_URL_ENV, &base);
 
         let err = run_clawhub_install(&workspace_dir, "demo")
             .expect_err("a wrong sha256 must fail the install");
@@ -4004,7 +3969,8 @@ description = "Bare minimum"
             MockClawhubFile::hashed("SKILL.md", &new_skill_md),
             MockClawhubFile::raw_sha("run.sh", b"#!/bin/sh\n", ""),
         ]);
-        let _clawhub = EnvVarGuard::set(crate::skills::clawhub::CLAWHUB_BASE_URL_ENV, &base);
+        let _clawhub =
+            crate::test_env::EnvGuard::set(crate::skills::clawhub::CLAWHUB_BASE_URL_ENV, &base);
 
         let mut config = crate::config::Config::default();
         config.workspace_dir = workspace_dir.clone();
@@ -4049,7 +4015,8 @@ description = "Bare minimum"
         let new_body = b"# demo skill\n\nUpdated content from ClawHub.\n".to_vec();
         let new_sha = sha256_hex(&new_body);
         let base = spawn_mock_clawhub(new_body.clone(), new_sha, false);
-        let _clawhub = EnvVarGuard::set(crate::skills::clawhub::CLAWHUB_BASE_URL_ENV, &base);
+        let _clawhub =
+            crate::test_env::EnvGuard::set(crate::skills::clawhub::CLAWHUB_BASE_URL_ENV, &base);
 
         let mut config = crate::config::Config::default();
         config.workspace_dir = workspace_dir.clone();
@@ -4091,7 +4058,8 @@ description = "Bare minimum"
         // transient network error, or a bundled/non-ClawHub slug that
         // somehow slipped past the origin guard).
         let base = spawn_mock_clawhub(Vec::new(), String::new(), true);
-        let _clawhub = EnvVarGuard::set(crate::skills::clawhub::CLAWHUB_BASE_URL_ENV, &base);
+        let _clawhub =
+            crate::test_env::EnvGuard::set(crate::skills::clawhub::CLAWHUB_BASE_URL_ENV, &base);
 
         let mut config = crate::config::Config::default();
         config.workspace_dir = workspace_dir.clone();
@@ -4156,7 +4124,7 @@ description = "Bare minimum"
         // Point CLAWHUB_BASE_URL_ENV at a dead port — if the origin guard
         // is ever bypassed, the resulting network attempt fails fast and
         // loud instead of silently succeeding or hanging.
-        let _clawhub = EnvVarGuard::set(
+        let _clawhub = crate::test_env::EnvGuard::set(
             crate::skills::clawhub::CLAWHUB_BASE_URL_ENV,
             "http://127.0.0.1:1",
         );
@@ -4214,7 +4182,8 @@ description = "Bare minimum"
         let new_body = b"# weather-dir\n\nUpdated via --all.\n".to_vec();
         let new_sha = sha256_hex(&new_body);
         let base = spawn_mock_clawhub(new_body.clone(), new_sha, false);
-        let _clawhub = EnvVarGuard::set(crate::skills::clawhub::CLAWHUB_BASE_URL_ENV, &base);
+        let _clawhub =
+            crate::test_env::EnvGuard::set(crate::skills::clawhub::CLAWHUB_BASE_URL_ENV, &base);
 
         let mut config = crate::config::Config::default();
         config.workspace_dir = workspace_dir.clone();
@@ -4631,7 +4600,7 @@ description = "Bare minimum"
     fn install_deps_download_with_wrong_sha256_errors_and_leaves_no_executable() {
         let (_env, workspace_dir) = FakeProfileEnv::new();
         let data = tempfile::tempdir().unwrap();
-        let _data = EnvVarGuard::set("XDG_DATA_HOME", &data.path().to_string_lossy());
+        let _data = crate::test_env::EnvGuard::set("XDG_DATA_HOME", data.path());
 
         let body = b"#!/bin/sh\necho wrong-hash-probe\n".to_vec();
         let base = spawn_mock_file(body);
@@ -4743,7 +4712,7 @@ description = "Bare minimum"
     fn unmet_accepts_a_binary_in_the_skill_own_tools_directory() {
         let _env = crate::test_env::ENV_LOCK.blocking_lock();
         let data = tempfile::tempdir().unwrap();
-        let _data = EnvVarGuard::set("XDG_DATA_HOME", &data.path().to_string_lossy());
+        let _data = crate::test_env::EnvGuard::set("XDG_DATA_HOME", data.path());
 
         let skill = skill_with_bin("own-tools-skill", "own-tools-bin");
         write_executable(
@@ -4781,7 +4750,7 @@ description = "Bare minimum"
     fn a_skill_whose_binary_lives_in_its_own_tools_directory_is_not_gated() {
         let (_env, workspace_dir) = FakeProfileEnv::new();
         let data = tempfile::tempdir().unwrap();
-        let _data = EnvVarGuard::set("XDG_DATA_HOME", &data.path().to_string_lossy());
+        let _data = crate::test_env::EnvGuard::set("XDG_DATA_HOME", data.path());
 
         write_probe_skill(
             &workspace_dir.join("skills"),
@@ -4828,7 +4797,7 @@ description = "Bare minimum"
             fs::set_permissions(&npm, fs::Permissions::from_mode(0o755)).unwrap();
         }
         let previous_path = std::env::var("PATH").unwrap_or_default();
-        let _path = EnvVarGuard::set(
+        let _path = crate::test_env::EnvGuard::set(
             "PATH",
             &format!("{}:{previous_path}", bin_dir.path().display()),
         );

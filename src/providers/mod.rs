@@ -1768,33 +1768,6 @@ pub(crate) mod tests {
         );
     }
 
-    struct EnvGuard {
-        key: &'static str,
-        original: Option<String>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: Option<&str>) -> Self {
-            let original = std::env::var(key).ok();
-            match value {
-                Some(next) => std::env::set_var(key, next),
-                None => std::env::remove_var(key),
-            }
-
-            Self { key, original }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            if let Some(original) = self.original.as_deref() {
-                std::env::set_var(self.key, original);
-            } else {
-                std::env::remove_var(self.key);
-            }
-        }
-    }
-
     /// The CRATE-shared env lock, not a module-local one.
     ///
     /// `cargo test --lib` runs every unit test in one process across many
@@ -1814,8 +1787,12 @@ pub(crate) mod tests {
 
     #[test]
     fn resolve_provider_credential_bedrock_uses_internal_credential_path() {
-        let _generic_guard = EnvGuard::set("API_KEY", Some("generic-key"));
-        let _override_guard = EnvGuard::set("OPENROUTER_API_KEY", Some("openrouter-key"));
+        // The credential resolver reads the environment, and another test may
+        // write these keys — so the crate lock is held for the whole read.
+        let _g = env_lock();
+        let _generic_guard = crate::test_env::EnvGuard::set("API_KEY", "generic-key");
+        let _override_guard =
+            crate::test_env::EnvGuard::set("OPENROUTER_API_KEY", "openrouter-key");
 
         assert_eq!(
             resolve_provider_credential("bedrock", Some("explicit")),
@@ -1996,20 +1973,10 @@ pub(crate) mod tests {
         // GOOGLE_API_KEY again. The rig-native migration dropped the gemini arm
         // in resolve_provider_credential, so env-key users hit "no key".
         let _g = crate::test_env::ENV_LOCK.blocking_lock();
-        let prev_g = std::env::var_os("GEMINI_API_KEY");
-        let prev_goog = std::env::var_os("GOOGLE_API_KEY");
-        std::env::remove_var("GOOGLE_API_KEY");
-        std::env::set_var("GEMINI_API_KEY", "AIzaSyTEST-env-key");
+        let _gemini_key = crate::test_env::EnvGuard::set("GEMINI_API_KEY", "AIzaSyTEST-env-key");
+        let _google_key = crate::test_env::EnvGuard::unset("GOOGLE_API_KEY");
         let with_env_ok = create_provider("gemini", None).is_ok();
         let resolved = resolve_provider_credential("gemini", None);
-        match prev_g {
-            Some(v) => std::env::set_var("GEMINI_API_KEY", v),
-            None => std::env::remove_var("GEMINI_API_KEY"),
-        }
-        match prev_goog {
-            Some(v) => std::env::set_var("GOOGLE_API_KEY", v),
-            None => std::env::remove_var("GOOGLE_API_KEY"),
-        }
         assert_eq!(resolved.as_deref(), Some("AIzaSyTEST-env-key"));
         assert!(
             with_env_ok,
@@ -2162,21 +2129,11 @@ pub(crate) mod tests {
         // Plan 025 (diagnostics): doctor/setup must see gemini env + config keys
         // as usable again.
         let _g = crate::test_env::ENV_LOCK.blocking_lock();
-        let prev_g = std::env::var_os("GEMINI_API_KEY");
-        let prev_goog = std::env::var_os("GOOGLE_API_KEY");
-        std::env::remove_var("GEMINI_API_KEY");
-        std::env::remove_var("GOOGLE_API_KEY");
+        let _gemini_key = crate::test_env::EnvGuard::unset("GEMINI_API_KEY");
+        let _google_key = crate::test_env::EnvGuard::unset("GOOGLE_API_KEY");
         assert!(has_usable_credential("gemini", Some("cfg-key")));
-        std::env::set_var("GOOGLE_API_KEY", "AIzaSy-goog");
+        let _google_key_set = crate::test_env::EnvGuard::set("GOOGLE_API_KEY", "AIzaSy-goog");
         let via_env = has_usable_credential("gemini", None);
-        match prev_g {
-            Some(v) => std::env::set_var("GEMINI_API_KEY", v),
-            None => std::env::remove_var("GEMINI_API_KEY"),
-        }
-        match prev_goog {
-            Some(v) => std::env::set_var("GOOGLE_API_KEY", v),
-            None => std::env::remove_var("GOOGLE_API_KEY"),
-        }
         assert!(
             via_env,
             "GOOGLE_API_KEY must count as a usable gemini credential"

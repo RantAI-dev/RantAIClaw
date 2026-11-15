@@ -855,8 +855,8 @@ client_secret = "secret"
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        std::env::set_var("RANTAICLAW_CONFIG_DIR", root);
-        std::env::remove_var("RANTAICLAW_WORKSPACE");
+        let _config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", root);
+        let _workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
         {
             let mut seed = crate::config::Config::load_or_init().await.unwrap();
             seed.channels_config.dingtalk = Some(crate::config::schema::DingTalkConfig {
@@ -896,8 +896,6 @@ client_secret = "secret"
             .channels_config
             .approval_owners
             .contains(&"staff_abc".to_string()));
-
-        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
     }
 
     /// The half `resolve_chat_id_handles_numeric_group_conversation_type` does

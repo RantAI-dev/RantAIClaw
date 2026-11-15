@@ -1008,6 +1008,11 @@ mod tests {
     /// `skill_<skill>_<tool>` name that `BUILTIN_TOOL_NAMES` does not list.
     #[test]
     fn builtin_tool_names_match_the_full_registry() {
+        // `ProfileManager::active()` reads `RANTAICLAW_PROFILE` and `HOME`, and
+        // its answer decides which names the registry is expected to carry —
+        // while `all_tools` asks the same question to build the registry. Hold
+        // the crate lock so both see the same profile.
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
         let mem_cfg = MemoryConfig {

@@ -650,6 +650,15 @@ mod tests {
         // The two are one letter apart. `/skills new "Kopi Pagi"` used to fall
         // through to the picker, which preselected nothing and said nothing —
         // the request vanished without a word.
+        //
+        // `/skills new` resolves the active profile, which reads `HOME` and
+        // `RANTAICLAW_PROFILE` from the process environment. Hold the crate
+        // lock and pin both, so another test's profile name cannot reach this
+        // one and fail it with `profile "..." does not exist`.
+        let _env_guard = crate::test_env::ENV_LOCK.blocking_lock();
+        let temp_home = tempfile::tempdir().unwrap();
+        let _g_home = crate::test_env::EnvGuard::set("HOME", temp_home.path());
+        let _g_profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
         let cmd = SkillsCommand;
         let mut ctx = test_context();
 

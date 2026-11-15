@@ -851,8 +851,8 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        std::env::set_var("RANTAICLAW_CONFIG_DIR", root);
-        std::env::remove_var("RANTAICLAW_WORKSPACE");
+        let _config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", root);
+        let _workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
         {
             let mut seed = crate::config::Config::load_or_init().await.unwrap();
             seed.channels_config.matrix = Some(crate::config::MatrixConfig {
@@ -895,8 +895,6 @@ mod tests {
             .channels_config
             .approval_owners
             .contains(&"@newuser:matrix.org".to_string()));
-
-        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
     }
 
     #[test]

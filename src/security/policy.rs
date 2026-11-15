@@ -3068,6 +3068,11 @@ mod tests {
 
     #[test]
     fn empty_forbidden_paths_still_denies_the_floor() {
+        // The floor expands `~/` against the CURRENT `HOME`, and this test
+        // builds its paths from a `HOME` it read a moment earlier. Without the
+        // lock, another test's `HOME` can land between the two and the floor
+        // stops matching the path under test.
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
         // The operator's forbidden_paths can be emptied (e.g. via
         // `PUT /api/v1/config/autonomy`), but the hardcoded floor must still
         // deny system/credential directories.
@@ -3334,6 +3339,11 @@ mod tests {
 
     #[test]
     fn credential_floor_file_tools_refuse_azure_gcloud_and_profile_secrets() {
+        // The floor expands `~/` against the CURRENT `HOME`, and this test
+        // builds its paths from a `HOME` it read a moment earlier. Without the
+        // lock, another test's `HOME` can land between the two and the floor
+        // stops matching the path under test.
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
         let home = std::env::var("HOME").expect("HOME is set in tests");
         let p = SecurityPolicy::default().with_workspace_only(false);
         assert!(!p.is_path_allowed(&format!("{home}/.azure/accessTokens.json")));
@@ -3347,6 +3357,11 @@ mod tests {
 
     #[test]
     fn credential_floor_file_tools_refuse_every_credential_directory() {
+        // The floor expands `~/` against the CURRENT `HOME`, and this test
+        // builds its paths from a `HOME` it read a moment earlier. Without the
+        // lock, another test's `HOME` can land between the two and the floor
+        // stops matching the path under test.
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
         // The required list is written out here, not read from CREDENTIAL_DIRECTORIES,
         // so deleting any entry from the constant fails this test for the file tools.
         let home = std::env::var("HOME").expect("HOME is set in tests");
@@ -3370,6 +3385,11 @@ mod tests {
 
     #[test]
     fn credential_floor_holds_with_empty_config_forbidden_paths() {
+        // The floor expands `~/` against the CURRENT `HOME`, and this test
+        // builds its paths from a `HOME` it read a moment earlier. Without the
+        // lock, another test's `HOME` can land between the two and the floor
+        // stops matching the path under test.
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
         let home = std::env::var("HOME").expect("HOME is set in tests");
         let p = SecurityPolicy::default()
             .with_forbidden_paths(vec![])
@@ -3386,6 +3406,11 @@ mod tests {
 
     #[test]
     fn credential_floor_is_component_matched_not_a_prefix_of_a_sibling() {
+        // The floor expands `~/` against the CURRENT `HOME`, and this test
+        // builds its paths from a `HOME` it read a moment earlier. Without the
+        // lock, another test's `HOME` can land between the two and the floor
+        // stops matching the path under test.
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
         // `secrets_extra` is a different directory from `secrets`: the profile
         // rule matches whole components, never a string prefix. The config list
         // is emptied so only the floor is under test: the default config list
@@ -3403,6 +3428,11 @@ mod tests {
 
     #[test]
     fn command_under_full_refuses_credential_directories() {
+        // The floor expands `~/` against the CURRENT `HOME`, and this test
+        // builds its paths from a `HOME` it read a moment earlier. Without the
+        // lock, another test's `HOME` can land between the two and the floor
+        // stops matching the path under test.
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
         let home = std::env::var("HOME").expect("HOME is set in tests");
         let p = full_policy();
         for cmd in [

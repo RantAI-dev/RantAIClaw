@@ -163,8 +163,36 @@ mod tests {
         ctx
     }
 
+    /// `/autonomy` resolves the active profile, which reads `HOME` and
+    /// `RANTAICLAW_PROFILE` from the process environment. Hold the crate lock
+    /// and pin both, so a profile name leaked by another test cannot reach
+    /// this one and fail it with "Could not resolve active profile".
+    ///
+    /// The fields drop in declaration order, so the environment is restored
+    /// while the lock is still held.
+    struct PinnedProfileEnv {
+        _g_profile: crate::test_env::EnvGuard,
+        _g_home: crate::test_env::EnvGuard,
+        _home: tempfile::TempDir,
+        _lock: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    fn pinned_profile_env() -> PinnedProfileEnv {
+        let lock = crate::test_env::ENV_LOCK.blocking_lock();
+        let home = tempfile::tempdir().unwrap();
+        let g_home = crate::test_env::EnvGuard::set("HOME", home.path());
+        let g_profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
+        PinnedProfileEnv {
+            _g_profile: g_profile,
+            _g_home: g_home,
+            _home: home,
+            _lock: lock,
+        }
+    }
+
     #[test]
     fn no_arg_opens_picker_with_all_four_presets() {
+        let _env = pinned_profile_env();
         let cmd = AutonomyCommand;
         let mut ctx = test_context();
         let result = cmd.execute("", &mut ctx).unwrap();
@@ -184,6 +212,7 @@ mod tests {
 
     #[test]
     fn invalid_arg_returns_error_message() {
+        let _env = pinned_profile_env();
         let cmd = AutonomyCommand;
         let mut ctx = test_context();
         let result = cmd.execute("paranoid", &mut ctx).unwrap();

@@ -682,13 +682,17 @@ mod tests {
             .collect()
     }
 
-    fn restore_proxy_env(snapshot: &[Option<String>]) {
-        for (key, value) in PROXY_ENV_KEYS.iter().zip(snapshot) {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
+    /// Hold the proxy variables exactly as they are now and put them back on
+    /// drop — the crate guard restores the previous value, so a panicking
+    /// assertion cannot leave the operator's proxy variables changed.
+    fn proxy_env_restore_guards() -> Vec<crate::test_env::EnvGuard> {
+        PROXY_ENV_KEYS
+            .iter()
+            .map(|key| match std::env::var(key) {
+                Ok(value) => crate::test_env::EnvGuard::set(key, value),
+                Err(_) => crate::test_env::EnvGuard::unset(key),
+            })
+            .collect()
     }
 
     async fn listening_proxy_url() -> (tokio::net::TcpListener, String) {
@@ -731,6 +735,7 @@ mod tests {
     async fn set_to_closed_port_is_refused_and_changes_nothing() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
         let env_before = proxy_env_snapshot();
+        let _proxy_env = proxy_env_restore_guards();
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let tool = ProxyConfigTool::new(config.clone(), test_security());
@@ -759,13 +764,13 @@ mod tests {
         assert_eq!(runtime_proxy_config().http_proxy, runtime_before.http_proxy);
         assert_eq!(runtime_proxy_config().enabled, runtime_before.enabled);
         assert_eq!(proxy_env_snapshot(), env_before);
-        restore_proxy_env(&env_before);
     }
 
     #[tokio::test]
     async fn apply_env_refuses_saved_unreachable_proxy_and_leaves_env_alone() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
         let env_before = proxy_env_snapshot();
+        let _proxy_env = proxy_env_restore_guards();
         let tmp = TempDir::new().unwrap();
         let mut config = Config {
             workspace_dir: tmp.path().join("workspace"),
@@ -787,7 +792,6 @@ mod tests {
             "names the URL: {error}"
         );
         assert_eq!(proxy_env_snapshot(), env_before);
-        restore_proxy_env(&env_before);
     }
 
     #[tokio::test]

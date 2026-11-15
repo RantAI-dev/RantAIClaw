@@ -2817,8 +2817,8 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
 
-        std::env::set_var("RANTAICLAW_CONFIG_DIR", root);
-        std::env::remove_var("RANTAICLAW_WORKSPACE");
+        let _config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", root);
+        let _workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
 
         // Seed a config with a telegram section so apply_pairing has a target.
         {
@@ -2867,8 +2867,6 @@ mod tests {
         let owners = &config.channels_config.approval_owners;
         assert!(owners.contains(&"999".to_string()), "owners: {owners:?}");
         assert!(owners.contains(&"carol".to_string()), "owners: {owners:?}");
-
-        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
     }
 
     /// The legacy `/claim`/`/bind` owner-persist path must write to the config
@@ -2881,8 +2879,8 @@ mod tests {
         let _guard = crate::test_env::ENV_LOCK.lock().await;
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
-        std::env::set_var("RANTAICLAW_CONFIG_DIR", root);
-        std::env::remove_var("RANTAICLAW_WORKSPACE");
+        let _config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", root);
+        let _workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
 
         // Seed a config in the ACTIVE dir (this is where the daemon reads).
         crate::config::Config::load_or_init()
@@ -2908,8 +2906,6 @@ mod tests {
             "legacy owner-persist must land in the active config dir; owners: {:?}",
             config.channels_config.approval_owners
         );
-
-        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
     }
 
     #[test]

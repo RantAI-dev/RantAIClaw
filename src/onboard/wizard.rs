@@ -6370,15 +6370,17 @@ mod tests {
     #[test]
     fn env_key_present_treats_empty_as_absent() {
         // Unique var name so this never clobbers a real provider key nor races
-        // another test reading the same variable.
+        // another test reading the same variable. The crate lock is held for
+        // every write, and each guard restores the previous value on drop.
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
         let var = "RANTAICLAW_TEST_ENV_KEY_PRESENT";
-        std::env::set_var(var, "");
+        let _empty = crate::test_env::EnvGuard::set(var, "");
         assert!(!env_key_present(var), "empty string must be absent");
-        std::env::set_var(var, "   ");
+        let _whitespace = crate::test_env::EnvGuard::set(var, "   ");
         assert!(!env_key_present(var), "whitespace-only must be absent");
-        std::env::set_var(var, "sk-real");
+        let _real = crate::test_env::EnvGuard::set(var, "sk-real");
         assert!(env_key_present(var), "a real value must be present");
-        std::env::remove_var(var);
+        let _unset = crate::test_env::EnvGuard::unset(var);
         assert!(!env_key_present(var), "unset must be absent");
     }
 
