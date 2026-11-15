@@ -6697,6 +6697,8 @@ mod tests {
     #[tokio::test]
     async fn quick_setup_writes_the_config_dir_the_loader_reads() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
         let _home = pin_home(&tmp);
         let config_dir = tmp.path().join("custom-config-dir");

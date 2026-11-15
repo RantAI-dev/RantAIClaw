@@ -848,6 +848,8 @@ mod tests {
         use crate::security::pairing_store;
 
         let _guard = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();

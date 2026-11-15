@@ -2991,6 +2991,8 @@ mod tests {
         // Pin HOME so the v0.5.0 profile-aware fallback resolves into a
         // tempdir we control instead of the real ~/.rantaiclaw.
         let _env_guard = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let temp_home =
             std::env::temp_dir().join(format!("rantaiclaw_test_home_{}", uuid::Uuid::new_v4()));
         let workspace_dir = temp_home.join("profile-a");
@@ -3080,6 +3082,8 @@ mod tests {
     #[tokio::test]
     async fn refresh_working_config_relogs_config_loaded_after_an_edit() {
         let _env_guard = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let temp_home =
             std::env::temp_dir().join(format!("rantaiclaw_test_home_{}", uuid::Uuid::new_v4()));
         let workspace_dir = temp_home.join("profile-a");

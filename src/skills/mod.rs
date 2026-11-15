@@ -3517,7 +3517,7 @@ description = "Bare minimum"
     /// Minimal blocking mock ClawHub server for `update_*` tests. Serves the
     /// three endpoints `install_one` walks (`GET /skills/<slug>`, `GET
     /// /skills/<slug>/versions/<v>`, `GET /skills/<slug>/file?...`, modeled
-    /// on `tests/onboard_skills_section.rs`'s `spawn_mock_clawhub_full`).
+    /// on `tests/it/onboard_skills_section.rs`'s `spawn_mock_clawhub_full`).
     /// When `fail_detail` is set, the detail endpoint always 404s (models a
     /// failed fetch) so `install_one` never gets past step 1.
     ///

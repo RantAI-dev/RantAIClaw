@@ -379,6 +379,7 @@ mod tests {
     /// stopped the agent.
     #[tokio::test]
     async fn a_pdf_that_makes_the_parser_panic_is_refused_and_the_next_pdf_is_read() {
+        let _slot = crate::test_slot::EXTRACTION_SLOT_LOCK.lock().await;
         let err = extract_inbound_document(
             InboundDocumentKind::Pdf,
             hostile_fixture_pdf(1, "Hello from a PDF"),
@@ -417,6 +418,7 @@ mod tests {
     /// therefore a sentence of ours, never the parser's own text.
     #[tokio::test]
     async fn a_refused_document_carries_our_own_words() {
+        let _slot = crate::test_slot::EXTRACTION_SLOT_LOCK.lock().await;
         let err = extract_inbound_document(
             InboundDocumentKind::Pdf,
             b"%PDF-1.4\nthis is not a pdf".to_vec(),
@@ -436,6 +438,7 @@ mod tests {
     #[cfg(feature = "kb-office")]
     #[tokio::test]
     async fn a_refused_docx_carries_our_own_words() {
+        let _slot = crate::test_slot::EXTRACTION_SLOT_LOCK.lock().await;
         let err = extract_inbound_document(
             InboundDocumentKind::Docx,
             docx_without_its_document_rels(),
@@ -458,6 +461,7 @@ mod tests {
     /// for the deadline instead of refusing the answer.
     #[tokio::test]
     async fn a_reader_that_sends_too_much_is_refused_at_once() {
+        let _slot = crate::test_slot::EXTRACTION_SLOT_LOCK.lock().await;
         let started = std::time::Instant::now();
         let err = extract_test_document(
             "flood",
@@ -482,6 +486,7 @@ mod tests {
     /// document is read.
     #[tokio::test]
     async fn a_reader_that_sleeps_past_the_deadline_is_killed_and_the_next_document_is_read() {
+        let _slot = crate::test_slot::EXTRACTION_SLOT_LOCK.lock().await;
         let dir = tempfile::tempdir().expect("a temp dir");
         let pid_file = dir.path().join("reader.pid");
         let started = std::time::Instant::now();
@@ -528,6 +533,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_reader_that_sleeps_past_the_deadline_is_killed_and_is_gone() {
+        let _slot = crate::test_slot::EXTRACTION_SLOT_LOCK.lock().await;
         let dir = tempfile::tempdir().expect("a temp dir");
         let pid_file = dir.path().join("reader.pid");
         let err = extract_test_document(
@@ -590,6 +596,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn an_allocation_past_the_ceiling_is_a_rejection() {
+        let _slot = crate::test_slot::EXTRACTION_SLOT_LOCK.lock().await;
         let err = extract_test_document(
             "alloc",
             &[],
@@ -615,6 +622,7 @@ mod tests {
     /// the parent holds.
     #[tokio::test]
     async fn the_reader_sees_no_environment() {
+        let _slot = crate::test_slot::EXTRACTION_SLOT_LOCK.lock().await;
         // The parent holds a value the child must not see: the write goes
         // through the crate guard, so the crate lock is held while it is set.
         let _env = crate::test_env::ENV_LOCK.lock().await;
@@ -648,6 +656,7 @@ mod tests {
     /// nothing that holds data — so a legitimate document would be refused.
     #[tokio::test]
     async fn the_reader_gets_one_allocator_arena() {
+        let _slot = crate::test_slot::EXTRACTION_SLOT_LOCK.lock().await;
         let extraction = extract_test_document(
             "env",
             &[],
@@ -666,6 +675,7 @@ mod tests {
     /// The reader is a process of its own.
     #[tokio::test]
     async fn the_reader_is_another_process() {
+        let _slot = crate::test_slot::EXTRACTION_SLOT_LOCK.lock().await;
         let extraction = extract_test_document(
             "pid",
             &[],
@@ -681,6 +691,7 @@ mod tests {
     /// A kind the parent does not know is refused before a child is started.
     #[tokio::test]
     async fn an_unknown_kind_is_refused() {
+        let _slot = crate::test_slot::EXTRACTION_SLOT_LOCK.lock().await;
         let err = extract_test_document(
             "nonsense",
             &[],
@@ -699,6 +710,7 @@ mod tests {
     #[cfg(feature = "kb-office")]
     #[tokio::test]
     async fn a_corrupt_deflate_docx_is_refused() {
+        let _slot = crate::test_slot::EXTRACTION_SLOT_LOCK.lock().await;
         let err = extract_inbound_document(
             InboundDocumentKind::Docx,
             corrupt_deflate_docx(),

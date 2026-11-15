@@ -77,7 +77,13 @@ pub mod sessions;
 pub mod skills;
 pub(crate) mod tasks;
 #[cfg(test)]
+mod test_autostart;
+#[cfg(test)]
 mod test_env;
+#[cfg(test)]
+mod test_proxy;
+#[cfg(test)]
+mod test_slot;
 pub mod tools;
 pub mod tui;
 pub(crate) mod tunnel;

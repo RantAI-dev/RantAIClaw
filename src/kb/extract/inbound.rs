@@ -232,6 +232,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_text_document_is_read_as_it_is() {
+        let _slot = crate::test_slot::EXTRACTION_SLOT_LOCK.lock().await;
         let extraction = extract_inbound_document(
             InboundDocumentKind::Text,
             b"hello from a document".to_vec(),
@@ -246,6 +247,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_pdf_is_read_with_its_page_count() {
+        let _slot = crate::test_slot::EXTRACTION_SLOT_LOCK.lock().await;
         let extraction = extract_inbound_document(
             InboundDocumentKind::Pdf,
             fixture_pdf(1, "Hello from a PDF"),
@@ -266,6 +268,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_pdf_over_the_page_limit_is_refused_before_its_text_is_read() {
+        let _slot = crate::test_slot::EXTRACTION_SLOT_LOCK.lock().await;
         let err = extract_inbound_document(
             InboundDocumentKind::Pdf,
             fixture_pdf(51, "page"),
@@ -279,6 +282,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_pdf_at_the_page_limit_is_read() {
+        let _slot = crate::test_slot::EXTRACTION_SLOT_LOCK.lock().await;
         let extraction = extract_inbound_document(
             InboundDocumentKind::Pdf,
             fixture_pdf(50, "page"),
@@ -291,6 +295,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_long_document_is_cut_and_says_so() {
+        let _slot = crate::test_slot::EXTRACTION_SLOT_LOCK.lock().await;
         let extraction = extract_inbound_document(
             InboundDocumentKind::Text,
             "x".repeat(100).into_bytes(),

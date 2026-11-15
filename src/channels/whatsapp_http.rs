@@ -142,6 +142,8 @@ mod tests {
     async fn the_streaming_download_goes_through_the_configured_proxy() {
         static HITS: AtomicUsize = AtomicUsize::new(0);
         let _guard = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
 
         let proxy_url = spawn_recording_proxy(&HITS).await;
         crate::config::set_runtime_proxy_config(proxy_everything_through(&proxy_url));
@@ -176,6 +178,8 @@ mod tests {
     async fn the_async_request_goes_through_the_configured_proxy() {
         static HITS: AtomicUsize = AtomicUsize::new(0);
         let _guard = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
 
         let proxy_url = spawn_recording_proxy(&HITS).await;
         crate::config::set_runtime_proxy_config(proxy_everything_through(&proxy_url));

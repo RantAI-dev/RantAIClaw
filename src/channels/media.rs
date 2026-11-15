@@ -1817,6 +1817,7 @@ mod document_tests {
     #[cfg(feature = "kb")]
     #[tokio::test]
     async fn a_pdf_over_the_page_limit_is_refused_through_the_production_path() {
+        let _slot = crate::test_slot::EXTRACTION_SLOT_LOCK.lock().await;
         let bytes = crate::kb::extract::inbound::fixture_pdf(51, "page");
         let outcome = document_outcome(bytes, &claim(None, None), Some("long.pdf")).await;
         let note = outcome.to_text();
@@ -1833,6 +1834,7 @@ mod document_tests {
     #[cfg(feature = "kb")]
     #[tokio::test]
     async fn a_long_document_is_cut_through_the_production_path() {
+        let _slot = crate::test_slot::EXTRACTION_SLOT_LOCK.lock().await;
         let bytes = "x".repeat(60_000).into_bytes();
         let outcome = document_outcome(bytes, &claim(None, None), Some("long.txt")).await;
         let block = outcome.to_text();

@@ -2514,6 +2514,8 @@ mod media_tests {
     /// no bandwidth.
     #[tokio::test]
     async fn an_exhausted_document_budget_costs_no_download() {
+        // The shared resource: the process-global extraction slot.
+        let _slot = crate::test_slot::EXTRACTION_SLOT_LOCK.lock().await;
         let sender = "6280000009999";
         // Five documents already sent: written out rather than read from the
         // constant, so the test still fails if the budget moves.
@@ -2544,6 +2546,8 @@ mod media_tests {
     /// Document bytes become the delimited block the model reads.
     #[tokio::test]
     async fn document_bytes_become_a_block_the_model_reads() {
+        // The shared resource: the process-global extraction slot.
+        let _slot = crate::test_slot::EXTRACTION_SLOT_LOCK.lock().await;
         let outcome = WhatsAppWebChannel::document_outcome_from_bytes(
             b"hello from a document".to_vec(),
             Some("text/plain"),
@@ -2563,6 +2567,8 @@ mod media_tests {
     /// Bytes that are not a document are refused with a visible note.
     #[tokio::test]
     async fn bytes_that_are_not_a_document_are_refused() {
+        // The shared resource: the process-global extraction slot.
+        let _slot = crate::test_slot::EXTRACTION_SLOT_LOCK.lock().await;
         let outcome = WhatsAppWebChannel::document_outcome_from_bytes(
             vec![0xff, 0xfe, 0xfd, 0xfc],
             Some("text/plain"),
@@ -2581,6 +2587,8 @@ mod media_tests {
     /// again and again: the budget sees every download.
     #[tokio::test]
     async fn a_download_the_cap_stops_still_costs_the_budget() {
+        // The shared resource: the process-global extraction slot.
+        let _slot = crate::test_slot::EXTRACTION_SLOT_LOCK.lock().await;
         let sender = "6280000002222";
         // Four documents already sent: one slot left.
         for _ in 0..4 {
@@ -2632,6 +2640,8 @@ mod media_tests {
     /// must not cost a slot. Telegram refuses the same way.
     #[tokio::test]
     async fn a_document_refused_for_its_announced_size_costs_no_budget_slot() {
+        // The shared resource: the process-global extraction slot.
+        let _slot = crate::test_slot::EXTRACTION_SLOT_LOCK.lock().await;
         let sender = "6280000001111";
         // Four documents already sent: one slot left.
         for _ in 0..4 {
@@ -2688,6 +2698,8 @@ mod media_tests {
     /// attempts.
     #[tokio::test]
     async fn a_document_with_no_announced_size_costs_no_budget_slot() {
+        // The shared resource: the process-global extraction slot.
+        let _slot = crate::test_slot::EXTRACTION_SLOT_LOCK.lock().await;
         let sender = "6280000001212";
         // Four documents already sent: one slot left.
         for _ in 0..4 {
@@ -2743,6 +2755,8 @@ mod media_tests {
     /// announced size costs nothing to check.
     #[tokio::test]
     async fn a_document_announced_over_the_cap_is_refused_without_a_download() {
+        // The shared resource: the process-global extraction slot.
+        let _slot = crate::test_slot::EXTRACTION_SLOT_LOCK.lock().await;
         let mut downloaded = false;
         let outcome = WhatsAppWebChannel::resolve_document_with(
             async {
@@ -2767,6 +2781,8 @@ mod media_tests {
     /// of unknown size is the one case the cap cannot apply to.
     #[tokio::test]
     async fn a_document_with_no_announced_size_is_refused_without_a_download() {
+        // The shared resource: the process-global extraction slot.
+        let _slot = crate::test_slot::EXTRACTION_SLOT_LOCK.lock().await;
         let mut downloaded = false;
         let outcome = WhatsAppWebChannel::resolve_document_with(
             async {
@@ -2794,6 +2810,8 @@ mod media_tests {
     /// a generic failure.
     #[tokio::test]
     async fn the_reason_a_failed_download_gives_is_the_reason_the_sender_sees() {
+        // The shared resource: the process-global extraction slot.
+        let _slot = crate::test_slot::EXTRACTION_SLOT_LOCK.lock().await;
         let outcome = WhatsAppWebChannel::resolve_document_with(
             async { Err("the document is too large (limit 10 MiB)".to_string()) },
             Some("text/plain"),
@@ -4202,6 +4220,8 @@ mod tests {
         use crate::security::pairing_store;
 
         let _guard = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
 

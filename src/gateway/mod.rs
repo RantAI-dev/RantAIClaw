@@ -7776,7 +7776,7 @@ mod tests {
     // Handler-level authentication — the boundary itself, not the
     // signature function.
     //
-    // `tests/whatsapp_webhook_security.rs` asserted the signature helper eight
+    // `tests/it/whatsapp_webhook_security.rs` asserted the signature helper eight
     // ways and never invoked a handler: deleting the fail-closed 401 and the
     // signature check left every one of those tests passing while the endpoint
     // became unauthenticated. These call the handlers.

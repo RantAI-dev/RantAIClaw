@@ -155,7 +155,7 @@ impl DoctorCheck for ProviderKeyCheck {
             // Warn, not Fail: a missing key is a setup GAP, not a breakage — a
             // fresh headless `setup --non-interactive` legitimately leaves it
             // unset, and `doctor --brief` must still exit 0 there (the
-            // `setup && doctor` smoke contract, `tests/setup_e2e.rs`). Warn
+            // `setup && doctor` smoke contract, `tests/it/setup_e2e.rs`). Warn
             // still surfaces it as `⚠` with an actionable hint, which is the
             // whole point — doctor no longer claims a keyless config is `✓`.
             (false, _) => CheckResult::warn(

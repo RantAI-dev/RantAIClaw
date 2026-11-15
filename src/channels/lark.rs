@@ -2564,12 +2564,16 @@ mod tests {
     #[tokio::test]
     async fn the_webhook_listener_stops_when_the_token_is_cancelled() {
         // Hold `ENV_LOCK` across the spawned listen task too: `listen_http`
-        // calls `Config::load_or_init()` (which reads `RANTAICLAW_CONFIG_DIR`)
-        // without it, so without this lock a sibling test that sets the var
-        // can race in and have this listener write a lark-less default into
-        // that test's config file. Pin the var at a fresh tempdir for the
-        // same reason, so we never fresh-init the runner's real `$HOME`.
+        // calls `Config::load_or_init()` (which reads `RANTAICLAW_CONFIG_DIR`
+        // and empties the process-global proxy client cache) without it, so
+        // without this lock a sibling test that sets the var can race in and
+        // have this listener write a lark-less default into that test's
+        // config file, and a sibling test that reads the proxy cache can see
+        // its entry taken away. Pin the var at a fresh tempdir for the same
+        // reason, so we never fresh-init the runner's real `$HOME`.
         let _guard = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let _config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", dir.path());
         let _workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
@@ -3456,6 +3460,8 @@ mod tests {
         use crate::security::pairing_store;
 
         let _guard = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();

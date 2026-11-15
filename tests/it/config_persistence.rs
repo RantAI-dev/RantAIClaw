@@ -288,6 +288,8 @@ async fn knowledge_keys_encrypt_at_rest_and_decrypt_on_load() {
 
 #[test]
 fn kb_env_vars_override_config_knowledge_at_load() {
+    // The shared resource: the process environment.
+    let _env = crate::common::ENV_LOCK.blocking_lock();
     let mut cfg = rantaiclaw::config::Config::default();
     cfg.knowledge.embedding_api_key = Some("from-file".into());
     std::env::set_var("KB_EMBEDDING_API_KEY", "from-env");

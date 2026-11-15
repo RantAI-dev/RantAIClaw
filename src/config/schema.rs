@@ -9126,10 +9126,21 @@ level = "full"
 
     // ── Environment variable overrides (Docker support) ─────────
 
-    async fn env_override_lock() -> MutexGuard<'static, ()> {
+    /// The locks a config test that reads the environment holds: the
+    /// crate-wide environment lock first, then the proxy-state lock.
+    ///
+    /// The proxy lock comes **second**, and both locks are taken in the same
+    /// order everywhere in the crate, because `apply_env_overrides` ends in
+    /// `set_runtime_proxy_config`, which **empties** the process-global proxy
+    /// client cache. A test that asserts on that cache must not run beside a
+    /// test that reloads a config. See `crate::test_proxy`.
+    async fn env_override_lock() -> (MutexGuard<'static, ()>, MutexGuard<'static, ()>) {
         // Shared with every other config-resolution-env test in the crate;
         // per-module locks don't serialize across modules. See `crate::test_env`.
-        crate::test_env::ENV_LOCK.lock().await
+        let env = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
+        (env, proxy_state)
     }
 
     /// Unset every proxy variable a test must not inherit from the developer's
@@ -10501,7 +10512,7 @@ level = "full"
 
     /// Recursive copy helper for the cross-root tests. The snapshot-restore
     /// variant of the cross-root case lives in
-    /// `tests/cross_root_marker.rs`; it needs `lifecycle::update_snapshot`,
+    /// `tests/it/cross_root_marker.rs`; it needs `lifecycle::update_snapshot`,
     /// which this lib-internal test module cannot reach from both
     /// `cargo test --lib` and the bin's test build.
     async fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -11557,6 +11568,8 @@ default_model = "legacy-model"
 
     #[test]
     async fn runtime_proxy_client_cache_reuses_default_profile_key() {
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let service_key = format!(
             "provider.cache_test.{}",
             std::time::SystemTime::now()
@@ -11582,6 +11595,8 @@ default_model = "legacy-model"
 
     #[test]
     async fn set_runtime_proxy_config_clears_runtime_proxy_client_cache() {
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let service_key = format!(
             "provider.cache_timeout_test.{}",
             std::time::SystemTime::now()
@@ -11608,6 +11623,8 @@ default_model = "legacy-model"
     /// has the timeout pair).
     #[test]
     async fn runtime_proxy_default_builder_carries_bounded_timeouts() {
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let service_key = format!(
             "provider.default_timeout_test.{}",
             std::time::SystemTime::now()
@@ -11644,6 +11661,8 @@ default_model = "legacy-model"
     /// a regression for the default builder too.
     #[tokio::test]
     async fn runtime_proxy_bounded_client_fails_within_the_bound() {
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         // Bind a listener that accepts the TCP connection but never writes
         // a response, so the request hangs on the read. The thread detaches
         // so the test does not block on its own teardown — the OS reclaims
@@ -11685,6 +11704,8 @@ default_model = "legacy-model"
 
     #[test]
     async fn build_runtime_proxy_client_no_redirect_is_cached() {
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let service_key = format!(
             "provider.cache_no_redirect_test.{}",
             std::time::SystemTime::now()

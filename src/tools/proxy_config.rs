@@ -605,6 +605,8 @@ mod tests {
 
     #[tokio::test]
     async fn list_services_action_returns_known_keys() {
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
         let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
 
@@ -619,6 +621,8 @@ mod tests {
 
     #[tokio::test]
     async fn set_scope_services_requires_services_entries() {
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
         let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
 
@@ -643,6 +647,8 @@ mod tests {
     #[tokio::test]
     async fn set_and_get_round_trip_proxy_scope() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
         let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
         let (_listener, url) = listening_proxy_url().await;
@@ -662,6 +668,11 @@ mod tests {
         assert!(get_result.success);
         assert!(get_result.output.contains("provider.openai"));
         assert!(get_result.output.contains("services"));
+
+        // The global proxy config is process-wide: leave it as it was
+        // found, so a test that runs later does not inherit this
+        // test's proxy.
+        set_runtime_proxy_config(ProxyConfig::default());
     }
 
     const PROXY_ENV_KEYS: [&str; 8] = [
@@ -706,6 +717,8 @@ mod tests {
     #[tokio::test]
     async fn set_to_listening_proxy_saves_and_applies() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let tool = ProxyConfigTool::new(config.clone(), test_security());
@@ -734,6 +747,8 @@ mod tests {
     #[tokio::test]
     async fn set_to_closed_port_is_refused_and_changes_nothing() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let env_before = proxy_env_snapshot();
         let _proxy_env = proxy_env_restore_guards();
         let tmp = TempDir::new().unwrap();
@@ -768,7 +783,10 @@ mod tests {
 
     #[tokio::test]
     async fn apply_env_refuses_saved_unreachable_proxy_and_leaves_env_alone() {
+        // The shared resource: the process environment.
         let _env = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let env_before = proxy_env_snapshot();
         let _proxy_env = proxy_env_restore_guards();
         let tmp = TempDir::new().unwrap();
@@ -797,6 +815,8 @@ mod tests {
     #[tokio::test]
     async fn set_disabled_proxy_skips_reachability_check() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let tool = ProxyConfigTool::new(config.clone(), test_security());
@@ -819,7 +839,10 @@ mod tests {
 
     #[tokio::test]
     async fn refusal_redacts_proxy_userinfo() {
+        // The shared resource: the process environment.
         let _env = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
         let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
 
@@ -867,6 +890,8 @@ mod tests {
     #[tokio::test]
     async fn set_null_proxy_url_clears_existing_value() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
         let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
         let (_listener, url) = listening_proxy_url().await;
@@ -894,5 +919,10 @@ mod tests {
         let parsed: Value = serde_json::from_str(&get_result.output).unwrap();
         assert!(parsed["proxy"]["http_proxy"].is_null());
         assert!(parsed["runtime_proxy"]["http_proxy"].is_null());
+
+        // The global proxy config is process-wide: leave it as it was
+        // found, so a test that runs later does not inherit this
+        // test's proxy.
+        set_runtime_proxy_config(ProxyConfig::default());
     }
 }
