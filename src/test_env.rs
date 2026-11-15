@@ -449,7 +449,13 @@ fn relative_to(root: &Path, path: &Path) -> String {
 
 /// The 1-based line of a byte offset in a masked source.
 fn line_of(code: &[u8], offset: usize) -> usize {
-    code[..offset].iter().filter(|byte| **byte == b'\n').count() + 1
+    let mut line = 1;
+    for byte in &code[..offset] {
+        if *byte == b'\n' {
+            line += 1;
+        }
+    }
+    line
 }
 
 /// The byte offsets of every `env::set_var` / `env::remove_var` call in a
@@ -834,7 +840,7 @@ fn mask_comments_and_literals(src: &[u8]) -> Vec<u8> {
         } else if let Some(hashes) = raw_string_hashes(src, index) {
             let start = (index + hashes + 2).min(src.len());
             let mut closing = vec![b'"'];
-            closing.extend(std::iter::repeat(b'#').take(hashes));
+            closing.extend(std::iter::repeat_n(b'#', hashes));
             let end = src[start..]
                 .windows(closing.len())
                 .position(|window| window == closing.as_slice())
@@ -887,10 +893,10 @@ fn character_literal_end(src: &[u8], index: usize) -> Option<usize> {
 /// How many bytes the UTF-8 character starting with `first` takes.
 fn utf8_char_len(first: u8) -> usize {
     match first {
-        0x00..=0x7F => 1,
         0xC0..=0xDF => 2,
         0xE0..=0xEF => 3,
         0xF0..=0xF7 => 4,
+        // ASCII, and any byte that starts no multi-byte sequence.
         _ => 1,
     }
 }
