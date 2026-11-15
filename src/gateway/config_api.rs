@@ -3083,7 +3083,7 @@ struct WhatsAppWebConnectBody {
 /// before yielding the SSE and clears it when the stream drops. A second
 /// concurrent `POST /pair` returns 409.
 ///
-/// `pub` because `tests/kb/api_test.rs` builds an `AppState` literal and
+/// `pub` because `tests/it/kb/api_test.rs` builds an `AppState` literal and
 /// has to name the field's type; a `pub(crate)` alias is unreachable from
 /// an integration test. The alias only reveals an `Arc<AtomicBool>`, the
 /// same primitive the `pair` handler exchanges through it.
@@ -3737,6 +3737,8 @@ mod tests {
     #[tokio::test]
     async fn a_console_write_reads_the_file_the_gateway_booted_with() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let tmp = tempfile::tempdir().expect("temp root");
 
         // The file the gateway is running.
@@ -3782,6 +3784,8 @@ mod tests {
     #[tokio::test]
     async fn the_running_config_keeps_env_supplied_values() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let tmp = tempfile::tempdir().expect("temp root");
         let config_path = tmp.path().join("config.toml");
         std::fs::write(&config_path, "default_model = \"m\"\n").expect("write config");
@@ -5478,6 +5482,8 @@ mod tests {
     #[tokio::test]
     async fn mcp_env_that_only_tunes_the_launcher_is_accepted() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let tmp = tempfile::tempdir().expect("temp root");
         let _home = crate::test_env::HomeGuard::set(tmp.path());
         let mut config = Config::default();
@@ -7925,6 +7931,8 @@ mod tests {
     #[tokio::test]
     async fn a_config_read_replayed_into_every_write_route_keeps_every_stored_secret() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let tmp = tempfile::tempdir().expect("temp root");
         let _home = crate::test_env::HomeGuard::set(tmp.path());
 

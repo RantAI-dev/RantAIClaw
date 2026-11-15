@@ -25,7 +25,7 @@
 //! to a JSON string representation — the caller is responsible for picking
 //! flat fields. Keeps the AXI surface predictable.
 //!
-//! See `tests/kb/cli_test.rs` for the behavior matrix.
+//! See `tests/it/kb/cli_test.rs` for the behavior matrix.
 //!
 //! Defensive note: TOON consumers typically parse line-by-line. Embedding a
 //! literal newline inside a cell would corrupt downstream tooling, so the

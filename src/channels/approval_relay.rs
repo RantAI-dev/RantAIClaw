@@ -1048,10 +1048,10 @@ mod tests {
     /// Wait until `pending` has registered at least `n` requests.
     ///
     /// Replaces `sleep(20ms)` after spawning the producer. A fixed sleep is a
-    /// race: it passes because 20 ms is usually enough on an unloaded runner,
-    /// and the suite survives only because CI forces `--test-threads=1`. This
-    /// polls the registry the test actually depends on, so it is correct at any
-    /// scheduling speed and fails loudly instead of flakily.
+    /// race: it passes only while the machine is unloaded, and offers no
+    /// guarantee once the runner is busy. This polls the registry the test
+    /// actually depends on, so it is correct at any scheduling speed and fails
+    /// loudly instead of flakily.
     async fn await_pending(pending: &Arc<PendingApprovals>, n: usize) {
         for _ in 0..500 {
             if pending.list().len() >= n {

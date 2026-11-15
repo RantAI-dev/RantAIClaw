@@ -96,10 +96,12 @@ mod tests {
 
     #[test]
     fn transitions() {
-        // Note: the global cell is process-wide, so this test runs in
-        // isolation only when there's no concurrent test invoking the
-        // module. Acceptable for a smoke check; full ordering coverage
-        // would need an injected state holder.
+        // The shared resource: the process-global auto-start state.
+        let _auto_start = crate::test_autostart::AUTO_START_STATE_LOCK.blocking_lock();
+        // The global cell is process-wide, so this test holds the dedicated
+        // `AUTO_START_STATE_LOCK` above to keep a concurrent test from
+        // touching it. Full ordering coverage would need an injected state
+        // holder.
         mark_starting();
         assert!(matches!(snapshot(), AutoStartState::Starting { .. }));
 

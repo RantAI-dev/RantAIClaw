@@ -593,6 +593,8 @@ mod tests {
 
     #[test]
     fn doctor_model_row_reflects_provider_key_state() {
+        // The shared resource: the process-global auto-start state.
+        let _auto_start = crate::test_autostart::AUTO_START_STATE_LOCK.blocking_lock();
         // Key present or provider local → Ok; a genuinely missing key → Warn
         // (a setup gap, not a hard fail); no provider to judge → Ok.
         assert_eq!(doctor_model_status(Some(true)), StatusKind::Ok);
@@ -722,6 +724,8 @@ mod tests {
     /// would vanish from the panel.
     #[test]
     fn the_channels_panel_lists_an_unconfigured_webhook_outside_the_locked_bucket() {
+        // The shared resource: the process-global auto-start state.
+        let _auto_start = crate::test_autostart::AUTO_START_STATE_LOCK.blocking_lock();
         let mut ctx = test_context();
         ctx.channels_summary =
             crate::channels::channel_status_roster(&crate::config::Config::default())

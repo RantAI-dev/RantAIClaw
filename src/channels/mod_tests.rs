@@ -3126,6 +3126,10 @@ async fn process_channel_message_uses_runtime_default_model_from_store() {
 
 #[tokio::test]
 async fn maybe_apply_runtime_config_update_hot_reloads_owners_guest_gate_and_allowed_commands() {
+    // The shared resource: the process environment.
+    let _env_guard = crate::test_env::ENV_LOCK.lock().await;
+    // The shared resource: the process-global proxy client cache.
+    let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
     // Owners / guest-gate / autonomy allowed-commands must hot-reload from
     // disk when the config-file stamp changes — no `channels run` restart.
     let temp = tempfile::TempDir::new().expect("temp dir");
@@ -3299,6 +3303,10 @@ fn allowlist_test_ctx(
 /// new list must reach the channel with no restart at all.
 #[tokio::test]
 async fn allowlist_edit_reaches_the_live_channel_without_restart() {
+    // The shared resource: the process environment.
+    let _env_guard = crate::test_env::ENV_LOCK.lock().await;
+    // The shared resource: the process-global proxy client cache.
+    let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
     let temp = tempfile::TempDir::new().expect("temp dir");
     let config_path = temp.path().join("config.toml");
 
@@ -3357,6 +3365,10 @@ async fn allowlist_edit_reaches_the_live_channel_without_restart() {
 /// `allowlist_edit_reaches_the_live_channel_without_restart` already covers.
 #[tokio::test]
 async fn a_re_added_sender_reaches_the_live_channel_from_the_file_watch_alone() {
+    // The shared resource: the process environment.
+    let _env_guard = crate::test_env::ENV_LOCK.lock().await;
+    // The shared resource: the process-global proxy client cache.
+    let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
     let temp = tempfile::TempDir::new().expect("temp dir");
     let config_path = temp.path().join("config.toml");
 
@@ -3429,6 +3441,10 @@ async fn a_re_added_sender_reaches_the_live_channel_from_the_file_watch_alone() 
 /// `allowlist_edit_reaches_the_live_channel_without_restart` already covers.
 #[tokio::test]
 async fn a_revoked_sender_is_dropped_by_dispatch_after_the_refresh() {
+    // The shared resource: the process environment.
+    let _env_guard = crate::test_env::ENV_LOCK.lock().await;
+    // The shared resource: the process-global proxy client cache.
+    let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
     let temp = tempfile::TempDir::new().expect("temp dir");
     let config_path = temp.path().join("config.toml");
 
@@ -3493,6 +3509,10 @@ async fn a_revoked_sender_is_dropped_by_dispatch_after_the_refresh() {
 /// API key, which is the same shape as the autonomy bug fixed earlier.
 #[tokio::test]
 async fn allowlist_applies_even_when_the_provider_fails_to_build() {
+    // The shared resource: the process environment.
+    let _env_guard = crate::test_env::ENV_LOCK.lock().await;
+    // The shared resource: the process-global proxy client cache.
+    let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
     let temp = tempfile::TempDir::new().expect("temp dir");
     let config_path = temp.path().join("config.toml");
 
@@ -3574,6 +3594,10 @@ fn write_broken_provider_config(
 /// — and the stamp advanced, so nothing retried it.
 #[tokio::test]
 async fn owner_removal_applies_even_when_the_provider_fails_to_build() {
+    // The shared resource: the process environment.
+    let _env_guard = crate::test_env::ENV_LOCK.lock().await;
+    // The shared resource: the process-global proxy client cache.
+    let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
     let temp = tempfile::TempDir::new().expect("temp dir");
     let config_path = temp.path().join("config.toml");
     let channel = Arc::new(TelegramRecordingChannel::default());
@@ -3622,6 +3646,10 @@ async fn owner_removal_applies_even_when_the_provider_fails_to_build() {
 /// staying wider than the operator asked for.
 #[tokio::test]
 async fn guest_gate_applies_when_the_provider_fails_to_build() {
+    // The shared resource: the process environment.
+    let _env_guard = crate::test_env::ENV_LOCK.lock().await;
+    // The shared resource: the process-global proxy client cache.
+    let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
     let temp = tempfile::TempDir::new().expect("temp dir");
     let config_path = temp.path().join("config.toml");
     let channel = Arc::new(TelegramRecordingChannel::default());
@@ -3667,6 +3695,10 @@ async fn guest_gate_applies_when_the_provider_fails_to_build() {
 /// include-list shape it did not — and neither would any field added later.
 #[tokio::test]
 async fn a_non_excluded_defaults_field_is_applied_when_the_provider_fails() {
+    // The shared resource: the process environment.
+    let _env_guard = crate::test_env::ENV_LOCK.lock().await;
+    // The shared resource: the process-global proxy client cache.
+    let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
     let temp = tempfile::TempDir::new().expect("temp dir");
     let config_path = temp.path().join("config.toml");
     let channel = Arc::new(TelegramRecordingChannel::default());
@@ -3700,6 +3732,10 @@ async fn a_non_excluded_defaults_field_is_applied_when_the_provider_fails() {
 /// "Applied updated channel runtime config from disk" and got nothing.
 #[tokio::test]
 async fn autonomous_tools_change_is_applied_on_reload() {
+    // The shared resource: the process environment.
+    let _env_guard = crate::test_env::ENV_LOCK.lock().await;
+    // The shared resource: the process-global proxy client cache.
+    let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
     let temp = tempfile::TempDir::new().expect("temp dir");
     let config_path = temp.path().join("config.toml");
     let channel = Arc::new(TelegramRecordingChannel::default());
@@ -3732,6 +3768,10 @@ async fn autonomous_tools_change_is_applied_on_reload() {
 /// temp-file-and-rename write makes a briefly-absent config real.
 #[tokio::test]
 async fn unreadable_config_warns_once_and_does_not_advance_the_stamp() {
+    // The shared resource: the process environment.
+    let _env_guard = crate::test_env::ENV_LOCK.lock().await;
+    // The shared resource: the process-global proxy client cache.
+    let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
     let temp = tempfile::TempDir::new().expect("temp dir");
     let config_path = temp.path().join("config.toml");
     let channel = Arc::new(TelegramRecordingChannel::default());
@@ -4027,6 +4067,10 @@ async fn the_startup_channel_prompt_names_no_preset_the_gate_does_not_enforce() 
 /// its own.
 #[tokio::test]
 async fn two_runtimes_do_not_share_applied_config_state() {
+    // The shared resource: the process environment.
+    let _env_guard = crate::test_env::ENV_LOCK.lock().await;
+    // The shared resource: the process-global proxy client cache.
+    let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
     let temp_a = tempfile::TempDir::new().expect("temp dir");
     let temp_b = tempfile::TempDir::new().expect("temp dir");
     let ctx_a = allowlist_test_ctx(temp_a.path(), Arc::new(TelegramRecordingChannel::default()));
@@ -4061,6 +4105,10 @@ async fn two_runtimes_do_not_share_applied_config_state() {
 /// on a config reload, without a restart.
 #[tokio::test]
 async fn maybe_apply_runtime_config_update_rereads_the_preset_marker_when_provider_build_fails() {
+    // The shared resource: the process environment.
+    let _env_guard = crate::test_env::ENV_LOCK.lock().await;
+    // The shared resource: the process-global proxy client cache.
+    let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
     use crate::approval::policy_writer::PolicyPreset;
 
     let temp = tempfile::TempDir::new().expect("temp dir");
@@ -4291,6 +4339,10 @@ async fn maybe_apply_runtime_config_update_rereads_the_preset_marker_when_provid
 
 #[tokio::test]
 async fn maybe_apply_runtime_config_update_clears_pinned_sender_on_provider_switch() {
+    // The shared resource: the process environment.
+    let _env_guard = crate::test_env::ENV_LOCK.lock().await;
+    // The shared resource: the process-global proxy client cache.
+    let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
     // A per-sender override (set via /model in-channel) pins that sender to a
     // provider. A Web-UI provider switch rewrites config.toml; the reload must
     // CLEAR the override so the pinned sender follows the new default —
@@ -4394,6 +4446,10 @@ async fn maybe_apply_runtime_config_update_clears_pinned_sender_on_provider_swit
 
 #[tokio::test]
 async fn maybe_apply_runtime_config_update_keeps_provider_and_records_reason_on_build_failure() {
+    // The shared resource: the process environment.
+    let _env_guard = crate::test_env::ENV_LOCK.lock().await;
+    // The shared resource: the process-global proxy client cache.
+    let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
     // Switching to a provider that can't be built (unknown / no usable key)
     // must NOT swap the channel onto a broken provider: keep the working one,
     // advance the stamp (no per-message retry loop), and record the reason.
@@ -13294,7 +13350,7 @@ fn roster_note_distinguishes_all_three_states() {
 /// line. The absence is what made it survive two waves of reading.
 ///
 /// The fixture is a POSIX-shell MCP server, the same shape
-/// `tests/mcp_client_transport.rs` uses: a real child process speaking real
+/// `tests/it/mcp_client_transport.rs` uses: a real child process speaking real
 /// stdio JSON-RPC, so this asserts the wiring rather than a mock of it.
 #[tokio::test]
 async fn a_configured_mcp_server_reaches_the_channel_tool_registry() {
@@ -15655,6 +15711,8 @@ async fn a_channel_reload_that_adds_a_route_makes_the_next_turn_use_it() {
     // so the tests that read it run one at a time.
     let _recording = crate::providers::tests::RECORDING_LOCK.lock().await;
     let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
+    // The shared resource: the process-global proxy client cache.
+    let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
     // The environment may name a provider or a model of its own, and the
     // reload reads the environment over the file — so the file must be what
     // this test is about.

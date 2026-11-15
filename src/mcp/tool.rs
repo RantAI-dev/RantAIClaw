@@ -147,7 +147,7 @@ mod tests {
         );
     }
 
-    /// Fake stdio server (POSIX sh, as in `tests/mcp_client_transport.rs`):
+    /// Fake stdio server (POSIX sh, as in `tests/it/mcp_client_transport.rs`):
     /// answers `initialize`/`tools/list` like a normal server, and every
     /// `tools/call` with one text block of `$TEXT_BYTES` bytes of `a`.
     fn text_server(text_bytes: usize) -> String {

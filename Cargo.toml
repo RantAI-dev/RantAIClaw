@@ -215,7 +215,7 @@ sqlite-vec = { version = "0.1", optional = true }
 # - test fixtures generate small PDFs deterministically
 # Gated behind `kb`: lopdf pulls libz (`zlib-sys`) so keeping it optional
 # saves binary size on non-KB builds. The only consumers
-# (`src/kb/extract/pdf_splitter.rs`, `tests/kb/extract_test.rs`) are
+# (`src/kb/extract/pdf_splitter.rs`, `tests/it/kb/extract_test.rs`) are
 # already `#[cfg(feature = "kb")]`-gated.
 lopdf = { version = "0.42", optional = true }
 

@@ -132,6 +132,10 @@ mod tests {
 
     #[test]
     fn unknown_action_is_friendly() {
+        // The shared resource: the process environment.
+        let _env_guard = crate::test_env::ENV_LOCK.blocking_lock();
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.blocking_lock();
         let mut ctx = test_context();
         match PermissionsCommand
             .execute("frobnicate owner x", &mut ctx)
@@ -144,6 +148,10 @@ mod tests {
 
     #[test]
     fn unknown_target_is_friendly() {
+        // The shared resource: the process environment.
+        let _env_guard = crate::test_env::ENV_LOCK.blocking_lock();
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.blocking_lock();
         let mut ctx = test_context();
         match PermissionsCommand
             .execute("add wizard x", &mut ctx)
@@ -156,6 +164,10 @@ mod tests {
 
     #[test]
     fn add_without_value_is_friendly() {
+        // The shared resource: the process environment.
+        let _env_guard = crate::test_env::ENV_LOCK.blocking_lock();
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.blocking_lock();
         let mut ctx = test_context();
         match PermissionsCommand.execute("add owner", &mut ctx).unwrap() {
             CommandResult::Message(m) => assert!(m.contains("Missing value")),

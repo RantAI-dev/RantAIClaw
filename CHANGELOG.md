@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **CI runs the test suite in parallel.** The Test job ran `cargo test --locked --workspace --
+  --test-threads=1`, a flag that serialized the whole suite because tests clobbered each other's
+  environment. The environment writers now hold one crate lock (`src/test_env.rs`), and the tests
+  that share process state take a lock in the test code: the ones that reach the process-global
+  extraction slot (`kb::extract::inbound`) take a dedicated test-only lock (`src/test_slot.rs`), and
+  the ones that read or write the process-global proxy state take one of their own
+  (`src/test_proxy.rs`); the ones that read or write the process-global auto-start state take a
+  third (`src/test_autostart.rs`). The Test job runs `cargo test --locked --workspace` now. A test
+  that needs the process to itself takes a lock in the test code, never a CI flag.
+
 - **The integration tests build as one binary.** The 44 files under `tests/` were 44 separate
   test binaries, and each one linked the whole `rantaiclaw` library plus its dependency tree
   again. They are now modules of a single binary, `tests/it/main.rs`, declared explicitly in

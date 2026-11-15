@@ -10450,6 +10450,12 @@ mod tests {
     /// configured channels. No channel was chosen.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_wizard_does_not_claim_channels_when_it_saved_only_a_policy() {
+        // The shared resource: the process environment.
+        let _env_guard = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
+        // The shared resource: the process-global auto-start state.
+        let _auto_start = crate::test_autostart::AUTO_START_STATE_LOCK.lock().await;
         let dir = tempfile::tempdir().expect("tempdir");
         let (ctx, _req_rx, _events_tx) = crate::tui::context::TuiContext::test_context();
         let mut app = app_with_wizard_at_end(ctx, dir.path());
@@ -10476,6 +10482,12 @@ mod tests {
     /// still says so.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_wizard_claims_channels_when_it_saved_one() {
+        // The shared resource: the process environment.
+        let _env_guard = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
+        // The shared resource: the process-global auto-start state.
+        let _auto_start = crate::test_autostart::AUTO_START_STATE_LOCK.lock().await;
         let dir = tempfile::tempdir().expect("tempdir");
         let (ctx, _req_rx, _events_tx) = crate::tui::context::TuiContext::test_context();
         let mut app = app_with_wizard_at_end(ctx, dir.path());
@@ -10517,6 +10529,12 @@ mod tests {
     /// test reaches no network.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_policy_only_change_still_restarts_the_listeners() {
+        // The shared resource: the process environment.
+        let _env_guard = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
+        // The shared resource: the process-global auto-start state.
+        let _auto_start = crate::test_autostart::AUTO_START_STATE_LOCK.lock().await;
         let dir = tempfile::tempdir().expect("tempdir");
         let (ctx, _req_rx, _events_tx) = crate::tui::context::TuiContext::test_context();
         let mut app = super::test_support::app_with_profile_root(ctx, dir.path().to_path_buf());
@@ -10543,6 +10561,12 @@ mod tests {
     /// channel settings it never saved.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_policy_only_save_does_not_claim_channel_settings() {
+        // The shared resource: the process environment.
+        let _env_guard = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
+        // The shared resource: the process-global auto-start state.
+        let _auto_start = crate::test_autostart::AUTO_START_STATE_LOCK.lock().await;
         let dir = tempfile::tempdir().expect("tempdir");
         let (ctx, _req_rx, _events_tx) = crate::tui::context::TuiContext::test_context();
         let mut app = super::test_support::app_with_profile_root(ctx, dir.path().to_path_buf());
@@ -10570,6 +10594,12 @@ mod tests {
     /// run that never touched the policy.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_save_that_changed_nothing_prints_no_line() {
+        // The shared resource: the process environment.
+        let _env_guard = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
+        // The shared resource: the process-global auto-start state.
+        let _auto_start = crate::test_autostart::AUTO_START_STATE_LOCK.lock().await;
         let dir = tempfile::tempdir().expect("tempdir");
         let (ctx, _req_rx, _events_tx) = crate::tui::context::TuiContext::test_context();
         let mut app = super::test_support::app_with_profile_root(ctx, dir.path().to_path_buf());
@@ -11278,6 +11308,10 @@ mod tests {
     /// adopts it, so label, agent and file agree once everything settles.
     #[tokio::test]
     async fn a_hand_edit_during_a_switch_keeps_the_switch_and_its_model() {
+        // The shared resource: the process environment.
+        let _env_guard = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let tmp = tempfile::TempDir::new().expect("tmp");
         let root = tmp.path().to_path_buf();
         let path = root.join("config.toml");
@@ -11505,6 +11539,10 @@ mod tests {
     /// otherwise "no second reload" would only mean the watcher was dead.
     #[tokio::test]
     async fn the_models_own_save_does_not_start_a_second_rebuild() {
+        // The shared resource: the process environment.
+        let _env_guard = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let tmp = tempfile::TempDir::new().expect("tmp");
         let root = tmp.path().to_path_buf();
         let path = root.join("config.toml");
@@ -11717,6 +11755,10 @@ mod tests {
     /// pending slot clears.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_switch_landing_through_a_later_reloads_outcome_adopts_the_switch() {
+        // The shared resource: the process environment.
+        let _env_guard = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let tmp = tempfile::TempDir::new().expect("tmp");
         let root = tmp.path().to_path_buf();
         let path = root.join("config.toml");
@@ -11929,6 +11971,10 @@ mod tests {
     /// the previously stuck switch no longer wedges the session.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn after_a_verdict_a_later_config_reload_takes_its_own_slot_and_moves_the_label() {
+        // The shared resource: the process environment.
+        let _env_guard = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let tmp = tempfile::TempDir::new().expect("tmp");
         let root = tmp.path().to_path_buf();
         let path = root.join("config.toml");
@@ -15438,6 +15484,10 @@ mod autonomy_live_level_tests {
     /// deferred rebuild.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_tui_watcher_path_applies_the_new_level_to_the_running_policy() {
+        // The shared resource: the process environment.
+        let _env_guard = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut ctx, _req_rx, _events_tx) = crate::tui::context::TuiContext::test_context();
         let policy = Arc::new(crate::security::SecurityPolicy::from_config(
@@ -15475,6 +15525,10 @@ mod autonomy_live_level_tests {
     /// still answers it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_tui_watcher_path_applies_a_tightening_and_leaves_an_open_prompt() {
+        // The shared resource: the process environment.
+        let _env_guard = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut ctx, _req_rx, _events_tx) = crate::tui::context::TuiContext::test_context();
         let policy = Arc::new(crate::security::SecurityPolicy::from_config(
@@ -15652,7 +15706,12 @@ mod autonomy_live_level_tests {
     /// fingerprint starts empty, so the very first tick always looks new.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_tui_reload_reads_the_config_file_the_watcher_watches() {
+        // The shared resource: the process environment.
         let _env = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
+        // The shared resource: the process-global auto-start state.
+        let _auto_start = crate::test_autostart::AUTO_START_STATE_LOCK.lock().await;
         let flat = tempfile::tempdir().expect("flat config dir");
         let _config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", flat.path());
         // The profile lives somewhere else entirely — the split state the

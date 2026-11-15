@@ -2814,6 +2814,8 @@ mod tests {
         use crate::security::pairing_store;
 
         let _guard = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
 
@@ -2877,6 +2879,8 @@ mod tests {
     #[tokio::test]
     async fn legacy_owner_persist_targets_the_active_config_dir() {
         let _guard = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
         let _config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", root);
@@ -3785,6 +3789,8 @@ mod tests {
         body: serde_json::Value,
         cancel_after: Option<std::time::Duration>,
     ) -> anyhow::Result<()> {
+        // The shared resource: the process-global extraction slot.
+        let _slot = crate::test_slot::EXTRACTION_SLOT_LOCK.lock().await;
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
@@ -4999,6 +5005,8 @@ mod tests {
     /// fetched, the bytes are checked, and the model gets a delimited block.
     #[tokio::test]
     async fn a_downloaded_document_becomes_a_delimited_block() {
+        // The shared resource: the process-global extraction slot.
+        let _slot = crate::test_slot::EXTRACTION_SLOT_LOCK.lock().await;
         let (base, captured) =
             spawn_document_bot_api("documents/notes.txt", b"hello from a document".to_vec()).await;
         let ch =
@@ -5033,6 +5041,8 @@ mod tests {
     /// trip the sender would otherwise have made for free.
     #[tokio::test]
     async fn an_exhausted_document_budget_costs_no_request() {
+        // The shared resource: the process-global extraction slot.
+        let _slot = crate::test_slot::EXTRACTION_SLOT_LOCK.lock().await;
         let (base, captured) =
             spawn_document_bot_api("documents/notes.txt", b"hello".to_vec()).await;
         let ch =
@@ -5067,6 +5077,8 @@ mod tests {
     /// announced size costs nothing to check.
     #[tokio::test]
     async fn a_document_announced_over_the_cap_is_refused_without_a_request() {
+        // The shared resource: the process-global extraction slot.
+        let _slot = crate::test_slot::EXTRACTION_SLOT_LOCK.lock().await;
         let (base, captured) = spawn_document_bot_api("documents/big.txt", b"hello".to_vec()).await;
         let ch =
             TelegramChannel::new("123:ABC".into(), vec!["*".into()], false).with_api_base(base);
@@ -5097,6 +5109,8 @@ mod tests {
     /// refused, whatever it was announced as.
     #[tokio::test]
     async fn a_file_that_is_not_what_it_was_announced_as_is_refused() {
+        // The shared resource: the process-global extraction slot.
+        let _slot = crate::test_slot::EXTRACTION_SLOT_LOCK.lock().await;
         let (base, _captured) =
             spawn_document_bot_api("documents/report.pdf", b"just words".to_vec()).await;
         let ch =

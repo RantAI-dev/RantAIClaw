@@ -262,7 +262,10 @@ mod tests {
 
     #[tokio::test]
     async fn wildcard_owner_is_refused() {
+        // The shared resource: the process environment.
         let _g = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
         let _config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", tmp.path());
         let tool = tool_in(&tmp);
@@ -293,7 +296,10 @@ mod tests {
 
     #[tokio::test]
     async fn add_show_remove_roundtrip() {
+        // The shared resource: the process environment.
         let _g = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
         let _config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", tmp.path());
         let tool = tool_in(&tmp);
@@ -323,7 +329,10 @@ mod tests {
 
     #[tokio::test]
     async fn missing_value_is_rejected() {
+        // The shared resource: the process environment.
         let _g = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
         let _config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", tmp.path());
         let tool = tool_in(&tmp);
@@ -338,7 +347,10 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_to_remove_last_owner() {
+        // The shared resource: the process environment.
         let _g = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
         let _config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", tmp.path());
         let tool = tool_in(&tmp);
@@ -367,7 +379,10 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_action_is_rejected() {
+        // The shared resource: the process environment.
         let _g = crate::test_env::ENV_LOCK.lock().await;
+        // The shared resource: the process-global proxy client cache.
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
         let _config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", tmp.path());
         let tool = tool_in(&tmp);
