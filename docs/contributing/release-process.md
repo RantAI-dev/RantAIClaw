@@ -176,11 +176,12 @@ mean the image was pushed.
 
 The tag is cut from a commit, so the version has to be in `main` before you tag —
 `cut_release_tag.sh` will otherwise stamp a release whose `Cargo.toml` still
-claims the previous version. Open an ordinary PR touching exactly three files:
+claims the previous version. Open an ordinary PR touching exactly four files:
 
 - `Cargo.toml` — the new version
 - `Cargo.lock` — regenerate with `cargo check --offline` (`--locked` refuses, by design)
 - `CHANGELOG.md` — a new section for the version
+- `src/webui.rs`, the `CLAW_UI_RELEASE` pin: the claw-ui release that the console install fetches. Cut and publish that claw-ui release first, because the pin must name a tag that exists
 
 Choose the bump by what the release actually contains, not by how much work went
 into it: a new CLI surface or a changed API contract is minor; anything else is

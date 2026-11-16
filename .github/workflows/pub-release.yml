@@ -281,7 +281,7 @@ jobs:
                       cross_compiler: ""
                       linker_env: ""
                       linker: ""
-                    - os: macos-14
+                    - os: macos-15
                       target: aarch64-apple-darwin
                       artifact: rantaiclaw
                       archive_ext: tar.gz
