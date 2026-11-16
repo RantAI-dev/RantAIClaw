@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.35.0-alpha] — 2026-11-16
+
+The login-removal and approval release. Six subscription logins are gone and RantaiClaw uses API
+keys only, a TUI approval is answered only by a deliberate action, a channel `/approve` answers one
+call and `/allow` answers until the daemon restarts, and the console pin moves from `v0.3.31` to
+`v0.3.32`, which lists the `webhook` channel as served by the gateway.
+
+**Rolls back to v0.34.0-alpha without a manual fix.** The config schema stays at **40**, so a
+config this binary writes loads on v0.34.0-alpha. The sessions store moves from version **2** to
+**3** on the first start: the `sessions` table is rebuilt so that deleting a session that has forks
+clears the fork's `parent_session_id` (`ON DELETE SET NULL`) instead of failing. The column set is
+unchanged, and v0.34.0-alpha does not compare the stored version with its own, so it keeps reading
+and writing the file. Rolling back further, to v0.33.0-alpha or earlier, still needs the steps in
+the 0.34.0-alpha section. The first start of this build deletes the stored subscription login
+files, and a rollback does not restore them, so an operator who used one of those logins signs in
+again on v0.34.0-alpha.
+
 ### Changed
 
 - **CI runs the test suite in parallel.** The Test job ran `cargo test --locked --workspace --
@@ -75,8 +92,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   factory, the cron gate and the setup prompt all read `channel_is_usable`, which is untouched,
   so the webhook stays not usable and locked channels stay locked. The `channel` and `channel add`
   help texts now say "Channel types:" instead of "Supported channel types:", which claimed a
-  support commitment the catalog does not carry for most of the list. The claw-ui TypeScript
-  union for the support value is a follow-up in that repository.
+  support commitment the catalog does not carry for most of the list.
 
 - **The bundled SQLite moves from 3.50.2 to 3.53.2, and matrix-sdk moves from 0.18 to 0.19.1.** The
   `rusqlite` crate moves from 0.37 to 0.40.2, and `libsqlite3-sys` from 0.35 to 0.38.2. The
@@ -90,6 +106,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The waivers for RUSTSEC-2026-0194, RUSTSEC-2026-0195 and RUSTSEC-2026-0381 are removed too, but
   this move does not cause that: the lock already holds quick-xml 0.41.0 or later, and the advisory
   database lists webpki-roots 0.26.11 as unaffected.
+
+- **The SSH client library `russh` moves from 0.63 to 0.65.** It is the SSH transport of
+  the `remote-install` feature, which is in the default feature set.
+
+- **The IMAP client `async-imap`, used by the email channel, moves from 0.11 to 0.12.**
+
+- **Routine dependency group updates landed.** OpenTelemetry (3 updates), 13 Rust crate updates, 7
+  GitHub Actions updates, and the `distroless/cc-debian13` base image digest. None of them changes a
+  config key or a default.
 
 ### Removed
 
@@ -165,7 +190,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runs on every start and is idempotent, so only the first start after an upgrade has anything
   to remove: `auth-profiles.json`, `auth-profiles.lock` and `auth-openai-pending.json` in the
   active profile's config directory, and `access-token` and `api-key.json` in the `copilot`
-  subdirectory of the OS platform config directory. Each removed file gets one log line naming
+  subdirectory of the platform config directory (`$XDG_CONFIG_HOME/rantaiclaw/copilot/` on
+  Linux, `~/Library/Application Support/rantaiclaw/copilot/` on macOS, and
+  `%APPDATA%\rantaiclaw\copilot\` on Windows). Each removed file gets one log line naming
   the path and nothing else — the file held a credential, and a log is the wrong place for one.
   A file that cannot be removed is left in place and reported by `rantaiclaw doctor` as
   `config.legacy_logins`. `~/.gemini/` and `~/.qwen/` belong to other CLIs and are left alone.
@@ -565,6 +592,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   RUSTSEC-2026-0524 and RUSTSEC-2026-0538.** Both crates are optional dependencies of reqwest's
   `http3` feature, which no build enables, so no shipped binary changes. The update also drops the
   Windows-only entries that only quinn-udp 0.5.14 referenced.
+
+- **The advisory `RUSTSEC-2026-0441` (`pin-utils`, unmaintained) is accepted with a reason.** It is a
+  notice, not a vulnerability. No patched version exists, and the crate is a compile-time helper
+  that a lockfile bump cannot remove. The waiver is recorded in `deny.toml` and in the audit
+  workflow.
 
 ## [0.34.0-alpha] — 2026-11-05
 
