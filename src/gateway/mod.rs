@@ -1702,6 +1702,12 @@ async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
         .downcast_ref::<crate::observability::PrometheusObserver>()
     {
         prom.encode()
+    } else if state.config.lock().observability.backend == "prometheus" {
+        // The config asks for prometheus, but the observer is the one the
+        // process started with: a reload cannot swap it, because the channels,
+        // cron and heartbeat share it. Repeating "set the backend" would send an
+        // operator who already set it in circles.
+        String::from("# Prometheus is set in config, but the running observer was built before it: restart required to enable prometheus.\n")
     } else {
         String::from("# Prometheus backend not enabled. Set [observability] backend = \"prometheus\" in config.\n")
     };
@@ -1914,6 +1920,20 @@ fn apply_reloaded_config(
     live_autonomy: &LiveAutonomyRegistry,
 ) {
     let autonomy = fresh.autonomy.clone();
+    // The observer is built once at startup and shared with the channels, cron
+    // and heartbeat, so a reload cannot swap it. Say so instead of logging a
+    // reload that applied everything.
+    {
+        let running = config.lock();
+        if running.observability.backend != fresh.observability.backend {
+            tracing::warn!(
+                target: "gateway",
+                from = %running.observability.backend,
+                to = %fresh.observability.backend,
+                "observability backend changed in config; the change needs a restart to take effect"
+            );
+        }
+    }
     *config.lock() = fresh;
     *config_fingerprint.lock() = fresh_fp;
     security.apply_config(&autonomy);
@@ -3498,6 +3518,91 @@ mod tests {
         );
     }
 
+    /// The observer is built once at startup and shared with the channels, cron
+    /// and heartbeat, so a reload cannot swap it. A reload that changes the
+    /// backend says so in the log instead of reporting a success it did not
+    /// deliver.
+    #[test]
+    fn a_reload_that_changes_the_observability_backend_warns_that_a_restart_is_needed() {
+        let _env = crate::test_env::ENV_LOCK.blocking_lock();
+        let registry = super::LiveAutonomyRegistry::default();
+        let process_policy = std::sync::Arc::new(crate::security::SecurityPolicy::default());
+        let running = std::sync::Arc::new(super::Mutex::new(crate::config::Config::default()));
+        let fingerprint = std::sync::Arc::new(super::Mutex::new("old".to_string()));
+
+        let mut changed = crate::config::Config::default();
+        changed.observability.backend = "prometheus".to_string();
+        let warned = reload_log(|| {
+            super::apply_reloaded_config(
+                &running,
+                &fingerprint,
+                changed,
+                "new".to_string(),
+                &process_policy,
+                &registry,
+            );
+        });
+        assert!(
+            warned.contains("observability backend") && warned.contains("restart"),
+            "a changed backend must be reported as needing a restart: {warned}"
+        );
+
+        // Control: the same backend again is not news.
+        let unchanged = running.lock().clone();
+        let quiet = reload_log(|| {
+            super::apply_reloaded_config(
+                &running,
+                &fingerprint,
+                unchanged,
+                "newer".to_string(),
+                &process_policy,
+                &registry,
+            );
+        });
+        assert!(
+            !quiet.contains("observability backend"),
+            "a reload that keeps the backend must not warn about it: {quiet}"
+        );
+    }
+
+    /// The WARN-level output of `run`, as text.
+    fn reload_log(run: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("lock the log buffer")
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl tracing_subscriber::fmt::MakeWriter<'_> for Buffer {
+            type Writer = Self;
+
+            fn make_writer(&self) -> Self {
+                self.clone()
+            }
+        }
+
+        let buffer = Buffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, run);
+        let bytes = buffer.0.lock().expect("lock the log buffer").clone();
+        String::from_utf8(bytes).expect("log output is utf-8")
+    }
+
     /// Every reload through the reload step revokes the console's session
     /// grants, not only the ones that carry a rung change: the step cannot
     /// tell a rung change from any other write to the watched file, and a grant
@@ -5023,6 +5128,63 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("Prometheus backend not enabled"));
+    }
+
+    /// A reload can switch `observability.backend` to prometheus, but the
+    /// running observer is the one built at startup. `/metrics` must say a
+    /// restart is needed instead of repeating the "set the backend" hint to an
+    /// operator who just set it.
+    #[tokio::test]
+    async fn metrics_endpoint_says_a_restart_is_needed_when_the_config_asks_for_prometheus() {
+        let mut config = Config::default();
+        config.observability.backend = "prometheus".to_string();
+        let state = AppState {
+            config: Arc::new(Mutex::new(config)),
+            config_fingerprint: Arc::new(Mutex::new("test".to_string())),
+            provider: Arc::new(MockProvider::default()),
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            memory_search_mode: Arc::new("keyword".to_string()),
+
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            whatsapp_pair_guard: crate::gateway::config_api::PairGuard::default(),
+            // The observer the process started with, built before the config
+            // asked for prometheus.
+            observer: Arc::new(crate::observability::NoopObserver),
+            webhook_routes: Arc::new(Vec::new()),
+            channel_bus: Arc::new(crate::channels::ChannelBus::default()),
+            ledger: None,
+            web_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            mcp: Arc::new(crate::mcp::discover::McpPoolHandle::default()),
+            tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
+            live_autonomy: Arc::default(),
+        };
+
+        let response = handle_metrics(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.contains("restart required to enable prometheus"),
+            "the body must say a restart is needed: {text}"
+        );
+        assert!(
+            !text.contains("Prometheus backend not enabled"),
+            "the generic hint is wrong once the config already asks for prometheus: {text}"
+        );
     }
 
     #[tokio::test]

@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A config write with a misspelled or unknown field is refused instead of reported as saved.**
+  Every config write body (`PUT /config/model`, `/config/autonomy`, `/config/knowledge`,
+  `/secrets`, `POST /config/mcp_servers/{name}` and the Telegram, Discord, Slack, Lark and
+  WhatsApp Web connect routes) dropped unknown keys silently, so `PUT /secrets` with `api_kee`
+  saved nothing and answered `{"ok":true}`. These bodies now reject an unknown field with a `400`
+  that names it, in the same error shape as the other config refusals. The console sends no field
+  these routes lack, and `max_cost_per_day_cents` stays accepted on the autonomy route. A body
+  that is not valid JSON gets the same `400` instead of a plain-text answer. The check runs before
+  the bearer check, so an unauthenticated client that sends such a body sees the `400` where it
+  saw the `401`.
+
+- **A config write that names nothing to change answers `400 nothing_to_apply`.** `PUT /secrets`
+  with `{}` changed nothing, saved the file and answered success. The same holds for
+  `PUT /config/model`, `/config/autonomy` and `/config/knowledge`. An empty string is still a
+  field, so `{"api_key":""}` clears the key. The channel connect routes are unchanged, because an
+  empty body there can be an allowlist-only update.
+
+- **A provider that rejects the credential answers `502 provider_auth_failed`, not `500`.** A
+  chat turn whose provider answered `401` or `403` came back as `internal_error` with the raw
+  attempt log. The retry wrapper now keeps the rejection as a typed error, and both chat routes
+  say which provider refused and with which status. The body carries neither the credential nor
+  what the provider wrote. The streaming route has no status line to change, so its `error` event
+  message starts with `provider_auth_failed:` when the rejection happens while the turn runs, and
+  names the provider and the status.
+
+- **`/metrics` says a restart is needed after a reload switches the backend to prometheus.** The
+  observer is built once at startup and shared with the channels, cron and heartbeat, so a reload
+  cannot swap it, yet the reload logged success and `/metrics` kept answering "Prometheus backend
+  not enabled". A reload that changes `observability.backend` now logs a warning, and `/metrics`
+  answers `restart required to enable prometheus` while the file asks for prometheus and the
+  running observer is another one.
+
+- **Deleting something that does not exist answers `404 not_found`.** `DELETE
+  /config/mcp_servers/{name}` for a name that is not configured answered `200` with
+  `removed:false` and rewrote the file. `DELETE /kb/groups/{id}` for an unknown group answered
+  `200` with `deleted:false`, and `DELETE /kb/groups/{id}/documents/{doc}` for a document that is
+  not in the group answered `200` with `ok:false`. All three now answer `404` and save nothing.
+
 ## [0.35.0-alpha] — 2026-11-16
 
 The login-removal and approval release. Six subscription logins are gone and RantaiClaw uses API

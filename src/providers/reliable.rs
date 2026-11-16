@@ -1,4 +1,5 @@
 use super::local_refusal::is_local_refusal;
+use super::provider_auth::ProviderAuthError;
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamOptions, StreamResult,
 };
@@ -33,22 +34,10 @@ fn is_non_retryable(err: &anyhow::Error) -> bool {
 
     // 4xx errors are generally non-retryable (bad request, auth failure, etc.),
     // except 429 (rate-limit — transient) and 408 (timeout — worth retrying).
-    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
-        if let Some(status) = reqwest_err.status() {
-            let code = status.as_u16();
-            return status.is_client_error() && code != 429 && code != 408;
-        }
+    if let Some(code) = upstream_status(err) {
+        return (400..500).contains(&code) && code != 429 && code != 408;
     }
-    // Fallback: parse status codes from stringified errors (some providers
-    // embed codes in error messages rather than returning typed HTTP errors).
     let msg = err.to_string();
-    for word in msg.split(|c: char| !c.is_ascii_digit()) {
-        if let Ok(code) = word.parse::<u16>() {
-            if (400..500).contains(&code) {
-                return code != 429 && code != 408;
-            }
-        }
-    }
 
     // Heuristic: detect auth/model failures by keyword when no HTTP status
     // is available (e.g. gRPC or custom transport errors).
@@ -80,6 +69,27 @@ fn is_non_retryable(err: &anyhow::Error) -> bool {
             || msg_lower.contains("unsupported")
             || msg_lower.contains("does not exist")
             || msg_lower.contains("invalid"))
+}
+
+/// The HTTP status an upstream failure carries: the typed one when the error
+/// is a `reqwest` error that has one, otherwise the first 4xx number in the
+/// error text, because some providers embed the code in the message instead of
+/// returning a typed HTTP error.
+fn upstream_status(err: &anyhow::Error) -> Option<u16> {
+    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
+        if let Some(status) = reqwest_err.status() {
+            return Some(status.as_u16());
+        }
+    }
+    let msg = err.to_string();
+    for word in msg.split(|c: char| !c.is_ascii_digit()) {
+        if let Ok(code) = word.parse::<u16>() {
+            if (400..500).contains(&code) {
+                return Some(code);
+            }
+        }
+    }
+    None
 }
 
 fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
@@ -244,6 +254,43 @@ fn keep_first_refusal(slot: &mut Option<(anyhow::Error, String)>, error: anyhow:
     *slot = Some((error, detail));
 }
 
+/// Keep the FIRST authentication failure the chain produced: a provider that
+/// answered 401 or 403 to the credential it was sent.
+///
+/// The operator has to fix the credential outside the server, so when the chain
+/// runs out of providers this is the answer, not the aggregate that buries it
+/// under every other attempt. A local refusal is never one: its sentence may
+/// mention a status, but nothing was sent.
+fn keep_first_auth_failure(
+    slot: &mut Option<ProviderAuthError>,
+    provider_name: &str,
+    error: &anyhow::Error,
+) {
+    if slot.is_some() || is_local_refusal(error) {
+        return;
+    }
+    if let Some(status @ (401 | 403)) = upstream_status(error) {
+        *slot = Some(ProviderAuthError::new(provider_name, status));
+    }
+}
+
+/// What a chain that ran out of providers fails with.
+fn exhausted(failures: &[String], auth_failure: Option<ProviderAuthError>) -> anyhow::Error {
+    match auth_failure {
+        Some(auth) => {
+            tracing::warn!(
+                attempts = %failures.join(" | "),
+                "providers exhausted; a provider rejected the credential"
+            );
+            auth.into()
+        }
+        None => anyhow::anyhow!(
+            "All providers/models failed. Attempts:\n{}",
+            failures.join("\n")
+        ),
+    }
+}
+
 // ── Resilient Provider Wrapper ────────────────────────────────────────────
 // Three-level failover strategy: model chain → provider chain → retry loop.
 //   Outer loop:  iterate model fallback chain (original model first, then
@@ -368,6 +415,9 @@ impl Provider for ReliableProvider {
         // The first local refusal the chain produced, kept aside so the turn
         // fails with it instead of with the aggregate below.
         let mut refusal: Option<(anyhow::Error, String)> = None;
+        // The first provider that rejected the credential, kept for the same
+        // reason when no refusal settled the turn.
+        let mut auth_failure: Option<ProviderAuthError> = None;
 
         // Outer: model fallback chain. Middle: provider priority. Inner: retries.
         // Each iteration: attempt one (provider, model) call. On success, return
@@ -430,6 +480,7 @@ impl Provider for ReliableProvider {
                                     );
                                 }
 
+                                keep_first_auth_failure(&mut auth_failure, provider_name, &e);
                                 keep_first_refusal(&mut refusal, e);
                                 break;
                             }
@@ -475,10 +526,7 @@ impl Provider for ReliableProvider {
             return Err(cause.context(detail));
         }
 
-        anyhow::bail!(
-            "All providers/models failed. Attempts:\n{}",
-            failures.join("\n")
-        )
+        Err(exhausted(&failures, auth_failure))
     }
 
     async fn chat_with_history(
@@ -492,6 +540,9 @@ impl Provider for ReliableProvider {
         // The first local refusal the chain produced, kept aside so the turn
         // fails with it instead of with the aggregate below.
         let mut refusal: Option<(anyhow::Error, String)> = None;
+        // The first provider that rejected the credential, kept for the same
+        // reason when no refusal settled the turn.
+        let mut auth_failure: Option<ProviderAuthError> = None;
 
         for current_model in &models {
             for (provider_index, (provider_name, provider)) in self.providers.iter().enumerate() {
@@ -550,6 +601,7 @@ impl Provider for ReliableProvider {
                                     );
                                 }
 
+                                keep_first_auth_failure(&mut auth_failure, provider_name, &e);
                                 keep_first_refusal(&mut refusal, e);
                                 break;
                             }
@@ -587,10 +639,7 @@ impl Provider for ReliableProvider {
             return Err(cause.context(detail));
         }
 
-        anyhow::bail!(
-            "All providers/models failed. Attempts:\n{}",
-            failures.join("\n")
-        )
+        Err(exhausted(&failures, auth_failure))
     }
 
     async fn chat(
@@ -604,6 +653,9 @@ impl Provider for ReliableProvider {
         // The first local refusal the chain produced, kept aside so the turn
         // fails with it instead of with the aggregate below.
         let mut refusal: Option<(anyhow::Error, String)> = None;
+        // The first provider that rejected the credential, kept for the same
+        // reason when no refusal settled the turn.
+        let mut auth_failure: Option<ProviderAuthError> = None;
 
         for current_model in &models {
             for (provider_index, (provider_name, provider)) in self.providers.iter().enumerate() {
@@ -663,6 +715,7 @@ impl Provider for ReliableProvider {
                                     );
                                 }
 
+                                keep_first_auth_failure(&mut auth_failure, provider_name, &e);
                                 keep_first_refusal(&mut refusal, e);
                                 break;
                             }
@@ -700,10 +753,7 @@ impl Provider for ReliableProvider {
             return Err(cause.context(detail));
         }
 
-        anyhow::bail!(
-            "All providers/models failed. Attempts:\n{}",
-            failures.join("\n")
-        )
+        Err(exhausted(&failures, auth_failure))
     }
 
     fn supports_native_tools(&self) -> bool {
@@ -814,6 +864,9 @@ impl Provider for ReliableProvider {
         // The first local refusal the chain produced, kept aside so the turn
         // fails with it instead of with the aggregate below.
         let mut refusal: Option<(anyhow::Error, String)> = None;
+        // The first provider that rejected the credential, kept for the same
+        // reason when no refusal settled the turn.
+        let mut auth_failure: Option<ProviderAuthError> = None;
 
         for current_model in &models {
             for (provider_index, (provider_name, provider)) in self.providers.iter().enumerate() {
@@ -872,6 +925,7 @@ impl Provider for ReliableProvider {
                                     );
                                 }
 
+                                keep_first_auth_failure(&mut auth_failure, provider_name, &e);
                                 keep_first_refusal(&mut refusal, e);
                                 break;
                             }
@@ -909,10 +963,7 @@ impl Provider for ReliableProvider {
             return Err(cause.context(detail));
         }
 
-        anyhow::bail!(
-            "All providers/models failed. Attempts:\n{}",
-            failures.join("\n")
-        )
+        Err(exhausted(&failures, auth_failure))
     }
 
     fn supports_streaming(&self) -> bool {
@@ -2014,6 +2065,132 @@ mod tests {
             1,
             "must not retry on 401 — should be exactly 1 call"
         );
+    }
+
+    /// A wrapper whose only provider fails every call with `error`.
+    fn failing_provider(error: &'static str) -> ReliableProvider {
+        ReliableProvider::new(
+            vec![(
+                "primary".into(),
+                Box::new(MockProvider {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    fail_until_attempt: usize::MAX,
+                    response: "never",
+                    error,
+                }),
+            )],
+            1,
+            1,
+        )
+    }
+
+    /// The typed auth failure a failed turn carries, as `(provider, status)`
+    /// read through its sentence.
+    fn auth_sentence(error: &anyhow::Error) -> Option<String> {
+        crate::providers::provider_auth_failure_sentence(error)
+    }
+
+    /// Every aggregate the wrapper offers must keep the provider that rejected
+    /// the credential, by type, so a caller does not read the status from text.
+    #[tokio::test]
+    async fn a_provider_that_rejects_the_credential_fails_every_aggregate_with_a_typed_cause() {
+        let messages = vec![ChatMessage::user("hello")];
+        for (text, sentence) in [
+            (
+                "Custom API error (401 Unauthorized): {\"error\":\"bad key\"}",
+                "provider primary rejected the credential (HTTP 401)",
+            ),
+            (
+                "Custom API error (403 Forbidden): {\"error\":\"no access\"}",
+                "provider primary rejected the credential (HTTP 403)",
+            ),
+        ] {
+            let results = [
+                (
+                    "chat_with_system",
+                    failing_provider(text)
+                        .chat_with_system(None, "hello", "m", 0.0)
+                        .await,
+                ),
+                (
+                    "chat_with_history",
+                    failing_provider(text)
+                        .chat_with_history(&messages, "m", 0.0)
+                        .await,
+                ),
+                (
+                    "chat",
+                    failing_provider(text)
+                        .chat(
+                            ChatRequest {
+                                messages: &messages,
+                                tools: None,
+                            },
+                            "m",
+                            0.0,
+                        )
+                        .await
+                        .map(|_| String::new()),
+                ),
+                (
+                    "chat_with_tools",
+                    failing_provider(text)
+                        .chat_with_tools(&messages, &[], "m", 0.0)
+                        .await
+                        .map(|_| String::new()),
+                ),
+            ];
+            for (method, result) in results {
+                let error = result.expect_err("a rejected credential must fail the turn");
+                assert_eq!(
+                    auth_sentence(&error).as_deref(),
+                    Some(sentence),
+                    "{method}: {error:#}"
+                );
+                // The upstream body must not ride along in what the turn shows.
+                assert!(
+                    !error.to_string().contains("bad key")
+                        && !error.to_string().contains("no access"),
+                    "{method}: the text of the failure carries the upstream body: {error}"
+                );
+            }
+        }
+    }
+
+    /// Only a 401 or a 403 is an authentication failure. A server error, or a
+    /// request the provider found malformed, keeps the aggregate.
+    #[tokio::test]
+    async fn other_failures_keep_the_aggregate_and_no_auth_cause() {
+        for text in [
+            "API error (500 Internal Server Error): upstream down",
+            "API error (400 Bad Request): unknown parameter",
+            "API error (404 Not Found): no such model route",
+        ] {
+            let error = failing_provider(text)
+                .chat_with_system(None, "hello", "m", 0.0)
+                .await
+                .expect_err("the provider fails");
+            assert!(auth_sentence(&error).is_none(), "{text}: {error:#}");
+            assert!(
+                error.to_string().contains("All providers/models failed"),
+                "{text}: {error}"
+            );
+        }
+    }
+
+    /// A refusal decided locally fails the turn with its own sentence, even when
+    /// that sentence mentions a status. The error carries no auth failure.
+    #[tokio::test]
+    async fn a_local_refusal_is_returned_as_the_error_even_when_it_names_a_status() {
+        let sentence = "Set the key first; the provider answers 401 without one.";
+
+        let error = refusing_provider(sentence)
+            .chat_with_system(None, "hello", "m", 0.0)
+            .await
+            .expect_err("a local refusal must fail the turn");
+
+        assert!(auth_sentence(&error).is_none(), "{error:#}");
+        assert_eq!(error.to_string(), sentence);
     }
 
     #[tokio::test]

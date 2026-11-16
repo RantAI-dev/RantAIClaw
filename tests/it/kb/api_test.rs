@@ -1144,6 +1144,46 @@ async fn membership_route_404s_on_bogus_group() {
     );
 }
 
+/// `DELETE` of a group that does not exist used to answer 200 with
+/// `deleted:false`, which reads as a success to a client that checks only the
+/// status. The console treats a resolved call as "deleted".
+#[tokio::test]
+async fn deleting_an_unknown_group_404s() {
+    let h = start_harness(|_store| Box::pin(async move {})).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .delete(format!("{}/api/v1/kb/groups/no_such_group", h.base_url))
+        .send()
+        .await
+        .expect("request");
+
+    assert_eq!(resp.status(), 404, "an unknown group is not deleted");
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["error"], "not_found", "{body}");
+}
+
+/// Unlinking a document that is not in the group is the same shape: nothing to
+/// remove, so not a success.
+#[tokio::test]
+async fn unlinking_a_document_that_is_not_in_the_group_404s() {
+    let h = start_harness(|_store| Box::pin(async move {})).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .delete(format!(
+            "{}/api/v1/kb/groups/no_such_group/documents/no_such_doc",
+            h.base_url
+        ))
+        .send()
+        .await
+        .expect("request");
+
+    assert_eq!(resp.status(), 404, "a missing membership is not removed");
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["error"], "not_found", "{body}");
+}
+
 #[tokio::test]
 async fn kb_ingest_bogus_group_field_404s_before_storing() {
     // Plan 099 step 2: group ids are validated BEFORE staging/embedding, so

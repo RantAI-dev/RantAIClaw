@@ -31,6 +31,7 @@ pub mod ollama;
 #[cfg(feature = "legacy-providers")]
 pub mod openai;
 pub mod openrouter;
+pub(crate) mod provider_auth;
 pub mod reliable;
 pub(crate) mod removed_login;
 mod renewing_credential;
@@ -520,6 +521,19 @@ pub fn removed_login_refusal(name: &str) -> Option<&'static str> {
 /// of unwrapping the refusal type itself.
 pub fn local_refusal_text(error: &anyhow::Error) -> Option<&str> {
     local_refusal::local_refusal_text(error)
+}
+
+/// The code a surface reports when a provider rejects the credential.
+pub use provider_auth::PROVIDER_AUTH_FAILED;
+
+/// What happened when a provider rejected the credential `error` ends in:
+/// the provider id and the upstream status, no credential and no upstream
+/// body. `None` for any other failure.
+///
+/// The public door to the `provider_auth` module, for a caller that must
+/// answer this failure differently from a server fault.
+pub fn provider_auth_failure_sentence(error: &anyhow::Error) -> Option<String> {
+    provider_auth::provider_auth_failure(error).map(provider_auth::ProviderAuthError::sentence)
 }
 
 /// The base provider a `<base>-custom:<url>` name is an endpoint of, e.g.

@@ -20,7 +20,7 @@ use axum::response::{
     IntoResponse, Response,
 };
 use axum::{
-    extract::{Path, State},
+    extract::{rejection::JsonRejection, FromRequest, Path, Request, State},
     http::{HeaderMap, StatusCode},
     response::Json,
     routing::{get, post, put},
@@ -145,6 +145,66 @@ fn err_400(msg: impl Into<String>) -> ApiError {
     (
         StatusCode::BAD_REQUEST,
         Json(json!({ "error": "bad_request", "detail": msg.into() })),
+    )
+}
+
+fn err_404(msg: impl Into<String>) -> ApiError {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({ "error": "not_found", "detail": msg.into() })),
+    )
+}
+
+/// A write whose body names nothing to change. Answering it with success would
+/// tell a client that sent a misspelled or empty body that its write took effect.
+fn err_nothing_to_apply(what: &str) -> ApiError {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": "nothing_to_apply",
+            "detail": format!("the {what} request carries no field to change"),
+        })),
+    )
+}
+
+/// The JSON body extractor of every config write.
+///
+/// A body that does not parse, or names a field the route does not know, is
+/// answered in the config API's own error shape. Axum's default is a plain-text
+/// rejection with a different status for a data error (422), so a client would
+/// have to read two shapes from one API.
+///
+/// A body the extractor refuses is answered before the handler runs, and so
+/// before the handler's `check_auth`: an unauthenticated client that sends a
+/// malformed body sees this 400 where it would otherwise have seen the 401.
+pub(crate) struct StrictJson<T>(pub T);
+
+impl<T, S> FromRequest<S> for StrictJson<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(Self(value)),
+            Err(rejection) => Err(json_rejection(&rejection)),
+        }
+    }
+}
+
+/// A rejected body in the config API's shape. The status stays 413 or 415 where
+/// the body was too large or not JSON, and a body that parsed as JSON but not
+/// as this route's type becomes the 400 every other refusal here uses.
+fn json_rejection(rejection: &JsonRejection) -> ApiError {
+    let status = match rejection.status() {
+        StatusCode::UNPROCESSABLE_ENTITY => StatusCode::BAD_REQUEST,
+        other => other,
+    };
+    (
+        status,
+        Json(json!({ "error": "bad_request", "detail": rejection.body_text() })),
     )
 }
 
@@ -391,6 +451,7 @@ fn sanitize_api_url(value: &str) -> Option<String> {
 // ── PUT /config/model ────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ModelBody {
     #[serde(default)]
     provider: Option<String>,
@@ -398,6 +459,19 @@ struct ModelBody {
     model: Option<String>,
     #[serde(default)]
     temperature: Option<f64>,
+}
+
+impl ModelBody {
+    /// Whether the body names no field to change. The fields are destructured
+    /// by name, so a field added later cannot be left out of this check.
+    fn is_empty(&self) -> bool {
+        let Self {
+            provider,
+            model,
+            temperature,
+        } = self;
+        provider.is_none() && model.is_none() && temperature.is_none()
+    }
 }
 
 /// Serializes config-file mutations made through the gateway config API behind a
@@ -570,9 +644,12 @@ fn provider_switch_warning(cfg: &crate::config::Config, provider_changed: bool) 
 async fn set_model(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<ModelBody>,
+    StrictJson(body): StrictJson<ModelBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
+    if body.is_empty() {
+        return Err(err_nothing_to_apply("model"));
+    }
     let provider_changed = body.provider.is_some();
     let (_guard, mut cfg) = lock_and_load(&state).await?;
     if let Some(p) = body.provider {
@@ -609,6 +686,7 @@ async fn set_model(
 // ── PUT /config/autonomy ─────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AutonomyBody {
     #[serde(default)]
     level: Option<String>,
@@ -634,8 +712,8 @@ pub(crate) struct AutonomyBody {
     ///
     /// The key it wrote (`autonomy.max_cost_per_day_cents`) is gone: it was a
     /// money ceiling that was never enforced, replaced by `[cost]
-    /// max_tokens_per_day`, which is. A console built against the old shape
-    /// still sends this field, and rejecting the whole request over it would
+    /// max_tokens_per_day`, which is. An older client built against the old
+    /// shape may still send this field, and rejecting the whole request over it would
     /// break every other autonomy edit in the same PATCH. Remove after the
     /// console has shipped its side.
     #[serde(default)]
@@ -646,6 +724,38 @@ pub(crate) struct AutonomyBody {
     block_high_risk_commands: Option<bool>,
     #[serde(default)]
     require_approval_for_medium_risk: Option<bool>,
+}
+
+impl AutonomyBody {
+    /// Whether the body names no field that changes the policy. The retired
+    /// `max_cost_per_day_cents` is parsed but changes nothing, so it does not
+    /// count. The fields are destructured by name, so a field added later
+    /// cannot be left out of this check.
+    fn is_empty(&self) -> bool {
+        let Self {
+            level,
+            preset,
+            auto_approve,
+            always_ask,
+            allowed_commands,
+            forbidden_paths,
+            max_actions_per_hour,
+            max_cost_per_day_cents: _,
+            workspace_only,
+            block_high_risk_commands,
+            require_approval_for_medium_risk,
+        } = self;
+        level.is_none()
+            && preset.is_none()
+            && auto_approve.is_none()
+            && always_ask.is_none()
+            && allowed_commands.is_none()
+            && forbidden_paths.is_none()
+            && max_actions_per_hour.is_none()
+            && workspace_only.is_none()
+            && block_high_risk_commands.is_none()
+            && require_approval_for_medium_risk.is_none()
+    }
 }
 
 /// Accept both `read_only` (UI spelling) and `readonly` (enum serde spelling).
@@ -670,9 +780,12 @@ fn sets_readonly_or_full(level: Option<AutonomyLevel>) -> bool {
 pub(crate) async fn set_autonomy(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<AutonomyBody>,
+    StrictJson(body): StrictJson<AutonomyBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
+    if body.is_empty() {
+        return Err(err_nothing_to_apply("autonomy"));
+    }
     let (_guard, mut cfg) = lock_and_load(&state).await?;
     // The explicit level, parsed before anything is written so an invalid one
     // is rejected rather than half-applied.
@@ -791,6 +904,7 @@ const MAX_MCP_SERVERS_API: usize = 10;
 /// (matching the `/secrets` and `/config/knowledge` write contract) — re-adding a
 /// server to fix a typo must not wipe its stored env/args.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct McpServerBody {
     command: String,
     #[serde(default)]
@@ -2005,7 +2119,7 @@ async fn add_mcp_server(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(name): Path<String>,
-    Json(body): Json<McpServerBody>,
+    StrictJson(body): StrictJson<McpServerBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
     let name = name.trim().to_string();
@@ -2056,17 +2170,23 @@ async fn remove_mcp_server(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
     let (_guard, mut cfg) = lock_and_load(&state).await?;
-    let removed = cfg.mcp_servers.remove(&name).is_some();
+    // A name that is not configured is a 404, answered before anything is
+    // saved: re-writing the file for a delete that matched nothing would
+    // report a change that did not happen.
+    if cfg.mcp_servers.remove(&name).is_none() {
+        return Err(err_404(format!("MCP server '{name}' is not configured")));
+    }
     let count = cfg.mcp_servers.len();
     persist_and_swap(&state, cfg, "mcp_servers").await?;
     Ok(Json(
-        json!({ "name": name, "removed": removed, "count": count }),
+        json!({ "name": name, "removed": true, "count": count }),
     ))
 }
 
 // ── POST/DELETE /channels/telegram (experimental connect) ────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TelegramConnectBody {
     /// Bot API token from @BotFather. Validated live (`getMe`) before persisting.
     /// Optional: omit (or send empty) to update `allowed_users` on an
@@ -2258,7 +2378,7 @@ fn runtime_restart_note(restarts_runtime: bool) -> &'static str {
 async fn connect_telegram(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<TelegramConnectBody>,
+    StrictJson(body): StrictJson<TelegramConnectBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
 
@@ -2384,6 +2504,7 @@ async fn disconnect_telegram(
 // ── POST/DELETE /channels/discord and /channels/slack ───────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DiscordConnectBody {
     /// Bot token from the Discord developer portal. Validated live before
     /// persisting. Optional: omit to edit `allowed_users` on an already
@@ -2399,6 +2520,7 @@ struct DiscordConnectBody {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SlackConnectBody {
     /// Bot token (`xoxb-…`). Validated live before persisting. Optional, as for
     /// Discord.
@@ -2625,7 +2747,7 @@ fn allowlist_warning(allowed_users: &[String], subject: &str) -> Option<String> 
 async fn connect_discord(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<DiscordConnectBody>,
+    StrictJson(body): StrictJson<DiscordConnectBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
 
@@ -2690,7 +2812,7 @@ async fn disconnect_discord(
 async fn connect_slack(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<SlackConnectBody>,
+    StrictJson(body): StrictJson<SlackConnectBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
 
@@ -2766,6 +2888,7 @@ async fn disconnect_slack(
 // ── POST/DELETE /channels/lark ───────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LarkConnectBody {
     /// App ID from the Lark/Feishu developer console. Optional: omit (with
     /// `app_secret`) to edit the allowlist or region on an already connected
@@ -2952,7 +3075,7 @@ fn lark_encrypt_key_warning(encrypt_key: Option<&str>) -> Option<&'static str> {
 async fn connect_lark(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<LarkConnectBody>,
+    StrictJson(body): StrictJson<LarkConnectBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
 
@@ -3071,6 +3194,7 @@ async fn disconnect_lark(
 //     first version of this plan).
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WhatsAppWebConnectBody {
     /// Phone numbers allowed to talk to the bot (E.164, or "*"). An empty
     /// list denies everyone — the same convention Telegram and Discord
@@ -3103,7 +3227,7 @@ fn allowed_numbers_to_save(entries: &[String]) -> Result<Vec<String>, ApiError> 
 async fn whatsapp_web_connect(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<WhatsAppWebConnectBody>,
+    StrictJson(body): StrictJson<WhatsAppWebConnectBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
     let (_guard, mut cfg) = lock_and_load(&state).await?;
@@ -3180,7 +3304,7 @@ async fn whatsapp_web_disconnect(
 async fn whatsapp_web_pair(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<WhatsAppWebConnectBody>,
+    StrictJson(body): StrictJson<WhatsAppWebConnectBody>,
 ) -> Result<Response, ApiError> {
     check_auth(&state, &headers)?;
 
@@ -3392,11 +3516,21 @@ async fn persist_paired_session(
 // ── GET/PUT /secrets ─────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SecretsBody {
     #[serde(default)]
     api_key: Option<String>,
     #[serde(default)]
     api_url: Option<String>,
+}
+
+impl SecretsBody {
+    /// Whether the body names no field to change. An empty string is a field:
+    /// it clears the stored value.
+    fn is_empty(&self) -> bool {
+        let Self { api_key, api_url } = self;
+        api_key.is_none() && api_url.is_none()
+    }
 }
 
 /// True when a non-empty provider key is configured.
@@ -3511,9 +3645,12 @@ async fn get_secrets(
 async fn set_secrets(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<SecretsBody>,
+    StrictJson(body): StrictJson<SecretsBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
+    if body.is_empty() {
+        return Err(err_nothing_to_apply("secrets"));
+    }
     let (_guard, mut cfg) = lock_and_load(&state).await?;
     apply_secrets(&mut cfg, &body).map_err(err_400)?;
     let present = api_key_present(&cfg);
@@ -3525,6 +3662,7 @@ async fn set_secrets(
 
 #[cfg(feature = "kb")]
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct KnowledgeBody {
     /// Omitted leaves the current value — same contract as the key fields.
     #[serde(default)]
@@ -3533,6 +3671,20 @@ struct KnowledgeBody {
     embedding_api_key: Option<String>,
     #[serde(default)]
     vision_api_key: Option<String>,
+}
+
+#[cfg(feature = "kb")]
+impl KnowledgeBody {
+    /// Whether the body names no field to change. An empty string is a field:
+    /// it clears the stored key.
+    fn is_empty(&self) -> bool {
+        let Self {
+            enabled,
+            embedding_api_key,
+            vision_api_key,
+        } = self;
+        enabled.is_none() && embedding_api_key.is_none() && vision_api_key.is_none()
+    }
 }
 
 /// Probe the configured embedding endpoint with a one-token input so the
@@ -3631,9 +3783,12 @@ async fn get_knowledge(
 async fn set_knowledge(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<KnowledgeBody>,
+    StrictJson(body): StrictJson<KnowledgeBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
+    if body.is_empty() {
+        return Err(err_nothing_to_apply("knowledge"));
+    }
     let (_guard, mut cfg) = lock_and_load(&state).await?;
     if let Some(k) = body.embedding_api_key {
         let k = k.trim();
@@ -3702,7 +3857,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
 
-    /// A console built before the token ceiling still sends
+    /// An older client built before the token ceiling may still send
     /// `max_cost_per_day_cents` in its autonomy PATCH. The key it wrote is gone,
     /// but rejecting the request over it would break every other autonomy edit
     /// in the same body — an operator changing their allowlist would get a 400
@@ -5188,7 +5343,7 @@ mod tests {
             State(state.clone()),
             HeaderMap::new(),
             Path(name.to_string()),
-            Json(McpServerBody {
+            StrictJson(McpServerBody {
                 command: command.to_string(),
                 args,
                 env,
@@ -6545,7 +6700,7 @@ mod tests {
         let response = Box::pin(set_autonomy(
             State(state.clone()),
             HeaderMap::new(),
-            Json(body),
+            StrictJson(body),
         ))
         .await?;
         assert!(
@@ -6696,7 +6851,7 @@ mod tests {
         let response = Box::pin(set_autonomy(
             State(state.clone()),
             HeaderMap::new(),
-            Json(body),
+            StrictJson(body),
         ))
         .await
         .expect("autonomy write must succeed");
@@ -6726,7 +6881,7 @@ mod tests {
         let response = Box::pin(connect_lark(
             State(state.clone()),
             HeaderMap::new(),
-            Json(LarkConnectBody {
+            StrictJson(LarkConnectBody {
                 app_id: String::new(),
                 app_secret: String::new(),
                 encrypt_key: None,
@@ -6772,7 +6927,7 @@ mod tests {
         let refused = Box::pin(connect_lark(
             State(state.clone()),
             HeaderMap::new(),
-            Json(LarkConnectBody {
+            StrictJson(LarkConnectBody {
                 app_id: "new-app".into(),
                 app_secret: String::new(),
                 encrypt_key: None,
@@ -7209,7 +7364,7 @@ mod tests {
         let saved = Box::pin(whatsapp_web_connect(
             State(state.clone()),
             HeaderMap::new(),
-            Json(WhatsAppWebConnectBody {
+            StrictJson(WhatsAppWebConnectBody {
                 allowed_numbers: vec![
                     "15551234567".into(),
                     " +15557654321 ".into(),
@@ -7248,7 +7403,7 @@ mod tests {
         let refused = Box::pin(whatsapp_web_connect(
             State(state.clone()),
             HeaderMap::new(),
-            Json(WhatsAppWebConnectBody {
+            StrictJson(WhatsAppWebConnectBody {
                 allowed_numbers: vec!["+15551234567".into(), "1555-01x".into()],
             }),
         ))
@@ -7294,7 +7449,7 @@ mod tests {
         let refused = whatsapp_web_pair(
             State(state.clone()),
             HeaderMap::new(),
-            Json(WhatsAppWebConnectBody {
+            StrictJson(WhatsAppWebConnectBody {
                 allowed_numbers: vec!["1555-01x".into()],
             }),
         )
@@ -7660,7 +7815,7 @@ mod tests {
             State(state.clone()),
             HeaderMap::new(),
             Path("srv".into()),
-            Json(McpServerBody {
+            StrictJson(McpServerBody {
                 command: read["mcp_servers"]["srv"]["command"]
                     .as_str()
                     .unwrap_or_default()
@@ -7696,7 +7851,7 @@ mod tests {
             let response = Box::pin(connect_lark(
                 State(state),
                 HeaderMap::new(),
-                Json(LarkConnectBody {
+                StrictJson(LarkConnectBody {
                     app_id: String::new(),
                     app_secret: String::new(),
                     encrypt_key: body_key.clone(),
@@ -7961,7 +8116,7 @@ mod tests {
         let _slack_response = Box::pin(connect_slack(
             State(state.clone()),
             HeaderMap::new(),
-            Json(SlackConnectBody {
+            StrictJson(SlackConnectBody {
                 bot_token: slack["bot_token"].as_str().unwrap_or_default().into(),
                 app_token: slack["app_token"].as_str().map(str::to_string),
                 allowed_users: vec!["U_KEEP".into()],
@@ -7975,7 +8130,7 @@ mod tests {
         let _lark_response = Box::pin(connect_lark(
             State(state.clone()),
             HeaderMap::new(),
-            Json(LarkConnectBody {
+            StrictJson(LarkConnectBody {
                 app_id: String::new(),
                 app_secret: String::new(),
                 encrypt_key: lark["encrypt_key"].as_str().map(str::to_string),
@@ -7992,7 +8147,7 @@ mod tests {
             State(state.clone()),
             HeaderMap::new(),
             Path("srv".into()),
-            Json(McpServerBody {
+            StrictJson(McpServerBody {
                 command: srv["command"].as_str().unwrap_or_default().into(),
                 args: serde_json::from_value(srv["args"].clone()).ok(),
                 env: serde_json::from_value(srv["env"].clone()).ok(),
@@ -8004,7 +8159,7 @@ mod tests {
         let _secrets_response = Box::pin(set_secrets(
             State(state.clone()),
             HeaderMap::new(),
-            Json(SecretsBody {
+            StrictJson(SecretsBody {
                 api_key: None,
                 api_url: read["api_url"].as_str().map(str::to_string),
             }),
@@ -8165,5 +8320,248 @@ mod tests {
             raw_leaks.len() > 20,
             "the schema fill placed too few markers to mean anything: {raw_leaks:?}"
         );
+    }
+
+    // ── A write the server cannot apply is not answered as a success ────────
+
+    /// A gateway whose `config.toml` exists on disk under `root`, and that file's
+    /// path, so a test can prove a refused write left the bytes alone.
+    async fn state_with_file(root: &std::path::Path) -> (AppState, std::path::PathBuf) {
+        let mut config = Config::default();
+        config.config_path = root.join("config.toml");
+        config.workspace_dir = root.join("workspace");
+        config.save().await.expect("write the starting config");
+        let path = config.config_path.clone();
+        (console_state(config), path)
+    }
+
+    /// One request through the real router, so the body extractor's rejection is
+    /// part of what a test observes. A non-JSON answer comes back as a string.
+    async fn call(
+        state: &AppState,
+        method: &str,
+        uri: &str,
+        body: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        use tower::ServiceExt as _;
+        let mut request = axum::http::Request::builder().method(method).uri(uri);
+        let body = match body {
+            Some(text) => {
+                request = request.header("content-type", "application/json");
+                axum::body::Body::from(text.to_string())
+            }
+            None => axum::body::Body::empty(),
+        };
+        let response = router()
+            .with_state(state.clone())
+            .oneshot(request.body(body).expect("request"))
+            .await
+            .expect("router answers");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(&bytes).into()));
+        (status, json)
+    }
+
+    /// A misspelled key used to reach `apply_secrets` with both fields `None`,
+    /// save the file untouched in effect and answer `{"ok":true}`.
+    #[tokio::test]
+    async fn secrets_write_with_a_misspelled_key_is_refused_and_nothing_is_saved() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp root");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let (state, path) = state_with_file(tmp.path()).await;
+        let before = std::fs::read(&path).expect("read config");
+
+        let (status, body) =
+            call(&state, "PUT", "/api/v1/secrets", Some(r#"{"api_kee":"k"}"#)).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "bad_request", "{body}");
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("api_kee"),
+            "the answer must name the field it does not know: {body}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read config"),
+            before,
+            "a refused write must leave config.toml as it was"
+        );
+    }
+
+    /// The same refusal holds for the other config bodies, and a valid body is
+    /// still applied: the control that tells a strict extractor from a broken one.
+    #[tokio::test]
+    async fn config_bodies_refuse_an_unknown_key_and_still_apply_a_valid_one() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp root");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let (state, path) = state_with_file(tmp.path()).await;
+        let before = std::fs::read(&path).expect("read config");
+
+        for (uri, bad_key, body) in [
+            ("/api/v1/config/model", "modle", r#"{"modle":"m"}"#),
+            ("/api/v1/config/autonomy", "levl", r#"{"levl":"full"}"#),
+        ] {
+            let (status, answer) = call(&state, "PUT", uri, Some(body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {answer}");
+            assert!(
+                answer["detail"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains(bad_key),
+                "{uri} must name the unknown field: {answer}"
+            );
+        }
+        let (status, answer) = call(
+            &state,
+            "POST",
+            "/api/v1/channels/discord",
+            Some(r#"{"allowed_users":["u"],"bot_tokn":"x"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "discord: {answer}");
+        assert!(
+            answer["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("bot_tokn"),
+            "discord must name the unknown field: {answer}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read config"),
+            before,
+            "refused writes must leave config.toml as it was"
+        );
+
+        let (status, answer) = call(
+            &state,
+            "PUT",
+            "/api/v1/config/model",
+            Some(r#"{"model":"m-2"}"#),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a valid body must still apply: {answer}"
+        );
+        assert_eq!(answer["default_model"], "m-2");
+    }
+
+    /// An older client may still send the retired `max_cost_per_day_cents` key.
+    /// It is accepted and ignored next to a real field, so strict parsing must
+    /// not turn it into a 400.
+    #[tokio::test]
+    async fn autonomy_write_still_accepts_the_retired_money_key() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp root");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let (state, _path) = state_with_file(tmp.path()).await;
+
+        let (status, answer) = call(
+            &state,
+            "PUT",
+            "/api/v1/config/autonomy",
+            Some(r#"{"level":"full","max_cost_per_day_cents":500}"#),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{answer}");
+    }
+
+    /// An empty body names nothing to change. Answering `{"ok":true}` for it hid
+    /// a typo'd request; clearing a key is `{"api_key":""}` and must keep working.
+    #[tokio::test]
+    async fn secrets_write_with_nothing_to_apply_is_refused_but_clearing_a_key_is_not() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp root");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let (state, path) = state_with_file(tmp.path()).await;
+        let before = std::fs::read(&path).expect("read config");
+
+        let (status, body) = call(&state, "PUT", "/api/v1/secrets", Some("{}")).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "nothing_to_apply", "{body}");
+        assert_eq!(
+            std::fs::read(&path).expect("read config"),
+            before,
+            "a body with nothing to apply must not save"
+        );
+
+        let (status, body) =
+            call(&state, "PUT", "/api/v1/secrets", Some(r#"{"api_key":""}"#)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "clearing a key is a real write: {body}"
+        );
+        assert_eq!(body["ok"], true);
+    }
+
+    /// Model, autonomy and knowledge updates are partial writes too: a body with
+    /// no field to change is refused the same way.
+    #[tokio::test]
+    async fn partial_config_writes_with_no_field_are_refused() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp root");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let (state, path) = state_with_file(tmp.path()).await;
+        let before = std::fs::read(&path).expect("read config");
+
+        let mut uris = vec!["/api/v1/config/model", "/api/v1/config/autonomy"];
+        #[cfg(feature = "kb")]
+        uris.push("/api/v1/config/knowledge");
+        for uri in uris {
+            let (status, body) = call(&state, "PUT", uri, Some("{}")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+            assert_eq!(body["error"], "nothing_to_apply", "{uri}: {body}");
+        }
+        assert_eq!(
+            std::fs::read(&path).expect("read config"),
+            before,
+            "refused writes must leave config.toml as it was"
+        );
+    }
+
+    /// `DELETE` of a server that is not configured used to answer 200 with
+    /// `removed:false` after re-saving the file.
+    #[tokio::test]
+    async fn removing_an_unknown_mcp_server_is_a_404_and_saves_nothing() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp root");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let (state, path) = state_with_file(tmp.path()).await;
+        let before = std::fs::read(&path).expect("read config");
+
+        let (status, body) = call(&state, "DELETE", "/api/v1/config/mcp_servers/ghost", None).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["error"], "not_found", "{body}");
+        assert_eq!(
+            std::fs::read(&path).expect("read config"),
+            before,
+            "a delete that matched nothing must not save"
+        );
+
+        // Control: a configured server is still removed with a 200.
+        let (status, _) = call(
+            &state,
+            "POST",
+            "/api/v1/config/mcp_servers/srv",
+            Some(r#"{"command":"npx"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = call(&state, "DELETE", "/api/v1/config/mcp_servers/srv", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["removed"], true);
     }
 }

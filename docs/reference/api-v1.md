@@ -71,10 +71,19 @@ Non-2xx responses share one shape:
 }
 ```
 
-`error` is one of `unauthorized` (401), `bad_request` (400), `not_found`
-(404), `conflict` (409), `internal_error` (500). `detail` is present when the handler has more
-to say (it is always present for `internal_error`, which carries the
-sanitized error text).
+`error` is one of `unauthorized` (401), `bad_request` (400), `nothing_to_apply` (400),
+`not_found` (404), `conflict` (409), `internal_error` (500), `provider_auth_failed` (502).
+`detail` is present when the handler has more to say (it is always present for
+`internal_error`, which carries the sanitized error text).
+
+- `nothing_to_apply` is a config write whose body names no field to change. It saves nothing.
+- `provider_auth_failed` is a chat turn whose provider answered `401` or `403` to the credential
+  it was sent. The `detail` names the provider id and the upstream status, never the credential
+  and never the body the provider wrote. The operator fixes the key outside the gateway.
+- The config write routes (`/config/*`, `/secrets`, `/channels/*` and the MCP server route) refuse
+  a request body that names a field the route does not know. The answer is `400 bad_request`, and
+  `detail` names the field. A body that is not valid JSON gets the same `400`. These checks run
+  before the bearer check, so an unauthenticated client that sends such a body sees the `400`.
 
 ## Example base URL
 
@@ -268,6 +277,9 @@ tokens, session ids, or paths.
   Gemini or AWS Bedrock credential, an Ollama `:cloud` model, a removed
   subscription login, an Anthropic setup-token — with the fix named in the body),
   `401`,
+  `502` (`provider_auth_failed`: the provider answered `401` or `403` to the credential it was
+  sent, and the body names the provider id and that status; the 502 JSON route always carries
+  this code),
   `500` (any other provider/agent error — the body is sanitized of secret-looking
   tokens before being returned).
 - **One failure, one sentence, both modes.** A turn the provider refuses before it
@@ -275,6 +287,12 @@ tokens, session ids, or paths.
   was removed — fails with the same words on both modes: the sync form answers
   `400` with the sentence in the body, and the streaming form answers `200` and
   carries the same sentence in its `error` event.
+- **A rejected credential is a `502`, and its streaming form says so in the text.** The sync form
+  answers `502` with the code `provider_auth_failed`. The streaming form has no status line left to
+  change. An `error` event raised while the turn runs starts its `message` with
+  `provider_auth_failed:` and then names the provider and the status, for example
+  `provider_auth_failed: provider openrouter rejected the credential (HTTP 401)`. An error from
+  building the agent for the turn carries the sentence without that prefix.
 
 **Tool approvals on the non-streaming form.** A turn requested without the SSE
 `Accept` header has no stream for an approval modal to be raised on and no
@@ -1274,7 +1292,8 @@ no stored arg is taken as written.
 - **`warning`** is present only when the request sets `provider` and the new provider has no usable
   credential, or is a removed subscription login. The switch is still saved. Channels and chat
   cannot use that provider until a key is added. The field is absent otherwise.
-- **Status codes**: `200`, `400`, `401`, `500`.
+- **Status codes**: `200`, `400` (an unknown field, or a body with none of `provider`, `model`,
+  `temperature`: `nothing_to_apply`), `401`, `500`.
 
 ### PUT /api/v1/config/autonomy
 
@@ -1303,8 +1322,9 @@ no stored arg is taken as written.
   `[cost] max_tokens_per_day`. Sending it does not fail the request — it does nothing.
 - **Response** `200`: `{ "level": "...", "max_actions_per_hour": 20, ... }` — the autonomy
   config itself. The preset is not echoed back; the response carries no `preset` field.
-- **Status codes**: `200`, `400` (unparseable `level`, an unknown `preset`, or a rejected
-  command entry), `401`.
+- **Status codes**: `200`, `400` (unparseable `level`, an unknown `preset`, a rejected
+  command entry, an unknown field, or a body with no field that changes the policy:
+  `nothing_to_apply`), `401`.
 
 ### GET / PUT /api/v1/secrets
 
@@ -1315,7 +1335,8 @@ no stored arg is taken as written.
   credentials is read as that played-back value and keeps the stored credentials. To drop them, send `""`
   first and then the new URL.
 - **PUT response** `200`: `{ "ok": true, "api_key_present": true }`
-- **Status codes**: `200`, `400`, `401`, `500`.
+- **Status codes**: `200`, `400` (an unknown field, such as a misspelled `api_key`, or `{}`:
+  `nothing_to_apply`), `401`, `500`. `{ "api_key": "" }` is not empty: it clears the key and answers `200`.
 
 ### GET / PUT /api/v1/config/knowledge
 
@@ -1324,7 +1345,7 @@ no stored arg is taken as written.
 - **Response** `200`: `{ "enabled": true, "embedding_configured": true, "vision_configured": false, "source": "..." }`
 - Enabling probes the embedding key before persisting, so a bad key fails the request rather
   than being written and failing later.
-- **Status codes**: `200`, `400`, `401`, `500`.
+- **Status codes**: `200`, `400` (an unknown field, or `{}`: `nothing_to_apply`), `401`, `500`.
 
 ### POST / DELETE /api/v1/config/mcp_servers/{name}
 
@@ -1421,8 +1442,9 @@ no stored arg is taken as written.
   count: a request that sends only a `command` inherits them, and an inherited inline script is
   refused too. Nothing is written when a request is refused.
 - **POST response** `200`: `{ "name": "...", "added": true, "count": 3 }`
-- **DELETE response** `200`: `{ "name": "...", "removed": true, "count": 2 }`
-- **Status codes**: `200`, `400`, `401`, `500`.
+- **DELETE response** `200`: `{ "name": "...", "removed": true, "count": 2 }`. A name that is not
+  configured answers `404 not_found` and saves nothing.
+- **Status codes**: `200`, `400`, `401`, `404` (`DELETE` of a name that is not configured), `500`.
 
 ### POST / DELETE /api/v1/channels/telegram
 

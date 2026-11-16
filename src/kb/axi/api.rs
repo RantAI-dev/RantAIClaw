@@ -1237,6 +1237,11 @@ async fn delete_group(
     check_auth(&state, &headers)?;
     let ctx = ensure_kb_ctx(&state).await?;
     let deleted = ctx.store.delete_group(&id).await.map_err(ApiError::from)?;
+    // A group that was not there is not a success: `deleted:false` under a 200
+    // reads as done to a client that checks only the status.
+    if !deleted {
+        return Err(ApiError::not_found(format!("group {id} not found")).into());
+    }
     Ok(Json(DeleteGroupResponse { id, deleted }))
 }
 
@@ -1285,6 +1290,10 @@ async fn remove_group_document(
         .remove_document_from_group(&doc_id, &id)
         .await
         .map_err(ApiError::from)?;
+    // No such membership: nothing was removed, so not a success.
+    if !ok {
+        return Err(ApiError::not_found(format!("document {doc_id} is not in group {id}")).into());
+    }
     Ok(Json(OkResponse { ok }))
 }
 
