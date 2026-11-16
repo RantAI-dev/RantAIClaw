@@ -99,6 +99,7 @@ Notes:
 
 - `backend = "otel"` uses OTLP HTTP export with a blocking exporter client so spans and metrics can be emitted safely from non-Tokio contexts.
 - Alias values `opentelemetry` and `otlp` map to the same OTel backend.
+- The backend is chosen once, when the process starts. A config reload that changes it logs a warning and keeps the running backend. Until the process restarts, `GET /metrics` answers `restart required to enable prometheus` when the file says `prometheus` and the running backend is another one.
 
 Example:
 

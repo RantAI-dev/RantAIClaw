@@ -240,6 +240,10 @@ fn err_400(msg: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
 enum TurnFailure {
     /// The caller's to fix: a 400 carrying the actionable text.
     Client(String),
+    /// The provider rejected the credential it was sent: a 502. The operator
+    /// fixes it outside the gateway, so it is neither the caller's request nor
+    /// a server fault.
+    ProviderAuth(String),
     /// The server's fault: a 500.
     Server(String),
 }
@@ -248,13 +252,8 @@ impl TurnFailure {
     /// The text both chat routes report for this failure.
     fn text(&self) -> &str {
         match self {
-            Self::Client(text) | Self::Server(text) => text,
+            Self::Client(text) | Self::ProviderAuth(text) | Self::Server(text) => text,
         }
-    }
-
-    /// Whether the caller must change something before the request can work.
-    fn is_client_fault(&self) -> bool {
-        matches!(self, Self::Client(_))
     }
 }
 
@@ -297,19 +296,44 @@ fn classify_turn_failure(error: &anyhow::Error) -> TurnFailure {
     if let Some(refusal) = crate::providers::local_refusal_text(error) {
         return TurnFailure::Client(crate::providers::scrub_secret_patterns(refusal));
     }
+    // The provider answered 401 or 403 to the credential it was sent. The
+    // sentence names the provider and the status and nothing the provider
+    // wrote, because the upstream body can echo the credential back.
+    if let Some(sentence) = crate::providers::provider_auth_failure_sentence(error) {
+        return TurnFailure::ProviderAuth(crate::providers::scrub_secret_patterns(&sentence));
+    }
     TurnFailure::Server(crate::providers::sanitize_api_error(&format!("{error:#}")))
+}
+
+/// `502` for a provider that rejected the credential it was sent.
+///
+/// A bad gateway, not a 500: the gateway worked and the upstream refused it. The
+/// code is its own, so the console can tell the operator to fix the key.
+fn err_provider_auth_failed(msg: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(ErrorBody {
+            error: crate::providers::PROVIDER_AUTH_FAILED.into(),
+            matches: None,
+            detail: Some(msg.into()),
+        }),
+    )
 }
 
 /// Map an agent build/run failure to a response. A failure the caller has to
 /// fix — a missing model, a provider name that does not exist, a refusal the
-/// provider decided locally — is a 400 with the actionable text; everything
-/// else is a 500. Both paths scrub any secret-looking token.
+/// provider decided locally — is a 400 with the actionable text. A provider
+/// that rejected the credential is a 502. Everything else is a 500. Every path
+/// scrubs any secret-looking token.
 fn map_agent_error(e: anyhow::Error) -> (StatusCode, Json<ErrorBody>) {
-    let failure = classify_turn_failure(&e);
-    if failure.is_client_fault() {
-        return err_400(failure.text());
+    match classify_turn_failure(&e) {
+        TurnFailure::Client(text) => err_400(text),
+        TurnFailure::ProviderAuth(text) => {
+            tracing::warn!(detail = %text, "chat turn failed: provider rejected the credential");
+            err_provider_auth_failed(text)
+        }
+        TurnFailure::Server(text) => err_500(anyhow::anyhow!("{text}")),
     }
-    err_500(anyhow::anyhow!("{}", failure.text()))
 }
 
 /// The caller may see this resource but not act on it. Used by the skill
@@ -5211,7 +5235,7 @@ mod tests {
         let response = Box::pin(crate::gateway::config_api::set_autonomy(
             axum::extract::State(state.clone()),
             HeaderMap::new(),
-            axum::Json(body),
+            crate::gateway::config_api::StrictJson(body),
         ))
         .await
         .expect("the autonomy write must succeed");
@@ -9741,6 +9765,132 @@ mod tests {
         // so a future schema change that backfills the column from a
         // finished-row join surfaces here.
         assert_eq!(row["ended_at"], serde_json::Value::Null);
+    }
+
+    /// What a provider that rejects the credential writes back: the key it was
+    /// sent, echoed in its own words. None of this may reach the caller.
+    const UPSTREAM_REJECTION: &str =
+        r#"{"error":{"message":"Incorrect API key provided: sk-upstream-echoed-secret-9876"}}"#;
+
+    /// Text no chat answer may carry: the key the operator stored and the words
+    /// the provider wrote around its own copy of it.
+    fn assert_no_credential_material(text: &str) {
+        for forbidden in [
+            "key-for-test-0000",
+            "sk-upstream-echoed-secret-9876",
+            "Incorrect API key provided",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "the answer must not carry `{forbidden}`: {text}"
+            );
+        }
+    }
+
+    /// A provider that answers every request with `status`, and the id the
+    /// gateway knows it by. The operator has stored a key for it, as a console
+    /// that can chat has.
+    async fn rejecting_provider(
+        status: usize,
+    ) -> (mockito::ServerGuard, mockito::Mock, String, AppState) {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", mockito::Matcher::Any)
+            .with_status(status)
+            .with_body(UPSTREAM_REJECTION)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let provider = format!("custom:{}", server.url());
+        let state = scripted_state();
+        state
+            .config
+            .lock()
+            .provider_api_keys
+            .insert(provider.clone(), "key-for-test-0000".to_string());
+        (server, mock, provider, state)
+    }
+
+    /// A provider that rejects the credential is an upstream failure the
+    /// operator fixes outside the gateway, not an internal fault: a 502 with its
+    /// own code that names the provider and the status the provider answered.
+    #[tokio::test]
+    async fn chat_names_a_provider_that_rejected_the_credential() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _proxy = loopback_no_proxy();
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+
+        for status in [401usize, 403] {
+            let (_server, mock, provider, state) = rejecting_provider(status).await;
+
+            let refused = agent_chat_dispatch(
+                State(state),
+                HeaderMap::new(),
+                Query(ChatQuery::default()),
+                Json(ChatRequestBody {
+                    message: "hello".to_string(),
+                    model: None,
+                    provider: Some(provider.clone()),
+                    temperature: None,
+                    session_id: None,
+                    context: None,
+                    render_mode: None,
+                }),
+            )
+            .await;
+
+            let Err((code, Json(body))) = refused else {
+                panic!("a rejected credential must fail the turn");
+            };
+            mock.assert_async().await;
+            assert_eq!(code, StatusCode::BAD_GATEWAY, "HTTP {status}: {body:?}");
+            assert_eq!(body.error, "provider_auth_failed", "HTTP {status}");
+            let detail = body.detail.expect("the answer names what happened");
+            assert!(detail.contains(&provider), "provider id missing: {detail}");
+            assert!(
+                detail.contains(&status.to_string()),
+                "upstream status missing: {detail}"
+            );
+            assert_no_credential_material(&detail);
+        }
+    }
+
+    /// The streaming route has no status line to change once the stream is open,
+    /// so its `error` event carries the same code, provider and status.
+    #[tokio::test]
+    async fn chat_stream_names_a_provider_that_rejected_the_credential() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _proxy = loopback_no_proxy();
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+        let (_server, mock, provider, state) = rejecting_provider(401).await;
+
+        let (events, _prompt) = drive_console_turn(&state, &provider, None, "hello", None).await;
+
+        mock.assert_async().await;
+        let failure = events
+            .iter()
+            .find(|event| event["type"] == "error")
+            .unwrap_or_else(|| {
+                panic!("a rejected credential must emit an error event: {events:?}")
+            });
+        let message = failure["message"].as_str().expect("error message");
+        assert!(
+            message.contains("provider_auth_failed"),
+            "the stream must name the code: {message}"
+        );
+        assert!(
+            message.contains(&provider),
+            "provider id missing: {message}"
+        );
+        assert!(
+            message.contains("401"),
+            "upstream status missing: {message}"
+        );
+        assert_no_credential_material(message);
     }
 
     fn test_channel_message(
