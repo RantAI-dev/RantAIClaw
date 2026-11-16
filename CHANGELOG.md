@@ -453,6 +453,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on every run. It now requests `ghcr.io/rantai-dev/rantaiclaw`. The check stays non-blocking, and its
   warning stays until an org admin makes the package public for anonymous pulls.
 
+- **The release build for macOS on Apple silicon runs again.** The `aarch64-apple-darwin` job of
+  `pub-release.yml` asked for the `macos-14` runner, which GitHub rejected for this repository
+  (`The configuration 'macos-14-arm64-us-default' is not supported`), so the job was cancelled
+  before it started and the release and the weekly verification run could not finish. It uses
+  `macos-15` now. No source file changed.
+
 ### Security
 
 - **Answer keys act on an approval prompt only while its pane is on screen.** Before this change, a
