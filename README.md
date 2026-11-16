@@ -1,5 +1,9 @@
 <p align="center">
-  <img src="assets/rantaiclaw-banner.png" alt="RantaiClaw" width="600" />
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo/rantaiclaw-wordmark-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="assets/logo/rantaiclaw-wordmark-light.svg">
+    <img alt="RantaiClaw" src="assets/logo/rantaiclaw-wordmark-light.svg" width="520">
+  </picture>
 </p>
 
 <h3 align="center">Multi-Agent Runtime for Production AI Agents</h3>
