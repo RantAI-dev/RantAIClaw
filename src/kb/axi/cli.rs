@@ -1013,7 +1013,7 @@ fn cmd_status_sync(
 /// configured size, and the result reports what `config.toml` holds after the
 /// save, never the value that was requested.
 async fn cmd_set_enabled(enabled: bool) -> KbResult<i32> {
-    match super::activation::set_enabled(enabled).await? {
+    match Box::pin(super::activation::set_enabled(enabled)).await? {
         super::activation::Activation::Refused { code, message } => {
             print_error_toon(code, &message);
             Ok(1)
