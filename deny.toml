@@ -30,12 +30,13 @@ ignore = [
     # so advisories are NOT suppressed (they are matched by RUSTSEC id, which
     # this entry does not list). RUSTSEC-2025-0168 / CVE-2025-29787, the
     # advisory this entry was written against, is patched in >= 2.3.0 and so
-    # does not affect 8.6.0. RUSTSEC-2026-0367, -0368, -0369 and -0429 do
-    # affect 8.6.0; they are waived by id in the advisory ignore list below.
+    # does not affect 8.6.0. Eight later zip advisories do affect 8.6.0
+    # (RUSTSEC-2026-0367, -0368, -0369, -0429, -0545, -0546, -0547 and -0548);
+    # they are waived by id in the advisory ignore list below.
     #
     # REVIEW BY 2026-12-15: remove once docx-rs accepts zip 9 and the lockfile
     # picks it up.
-    { crate = "zip@8.6.0", reason = "reached only through docx-rs 0.4.22 (opt-in kb-office, requires zip ^8.6.0); the crates.io index does not flag 8.6.0 yanked (checked 2026-11-07), so cargo-deny reports this entry unused; the four extract() advisories (RUSTSEC-2026-0367, -0368, -0369, -0429) are waived by RUSTSEC id below; fixed when docx-rs accepts zip 9 (latest zip 9.4.1, latest docx-rs 0.4.22, checked 2026-11-07); REVIEW BY 2026-12-15" },
+    { crate = "zip@8.6.0", reason = "reached only through docx-rs 0.4.22 (opt-in kb-office, requires zip ^8.6.0); the crates.io index does not flag 8.6.0 yanked (checked 2026-11-07), so cargo-deny reports this entry unused; the eight zip advisories (RUSTSEC-2026-0367, -0368, -0369, -0429, -0545, -0546, -0547, -0548) are waived by RUSTSEC id below; fixed when docx-rs accepts zip 9 (latest zip 9.4.1, latest docx-rs 0.4.22, checked 2026-11-07); REVIEW BY 2026-12-15" },
     # rsa 0.10.0-rc.18 (Marvin timing sidechannel), pulled by russh 0.65.1 in the
     # default-on `remote-install` ssh/pty tools, so every default build carries it.
     # It is a client-side advisory against hosts the operator explicitly targets
@@ -84,7 +85,7 @@ ignore = [
     # documents, no fixed release (lopdf 0.42 is current). Revisit on a lopdf bump.
     "RUSTSEC-2026-0192",
     # zip 8.6.0: RUSTSEC-2026-0367, RUSTSEC-2026-0368, RUSTSEC-2026-0369 and
-    # RUSTSEC-2026-0429 (patched only in >= 9.0.0). All four concern
+    # RUSTSEC-2026-0429 (patched only in >= 9.0.0). These four concern
     # `ZipArchive::extract()` / `ZipStreamReader::extract()`, which unpack
     # archive entries to disk. RUSTSEC-2026-0429 is the one where
     # `ZipArchive::extract()` aborts the process on a symlink entry with a large
@@ -96,12 +97,41 @@ ignore = [
     # when docx-rs accepts zip >= 9; latest docx-rs is still 0.4.22, which
     # requires ^8.6.0 (checked 2026-11-07).
     #
-    # REVIEW BY 2026-12-15: drop these four ids once docx-rs accepts zip 9 and
-    # the lockfile picks it up.
+    # REVIEW BY 2026-12-15: drop these four ids, and the four zip ids waived
+    # below, once docx-rs accepts zip 9 and the lockfile picks it up.
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
     "RUSTSEC-2026-0429",
+    # zip 8.6.0: RUSTSEC-2026-0545, RUSTSEC-2026-0546, RUSTSEC-2026-0547 and
+    # RUSTSEC-2026-0548. These join the four ids already waived above, so eight
+    # zip ids are waived in total. All four are vulnerabilities in zip 8.6.0
+    # (patched in >= 9.0.0, and RUSTSEC-2026-0548 only in >= 9.0.5):
+    # - RUSTSEC-2026-0545 returns AES-encrypted entries without checking their
+    #   authentication code. Not compiled in: docx-rs depends on zip with
+    #   `default-features = false, features = ["deflate"]`, and the lock entry
+    #   for zip 8.6.0 lists no AES crates, so the `aes-crypto` code is absent.
+    # - RUSTSEC-2026-0546 lets `ZipArchive::extract` write outside the
+    #   destination through symlink targets. Nothing calls `extract`.
+    # - RUSTSEC-2026-0547 makes the legacy Shrink, Reduce and Implode decoders
+    #   preallocate the declared size. Not compiled in: the `legacy-zip`
+    #   feature is off for the same reason as `aes-crypto`.
+    # - RUSTSEC-2026-0548 lets `ZipStreamReader` extract entries under
+    #   local-header names that differ from the central directory. Nothing
+    #   uses `ZipStreamReader`.
+    # The only path to zip 8.6.0 is rantaiclaw -> docx-rs 0.4.22 -> zip 8.6.0
+    # behind the opt-in `kb-office` feature, and no default build contains zip.
+    # Nothing in `src/` calls the zip crate. docx-rs reads entries into memory
+    # through `ZipArchive<Cursor<&[u8]>>` and never calls `extract` or
+    # `ZipStreamReader`. Fixed when docx-rs accepts zip >= 9. The owner approved
+    # these four waivers explicitly on 2026-11-17, and the standing matrix-sdk
+    # permission does not cover them.
+    #
+    # REVIEW BY 2026-12-15 with the four zip ids above.
+    "RUSTSEC-2026-0545",
+    "RUSTSEC-2026-0546",
+    "RUSTSEC-2026-0547",
+    "RUSTSEC-2026-0548",
     # pin-utils v0.1.0 — RUSTSEC-2026-0441, unmaintained (INFO — notice only,
     # no vulnerability): the upstream repository was archived on 2026-10-01 and
     # the advisory lists no patched version, so no lockfile bump clears it.
@@ -169,6 +199,33 @@ ignore = [
     # (upstream main already accepts rusqlite 0.41.1) lands and the lockfile
     # picks up libsqlite3-sys >= 0.39.0.
     "RUSTSEC-2026-0459",
+    # chrono 0.4.45, RUSTSEC-2026-0543, flagged unmaintained, not a
+    # vulnerability. All versions are affected and there is no patched version.
+    # The announcement is https://github.com/chronotope/chrono/issues/1768.
+    # Path: chrono is a direct, non-optional dependency (Cargo.toml), used on
+    # 154 lines across 50 files in `src/`. It is also pulled by chrono-tz,
+    # `cron 0.17`, `async-imap 0.12` and, in default features, `lopdf 0.42`,
+    # `russh-sftp` and the `wa-rs*` crates, so every default build contains it.
+    # An unmaintained notice names no known flaw to trigger. Replacing chrono
+    # would also mean replacing cron, async-imap, lopdf and wa-rs, which we do
+    # not control. Moving our own code to another crate (for example jiff or
+    # time) is backlog work and not part of this change. Fixed when chrono is
+    # maintained again or the dependents move off it. The owner approved this
+    # waiver explicitly on 2026-11-17, and the standing matrix-sdk permission
+    # does not cover it.
+    #
+    # REVIEW BY 2026-12-15 with RUSTSEC-2026-0555 below.
+    "RUSTSEC-2026-0543",
+    # chrono-tz 0.10.4, RUSTSEC-2026-0555, flagged unmaintained, not a
+    # vulnerability. All versions are affected and there is no patched version.
+    # Path: chrono-tz is a direct, non-optional dependency (Cargo.toml), used in
+    # `src/cron/schedule.rs` and `src/persona/mod.rs`. The reasoning and the
+    # backlog note are the same as for chrono (RUSTSEC-2026-0543) above. The
+    # owner approved this waiver explicitly on 2026-11-17, and the standing
+    # matrix-sdk permission does not cover it.
+    #
+    # REVIEW BY 2026-12-15 with RUSTSEC-2026-0543 above.
+    "RUSTSEC-2026-0555",
 ]
 
 [licenses]
