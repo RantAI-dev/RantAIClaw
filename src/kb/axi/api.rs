@@ -208,7 +208,7 @@ async fn ensure_kb_ctx(state: &crate::gateway::AppState) -> Result<Arc<KbContext
     if !enabled {
         return Err(ApiError::service_unavailable(
             "kb_disabled",
-            "The Knowledge Base is turned off. Activate it in Configuration →              Knowledge Base."
+            "The Knowledge Base is turned off. Activate it in Configuration → Knowledge Base."
                 .into(),
         ));
     }
@@ -370,9 +370,13 @@ impl From<ApiError> for (StatusCode, Json<ErrorBody>) {
 
 impl From<KbError> for ApiError {
     /// Map kb errors to HTTP status codes. NotFound → 404, Config /
-    /// UnsupportedFileType → 400, embedding/chat upstream → 502, anything
-    /// else → 500. Detail surfaces the error's `Display` rendering; we never
-    /// log raw API keys because KbError variants don't carry them.
+    /// UnsupportedFileType → 400, a document the extractor cannot read → 422,
+    /// a vector size that disagrees with the store → 409, embedding / chat /
+    /// extractor upstream → 502, anything else → 500 (a length mismatch is an
+    /// internal invariant, not something the caller can fix). Detail surfaces
+    /// the error's `Display` rendering, except for upstream errors, which name
+    /// only the upstream; we never log raw API keys because KbError variants
+    /// don't carry them.
     fn from(err: KbError) -> Self {
         match err {
             KbError::NotFound(msg) => Self {
@@ -394,6 +398,36 @@ impl From<KbError> for ApiError {
                 body: ErrorBody {
                     error: "unsupported_file_type".into(),
                     detail: Some(msg),
+                },
+            },
+            e @ KbError::Extraction { .. } => Self {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                body: ErrorBody {
+                    error: "unprocessable_document".into(),
+                    detail: Some(format!("{e}")),
+                },
+            },
+            KbError::ExtractorUnavailable { extractor, message } => {
+                // The upstream's own words stay in the log: they can carry a
+                // response body the caller has no use for.
+                tracing::warn!(target: "kb::api", %extractor, "extractor upstream failed: {message}");
+                Self {
+                    status: StatusCode::BAD_GATEWAY,
+                    body: ErrorBody {
+                        error: "extractor_unavailable".into(),
+                        detail: Some(format!(
+                            "the {extractor} extractor upstream is unreachable or returned an error"
+                        )),
+                    },
+                }
+            }
+            KbError::DimensionMismatch { expected, got, .. } => Self {
+                status: StatusCode::CONFLICT,
+                body: ErrorBody {
+                    error: "dimension_mismatch".into(),
+                    detail: Some(format!(
+                        "embedding dimension mismatch: expected {expected}, got {got}"
+                    )),
                 },
             },
             KbError::EmbeddingApi { status, .. } => Self {
@@ -546,6 +580,9 @@ struct ReEmbedRequest {
 struct ReEmbedResponse {
     total_chunks_examined: usize,
     chunks_re_embedded: usize,
+    /// Chunks a real run would re-embed; only non-zero when `dry_run` is true.
+    chunks_would_re_embed: usize,
+    dry_run: bool,
     chunks_skipped: usize,
     errors: Vec<String>,
     elapsed_ms: u64,
@@ -556,6 +593,8 @@ impl From<&BulkReEmbedReport> for ReEmbedResponse {
         Self {
             total_chunks_examined: r.total_chunks_examined,
             chunks_re_embedded: r.chunks_re_embedded,
+            chunks_would_re_embed: r.chunks_would_re_embed,
+            dry_run: r.dry_run,
             chunks_skipped: r.chunks_skipped,
             errors: r.errors.clone(),
             elapsed_ms: r.elapsed_ms,
@@ -1701,6 +1740,68 @@ mod tests {
         clear_kb_ctx().await;
         let guard = KB_CTX.lock().await;
         assert!(guard.is_none());
+    }
+
+    fn mapped(err: KbError) -> (StatusCode, String, String) {
+        let api = ApiError::from(err);
+        (
+            api.status,
+            api.body.error,
+            api.body.detail.unwrap_or_default(),
+        )
+    }
+
+    #[test]
+    fn extraction_failure_on_the_callers_file_maps_to_422() {
+        let (status, code, detail) = mapped(KbError::Extraction {
+            extractor: "unpdf".into(),
+            message: "invalid file header".into(),
+        });
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(code, "unprocessable_document");
+        assert!(detail.contains("invalid file header"), "{detail}");
+    }
+
+    #[test]
+    fn extractor_upstream_failure_maps_to_502_and_names_the_upstream() {
+        let (status, code, detail) = mapped(KbError::ExtractorUnavailable {
+            extractor: "MineruExtractor".into(),
+            message: "mineru sidecar 500: rantaiclaw_secret_body".into(),
+        });
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(code, "extractor_unavailable");
+        assert!(detail.contains("MineruExtractor"), "{detail}");
+        assert!(detail.contains("upstream"), "{detail}");
+        assert!(
+            !detail.contains("rantaiclaw_secret_body"),
+            "the upstream's response body stays in the log: {detail}"
+        );
+    }
+
+    #[test]
+    fn dimension_mismatch_maps_to_409_naming_both_sizes() {
+        let (status, code, detail) = mapped(KbError::DimensionMismatch {
+            expected: 1024,
+            got: 768,
+            index: 0,
+        });
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(code, "dimension_mismatch");
+        assert!(
+            detail.contains("expected 1024") && detail.contains("got 768"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn length_mismatch_stays_an_internal_error() {
+        let (status, code, _) = mapped(KbError::LengthMismatch {
+            kind: "embedding batch",
+            left: 2,
+            right: 3,
+        });
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(code, "internal_error");
     }
 
     #[test]

@@ -892,6 +892,309 @@ fn kb_status_reports_disabled_state() {
     assert!(stdout.contains("false"), "reports disabled: {stdout}");
 }
 
+/// Spawn `rantaiclaw kb <args>` in a sandbox HOME that holds NO config, so the
+/// knowledge base starts off. Unlike [`run_kb`], nothing activates it and the
+/// two credential variables start empty; `extra_env` sets them per call.
+fn run_kb_in_fresh_home(
+    home: &std::path::Path,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> (i32, String, String) {
+    let mut cmd = Command::new(binary_path());
+    cmd.arg("kb")
+        .args(args)
+        .env("KB_DB_PATH", home.join("kb.db"))
+        .env("KB_EMBEDDING_DIM", "4")
+        .env("OPENROUTER_API_KEY", "")
+        .env("KB_EMBEDDING_API_KEY", "")
+        .env("RANTAICLAW_LOG_STDERR", "1")
+        .env("RUST_LOG", "warn")
+        .env("HOME", home)
+        .env_remove("RANTAICLAW_CONFIG_DIR")
+        .env_remove("RANTAICLAW_WORKSPACE");
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let output = cmd.output().expect("failed to spawn rantaiclaw binary");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// What a LATER process sees: `kb status --json` with no credential in its
+/// environment, so only the persisted config can say the knowledge base is on.
+fn persisted_enabled(home: &std::path::Path) -> bool {
+    let (code, stdout, stderr) = run_kb_in_fresh_home(home, &["status", "--json"], &[]);
+    assert_eq!(code, 0, "status must work: {stdout} {stderr}");
+    let status: serde_json::Value = serde_json::from_str(&stdout).expect("status json");
+    status["enabled"].as_bool().expect("enabled is a bool")
+}
+
+/// A fake embedding endpoint that answers every POST with `dim`-sized vectors.
+async fn embedding_endpoint(dim: usize) -> wiremock::MockServer {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [ { "embedding": vec![0.5_f64; dim] } ]
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// With the key only in the environment, `KB_EMBEDDING_API_KEY` already turns
+/// the knowledge base on at load, and the config saver drops values equal to
+/// what the environment produced. `kb enable` used to print "activated" while
+/// `config.toml` kept `enabled = false`. A later process must see it on.
+#[tokio::test]
+async fn kb_enable_with_env_only_key_persists_enabled_for_the_next_process() {
+    let server = embedding_endpoint(4).await;
+    let tmp = TempDir::new().unwrap();
+    let uri = server.uri();
+
+    let (code, stdout, stderr) = run_kb_in_fresh_home(
+        tmp.path(),
+        &["enable"],
+        &[
+            ("KB_EMBEDDING_API_KEY", "rantaiclaw_test_key"),
+            ("KB_EMBEDDING_BASE_URL", uri.as_str()),
+        ],
+    );
+    assert_eq!(code, 0, "enable must succeed: {stdout} {stderr}");
+    assert!(stdout.contains("activated"), "got: {stdout}");
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        1,
+        "enable probes the embedding endpoint once"
+    );
+
+    assert!(
+        persisted_enabled(tmp.path()),
+        "a command that said \"activated\" must have left the knowledge base on"
+    );
+}
+
+/// An endpoint that returns the wrong vector size must stop `enable`: the
+/// first ingest would otherwise fail with a dimension error.
+#[tokio::test]
+async fn kb_enable_refuses_when_the_endpoint_returns_the_wrong_vector_size() {
+    let server = embedding_endpoint(3).await;
+    let tmp = TempDir::new().unwrap();
+    let uri = server.uri();
+
+    let (code, stdout, _stderr) = run_kb_in_fresh_home(
+        tmp.path(),
+        &["enable"],
+        &[
+            ("KB_EMBEDDING_API_KEY", "rantaiclaw_test_key"),
+            ("KB_EMBEDDING_BASE_URL", uri.as_str()),
+        ],
+    );
+    assert_eq!(code, 1, "a wrong vector size must exit 1: {stdout}");
+    assert!(
+        stdout.starts_with("error[1]{code,message}"),
+        "got: {stdout}"
+    );
+    assert!(
+        stdout.contains("3-dimension") && stdout.contains("KB_EMBEDDING_DIM is 4"),
+        "the message names both sizes, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("rantaiclaw_test_key"),
+        "the key must not appear in the output: {stdout}"
+    );
+    assert!(
+        !persisted_enabled(tmp.path()),
+        "a refused enable must leave the knowledge base off"
+    );
+}
+
+/// An endpoint that answers 200 with something that is not an embedding list
+/// must stop `enable`, and the refusal must not repeat what it sent.
+#[tokio::test]
+async fn kb_enable_refusal_does_not_echo_a_malformed_endpoint_answer() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "leak": "secret-body-marker" })),
+        )
+        .mount(&server)
+        .await;
+    let tmp = TempDir::new().unwrap();
+    let uri = server.uri();
+
+    let (code, stdout, stderr) = run_kb_in_fresh_home(
+        tmp.path(),
+        &["enable"],
+        &[
+            ("KB_EMBEDDING_API_KEY", "rantaiclaw_test_key"),
+            ("KB_EMBEDDING_BASE_URL", uri.as_str()),
+        ],
+    );
+    assert_eq!(code, 1, "a malformed answer must exit 1: {stdout} {stderr}");
+    assert!(
+        !stdout.contains("secret-body-marker"),
+        "the refusal must not echo the endpoint's answer: {stdout}"
+    );
+    assert!(
+        stdout.contains("not an embedding list"),
+        "the refusal says what was wrong, got: {stdout}"
+    );
+    assert!(!persisted_enabled(tmp.path()));
+}
+
+/// A 200 whose body is not JSON fails in the HTTP client's decoder. That is
+/// not an unreachable endpoint and must not be reported as one.
+#[tokio::test]
+async fn kb_enable_does_not_call_an_undecodable_answer_unreachable() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("secret-body-marker <html>"))
+        .mount(&server)
+        .await;
+    let tmp = TempDir::new().unwrap();
+    let uri = server.uri();
+
+    let (code, stdout, _stderr) = run_kb_in_fresh_home(
+        tmp.path(),
+        &["enable"],
+        &[
+            ("KB_EMBEDDING_API_KEY", "rantaiclaw_test_key"),
+            ("KB_EMBEDDING_BASE_URL", uri.as_str()),
+        ],
+    );
+    assert_eq!(code, 1, "an undecodable answer must exit 1: {stdout}");
+    assert!(
+        stdout.contains("not an embedding list"),
+        "the refusal says what was wrong, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("could not reach"),
+        "a decode failure is not an unreachable endpoint: {stdout}"
+    );
+    assert!(!stdout.contains("secret-body-marker"), "{stdout}");
+}
+
+/// A dead endpoint must stop `enable` too, and say it could not be reached.
+#[tokio::test]
+async fn kb_enable_refuses_when_the_endpoint_is_unreachable() {
+    // Bind, note the port, release it: nothing listens there afterwards.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let url = format!("http://127.0.0.1:{port}/v1/embeddings");
+    let tmp = TempDir::new().unwrap();
+
+    let (code, stdout, _stderr) = run_kb_in_fresh_home(
+        tmp.path(),
+        &["enable"],
+        &[
+            ("KB_EMBEDDING_API_KEY", "rantaiclaw_test_key"),
+            ("KB_EMBEDDING_BASE_URL", url.as_str()),
+        ],
+    );
+    assert_eq!(code, 1, "an unreachable endpoint must exit 1: {stdout}");
+    assert!(
+        stdout.contains("could not reach the embedding endpoint"),
+        "got: {stdout}"
+    );
+    assert!(
+        !persisted_enabled(tmp.path()),
+        "a refused enable must leave the knowledge base off"
+    );
+}
+
+/// `kb disable` writes `enabled = false`, but a key still in the environment
+/// turns the knowledge base back on at every load. The command must say so
+/// instead of claiming a plain "deactivated", and the file must hold `false`.
+#[tokio::test]
+async fn kb_disable_reports_when_an_env_key_keeps_the_knowledge_base_on() {
+    let server = embedding_endpoint(4).await;
+    let tmp = TempDir::new().unwrap();
+    let uri = server.uri();
+    let env = [
+        ("KB_EMBEDDING_API_KEY", "rantaiclaw_test_key"),
+        ("KB_EMBEDDING_BASE_URL", uri.as_str()),
+    ];
+
+    let (code, stdout, stderr) = run_kb_in_fresh_home(tmp.path(), &["enable"], &env);
+    assert_eq!(code, 0, "enable must succeed: {stdout} {stderr}");
+    assert!(persisted_enabled(tmp.path()));
+
+    let (code, stdout, stderr) = run_kb_in_fresh_home(tmp.path(), &["disable"], &env);
+    assert_eq!(code, 0, "disable must succeed: {stdout} {stderr}");
+    assert!(
+        stdout.contains("KB_EMBEDDING_API_KEY"),
+        "the note must name the variable that keeps it on, got: {stdout}"
+    );
+    assert!(
+        !persisted_enabled(tmp.path()),
+        "config.toml must hold the disabled state"
+    );
+}
+
+/// A dry run must not call the paid embedding endpoint, and its counts are
+/// labelled as "would" counts with `re_embedded` left at 0.
+#[tokio::test]
+async fn kb_re_embed_dry_run_makes_no_embedding_call_and_reports_would_counts() {
+    let server = embedding_endpoint(4).await;
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("kb.db");
+    let store = SqliteStore::open(&db, 4).await.unwrap();
+    let doc = sample_doc("rantaiclaw_doc_dry", "Dry Run Doc");
+    store.create_document(&doc).await.unwrap();
+    let chunks: Vec<rantaiclaw::kb::Chunk> = (0..3)
+        .map(|i| rantaiclaw::kb::Chunk {
+            content: format!("chunk content {i}"),
+            metadata: rantaiclaw::kb::ChunkMetadata {
+                document_title: doc.title.clone(),
+                category: "FAQ".into(),
+                subcategory: None,
+                section: None,
+                chunk_index: i,
+                contextual_prefix: None,
+            },
+        })
+        .collect();
+    let embeds = vec![vec![1.0_f32; 4]; chunks.len()];
+    store
+        .store_chunks(&doc.id, &chunks, &embeds, "rantaiclaw_model_old")
+        .await
+        .unwrap();
+    drop(store);
+
+    let uri = server.uri();
+    let (code, stdout, stderr) = run_kb_with_env(
+        &db,
+        &["re-embed", "--dry-run", "--json"],
+        &[("KB_EMBEDDING_BASE_URL", uri.as_str())],
+    );
+    assert_eq!(code, 0, "dry run must succeed: {stdout} {stderr}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("re-embed json");
+    assert_eq!(report["dry_run"], true, "{report}");
+    assert_eq!(report["examined"], 3, "{report}");
+    assert_eq!(report["would_re_embed"], 3, "{report}");
+    assert_eq!(report["re_embedded"], 0, "{report}");
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "a dry run must not call the embedding endpoint"
+    );
+}
+
 /// `kb ingest --group <name>` must attach the new document to the named group.
 /// Before the fix the name was written only into `metadata["groups"]`, so the
 /// group listed nothing.

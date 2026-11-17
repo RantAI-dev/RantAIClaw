@@ -83,7 +83,7 @@ rantaiclaw kb delete <document_id> --hard    # permanent removal
 
 ```bash
 rantaiclaw kb drift                          # report chunks embedded with a non-current model
-rantaiclaw kb re-embed --dry-run             # preview a re-embed run
+rantaiclaw kb re-embed --dry-run             # count what a re-embed would touch (no embedding calls)
 rantaiclaw kb re-embed --include-current     # force re-embed every chunk
 ```
 
@@ -172,7 +172,7 @@ The CLI is the "axi-cli" surface: idempotent, never interactive, defaults to TOO
 | `kb get <id>` | Show one document by ID. `--json` |
 | `kb delete <id>` | Soft-delete a document (sets `deleted_at`). `--hard` for permanent |
 | `kb drift` | Report chunks embedded with a stale model. `--json` |
-| `kb re-embed` | Re-embed chunks. `--include-current`, `--dry-run`, `--batch-size`, `--json` |
+| `kb re-embed` | Re-embed chunks. `--include-current`, `--dry-run` (counts only, no embedding calls), `--batch-size`, `--json` |
 | `kb intelligence <document_id>` | Per-document extracted entities + relations. `--json`. An unknown ID exits `1` with a TOON `error[not_found]` block |
 | `kb graph` | Cross-document knowledge graph. `--group`, `--limit`, `--json` |
 
@@ -198,11 +198,21 @@ GET    /api/v1/kb/drift              # staleness report
 POST   /api/v1/kb/re-embed           # JSON body: { "include_current?", "dry_run?", "batch_size?" }
 ```
 
+`POST /api/v1/kb/re-embed` answers `total_chunks_examined`, `chunks_re_embedded`, `chunks_would_re_embed`, `dry_run`, `chunks_skipped`, `errors` and `elapsed_ms`. With `"dry_run": true` the gateway calls no embedding endpoint and writes nothing: `dry_run` is `true`, `chunks_would_re_embed` holds the count and `chunks_re_embedded` stays `0`.
+
 HTTP error codes specific to this surface (all 503):
 
 - `kb_disabled` — the operator turned the Knowledge Base off (`[knowledge].enabled = false`). Activate it in Configuration → Knowledge Base.
 - `kb_not_configured` — the KB is on but no embedding key resolves. Add a key under Knowledge Base settings.
 - `kb_unavailable` — the KB context failed to initialize for another reason (see gateway logs); fix the environment and restart the gateway.
+
+Errors from a document upload or a search, by who can fix them:
+
+- `unsupported_file_type` (400) — the file extension is not one the KB reads.
+- `unprocessable_document` (422) — the extractor read the file and could not make sense of it, for example a corrupt PDF. Send a different file.
+- `extractor_unavailable` (502) — the extractor service the document went to (MinerU, an OCR or vision endpoint) is down or answered with an error. The document may be fine; retry later. The answer names the extractor and leaves out what the upstream wrote.
+- `embedding_upstream` (502) / `chat_upstream` (502) — the embedding or chat endpoint answered with an error status.
+- `dimension_mismatch` (409) — a vector's size disagrees with the size the store was created with, for example because the embedding model changed. The answer reads "expected N, got M". Set `KB_EMBEDDING_DIM` to the store's size, or start a new database.
 
 
 Authentication mirrors the rest of `/api/v1/*`: pairing/bearer-token rules from `[gateway]` apply unchanged. When `require_pairing = false`, requests pass through.

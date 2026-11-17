@@ -714,8 +714,10 @@ async fn cmd_re_embed(
         println!("{}", re_embed_to_json(&report, elapsed_ms));
     } else {
         let row = serde_json::json!({
+            "dry_run": report.dry_run,
             "examined": report.total_chunks_examined,
             "re_embedded": report.chunks_re_embedded,
+            "would_re_embed": report.chunks_would_re_embed,
             "skipped": report.chunks_skipped,
             "errors": report.errors.len(),
             "elapsed_ms": elapsed_ms,
@@ -725,7 +727,15 @@ async fn cmd_re_embed(
             super::format_toon(
                 "result",
                 &[row],
-                &["examined", "re_embedded", "skipped", "errors", "elapsed_ms"],
+                &[
+                    "dry_run",
+                    "examined",
+                    "re_embedded",
+                    "would_re_embed",
+                    "skipped",
+                    "errors",
+                    "elapsed_ms",
+                ],
             )
         );
     }
@@ -941,22 +951,7 @@ fn cmd_status_sync(
     vision_api_key: Option<&str>,
     json: bool,
 ) -> KbResult<i32> {
-    let emb_cfg = embedding_api_key.unwrap_or_default();
-    let source = if std::env::var("KB_EMBEDDING_API_KEY")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)
-    {
-        "env"
-    } else if !emb_cfg.is_empty() {
-        "config"
-    } else if std::env::var("OPENROUTER_API_KEY")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)
-    {
-        "openrouter_env"
-    } else {
-        "none"
-    };
+    let source = super::activation::embedding_key_source(embedding_api_key);
     let vision_configured = vision_api_key.map(|v| !v.is_empty()).unwrap_or(false)
         || std::env::var("KB_EXTRACT_VISION_API_KEY")
             .map(|v| !v.is_empty())
@@ -1013,49 +1008,36 @@ fn cmd_status_sync(
 }
 
 /// `kb enable` / `kb disable` — the ONLY KbCommand arms that write config.
-/// Load fresh from disk, mutate, save (same discipline as the gateway's
-/// PUT): persisting a stale in-memory snapshot would clobber concurrent
-/// edits. Enable refuses when no embedding key resolves anywhere, so it
-/// cannot persist a config the gateway then 503s on (plan 103 agreement).
+/// The work is in [`super::activation::set_enabled`]: enabling refuses when no
+/// embedding key resolves or the endpoint does not answer with vectors of the
+/// configured size, and the result reports what `config.toml` holds after the
+/// save, never the value that was requested.
 async fn cmd_set_enabled(enabled: bool) -> KbResult<i32> {
-    let mut fresh = crate::config::Config::load_or_init()
-        .await
-        .map_err(|e| crate::kb::KbError::Other(format!("config load: {e}")))?;
-    if enabled {
-        let key_resolves = fresh
-            .knowledge
-            .embedding_api_key
-            .as_deref()
-            .map(|v| !v.is_empty())
-            .unwrap_or(false)
-            || std::env::var("KB_EMBEDDING_API_KEY")
-                .map(|v| !v.is_empty())
-                .unwrap_or(false)
-            || std::env::var("OPENROUTER_API_KEY")
+    match super::activation::set_enabled(enabled).await? {
+        super::activation::Activation::Refused { code, message } => {
+            print_error_toon(code, &message);
+            Ok(1)
+        }
+        super::activation::Activation::Persisted(persisted) => {
+            let env_key_set = std::env::var("KB_EMBEDDING_API_KEY")
                 .map(|v| !v.is_empty())
                 .unwrap_or(false);
-        if !key_resolves {
-            print_error_toon(
-                "no_credential",
-                "cannot activate the knowledge base without an embedding key;                  run `rantaiclaw setup knowledge` or set KB_EMBEDDING_API_KEY",
+            let note = if persisted {
+                "knowledge base activated"
+            } else if env_key_set {
+                "deactivated in config.toml; KB_EMBEDDING_API_KEY is set in the environment \
+                 and keeps the knowledge base on while it stays set"
+            } else {
+                "deactivated; credentials kept"
+            };
+            let row = serde_json::json!({ "enabled": persisted, "note": note });
+            print!(
+                "{}",
+                super::format_toon("result", &[row], &["enabled", "note"])
             );
-            return Ok(1);
+            Ok(0)
         }
     }
-    fresh.knowledge.enabled = enabled;
-    fresh
-        .save()
-        .await
-        .map_err(|e| crate::kb::KbError::Other(format!("config save: {e}")))?;
-    let row = serde_json::json!({
-        "enabled": enabled,
-        "note": if enabled { "knowledge base activated" } else { "deactivated; credentials kept" },
-    });
-    print!(
-        "{}",
-        super::format_toon("result", &[row], &["enabled", "note"])
-    );
-    Ok(0)
 }
 
 fn print_error_toon(code: &str, message: &str) {
@@ -1127,8 +1109,10 @@ fn drift_to_json(r: &DriftReport) -> String {
 
 fn re_embed_to_json(r: &BulkReEmbedReport, elapsed_ms: u64) -> String {
     let payload = serde_json::json!({
+        "dry_run": r.dry_run,
         "examined": r.total_chunks_examined,
         "re_embedded": r.chunks_re_embedded,
+        "would_re_embed": r.chunks_would_re_embed,
         "skipped": r.chunks_skipped,
         "errors": r.errors,
         "elapsed_ms": elapsed_ms,

@@ -1344,7 +1344,8 @@ no stored arg is taken as written.
   An omitted key is left alone. **An empty string deletes the key.**
 - **Response** `200`: `{ "enabled": true, "embedding_configured": true, "vision_configured": false, "source": "..." }`
 - Enabling probes the embedding key before persisting, so a bad key fails the request rather
-  than being written and failing later.
+  than being written and failing later. A key from `KB_EMBEDDING_API_KEY` or `OPENROUTER_API_KEY`
+  counts as an embedding key for activation and for `embedding_configured`, the same as `GET`.
 - **Status codes**: `200`, `400` (an unknown field, or `{}`: `nothing_to_apply`), `401`, `500`.
 
 ### POST / DELETE /api/v1/config/mcp_servers/{name}

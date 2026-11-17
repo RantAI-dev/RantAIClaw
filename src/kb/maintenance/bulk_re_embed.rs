@@ -13,8 +13,11 @@
 //!   in [`BulkReEmbedReport::errors`] and the driver advances to batch N+1;
 //!   the run does not abort. Store errors (DB-level), by contrast, are
 //!   propagated immediately — they signal something is structurally wrong.
-//! - **Dry-run.** With `dry_run = true`, no `update_chunk_embedding` calls
-//!   are issued. The report reflects what *would* have happened.
+//! - **Dry-run.** With `dry_run = true`, the embedder is never called (the
+//!   endpoint is paid) and no `update_chunk_embedding` calls are issued. The
+//!   report counts the chunks that *would* be re-embedded in
+//!   [`BulkReEmbedReport::chunks_would_re_embed`] and leaves
+//!   `chunks_re_embedded` at 0.
 //! - **Progress.** One `tracing::info!` per batch — operators can `tail -f`
 //!   the agent log to watch large migrations.
 
@@ -59,8 +62,13 @@ impl Default for BulkReEmbedOptions {
 pub struct BulkReEmbedReport {
     /// Chunks the driver looked at (sum of all page sizes).
     pub total_chunks_examined: usize,
-    /// Chunks re-embedded and written (or, with `dry_run`, would have been).
+    /// Chunks re-embedded and written. Always 0 on a dry run.
     pub chunks_re_embedded: usize,
+    /// Chunks a real run would re-embed. Only filled on a dry run, where no
+    /// embedding call is made and nothing is written.
+    pub chunks_would_re_embed: usize,
+    /// Whether this report comes from a dry run.
+    pub dry_run: bool,
     /// Chunks the driver skipped — currently always 0 here because the SQL
     /// pre-filters via `skip_model`; the field exists for parity with the
     /// TS report and to leave room for client-side skip logic later.
@@ -95,7 +103,10 @@ pub async fn run_bulk_re_embed(
         Some(target_model.as_str())
     };
 
-    let mut report = BulkReEmbedReport::default();
+    let mut report = BulkReEmbedReport {
+        dry_run: opts.dry_run,
+        ..BulkReEmbedReport::default()
+    };
     let mut after_id: Option<String> = None;
     let mut batch_idx: usize = 0;
 
@@ -119,6 +130,18 @@ pub async fn run_bulk_re_embed(
             .map(|(id, chunk, _)| (id, prepare_chunk_for_embedding(&chunk)))
             .unzip();
 
+        if opts.dry_run {
+            // Count only. The embedding endpoint is paid, so a dry run must
+            // not call it, and nothing is written.
+            report.chunks_would_re_embed += ids.len();
+            tracing::info!(
+                target: "kb::maintenance",
+                "bulk re-embed [dry-run] batch {batch_idx} size {page_size} (total examined {})",
+                report.total_chunks_examined
+            );
+            continue;
+        }
+
         // Embed the page. Provider errors are per-batch — record and move on.
         let embeddings = match embedder.embed_many(&texts).await {
             Ok(v) => v,
@@ -137,18 +160,6 @@ pub async fn run_bulk_re_embed(
             );
             tracing::warn!(target: "kb::maintenance", "{msg}");
             report.errors.push(msg);
-            continue;
-        }
-
-        if opts.dry_run {
-            // Report shape stays consistent so the operator sees the same
-            // numbers they would have seen with a real run. No DB writes.
-            report.chunks_re_embedded += ids.len();
-            tracing::info!(
-                target: "kb::maintenance",
-                "bulk re-embed [dry-run] batch {batch_idx} size {page_size} (total examined {})",
-                report.total_chunks_examined
-            );
             continue;
         }
 

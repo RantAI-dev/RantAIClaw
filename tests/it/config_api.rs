@@ -67,7 +67,12 @@ impl Drop for EnvGuard {
 }
 
 /// The process-global variables these tests own.
-const CONFIG_ENV_VARS: [&str; 2] = ["RANTAICLAW_CONFIG_DIR", "KB_EMBEDDING_BASE_URL"];
+const CONFIG_ENV_VARS: [&str; 4] = [
+    "RANTAICLAW_CONFIG_DIR",
+    "KB_EMBEDDING_BASE_URL",
+    "KB_EMBEDDING_API_KEY",
+    "OPENROUTER_API_KEY",
+];
 
 fn clear_config_env() {
     for key in CONFIG_ENV_VARS {
@@ -498,6 +503,84 @@ async fn knowledge_activate_without_key_returns_400() {
         .expect("json");
     assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
     assert_eq!(got["enabled"], false, "{got}");
+}
+
+/// The gateway resolves the embedding key the way `kb status` does, so a key
+/// that only `OPENROUTER_API_KEY` provides is reported as configured.
+#[tokio::test]
+async fn knowledge_get_reports_openrouter_env_key_as_embedding_source() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let config_dir = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::acquire().await;
+    std::env::set_var("RANTAICLAW_CONFIG_DIR", config_dir.path());
+    std::env::set_var("OPENROUTER_API_KEY", "rantaiclaw_test_key");
+    let base_url = spawn_test_gateway(test_config(workspace.path())).await;
+
+    let got: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base_url}/api/v1/config/knowledge"))
+        .bearer_auth(TEST_TOKEN)
+        .send()
+        .await
+        .expect("get")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(got["source"], "openrouter_env", "{got}");
+    assert_eq!(got["embedding_configured"], true, "{got}");
+}
+
+/// A key that only `OPENROUTER_API_KEY` provides is a key: PUT activates with
+/// it, probes with it, and answers `embedding_configured` the way GET does.
+#[tokio::test]
+async fn knowledge_put_activates_with_an_openrouter_env_key_and_agrees_with_get() {
+    use wiremock::matchers::{header, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let embed = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(header("authorization", "Bearer rantaiclaw_openrouter_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [ { "embedding": [0.1, 0.2] } ]
+        })))
+        .expect(1)
+        .mount(&embed)
+        .await;
+
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let config_dir = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::acquire().await;
+    std::env::set_var("RANTAICLAW_CONFIG_DIR", config_dir.path());
+    std::env::set_var("KB_EMBEDDING_BASE_URL", embed.uri());
+    std::env::set_var("OPENROUTER_API_KEY", "rantaiclaw_openrouter_key");
+    let base_url = spawn_test_gateway(test_config(workspace.path())).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .put(format!("{base_url}/api/v1/config/knowledge"))
+        .bearer_auth(TEST_TOKEN)
+        .json(&serde_json::json!({ "enabled": true }))
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status();
+    let put: serde_json::Value = resp.json().await.expect("json");
+    assert_eq!(status, reqwest::StatusCode::OK, "{put}");
+    assert_eq!(put["enabled"], true, "{put}");
+    assert_eq!(put["embedding_configured"], true, "{put}");
+
+    let got: serde_json::Value = client
+        .get(format!("{base_url}/api/v1/config/knowledge"))
+        .bearer_auth(TEST_TOKEN)
+        .send()
+        .await
+        .expect("get")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        got["embedding_configured"], put["embedding_configured"],
+        "GET and PUT must agree: get={got} put={put}"
+    );
 }
 
 #[tokio::test]
