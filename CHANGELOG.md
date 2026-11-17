@@ -9,6 +9,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`rantaiclaw kb enable` leaves the knowledge base enabled when it says it did.** With the
+  embedding key only in `KB_EMBEDDING_API_KEY`, `kb enable` printed "knowledge base activated"
+  while `config.toml` kept `enabled = false`: the key already turns the knowledge base on at load,
+  and the config saver drops a value equal to what the environment produced. `kb enable`,
+  `kb disable` and the TUI `/kb` command now write through a config loaded without environment
+  overrides, read the file again, and report the value it holds. `kb disable` says when a key
+  still in the environment keeps the knowledge base on.
+
+- **`kb enable` checks the embedding endpoint before it enables.** It embeds one short string and
+  refuses, with exit `1` and nothing written, when the endpoint is unreachable, rejects the key,
+  or returns vectors of a size other than `KB_EMBEDDING_DIM`. The message names both sizes. The
+  gateway's own key probe is unchanged.
+
+- **`kb re-embed --dry-run` makes no embedding call.** It called the paid endpoint for every page
+  and then counted the chunks as re-embedded. A dry run now counts the chunks a real run would
+  re-embed in `would_re_embed` (`chunks_would_re_embed` on `POST /kb/re-embed`), leaves
+  `re_embedded` at `0`, and both the CLI output and the gateway answer carry `dry_run`.
+
+- **Pairing no longer switches the knowledge base off for the running gateway.** Persisting the
+  paired token reloaded the config from disk without the environment overrides and put that copy
+  in place of the running one, so an embedding key supplied only through `KB_EMBEDDING_API_KEY`
+  was gone from the running config, and every `/kb/*` route answered `503 kb_disabled`, until the
+  file watcher reloaded the config. The overrides are applied again before the swap.
+
+- **`GET /config/knowledge`, `kb status` and `/kb` agree on where the embedding key comes from.**
+  The gateway did not count `OPENROUTER_API_KEY`, which the embedder uses, so it reported
+  `source: "none"` while `kb status` said `openrouter_env`. All three use one resolver now, and
+  the gateway reports `openrouter_env` too. `PUT /config/knowledge {"enabled": true}` now also
+  activates the knowledge base when the key is only in `OPENROUTER_API_KEY` or
+  `KB_EMBEDDING_API_KEY`, where it answered `400` before. The activation probe sends the key the
+  embedder would send, and `embedding_configured` in the answer counts an environment key.
+
+- **A corrupt document upload answers `422 unprocessable_document`, and an extractor outage
+  answers `502 extractor_unavailable`.** `POST /kb/documents` answered `500 internal_error` for
+  both. A new `ExtractorUnavailable` error separates a down MinerU, OCR or vision service from a
+  file the extractor could not read; when two extractors both fail, the answer is a `502` if
+  either failure was an outage. The `502` names the extractor and leaves out the upstream's
+  response body. A vector size that disagrees with the store answers `409 dimension_mismatch` with
+  both sizes. A missing vision API key in the PDF vision extractor is a configuration error (`400`)
+  instead of an extraction failure.
+
+- **KB error messages no longer carry a run of spaces.** The unknown-extractor, unimplemented
+  intelligence-resolution, embedding-dimension and `kb_disabled` messages, and the `kb enable`
+  no-credential message, held the indentation of the source line they were written across.
+
 - **Editing a skill's `SKILL.md` reaches the agent in a running TUI.** The skills watcher
   compared the set of skill names, so an edit that kept the name refreshed the `/skills` picker
   but sent no agent reload and no channel restart, and the model kept the old instructions until

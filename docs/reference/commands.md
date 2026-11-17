@@ -550,9 +550,11 @@ Re-embed chunks using the currently-configured embedding model.
 | Flag | Description | Default |
 |---|---|---|
 | `--include-current` | Re-embed even chunks already on the current model | `false` |
-| `--dry-run` | Report what would happen without writing | `false` |
+| `--dry-run` | Count the chunks a real run would re-embed. Makes no embedding call and writes nothing | `false` |
 | `--batch-size <n>` | Batch size for re-embed work | `100` |
 | `--json` | Emit JSON instead of TOON | `false` |
+
+The result carries `dry_run`, `re_embedded` (chunks written) and `would_re_embed` (chunks a real run would re-embed). A dry run reports its count in `would_re_embed` and leaves `re_embedded` at `0`.
 
 #### `kb status`
 
@@ -564,7 +566,7 @@ Show whether the Knowledge Base is active, whether a key resolves (and from wher
 
 #### `kb enable` / `kb disable`
 
-Toggle `[knowledge].enabled` and persist it. `enable` refuses when no embedding key resolves anywhere (config or env) — it will not persist a config the gateway then rejects. `disable` keeps the credentials, so re-activation is one command. While disabled, the data subcommands (`search`, `ingest`, `list`, …) answer a `kb_disabled` TOON error with exit 1.
+Toggle `[knowledge].enabled` and persist it. `enable` refuses (exit `1`, nothing written) when no embedding key resolves anywhere (config or env), when the embedding endpoint cannot be reached or rejects the key, or when it returns vectors of a size other than `KB_EMBEDDING_DIM`. The size check embeds one short string, so `enable` makes one embedding call. Both commands read `config.toml` again after the save and report the value it holds, so `enable` prints "activated" only when the file says `enabled = true`. A key supplied only through `KB_EMBEDDING_API_KEY` does not change that: the value is written to the file. `disable` keeps the credentials, so re-activation is one command. While `KB_EMBEDDING_API_KEY` stays set in the environment, it turns the knowledge base back on at every load, and `disable` says so. While disabled, the data subcommands (`search`, `ingest`, `list`, …) answer a `kb_disabled` TOON error with exit 1.
 
 In the TUI, `/kb` shows the same status and `/kb enable` / `/kb disable` toggle it.
 

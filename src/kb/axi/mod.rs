@@ -14,7 +14,10 @@
 //! - [`cli`] — the `rantaiclaw kb ...` clap subcommand and dispatcher.
 //! - [`api`] — the `/api/v1/kb/*` axum router merged into the gateway.
 //! - [`ambient`] — the AXI ambient-context line for the agent loop.
+//! - [`activation`] — the `kb enable|disable` toggle and the embedding-key
+//!   resolver shared by the CLI, the TUI and the gateway.
 
+pub mod activation;
 pub mod ambient;
 pub mod api;
 pub mod cli;

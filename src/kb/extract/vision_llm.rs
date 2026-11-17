@@ -159,12 +159,9 @@ async fn send_single_pdf_call(args: SendCallArgs<'_>) -> KbResult<ExtractionResu
     let api_key =
         KbConfig::resolve_key_with_fallback(args.api_key_override, args.embedding_api_key_fallback);
     if api_key.is_empty() {
-        return Err(KbError::Extraction {
-            extractor: args.model.to_string(),
-            message: format!(
-                "{prefix}No API key configured: set KB_EXTRACT_VISION_API_KEY, KB_EMBEDDING_API_KEY, or OPENROUTER_API_KEY"
-            ),
-        });
+        return Err(KbError::Config(format!(
+            "{prefix}No API key configured: set KB_EXTRACT_VISION_API_KEY, KB_EMBEDDING_API_KEY, or OPENROUTER_API_KEY"
+        )));
     }
 
     let base64 = B64.encode(args.pdf_bytes);
@@ -198,7 +195,7 @@ async fn send_single_pdf_call(args: SendCallArgs<'_>) -> KbResult<ExtractionResu
         .json(&body)
         .send()
         .await
-        .map_err(|e| KbError::Extraction {
+        .map_err(|e| KbError::ExtractorUnavailable {
             extractor: args.model.to_string(),
             // Single-call path historically surfaced just `{e}`; segment path
             // surfaced `[VisionLlmExtractor segment N/M] {e}`. Both are
@@ -218,7 +215,7 @@ async fn send_single_pdf_call(args: SendCallArgs<'_>) -> KbResult<ExtractionResu
         } else {
             "VisionLlmExtractor ".into()
         };
-        return Err(KbError::Extraction {
+        return Err(KbError::ExtractorUnavailable {
             extractor: args.model.to_string(),
             message: format!(
                 "{prefix}{head}{} {}: {}",
@@ -229,16 +226,19 @@ async fn send_single_pdf_call(args: SendCallArgs<'_>) -> KbResult<ExtractionResu
         });
     }
 
-    let data: ChatResponse = res.json().await.map_err(|e| KbError::Extraction {
-        extractor: args.model.to_string(),
-        // Single-call: "response parse: {e}"; segment: "parse: {e}". Match
-        // both faithfully.
-        message: if args.error_prefix.is_some() {
-            format!("{prefix}parse: {e}")
-        } else {
-            format!("response parse: {e}")
-        },
-    })?;
+    let data: ChatResponse = res
+        .json()
+        .await
+        .map_err(|e| KbError::ExtractorUnavailable {
+            extractor: args.model.to_string(),
+            // Single-call: "response parse: {e}"; segment: "parse: {e}". Match
+            // both faithfully.
+            message: if args.error_prefix.is_some() {
+                format!("{prefix}parse: {e}")
+            } else {
+                format!("response parse: {e}")
+            },
+        })?;
 
     let text = data
         .choices

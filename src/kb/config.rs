@@ -139,7 +139,7 @@ impl KbConfig {
                 // advertised and silently behaved as `exact` (plan 097).
                 if v != "exact" {
                     return Err(KbError::Config(format!(
-                        "KB_INTELLIGENCE_RESOLUTION={v} is not implemented;                          only 'exact' is supported — unset the variable or set it to 'exact'"
+                        "KB_INTELLIGENCE_RESOLUTION={v} is not implemented; only 'exact' is supported — unset the variable or set it to 'exact'"
                     )));
                 }
                 v

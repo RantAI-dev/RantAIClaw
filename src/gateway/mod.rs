@@ -2061,6 +2061,12 @@ async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGua
         .await
         .context("Failed to persist paired tokens to config.toml")?;
 
+    // The file read above carries no environment overrides, but the running
+    // config was built with them. Fold them back in after the save (which
+    // would otherwise strip them) so an env-supplied credential, and the
+    // knowledge base it enables, survive a pairing.
+    updated_cfg.apply_env_overrides();
+
     // Keep shared runtime config in sync with persisted tokens.
     *config.lock() = updated_cfg;
     Ok(())
@@ -5564,6 +5570,48 @@ mod tests {
         let in_memory = shared_config.lock();
         assert_eq!(in_memory.gateway.paired_tokens.len(), 1);
         assert_eq!(&in_memory.gateway.paired_tokens[0], persisted);
+    }
+
+    #[tokio::test]
+    async fn persist_pairing_tokens_keeps_env_supplied_knowledge_key() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _kb_key = crate::test_env::EnvGuard::set("KB_EMBEDDING_API_KEY", "rantaiclaw_test_key");
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+
+        let mut config = Config::default();
+        config.config_path = config_path.clone();
+        config.workspace_dir = temp.path().join("workspace");
+        config.save().await.unwrap();
+        // The running config is built the way the gateway builds it: from the
+        // file plus the environment.
+        config.apply_env_overrides();
+        assert!(config.knowledge.enabled);
+
+        let guard = PairingGuard::new(true, &[]);
+        let code = guard.pairing_code().unwrap();
+        guard.try_pair(&code, "test_client").await.unwrap().unwrap();
+
+        let shared_config = Arc::new(Mutex::new(config));
+        persist_pairing_tokens(shared_config.clone(), &guard)
+            .await
+            .unwrap();
+
+        {
+            let running = shared_config.lock();
+            assert!(
+                running.knowledge.enabled,
+                "pairing must not drop the env-enabled knowledge base from the running config"
+            );
+            assert_eq!(
+                running.knowledge.embedding_api_key.as_deref(),
+                Some("rantaiclaw_test_key")
+            );
+        }
+
+        // The env value is never written to disk.
+        let saved = tokio::fs::read_to_string(config_path).await.unwrap();
+        assert!(!saved.contains("rantaiclaw_test_key"));
     }
 
     /// Minimal `AppState` for the store-pairing test: a fresh pairing guard plus

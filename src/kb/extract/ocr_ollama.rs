@@ -121,7 +121,7 @@ impl Extractor for OllamaOcrExtractor {
             .json(&body)
             .send()
             .await
-            .map_err(|e| KbError::Extraction {
+            .map_err(|e| KbError::ExtractorUnavailable {
                 extractor: "OllamaOcrExtractor".into(),
                 message: e.to_string(),
             })?;
@@ -130,16 +130,19 @@ impl Extractor for OllamaOcrExtractor {
         if !status.is_success() {
             let body_text = res.text().await.unwrap_or_default();
             let truncated: String = body_text.chars().take(300).collect();
-            return Err(KbError::Extraction {
+            return Err(KbError::ExtractorUnavailable {
                 extractor: "OllamaOcrExtractor".into(),
                 message: format!("ollama OCR endpoint {}: {}", status.as_u16(), truncated),
             });
         }
 
-        let data: OllamaGenerateResponse = res.json().await.map_err(|e| KbError::Extraction {
-            extractor: "OllamaOcrExtractor".into(),
-            message: format!("response parse: {e}"),
-        })?;
+        let data: OllamaGenerateResponse =
+            res.json()
+                .await
+                .map_err(|e| KbError::ExtractorUnavailable {
+                    extractor: "OllamaOcrExtractor".into(),
+                    message: format!("response parse: {e}"),
+                })?;
 
         Ok(ExtractionResult {
             text: data.response,
