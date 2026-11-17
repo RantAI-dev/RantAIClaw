@@ -162,6 +162,10 @@ fn config_rejects_unimplemented_resolution_strategy() {
         msg.contains("not implemented") && msg.contains("exact"),
         "error must say what to do, got: {msg}"
     );
+    assert!(
+        !msg.contains("  "),
+        "no run of spaces from line-continuation indentation: {msg:?}"
+    );
 }
 
 #[test]

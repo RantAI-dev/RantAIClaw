@@ -3759,8 +3759,9 @@ async fn get_knowledge(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
     let cfg = state.config.lock().clone();
-    let emb_src = knowledge_source(
-        "KB_EMBEDDING_API_KEY",
+    // The same resolver `kb status` and `/kb` use, so all three agree on
+    // whether an embedding key resolves (OPENROUTER_API_KEY counts).
+    let emb_src = crate::kb::axi::activation::embedding_key_source(
         cfg.knowledge.embedding_api_key.as_deref(),
     );
     let vis_src = knowledge_source(
@@ -3814,16 +3815,25 @@ async fn set_knowledge(
     // — deactivating or clearing a key never makes a network call. A typo'd
     // key used to persist happily and fail later as a 502 on every KB call,
     // far from the action that caused it (plan 103).
+    //
+    // "Has a key" is the resolver `kb status` and `kb enable` use, so a key
+    // that only `OPENROUTER_API_KEY` or `KB_EMBEDDING_API_KEY` provides
+    // counts, and the probe sends the key the embedder would send.
     if cfg.knowledge.enabled {
-        if let Some(key) = cfg
-            .knowledge
-            .embedding_api_key
-            .as_deref()
-            .filter(|k| !k.is_empty())
+        if crate::kb::axi::activation::embedding_key_source(
+            cfg.knowledge.embedding_api_key.as_deref(),
+        ) != "none"
         {
-            let kb_cfg = crate::kb::KbConfig::from_env_with_keys(Some(key), None)
-                .map_err(|e| err_400(format!("kb config: {e}")))?;
-            if let Err(msg) = probe_embedding_key(&kb_cfg, key).await {
+            let kb_cfg = crate::kb::KbConfig::from_env_with_keys(
+                cfg.knowledge
+                    .embedding_api_key
+                    .as_deref()
+                    .filter(|k| !k.is_empty()),
+                None,
+            )
+            .map_err(|e| err_400(format!("kb config: {e}")))?;
+            let key = crate::kb::KbConfig::resolve_key(&kb_cfg.embedding_api_key);
+            if let Err(msg) = probe_embedding_key(&kb_cfg, &key).await {
                 return Err(err_400(msg));
             }
         } else if body.enabled == Some(true) {
@@ -3847,7 +3857,9 @@ async fn set_knowledge(
     let cfg = state.config.lock().clone();
     Ok(Json(json!({
         "enabled": cfg.knowledge.enabled,
-        "embedding_configured": cfg.knowledge.embedding_api_key.is_some(),
+        "embedding_configured": crate::kb::axi::activation::embedding_key_source(
+            cfg.knowledge.embedding_api_key.as_deref(),
+        ) != "none",
         "vision_configured": cfg.knowledge.vision_api_key.is_some(),
     })))
 }

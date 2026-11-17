@@ -9,39 +9,19 @@
 use anyhow::Result;
 
 use super::{CommandHandler, CommandResult, TuiContext};
+use crate::kb::axi::activation::{embedding_key_source, set_enabled, Activation};
 
 pub struct KbCommand;
 
-/// Load config.toml fresh, apply the toggle, save back. Same
-/// `block_in_place` idiom as `/autonomy` — `CommandHandler::execute` is
-/// sync, `Config::save` is async.
-fn persist_enabled(enabled: bool) -> anyhow::Result<()> {
+/// Toggle `[knowledge].enabled` through the shared activation logic: it
+/// probes the endpoint before enabling and returns the value it read back
+/// from `config.toml`. Same `block_in_place` idiom as `/autonomy` —
+/// `CommandHandler::execute` is sync, the config I/O is async.
+fn persist_enabled(enabled: bool) -> anyhow::Result<Activation> {
     let handle = tokio::runtime::Handle::try_current()
         .map_err(|_| anyhow::anyhow!("/kb must run inside a tokio runtime"))?;
-    tokio::task::block_in_place(|| {
-        handle.block_on(async move {
-            let mut config = crate::config::Config::load_or_init().await?;
-            if enabled {
-                let key_resolves = config
-                    .knowledge
-                    .embedding_api_key
-                    .as_deref()
-                    .map(|v| !v.is_empty())
-                    .unwrap_or(false)
-                    || std::env::var("KB_EMBEDDING_API_KEY")
-                        .map(|v| !v.is_empty())
-                        .unwrap_or(false)
-                    || std::env::var("OPENROUTER_API_KEY")
-                        .map(|v| !v.is_empty())
-                        .unwrap_or(false);
-                if !key_resolves {
-                    anyhow::bail!("no embedding key resolves — run /setup knowledge first");
-                }
-            }
-            config.knowledge.enabled = enabled;
-            config.save().await
-        })
-    })
+    tokio::task::block_in_place(|| handle.block_on(set_enabled(enabled)))
+        .map_err(anyhow::Error::from)
 }
 
 impl CommandHandler for KbCommand {
@@ -60,16 +40,30 @@ impl CommandHandler for KbCommand {
     fn execute(&self, args: &str, _ctx: &mut TuiContext) -> Result<CommandResult> {
         match args.trim() {
             "enable" => match persist_enabled(true) {
-                Ok(()) => Ok(CommandResult::Message("✓ Knowledge Base activated".into())),
+                Ok(Activation::Persisted(true)) => {
+                    Ok(CommandResult::Message("✓ Knowledge Base activated".into()))
+                }
+                Ok(Activation::Persisted(false)) => Ok(CommandResult::Message(
+                    "✗ Could not activate the Knowledge Base: config.toml still has it off".into(),
+                )),
+                Ok(Activation::Refused { message, .. }) => Ok(CommandResult::Message(format!(
+                    "✗ Could not activate the Knowledge Base: {message}"
+                ))),
                 Err(e) => Ok(CommandResult::Message(format!(
                     "✗ Could not activate the Knowledge Base: {e}"
                 ))),
             },
             "disable" => match persist_enabled(false) {
-                Ok(()) => Ok(CommandResult::Message(
+                Ok(Activation::Persisted(false)) => Ok(CommandResult::Message(
                     "✓ Knowledge Base deactivated — credentials kept; /kb enable turns it back on"
                         .into(),
                 )),
+                Ok(Activation::Persisted(true)) => Ok(CommandResult::Message(
+                    "✗ Could not deactivate the Knowledge Base: config.toml still has it on".into(),
+                )),
+                Ok(Activation::Refused { message, .. }) => Ok(CommandResult::Message(format!(
+                    "✗ Could not deactivate the Knowledge Base: {message}"
+                ))),
                 Err(e) => Ok(CommandResult::Message(format!(
                     "✗ Could not deactivate the Knowledge Base: {e}"
                 ))),
@@ -84,27 +78,8 @@ impl CommandHandler for KbCommand {
                     handle.block_on(crate::config::Config::load_or_init())
                 })?;
                 let enabled = config.knowledge.enabled;
-                let key_source = if std::env::var("KB_EMBEDDING_API_KEY")
-                    .map(|v| !v.is_empty())
-                    .unwrap_or(false)
-                {
-                    "env"
-                } else if config
-                    .knowledge
-                    .embedding_api_key
-                    .as_deref()
-                    .map(|v| !v.is_empty())
-                    .unwrap_or(false)
-                {
-                    "config"
-                } else if std::env::var("OPENROUTER_API_KEY")
-                    .map(|v| !v.is_empty())
-                    .unwrap_or(false)
-                {
-                    "openrouter env"
-                } else {
-                    "none"
-                };
+                let key_source =
+                    embedding_key_source(config.knowledge.embedding_api_key.as_deref());
                 let db_path = crate::kb::axi::cli::resolve_kb_db_path();
                 let db_state = if db_path.exists() {
                     "present"

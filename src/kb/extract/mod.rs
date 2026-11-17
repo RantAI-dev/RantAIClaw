@@ -123,7 +123,7 @@ pub fn build_extractor(cfg: &KbConfig, sentinel: &str) -> KbResult<Box<dyn Extra
             // error instead of a config error (plan 113).
             if !model_id.contains('/') {
                 return Err(KbError::Config(format!(
-                    "unknown extractor '{model_id}': expected one of                      unpdf | mineru | hybrid | smart, or an OpenRouter model                      id (e.g. `openai/gpt-4.1-nano`)"
+                    "unknown extractor '{model_id}': expected one of unpdf | mineru | hybrid | smart, or an OpenRouter model id (e.g. `openai/gpt-4.1-nano`)"
                 )));
             }
             Ok(Box::new(vision_llm::VisionLlmExtractor::new(

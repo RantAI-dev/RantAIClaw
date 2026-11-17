@@ -632,6 +632,10 @@ async fn reopen_with_different_dim_is_refused_and_evidence_survives() {
         msg.contains('4') && msg.contains('8'),
         "error must name both dimensions: {msg}"
     );
+    assert!(
+        !msg.contains("  "),
+        "no run of spaces from line-continuation indentation: {msg:?}"
+    );
 
     // The point of the plan: the recorded value survives the failed open.
     let conn = rusqlite::Connection::open(&path).unwrap();

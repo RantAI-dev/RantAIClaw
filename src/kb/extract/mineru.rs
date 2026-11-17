@@ -70,10 +70,7 @@ impl Extractor for MineruExtractor {
         let part = multipart::Part::bytes(pdf_bytes.to_vec())
             .file_name("document.pdf")
             .mime_str("application/pdf")
-            .map_err(|e| KbError::Extraction {
-                extractor: "MineruExtractor".into(),
-                message: format!("invalid mime: {e}"),
-            })?;
+            .map_err(|e| KbError::Other(format!("MineruExtractor invalid mime: {e}")))?;
         let form = multipart::Form::new().part("file", part);
 
         let url = format!("{}/extract", self.base_url);
@@ -83,7 +80,7 @@ impl Extractor for MineruExtractor {
             .multipart(form)
             .send()
             .await
-            .map_err(|e| KbError::Extraction {
+            .map_err(|e| KbError::ExtractorUnavailable {
                 extractor: "MineruExtractor".into(),
                 message: e.to_string(),
             })?;
@@ -92,16 +89,19 @@ impl Extractor for MineruExtractor {
         if !status.is_success() {
             let body = res.text().await.unwrap_or_default();
             let truncated: String = body.chars().take(300).collect();
-            return Err(KbError::Extraction {
+            return Err(KbError::ExtractorUnavailable {
                 extractor: "MineruExtractor".into(),
                 message: format!("mineru sidecar {}: {}", status.as_u16(), truncated),
             });
         }
 
-        let data: MineruResponse = res.json().await.map_err(|e| KbError::Extraction {
-            extractor: "MineruExtractor".into(),
-            message: format!("response parse: {e}"),
-        })?;
+        let data: MineruResponse = res
+            .json()
+            .await
+            .map_err(|e| KbError::ExtractorUnavailable {
+                extractor: "MineruExtractor".into(),
+                message: format!("response parse: {e}"),
+            })?;
 
         let took_ms = data.ms.unwrap_or_else(|| elapsed_ms(t0));
         Ok(ExtractionResult {

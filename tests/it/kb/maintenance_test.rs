@@ -390,7 +390,9 @@ async fn bulk_re_embed_dry_run_writes_nothing() {
     let drift_before = check_drift(&cfg, &store).await.unwrap();
     assert_eq!(drift_before.stale_chunk_count, 4);
 
-    let embedder: Arc<dyn EmbeddingProvider> = Arc::new(ConstantEmbedder::new(DIM));
+    let constant = ConstantEmbedder::new(DIM);
+    let calls = constant.calls.clone();
+    let embedder: Arc<dyn EmbeddingProvider> = Arc::new(constant);
     let report = run_bulk_re_embed(
         &cfg,
         &store,
@@ -403,7 +405,21 @@ async fn bulk_re_embed_dry_run_writes_nothing() {
     )
     .await
     .unwrap();
-    assert_eq!(report.chunks_re_embedded, 4, "report shows would-be writes");
+    assert!(report.dry_run, "the report says it came from a dry run");
+    assert_eq!(report.total_chunks_examined, 4);
+    assert_eq!(
+        report.chunks_would_re_embed, 4,
+        "report counts the chunks a real run would re-embed"
+    );
+    assert_eq!(
+        report.chunks_re_embedded, 0,
+        "a dry run re-embeds nothing, so the re-embedded count stays 0"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "a dry run must not call the (paid) embedding endpoint"
+    );
 
     // DB must be untouched — drift report identical to before.
     let drift_after = check_drift(&cfg, &store).await.unwrap();

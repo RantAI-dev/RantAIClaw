@@ -170,6 +170,10 @@ async fn unpdf_returns_extraction_error_on_garbage_input() {
         .extract(bytes)
         .await
         .expect_err("garbage bytes must not parse");
+    assert!(
+        matches!(err, KbError::Extraction { .. }),
+        "an unreadable document is the caller's file, not an upstream failure, got: {err:?}"
+    );
     let msg = err.to_string();
     assert!(
         msg.contains("extraction failed") || msg.contains("unpdf"),
@@ -449,7 +453,11 @@ async fn mineru_extractor_surfaces_sidecar_errors() {
     let err = ext
         .extract(b"%PDF-1.5\n")
         .await
-        .expect_err("5xx sidecar response must surface as KbError::Extraction");
+        .expect_err("5xx sidecar response must surface as an extractor error");
+    assert!(
+        matches!(err, KbError::ExtractorUnavailable { .. }),
+        "a failing sidecar is an upstream failure, got: {err:?}"
+    );
     let msg = err.to_string();
     assert!(msg.contains("500"), "error must include status code: {msg}");
 }
@@ -472,7 +480,11 @@ async fn vision_llm_4xx_surfaces_extraction_error() {
     let err = ext
         .extract(&pdf)
         .await
-        .expect_err("4xx must surface KbError::Extraction");
+        .expect_err("4xx must surface an extractor error");
+    assert!(
+        matches!(err, KbError::ExtractorUnavailable { .. }),
+        "a rejecting vision endpoint is an upstream failure, got: {err:?}"
+    );
     let msg = err.to_string();
     assert!(
         msg.contains("400"),
@@ -568,6 +580,30 @@ impl CannedExtractor {
             }),
         }
     }
+    /// An extractor whose configuration is wrong, for example a missing key.
+    fn misconfigured(name: &str, msg: &str) -> Self {
+        Self {
+            name: name.into(),
+            result: Err(KbError::Config(msg.into())),
+        }
+    }
+    fn internal(name: &str, msg: &str) -> Self {
+        Self {
+            name: name.into(),
+            result: Err(KbError::Other(msg.into())),
+        }
+    }
+    /// An extractor whose upstream service is down, as opposed to one that
+    /// could not read the document.
+    fn unavailable(name: &str, msg: &str) -> Self {
+        Self {
+            name: name.into(),
+            result: Err(KbError::ExtractorUnavailable {
+                extractor: name.into(),
+                message: msg.into(),
+            }),
+        }
+    }
 }
 
 #[async_trait]
@@ -578,6 +614,14 @@ impl Extractor for CannedExtractor {
     async fn extract(&self, _: &[u8]) -> KbResult<ExtractionResult> {
         match &self.result {
             Ok(r) => Ok(r.clone()),
+            Err(KbError::Config(message)) => Err(KbError::Config(message.clone())),
+            Err(KbError::Other(message)) => Err(KbError::Other(message.clone())),
+            Err(KbError::ExtractorUnavailable { message, .. }) => {
+                Err(KbError::ExtractorUnavailable {
+                    extractor: self.name.clone(),
+                    message: message.clone(),
+                })
+            }
             Err(e) => Err(KbError::Extraction {
                 extractor: self.name.clone(),
                 message: e.to_string(),
@@ -658,6 +702,107 @@ async fn smart_router_surfaces_aggregate_error_when_both_fail() {
     let msg = err.to_string();
     assert!(msg.contains("tlfail"), "msg must include tl error: {msg}");
     assert!(msg.contains("fbfail"), "msg must include fb error: {msg}");
+}
+
+/// Both extractors read the document and failed: the document is at fault.
+#[tokio::test]
+async fn smart_router_aggregate_blames_the_document_when_both_extractors_read_it() {
+    let text_layer = Box::new(CannedExtractor::err("unpdf", "tlfail"));
+    let fallback = Box::new(CannedExtractor::err("vision", "fbfail"));
+    let router = SmartRouterExtractor::new(text_layer, fallback);
+    let err = router.extract(b"unused").await.expect_err("must fail");
+    assert!(
+        matches!(err, KbError::Extraction { .. }),
+        "two document failures are a document failure, got: {err:?}"
+    );
+}
+
+/// The fallback service is down: the aggregate is an upstream failure even
+/// though the text layer also failed on the document.
+#[tokio::test]
+async fn smart_router_aggregate_is_upstream_when_the_fallback_service_is_down() {
+    let text_layer = Box::new(CannedExtractor::err("unpdf", "tlfail"));
+    let fallback = Box::new(CannedExtractor::unavailable("vision", "connection refused"));
+    let router = SmartRouterExtractor::new(text_layer, fallback);
+    let err = router.extract(b"unused").await.expect_err("must fail");
+    assert!(
+        matches!(err, KbError::ExtractorUnavailable { .. }),
+        "a down fallback service is an upstream failure, got: {err:?}"
+    );
+}
+
+/// A missing key or an internal fault is not the document's fault: the
+/// aggregate surfaces it as itself so it keeps its own status.
+#[tokio::test]
+async fn smart_router_aggregate_keeps_a_configuration_error_as_itself() {
+    let text_layer = Box::new(CannedExtractor::err("unpdf", "tlfail"));
+    let fallback = Box::new(CannedExtractor::misconfigured("vision", "no key"));
+    let router = SmartRouterExtractor::new(text_layer, fallback);
+    let err = router.extract(b"unused").await.expect_err("must fail");
+    assert!(
+        matches!(err, KbError::Config(_)),
+        "a missing key stays a configuration error, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn smart_router_aggregate_keeps_an_internal_error_as_itself() {
+    let text_layer = Box::new(CannedExtractor::err("unpdf", "tlfail"));
+    let fallback = Box::new(CannedExtractor::internal("vision", "bad mime"));
+    let router = SmartRouterExtractor::new(text_layer, fallback);
+    let err = router.extract(b"unused").await.expect_err("must fail");
+    assert!(
+        matches!(err, KbError::Other(_)),
+        "an internal fault stays internal, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn hybrid_aggregate_keeps_a_configuration_error_as_itself() {
+    let structural = Box::new(CannedExtractor::misconfigured("mineru", "no url"));
+    let text_layer = Box::new(CannedExtractor::err("unpdf", "tfail"));
+    let hybrid = HybridExtractor::new(structural, text_layer);
+    let err = hybrid.extract(b"unused").await.expect_err("must fail");
+    assert!(
+        matches!(err, KbError::Config(_)),
+        "a configuration error stays one, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn hybrid_aggregate_keeps_an_internal_error_as_itself() {
+    let structural = Box::new(CannedExtractor::err("mineru", "sfail"));
+    let text_layer = Box::new(CannedExtractor::internal("unpdf", "join error"));
+    let hybrid = HybridExtractor::new(structural, text_layer);
+    let err = hybrid.extract(b"unused").await.expect_err("must fail");
+    assert!(
+        matches!(err, KbError::Other(_)),
+        "an internal fault stays internal, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn hybrid_aggregate_blames_the_document_when_both_extractors_read_it() {
+    let structural = Box::new(CannedExtractor::err("mineru", "sfail"));
+    let text_layer = Box::new(CannedExtractor::err("unpdf", "tfail"));
+    let hybrid = HybridExtractor::new(structural, text_layer);
+    let err = hybrid.extract(b"unused").await.expect_err("must fail");
+    assert!(
+        matches!(err, KbError::Extraction { .. }),
+        "two document failures are a document failure, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn hybrid_aggregate_is_upstream_when_the_structural_service_is_down() {
+    let structural = Box::new(CannedExtractor::unavailable("mineru", "connection refused"));
+    let text_layer = Box::new(CannedExtractor::err("unpdf", "tfail"));
+    let hybrid = HybridExtractor::new(structural, text_layer);
+    let err = hybrid.extract(b"unused").await.expect_err("must fail");
+    assert!(
+        matches!(err, KbError::ExtractorUnavailable { .. }),
+        "a down structural service is an upstream failure, got: {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -815,7 +960,11 @@ async fn ocr_ollama_extractor_surfaces_endpoint_errors() {
     let err = ext
         .extract(b"\x89PNG")
         .await
-        .expect_err("5xx endpoint response must surface as KbError::Extraction");
+        .expect_err("5xx endpoint response must surface as an extractor error");
+    assert!(
+        matches!(err, KbError::ExtractorUnavailable { .. }),
+        "a failing OCR endpoint is an upstream failure, got: {err:?}"
+    );
     let msg = err.to_string();
     assert!(msg.contains("500"), "error must include status code: {msg}");
 }
@@ -937,6 +1086,10 @@ fn build_extractor_rejects_bare_word_typo() {
     };
     let msg = err.to_string();
     assert!(msg.contains("unpfd"), "names the offender: {msg}");
+    assert!(
+        !msg.contains("  "),
+        "no run of spaces from line-continuation indentation: {msg:?}"
+    );
     assert!(
         msg.contains("unpdf") && msg.contains("smart"),
         "names the valid sentinels: {msg}"

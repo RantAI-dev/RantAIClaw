@@ -74,16 +74,17 @@ impl Extractor for HybridExtractor {
             (Err(s_err), Err(t_err)) => {
                 let s_msg: String = s_err.to_string().chars().take(150).collect();
                 let t_msg: String = t_err.to_string().chars().take(150).collect();
-                Err(KbError::Extraction {
-                    extractor: self.name.clone(),
-                    message: format!(
+                Err(KbError::extraction_failed(
+                    self.name.clone(),
+                    format!(
                         "Both extractors failed — structural({}): {}; textLayer({}): {}",
                         self.structural.name(),
                         s_msg,
                         self.text_layer.name(),
                         t_msg
                     ),
-                })
+                    vec![s_err, t_err],
+                ))
             }
         }
     }

@@ -508,6 +508,8 @@ async fn kb_re_embed_dry_run_on_empty_store_writes_nothing() {
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.expect("json body");
     assert_eq!(body["chunks_re_embedded"], 0);
+    assert_eq!(body["chunks_would_re_embed"], 0);
+    assert_eq!(body["dry_run"], true);
     assert_eq!(body["total_chunks_examined"], 0);
     assert!(body["errors"].as_array().unwrap().is_empty());
 }
@@ -1184,6 +1186,87 @@ async fn unlinking_a_document_that_is_not_in_the_group_404s() {
     assert_eq!(body["error"], "not_found", "{body}");
 }
 
+/// Sets the env vars that pick the PDF extractors and removes them on drop.
+/// Only meaningful while the harness holds `ENV_LOCK`.
+struct ExtractorEnv(Vec<&'static str>);
+
+impl ExtractorEnv {
+    fn set(vars: &[(&'static str, &str)]) -> Self {
+        for (k, v) in vars {
+            std::env::set_var(k, v);
+        }
+        Self(vars.iter().map(|(k, _)| *k).collect())
+    }
+}
+
+impl Drop for ExtractorEnv {
+    fn drop(&mut self) {
+        for k in &self.0 {
+            std::env::remove_var(k);
+        }
+    }
+}
+
+async fn upload_pdf(base_url: &str, bytes: &[u8]) -> reqwest::Response {
+    let form = reqwest::multipart::Form::new().part(
+        "file",
+        reqwest::multipart::Part::bytes(bytes.to_vec()).file_name("upload.pdf"),
+    );
+    reqwest::Client::new()
+        .post(format!("{base_url}/api/v1/kb/documents"))
+        .multipart(form)
+        .send()
+        .await
+        .expect("request")
+}
+
+/// A corrupt PDF is the caller's own file: 422, not a 500 "internal" error.
+/// The default `smart` strategy would rescue it through the LLM fallback, so
+/// the test pins the text-layer extractor on both sides.
+#[tokio::test]
+async fn kb_upload_of_a_corrupt_pdf_answers_422_unprocessable_document() {
+    let h = start_harness(|_store| Box::pin(async move {})).await;
+    let _env = ExtractorEnv::set(&[
+        ("KB_EXTRACT_PRIMARY", "unpdf"),
+        ("KB_EXTRACT_FALLBACK", "unpdf"),
+    ]);
+
+    let resp = upload_pdf(&h.base_url, b"not a pdf at all").await;
+    assert_eq!(resp.status(), 422, "a corrupt upload is a 4xx");
+    let body: Value = resp.json().await.expect("json body");
+    assert_eq!(body["error"], "unprocessable_document", "{body}");
+}
+
+/// An extractor service that is down is not the caller's fault: 502, and the
+/// answer says it is the extractor upstream.
+#[tokio::test]
+async fn kb_upload_answers_502_when_the_extractor_service_is_down() {
+    // Bind, note the port, release it: nothing listens there afterwards.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let h = start_harness(|_store| Box::pin(async move {})).await;
+    let mineru_url = format!("http://127.0.0.1:{port}");
+    let _env = ExtractorEnv::set(&[
+        ("KB_EXTRACT_PRIMARY", "mineru"),
+        ("KB_EXTRACT_FALLBACK", "mineru"),
+        ("KB_EXTRACT_MINERU_BASE_URL", mineru_url.as_str()),
+    ]);
+
+    let resp = upload_pdf(&h.base_url, b"%PDF-1.4 whatever").await;
+    assert_eq!(resp.status(), 502, "an extractor outage is a 502");
+    let body: Value = resp.json().await.expect("json body");
+    assert_eq!(body["error"], "extractor_unavailable", "{body}");
+    assert!(
+        body["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("extractor upstream")),
+        "the answer says it is the upstream: {body}"
+    );
+}
+
 #[tokio::test]
 async fn kb_ingest_bogus_group_field_404s_before_storing() {
     // Plan 099 step 2: group ids are validated BEFORE staging/embedding, so
@@ -1339,6 +1422,11 @@ async fn kb_routes_report_disabled_when_turned_off() {
     assert_eq!(resp.status(), 503);
     let body: Value = resp.json().await.expect("json");
     assert_eq!(body["error"], "kb_disabled", "{body}");
+    let detail = body["detail"].as_str().expect("detail is a string");
+    assert!(
+        !detail.contains("  "),
+        "no run of spaces from line-continuation indentation: {detail:?}"
+    );
 }
 
 #[tokio::test]

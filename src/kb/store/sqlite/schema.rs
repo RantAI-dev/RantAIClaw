@@ -205,7 +205,7 @@ pub(crate) fn migrate(conn: &Connection, embedding_dim: usize) -> KbResult<()> {
     if let Some(existing) = current_embedding_dim(conn)? {
         if existing != embedding_dim {
             return Err(KbError::Config(format!(
-                "KB embedding dimension mismatch: this database was created with                  {existing}, but KB_EMBEDDING_DIM is {embedding_dim}. The vector                  table's width is fixed at creation. Either set                  KB_EMBEDDING_DIM={existing}, or start a new database (move                  kb.db aside and re-ingest) — there is no in-place dimension                  migration."
+                "KB embedding dimension mismatch: this database was created with {existing}, but KB_EMBEDDING_DIM is {embedding_dim}. The vector table's width is fixed at creation. Either set KB_EMBEDDING_DIM={existing}, or start a new database (move kb.db aside and re-ingest) — there is no in-place dimension migration."
             )));
         }
     }

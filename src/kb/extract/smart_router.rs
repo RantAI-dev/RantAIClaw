@@ -44,7 +44,7 @@ impl Extractor for SmartRouterExtractor {
     }
 
     async fn extract(&self, pdf_bytes: &[u8]) -> KbResult<ExtractionResult> {
-        let mut text_layer_err: Option<String> = None;
+        let mut text_layer_err: Option<KbError> = None;
         let mut text_layer_result: Option<ExtractionResult> = None;
 
         match self.text_layer.extract(pdf_bytes).await {
@@ -58,7 +58,7 @@ impl Extractor for SmartRouterExtractor {
                     "smart-router text-layer extractor threw ({}); falling through",
                     truncated
                 );
-                text_layer_err = Some(msg);
+                text_layer_err = Some(e);
             }
         }
 
@@ -92,18 +92,22 @@ impl Extractor for SmartRouterExtractor {
             Err(e) => {
                 let fb_msg = e.to_string();
                 let fb_short: String = fb_msg.chars().take(150).collect();
-                let tl_msg = text_layer_err.unwrap_or_else(|| "insufficient output".into());
+                let tl_msg = text_layer_err
+                    .as_ref()
+                    .map_or_else(|| "insufficient output".to_string(), ToString::to_string);
                 let tl_short: String = tl_msg.chars().take(150).collect();
-                Err(KbError::Extraction {
-                    extractor: self.name.clone(),
-                    message: format!(
+                let causes: Vec<KbError> = text_layer_err.into_iter().chain([e]).collect();
+                Err(KbError::extraction_failed(
+                    self.name.clone(),
+                    format!(
                         "Both extractors failed — textLayer({}): {}; fallback({}): {}",
                         self.text_layer.name(),
                         tl_short,
                         self.fallback.name(),
                         fb_short
                     ),
-                })
+                    causes,
+                ))
             }
         }
     }
