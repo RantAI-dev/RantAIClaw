@@ -483,20 +483,17 @@ Delete the `CHANNEL_TYPES` const (not used after this).
 **Legacy reference:** `src/onboard/section/skills.rs:1-218`.
 
 **Prompt schedule:**
-1. `Choose` (multi-select) — bundled starter pack. Options: `["web-search", "summarizer", "research-assistant", "scheduler-reminders", "meeting-notes"]`. Default: all selected.
-2. `Choose` (multi-select) — ClawHub picks. Options fetched from `crate::skills::clawhub::list_top(20)`. On network failure: skip this prompt with a `Message { Warn }`.
-3. `Prompt` (text, optional) — additional ClawHub slug. Empty = skip.
+1. No question: the always-on core skill (`owner-permissions`) is installed first.
+2. `Choose` (single) — "Install the starter pack?" with `Yes — install starter pack` and `Skip`. It is asked only when some starter-pack skill is missing. When only some are missing, the label names them and the first option reads `Yes — install the missing skills`. When all five are installed, the provisioner sends `Message { Info, "Starter pack already installed (5 skills)." }` and asks nothing.
+3. No question: a `Message { Info }` points at `/skills install`, the live ClawHub search and install picker. The provisioner has no ClawHub prompt of its own.
 
 **Config writes:**
-- Calls `crate::skills::bundled::install_starter_pack_filtered(profile, &selected_bundled)`.
-- For each ClawHub pick: `crate::skills::clawhub::install_one(profile, slug).await`.
+- Calls `crate::skills::bundled::install_core_skills(profile)`, then, on `Yes`, `crate::skills::bundled::install_starter_pack(profile)`. Neither overwrites an existing skill directory.
 - No `Config` mutation — skills live in `<profile>/skills/`.
 
-**Validation:** After install, list `<profile>/skills/` and emit a `Message { Success, "Installed N skills: <names>" }`.
+**Validation:** `crate::skills::bundled::starter_pack_missing(profile)` decides whether the question is asked.
 
-**Note:** This task depends on the audit §7 ClawHub `install_one` rewrite (separate plan: `2026-04-29-setup-audit.md` §7). If that rewrite hasn't shipped, ClawHub picks will write stub `SKILL.md` placeholders — port the provisioner anyway and call out the dependency.
-
-**Done summary:** `"Skills installed: <count> bundled, <count> ClawHub"`.
+**Done summary:** ``"Skills installed: <count> from starter pack — `/skills install` for more"``, where `<count>` is what this run installed.
 
 **Standard cycle.**
 

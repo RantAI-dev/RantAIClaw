@@ -4691,6 +4691,69 @@ impl TuiApp {
         }
     }
 
+    /// Reload the skills from disk and, when what the agent's prompt is built
+    /// from changed, rebuild the agent (and the channel runtime, when one runs)
+    /// so the next turn uses the edited skills.
+    fn refresh_skills_and_reload_agent_if_changed(&mut self) {
+        // Compare skills before/after refresh so we only push a full
+        // `TurnRequest::Reload` to the agent when a skill was added, removed
+        // or edited. notify can fire on innocuous fs noise (editor temp
+        // files, mtime touches) — rebuilding the agent on every tick would
+        // respawn MCP servers and rerun discovery for nothing. The
+        // comparison covers each skill's content, not just its name: an
+        // edited `SKILL.md` keeps its name and still changes the prompt.
+        let prev = crate::skills::skill_fingerprints(&self.context.available_skills);
+        self.refresh_available_skills();
+        let new = crate::skills::skill_fingerprints(&self.context.available_skills);
+        if prev == new {
+            return;
+        }
+
+        // Push a full reload to the agent actor so the next turn's
+        // system prompt reflects the new skills. Uses the
+        // existing `TurnRequest::Reload` path (same as wizard
+        // close) — costs ~one Agent rebuild including MCP
+        // re-discovery, but only on a real skill add/remove/edit.
+        let id = self.next_reload_id();
+        let config = self.with_pending_model(self.config.clone());
+        let req_tx = self.context.req_tx.clone();
+        tokio::spawn(async move {
+            let _ = req_tx
+                .send(crate::tui::TurnRequest::Reload {
+                    id,
+                    config: Box::new(config),
+                })
+                .await;
+        });
+        let added: Vec<&String> = new.keys().filter(|k| !prev.contains_key(*k)).collect();
+        let removed: Vec<&String> = prev.keys().filter(|k| !new.contains_key(*k)).collect();
+        let edited: Vec<&String> = new
+            .iter()
+            .filter(|(k, digest)| prev.get(*k).is_some_and(|before| before != *digest))
+            .map(|(k, _)| k)
+            .collect();
+        tracing::info!(
+            target: "tui",
+            added = ?added,
+            removed = ?removed,
+            edited = ?edited,
+            "skills changed on disk — dispatching agent reload"
+        );
+        // The channel runtime bakes the skill list into its system
+        // prompt at build time (see `start_channels`), so the local
+        // agent reload above does not reach running channel listeners
+        // (Telegram/Discord/…). Restart the runtime in place — only
+        // when one is actually running — so the channel bot picks up the
+        // new skill set too. Skipped when no channels run, to avoid
+        // spurious teardown on skill edits in a pure local-chat session.
+        if self.channel_supervisor.is_some() {
+            let _ = self
+                .context
+                .append_system_message("✓ Skills changed — refreshing channel bot(s) now.");
+            self.restart_channels();
+        }
+    }
+
     fn drain_skill_reload_events(&mut self) {
         let mut should_reload = false;
         if let Some(watcher) = self.skills_watcher.as_mut() {
@@ -4702,62 +4765,7 @@ impl TuiApp {
             return;
         }
 
-        // Compare skills before/after refresh so we only push a full
-        // `TurnRequest::Reload` to the agent when the *set of skills*
-        // actually changed. notify can fire on innocuous fs noise
-        // (editor temp files, mtime touches) — rebuilding the agent on
-        // every tick would respawn MCP servers and rerun discovery for
-        // nothing.
-        let prev_keys: std::collections::HashSet<String> = self
-            .context
-            .available_skills
-            .iter()
-            .map(|s| s.name.clone())
-            .collect();
-        self.refresh_available_skills();
-        let new_keys: std::collections::HashSet<String> = self
-            .context
-            .available_skills
-            .iter()
-            .map(|s| s.name.clone())
-            .collect();
-        if prev_keys != new_keys {
-            // Push a full reload to the agent actor so the next turn's
-            // system prompt reflects the new skill list. Uses the
-            // existing `TurnRequest::Reload` path (same as wizard
-            // close) — costs ~one Agent rebuild including MCP
-            // re-discovery, but only on real skill add/remove.
-            let id = self.next_reload_id();
-            let config = self.with_pending_model(self.config.clone());
-            let req_tx = self.context.req_tx.clone();
-            tokio::spawn(async move {
-                let _ = req_tx
-                    .send(crate::tui::TurnRequest::Reload {
-                        id,
-                        config: Box::new(config),
-                    })
-                    .await;
-            });
-            tracing::info!(
-                target: "tui",
-                added = ?new_keys.difference(&prev_keys).collect::<Vec<_>>(),
-                removed = ?prev_keys.difference(&new_keys).collect::<Vec<_>>(),
-                "skills changed on disk — dispatching agent reload"
-            );
-            // The channel runtime bakes the skill list into its system
-            // prompt at build time (see `start_channels`), so the local
-            // agent reload above does not reach running channel listeners
-            // (Telegram/Discord/…). Restart the runtime in place — only
-            // when one is actually running — so the channel bot picks up the
-            // new skill set too. Skipped when no channels run, to avoid
-            // spurious teardown on skill edits in a pure local-chat session.
-            if self.channel_supervisor.is_some() {
-                let _ = self
-                    .context
-                    .append_system_message("✓ Skills changed — refreshing channel bot(s) now.");
-                self.restart_channels();
-            }
-        }
+        self.refresh_skills_and_reload_agent_if_changed();
 
         let items = self.skill_picker_items();
         let suppress_title = self.skill_deps_install_in_progress.is_some()
@@ -9811,13 +9819,17 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
         ));
     }
 
-    // Idempotent first-run skill seeding: if the workspace skills dir
-    // is empty, drop the five starter skills (web-search, summarizer,
+    // First-run skill seeding: only when the profile's skills dir holds no
+    // skill at all, drop the five starter skills (web-search, summarizer,
     // research-assistant, scheduler-reminders, meeting-notes) so the
     // /skills picker has real content out of the box. Mirrors Hermes'
-    // bundled-skills-on-install UX. Best-effort — failure is logged but
+    // bundled-skills-on-install UX. A profile that already has any skill is
+    // not touched, so a pack the operator skipped or trimmed in
+    // `setup skills` stays that way. Best-effort — failure is logged but
     // doesn't block startup.
-    let _ = crate::skills::bundled::install_starter_pack(&profile);
+    if let Err(e) = crate::skills::bundled::seed_starter_pack_if_empty(&profile) {
+        tracing::warn!("starter pack seeding failed: {e:#}");
+    }
     // Load skills from the active workspace so /skills can browse them.
     // load_skills_with_config falls back to an empty vec on any error
     // (missing dir, malformed manifest, etc.) — never blocks startup.
@@ -11043,6 +11055,112 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_millis(200), req_rx.recv())
             .await
             .is_err()
+    }
+
+    // ── a skill edit on disk reaches the agent ───────────────────
+    //
+    // The skills watcher fires on any change under the skills directories. The
+    // agent is rebuilt only when the skills differ, and "differ" has to include
+    // a skill's content: an edited `SKILL.md` keeps its name.
+
+    /// A TUI app whose workspace holds one skill, `notes`, with `body` as its
+    /// `SKILL.md`. Hands back the temp home and the guards that keep the
+    /// process environment pointed at it.
+    struct SkillReloadFixture {
+        app: TuiApp,
+        req_rx: tokio::sync::mpsc::Receiver<TurnRequest>,
+        skills_root: std::path::PathBuf,
+        _home: crate::test_env::HomeGuard,
+        _profile: crate::test_env::EnvGuard,
+        _open_skills: crate::test_env::EnvGuard,
+        _tmp: tempfile::TempDir,
+        // Declared last so the environment is restored while the lock is held.
+        _env_lock: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    async fn skill_reload_fixture(body: &str) -> SkillReloadFixture {
+        let env_lock = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let home = crate::test_env::HomeGuard::set(tmp.path());
+        let profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
+        let open_skills = crate::test_env::EnvGuard::unset("RANTAICLAW_OPEN_SKILLS_ENABLED");
+
+        let (mut app, req_rx) = make_app_with_bridge_from_store(
+            SessionStore::in_memory().expect("store"),
+            "anthropic:test-model",
+        );
+        app.config.workspace_dir = tmp.path().join("workspace");
+        let skills_root = crate::skills::skills_dir(&app.config.workspace_dir);
+        std::fs::create_dir_all(skills_root.join("notes")).expect("skill dir");
+        std::fs::write(skills_root.join("notes").join("SKILL.md"), body).expect("write skill");
+        app.refresh_available_skills();
+        assert!(
+            app.context
+                .available_skills
+                .iter()
+                .any(|s| s.name == "notes"),
+            "the fixture skill must load"
+        );
+        SkillReloadFixture {
+            app,
+            req_rx,
+            skills_root,
+            _home: home,
+            _profile: profile,
+            _open_skills: open_skills,
+            _tmp: tmp,
+            _env_lock: env_lock,
+        }
+    }
+
+    #[tokio::test]
+    async fn editing_a_skill_body_reloads_the_agent() {
+        let mut fx = skill_reload_fixture("# Notes\nKeeps notes. Old instructions.\n").await;
+
+        std::fs::write(
+            fx.skills_root.join("notes").join("SKILL.md"),
+            "# Notes\nKeeps notes. New instructions.\n",
+        )
+        .expect("edit skill");
+        fx.app.refresh_skills_and_reload_agent_if_changed();
+
+        expect_reload(&mut fx.req_rx).await;
+        assert!(
+            fx.app
+                .context
+                .available_skills
+                .iter()
+                .any(|s| s.prompts.iter().any(|p| p.contains("New instructions"))),
+            "the app's own skill list holds the edited body"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_skill_does_not_reload_the_agent() {
+        let mut fx = skill_reload_fixture("# Notes\nKeeps notes.\n").await;
+
+        // The watcher fires on editor temp files and mtime touches too.
+        fx.app.refresh_skills_and_reload_agent_if_changed();
+
+        assert!(
+            no_second_reload(&mut fx.req_rx).await,
+            "a skill list that did not change must not rebuild the agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn adding_a_skill_reloads_the_agent() {
+        let mut fx = skill_reload_fixture("# Notes\nKeeps notes.\n").await;
+
+        std::fs::create_dir_all(fx.skills_root.join("summary")).expect("skill dir");
+        std::fs::write(
+            fx.skills_root.join("summary").join("SKILL.md"),
+            "# Summary\nSummarizes.\n",
+        )
+        .expect("write skill");
+        fx.app.refresh_skills_and_reload_agent_if_changed();
+
+        expect_reload(&mut fx.req_rx).await;
     }
 
     #[tokio::test]

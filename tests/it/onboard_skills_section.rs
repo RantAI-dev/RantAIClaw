@@ -130,6 +130,48 @@ fn install_starter_pack_does_not_overwrite_existing() {
 }
 
 // ---------------------------------------------------------------------------
+// seed_starter_pack_if_empty — the TUI's first-run seeding
+// ---------------------------------------------------------------------------
+
+#[test]
+fn seed_starter_pack_if_empty_fills_a_fresh_profile() {
+    with_home(|| {
+        let profile = ProfileManager::ensure_default().expect("ensure default");
+
+        let seeded = bundled::seed_starter_pack_if_empty(&profile).expect("seed");
+
+        assert_eq!(seeded.len(), STARTER_PACK.len());
+        for s in STARTER_PACK {
+            assert!(profile.skills_dir().join(s.slug).join("SKILL.md").is_file());
+        }
+    });
+}
+
+#[test]
+fn seed_starter_pack_if_empty_leaves_a_profile_with_a_skill_alone() {
+    with_home(|| {
+        let profile = ProfileManager::ensure_default().expect("ensure default");
+        let mine = profile.skills_dir().join("my-skill");
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::write(mine.join("SKILL.md"), "# Mine\n").unwrap();
+
+        let seeded = bundled::seed_starter_pack_if_empty(&profile).expect("seed");
+
+        assert!(
+            seeded.is_empty(),
+            "seeded {seeded:?} next to an existing skill"
+        );
+        for s in STARTER_PACK {
+            assert!(
+                !profile.skills_dir().join(s.slug).exists(),
+                "{} was installed next to an existing skill",
+                s.slug
+            );
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // clawhub::list_top — mock HTTP server
 // ---------------------------------------------------------------------------
 

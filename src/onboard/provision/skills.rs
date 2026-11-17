@@ -29,7 +29,9 @@ pub const SKILLS_DESC: &str = "Bundled starter pack + optional ClawHub skills";
 /// The label the wizard asks the operator with before the starter pack.
 pub const SKILLS_INSTALL_LABEL: &str = "Install the starter pack?";
 
-/// The message shown when every starter-pack skill is already on disk.
+/// The message shown when an accepted install finds every starter-pack skill
+/// on disk after all, because the skills appeared between the check and the
+/// install. A pack that is already complete before the question skips it.
 pub const SKILLS_ALREADY_PRESENT: &str = "All starter-pack skills already present.";
 
 #[derive(Debug, Clone)]
@@ -112,59 +114,95 @@ impl TuiProvisioner for SkillsProvisioner {
             }
         }
 
-        // Step 1: Install starter pack?
-        send(
-            &events,
-            ProvisionEvent::Choose {
-                id: "install_pack".into(),
-                label: SKILLS_INSTALL_LABEL.into(),
-                options: vec!["Yes — install starter pack".to_string(), "Skip".to_string()],
-                multi: false,
-                filterable: false,
-            },
-        )
-        .await?;
-
-        let install_pack = {
-            let sel = recv_selection(&mut responses).await?;
-            sel.first().copied() == Some(0)
-        };
-
+        // Step 1: Install the starter pack, but only ask when either answer
+        // changes something. A pack that is fully on disk needs no question,
+        // and a partly installed one is offered only what is missing.
+        let missing = bundled::starter_pack_missing(profile);
         let mut installed_names: Vec<String> = Vec::new();
 
-        if install_pack {
-            match bundled::install_starter_pack(profile) {
-                Ok(installed) => {
-                    if installed.is_empty() {
-                        send(
-                            &events,
-                            ProvisionEvent::Message {
-                                severity: Severity::Info,
-                                text: SKILLS_ALREADY_PRESENT.into(),
-                            },
-                        )
-                        .await?;
-                    } else {
-                        send(
-                            &events,
-                            ProvisionEvent::Message {
-                                severity: Severity::Success,
-                                text: format!("Installed starter pack: {}", installed.join(", ")),
-                            },
-                        )
-                        .await?;
-                        installed_names.extend(installed);
+        if missing.is_empty() {
+            send(
+                &events,
+                ProvisionEvent::Message {
+                    severity: Severity::Info,
+                    text: format!(
+                        "Starter pack already installed ({} skills).",
+                        bundled::STARTER_PACK.len()
+                    ),
+                },
+            )
+            .await?;
+        } else {
+            let (label, yes) = if missing.len() == bundled::STARTER_PACK.len() {
+                (
+                    SKILLS_INSTALL_LABEL.to_string(),
+                    "Yes — install starter pack".to_string(),
+                )
+            } else {
+                let slugs: Vec<&str> = missing.iter().map(|skill| skill.slug).collect();
+                (
+                    format!(
+                        "Install the {} missing starter-pack skill(s): {}?",
+                        missing.len(),
+                        slugs.join(", ")
+                    ),
+                    "Yes — install the missing skills".to_string(),
+                )
+            };
+            send(
+                &events,
+                ProvisionEvent::Choose {
+                    id: "install_pack".into(),
+                    label,
+                    options: vec![yes, "Skip".to_string()],
+                    multi: false,
+                    filterable: false,
+                },
+            )
+            .await?;
+
+            let install_pack = {
+                let sel = recv_selection(&mut responses).await?;
+                sel.first().copied() == Some(0)
+            };
+
+            if install_pack {
+                match bundled::install_starter_pack(profile) {
+                    Ok(installed) => {
+                        if installed.is_empty() {
+                            send(
+                                &events,
+                                ProvisionEvent::Message {
+                                    severity: Severity::Info,
+                                    text: SKILLS_ALREADY_PRESENT.into(),
+                                },
+                            )
+                            .await?;
+                        } else {
+                            send(
+                                &events,
+                                ProvisionEvent::Message {
+                                    severity: Severity::Success,
+                                    text: format!(
+                                        "Installed starter pack: {}",
+                                        installed.join(", ")
+                                    ),
+                                },
+                            )
+                            .await?;
+                            installed_names.extend(installed);
+                        }
                     }
-                }
-                Err(e) => {
-                    send(
-                        &events,
-                        ProvisionEvent::Message {
-                            severity: Severity::Warn,
-                            text: format!("Starter pack install failed: {e}"),
-                        },
-                    )
-                    .await?;
+                    Err(e) => {
+                        send(
+                            &events,
+                            ProvisionEvent::Message {
+                                severity: Severity::Warn,
+                                text: format!("Starter pack install failed: {e}"),
+                            },
+                        )
+                        .await?;
+                    }
                 }
             }
         }
@@ -251,6 +289,179 @@ mod tests {
             .await
             .expect("provisioner run");
         responder.abort();
+    }
+
+    /// Drive `run` to completion, answering every `Choose` with `answer`
+    /// (0 = yes, 1 = skip), and return every event it sent.
+    async fn run_recording(profile: &Profile, answer: usize) -> Vec<ProvisionEvent> {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
+        let (response_tx, response_rx) = tokio::sync::mpsc::channel(4);
+
+        let responder = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            while let Some(event) = event_rx.recv().await {
+                let is_choose = matches!(event, ProvisionEvent::Choose { .. });
+                seen.push(event);
+                if is_choose
+                    && response_tx
+                        .send(ProvisionResponse::Selection(vec![answer]))
+                        .await
+                        .is_err()
+                {
+                    break;
+                }
+            }
+            seen
+        });
+
+        let mut config = Config::default();
+        SkillsProvisioner::new()
+            .run(
+                &mut config,
+                profile,
+                ProvisionIo {
+                    events: event_tx,
+                    responses: response_rx,
+                },
+            )
+            .await
+            .expect("provisioner run");
+        responder.await.expect("responder")
+    }
+
+    fn chooses(events: &[ProvisionEvent]) -> Vec<&ProvisionEvent> {
+        events
+            .iter()
+            .filter(|e| matches!(e, ProvisionEvent::Choose { .. }))
+            .collect()
+    }
+
+    fn message_texts(events: &[ProvisionEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ProvisionEvent::Message { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn done_summary(events: &[ProvisionEvent]) -> &str {
+        events
+            .iter()
+            .find_map(|e| match e {
+                ProvisionEvent::Done { summary } => Some(summary.as_str()),
+                _ => None,
+            })
+            .expect("the provisioner finished with a summary")
+    }
+
+    #[tokio::test]
+    async fn a_complete_starter_pack_is_reported_and_not_asked_about() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _home = HomeGuard::set(tmp.path());
+        let profile = Profile {
+            name: "provision-skills-test".to_string(),
+            root: tmp.path().to_path_buf(),
+        };
+        crate::skills::bundled::install_starter_pack(&profile).expect("pack installs");
+
+        // Answering "Skip" to any question keeps a base build from hanging.
+        let events = run_recording(&profile, 1).await;
+
+        assert!(
+            chooses(&events).is_empty(),
+            "a question was asked about a pack that is fully installed: {:?}",
+            chooses(&events)
+        );
+        let expected = format!(
+            "Starter pack already installed ({} skills).",
+            crate::skills::bundled::STARTER_PACK.len()
+        );
+        assert!(
+            message_texts(&events).contains(&expected.as_str()),
+            "no already-installed message in {:?}",
+            message_texts(&events)
+        );
+        assert!(
+            done_summary(&events).contains("Skills installed: 0 from starter pack"),
+            "{}",
+            done_summary(&events)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_partial_starter_pack_asks_about_the_missing_skills_only() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _home = HomeGuard::set(tmp.path());
+        let profile = Profile {
+            name: "provision-skills-test".to_string(),
+            root: tmp.path().to_path_buf(),
+        };
+        crate::skills::bundled::install_starter_pack(&profile).expect("pack installs");
+        for slug in ["summarizer", "web-search"] {
+            std::fs::remove_dir_all(profile.skills_dir().join(slug)).expect("remove skill");
+        }
+
+        let events = run_recording(&profile, 0).await;
+
+        let asked = chooses(&events);
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        let ProvisionEvent::Choose { label, .. } = asked[0] else {
+            unreachable!("chooses() returns only Choose events");
+        };
+        assert!(
+            label.contains("summarizer") && label.contains("web-search"),
+            "the question must name the missing skills: {label:?}"
+        );
+        assert!(
+            !label.contains("meeting-notes"),
+            "the question must not name an installed skill: {label:?}"
+        );
+        for skill in crate::skills::bundled::STARTER_PACK {
+            assert!(
+                profile
+                    .skills_dir()
+                    .join(skill.slug)
+                    .join("SKILL.md")
+                    .exists(),
+                "{} is not installed after Yes",
+                skill.slug
+            );
+        }
+        assert!(
+            done_summary(&events).contains("Skills installed: 2 from starter pack"),
+            "the summary counts only what this run installed: {}",
+            done_summary(&events)
+        );
+    }
+
+    #[tokio::test]
+    async fn skipping_a_partial_starter_pack_installs_nothing() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _home = HomeGuard::set(tmp.path());
+        let profile = Profile {
+            name: "provision-skills-test".to_string(),
+            root: tmp.path().to_path_buf(),
+        };
+        crate::skills::bundled::install_starter_pack(&profile).expect("pack installs");
+        std::fs::remove_dir_all(profile.skills_dir().join("summarizer")).expect("remove skill");
+
+        let events = run_recording(&profile, 1).await;
+
+        assert_eq!(chooses(&events).len(), 1);
+        assert!(
+            !profile.skills_dir().join("summarizer").exists(),
+            "Skip must not install the missing skill"
+        );
+        assert!(
+            done_summary(&events).contains("Skills installed: 0 from starter pack"),
+            "{}",
+            done_summary(&events)
+        );
     }
 
     #[tokio::test]

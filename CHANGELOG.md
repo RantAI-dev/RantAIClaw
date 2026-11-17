@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Editing a skill's `SKILL.md` reaches the agent in a running TUI.** The skills watcher
+  compared the set of skill names, so an edit that kept the name refreshed the `/skills` picker
+  but sent no agent reload and no channel restart, and the model kept the old instructions until
+  the TUI restarted. The comparison now covers each skill's description, tools and body, and a
+  content change triggers the same agent reload and channel restart a new or removed skill does.
+  A change that leaves every skill as it was still rebuilds nothing. Only the TUI watches the
+  skills directories: a daemon that runs without a TUI keeps the skills it loaded at start until
+  it restarts.
+
+- **The starter pack is seeded only into a profile that has no skills, and `setup skills` asks
+  only when the answer changes something.** The TUI installed the starter pack on every start
+  although its comment said "if the skills directory is empty". A pack skipped in `setup skills`
+  came back on the next start, and `setup skills` asked "Install the starter pack?" about a pack
+  that was already on disk. The TUI now seeds only when the profile's `skills/` directory holds
+  no skill. `setup skills` reports "Starter pack already installed" and asks nothing when all five
+  skills are present, asks about the missing ones by name when some are, and counts in its
+  summary only what the run installed. The non-interactive `setup` section still installs the
+  pack unconditionally.
+
 - **A config write with a misspelled or unknown field is refused instead of reported as saved.**
   Every config write body (`PUT /config/model`, `/config/autonomy`, `/config/knowledge`,
   `/secrets`, `POST /config/mcp_servers/{name}` and the Telegram, Discord, Slack, Lark and
