@@ -313,6 +313,52 @@ pub fn install_starter_pack(profile: &Profile) -> Result<Vec<String>> {
     install_pack(profile, STARTER_PACK)
 }
 
+/// The starter-pack skills whose directory is not under the profile's
+/// `skills/` yet, in pack order. A directory the operator emptied or edited
+/// still counts as present: [`install_pack`] skips it either way.
+pub fn starter_pack_missing(profile: &Profile) -> Vec<&'static StarterPackSkill> {
+    let skills_root = profile.skills_dir();
+    STARTER_PACK
+        .iter()
+        .filter(|skill| !skills_root.join(skill.slug).exists())
+        .collect()
+}
+
+/// Whether `skills_root` holds at least one skill: a subdirectory with a
+/// `SKILL.md` or `SKILL.toml`. The directory merely existing proves nothing,
+/// because installing, watching and `setup` all create it empty.
+fn holds_a_skill(skills_root: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(skills_root) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let dir = entry.path();
+        dir.is_dir() && (dir.join("SKILL.md").exists() || dir.join("SKILL.toml").exists())
+    })
+}
+
+/// First-run seeding for the TUI: install the starter pack only when the
+/// profile's `skills/` holds no skill at all, so a fresh profile has real
+/// content to browse. A profile that has any skill is left alone, which keeps
+/// an operator's choice to skip the pack, or to delete some of it, from being
+/// undone on the next start. Returns the slugs it created.
+///
+/// Starter-pack skills that are already installed still go through
+/// [`install_pack`]'s text refreshes (the tool-name lines from before the tool rename), which
+/// create nothing.
+pub fn seed_starter_pack_if_empty(profile: &Profile) -> Result<Vec<String>> {
+    if holds_a_skill(&profile.skills_dir()) {
+        let skills_root = profile.skills_dir();
+        let installed: Vec<StarterPackSkill> = STARTER_PACK
+            .iter()
+            .filter(|skill| skills_root.join(skill.slug).exists())
+            .copied()
+            .collect();
+        return install_pack(profile, &installed);
+    }
+    install_starter_pack(profile)
+}
+
 /// Idempotently install the always-on [`CORE_PACK`] skills. Call this on any
 /// setup path that should guarantee the owner can self-serve administration
 /// from chat (fresh onboarding, channel configuration).
@@ -863,6 +909,115 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn write_skill(profile: &Profile, slug: &str) {
+        let dir = profile.skills_dir().join(slug);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SKILL.md"), "# Mine\nAn operator-written skill.\n").unwrap();
+    }
+
+    fn pack_slugs() -> Vec<String> {
+        STARTER_PACK.iter().map(|s| s.slug.to_string()).collect()
+    }
+
+    #[test]
+    fn seeding_installs_the_pack_when_the_skills_dir_does_not_exist() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let profile = profile_in(&tmp);
+
+        let seeded = seed_starter_pack_if_empty(&profile).unwrap();
+
+        assert_eq!(seeded, pack_slugs());
+        for skill in STARTER_PACK {
+            assert!(profile
+                .skills_dir()
+                .join(skill.slug)
+                .join("SKILL.md")
+                .is_file());
+        }
+    }
+
+    #[test]
+    fn seeding_treats_an_existing_empty_skills_dir_as_empty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let profile = profile_in(&tmp);
+        // The directory is there, as it is after the watcher or an install
+        // created it, and so is a stray directory that is not a skill.
+        fs::create_dir_all(profile.skills_dir().join(".cache")).unwrap();
+
+        let seeded = seed_starter_pack_if_empty(&profile).unwrap();
+
+        assert_eq!(seeded, pack_slugs());
+    }
+
+    #[test]
+    fn seeding_leaves_a_profile_that_already_has_a_skill_alone() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let profile = profile_in(&tmp);
+        write_skill(&profile, "my-skill");
+
+        let seeded = seed_starter_pack_if_empty(&profile).unwrap();
+
+        assert!(seeded.is_empty(), "seeded {seeded:?} into a non-empty dir");
+        for skill in STARTER_PACK {
+            assert!(
+                !profile.skills_dir().join(skill.slug).exists(),
+                "{} was installed next to the operator's skill",
+                skill.slug
+            );
+        }
+    }
+
+    /// `setup skills` installs the core skill whatever the operator answers, so
+    /// a profile that skipped the starter pack still holds one skill. The next
+    /// TUI start must not install the pack it skipped.
+    #[test]
+    fn seeding_does_not_reinstall_a_pack_the_operator_skipped() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let profile = profile_in(&tmp);
+        install_core_skills(&profile).unwrap();
+
+        let seeded = seed_starter_pack_if_empty(&profile).unwrap();
+
+        assert!(seeded.is_empty(), "seeded {seeded:?} after a skipped pack");
+        assert_eq!(starter_pack_missing(&profile).len(), STARTER_PACK.len());
+    }
+
+    #[test]
+    fn seeding_a_populated_profile_still_refreshes_stale_tool_names() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let profile = profile_in(&tmp);
+        let installed = install_old_tool_names(&profile);
+
+        let seeded = seed_starter_pack_if_empty(&profile).unwrap();
+
+        assert!(seeded.is_empty());
+        for (slug, dir, _) in &installed {
+            assert_eq!(
+                fs::read_to_string(dir.join("SKILL.md")).unwrap(),
+                find_by_slug(slug).expect("starter pack").skill_md,
+                "{slug}: the stale tool names were not refreshed"
+            );
+        }
+    }
+
+    #[test]
+    fn starter_pack_missing_lists_what_is_not_on_disk_in_pack_order() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let profile = profile_in(&tmp);
+        assert_eq!(starter_pack_missing(&profile).len(), STARTER_PACK.len());
+
+        install_starter_pack(&profile).unwrap();
+        assert!(starter_pack_missing(&profile).is_empty());
+
+        fs::remove_dir_all(profile.skills_dir().join("summarizer")).unwrap();
+        fs::remove_dir_all(profile.skills_dir().join("web-search")).unwrap();
+        let missing: Vec<&str> = starter_pack_missing(&profile)
+            .iter()
+            .map(|s| s.slug)
+            .collect();
+        assert_eq!(missing, ["web-search", "summarizer"]);
     }
 
     #[test]

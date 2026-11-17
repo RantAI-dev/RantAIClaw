@@ -301,6 +301,47 @@ pub(crate) fn skill_disabled_in_config(config: &crate::config::Config, skill_nam
         .unwrap_or(false)
 }
 
+/// One digest per skill name over everything the agent's prompt is built from:
+/// the description, version, tags, tools, prompts (the whole `SKILL.md` body),
+/// the remote flag and the manifest location.
+///
+/// Compare two results with `!=` to learn whether a reload would change the
+/// prompt. Comparing names alone misses an edit to a skill's content, which
+/// keeps its name. A name that two skills share (the profile and workspace
+/// roots) folds into one entry, so a change to either still shows.
+///
+/// The digest is only meaningful inside one process: `DefaultHasher` makes no
+/// promise across Rust releases.
+pub(crate) fn skill_fingerprints(skills: &[Skill]) -> std::collections::BTreeMap<String, u64> {
+    use std::hash::{Hash, Hasher};
+
+    let mut digests = std::collections::BTreeMap::new();
+    for skill in skills {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        digests.get(&skill.name).hash(&mut hasher);
+        skill.description.hash(&mut hasher);
+        skill.version.hash(&mut hasher);
+        skill.tags.hash(&mut hasher);
+        skill.prompts.hash(&mut hasher);
+        skill.remote.hash(&mut hasher);
+        skill.location.hash(&mut hasher);
+        skill.tools.len().hash(&mut hasher);
+        for tool in &skill.tools {
+            tool.name.hash(&mut hasher);
+            tool.description.hash(&mut hasher);
+            tool.kind.hash(&mut hasher);
+            tool.command.hash(&mut hasher);
+            // `HashMap` iterates in a different order per instance, so a plain
+            // hash of `args` would differ between two loads of the same file.
+            let mut args: Vec<_> = tool.args.iter().collect();
+            args.sort();
+            args.hash(&mut hasher);
+        }
+        digests.insert(skill.name.clone(), hasher.finish());
+    }
+    digests
+}
+
 /// Load all skills from the workspace skills directory
 pub fn load_skills(workspace_dir: &Path) -> Vec<Skill> {
     load_skills_with_open_skills_config(workspace_dir, None, None, None)
@@ -2414,6 +2455,140 @@ mod tests {
             None => format!("# {dirname}\nA test skill.\n"),
         };
         fs::write(skill_dir.join("SKILL.md"), body).unwrap();
+    }
+
+    fn fingerprint_skill(name: &str, description: &str, body: &str) -> Skill {
+        Skill {
+            name: name.to_string(),
+            description: description.to_string(),
+            version: "0.1.0".to_string(),
+            author: None,
+            tags: Vec::new(),
+            tools: Vec::new(),
+            prompts: vec![body.to_string()],
+            location: Some(PathBuf::from(format!("/skills/{name}/SKILL.md"))),
+            requires: SkillRequires::default(),
+            install_recipes: Vec::new(),
+            remote: false,
+            origin: None,
+        }
+    }
+
+    #[test]
+    fn fingerprints_of_identical_skills_are_equal() {
+        let mut args = HashMap::new();
+        for i in 0..8 {
+            args.insert(format!("arg{i}"), format!("value{i}"));
+        }
+        let mut with_tool = fingerprint_skill("notes", "Keeps notes.", "# Notes\nBody.\n");
+        with_tool.tools.push(SkillTool {
+            name: "save".to_string(),
+            description: "Save a note.".to_string(),
+            kind: "shell".to_string(),
+            command: "echo saved".to_string(),
+            args,
+        });
+
+        // A second copy rebuilds `args` with a fresh `HashMap`, whose
+        // iteration order differs from the first one's.
+        let mut reloaded = with_tool.clone();
+        reloaded.tools[0].args = with_tool.tools[0]
+            .args
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        assert_eq!(
+            skill_fingerprints(&[with_tool, fingerprint_skill("other", "Other.", "# Other\n")]),
+            skill_fingerprints(&[reloaded, fingerprint_skill("other", "Other.", "# Other\n")]),
+        );
+    }
+
+    #[test]
+    fn fingerprints_change_when_only_the_skill_body_changes() {
+        let before = [fingerprint_skill(
+            "notes",
+            "Keeps notes.",
+            "# Notes\nOld.\n",
+        )];
+        let after = [fingerprint_skill(
+            "notes",
+            "Keeps notes.",
+            "# Notes\nNew.\n",
+        )];
+
+        assert_eq!(
+            before[0].name, after[0].name,
+            "the edit keeps the skill name"
+        );
+        assert_ne!(skill_fingerprints(&before), skill_fingerprints(&after));
+    }
+
+    #[test]
+    fn fingerprints_change_when_only_the_description_changes() {
+        let before = [fingerprint_skill("notes", "Keeps notes.", "# Notes\n")];
+        let after = [fingerprint_skill(
+            "notes",
+            "Keeps meeting notes.",
+            "# Notes\n",
+        )];
+
+        assert_ne!(skill_fingerprints(&before), skill_fingerprints(&after));
+    }
+
+    #[test]
+    fn fingerprints_change_when_a_tool_changes() {
+        let plain = fingerprint_skill("notes", "Keeps notes.", "# Notes\n");
+        let mut with_tool = plain.clone();
+        with_tool.tools.push(SkillTool {
+            name: "save".to_string(),
+            description: "Save a note.".to_string(),
+            kind: "shell".to_string(),
+            command: "echo saved".to_string(),
+            args: HashMap::new(),
+        });
+        let mut other_command = with_tool.clone();
+        other_command.tools[0].command = "echo stored".to_string();
+
+        let fingerprints = [
+            skill_fingerprints(&[plain]),
+            skill_fingerprints(&[with_tool]),
+            skill_fingerprints(&[other_command]),
+        ];
+        assert_ne!(fingerprints[0], fingerprints[1]);
+        assert_ne!(fingerprints[1], fingerprints[2]);
+    }
+
+    #[test]
+    fn fingerprints_change_when_a_skill_is_added_removed_or_renamed() {
+        let one = [fingerprint_skill("notes", "Keeps notes.", "# Notes\n")];
+        let two = [
+            fingerprint_skill("notes", "Keeps notes.", "# Notes\n"),
+            fingerprint_skill("summary", "Summarizes.", "# Summary\n"),
+        ];
+        let renamed = [fingerprint_skill("memos", "Keeps notes.", "# Notes\n")];
+
+        assert_ne!(skill_fingerprints(&one), skill_fingerprints(&two));
+        assert_ne!(skill_fingerprints(&two), skill_fingerprints(&one));
+        assert_ne!(skill_fingerprints(&one), skill_fingerprints(&renamed));
+        assert_eq!(
+            skill_fingerprints(&two).keys().collect::<Vec<_>>(),
+            ["notes", "summary"]
+        );
+    }
+
+    #[test]
+    fn fingerprints_see_a_change_to_either_of_two_skills_sharing_a_name() {
+        let profile_copy = fingerprint_skill("notes", "Keeps notes.", "# Notes\nProfile.\n");
+        let workspace_copy = fingerprint_skill("notes", "Keeps notes.", "# Notes\nWorkspace.\n");
+        let mut edited_profile_copy = profile_copy.clone();
+        edited_profile_copy.prompts = vec!["# Notes\nProfile, edited.\n".to_string()];
+
+        assert_ne!(
+            skill_fingerprints(&[profile_copy.clone(), workspace_copy.clone()]),
+            skill_fingerprints(&[edited_profile_copy, workspace_copy]),
+            "an edit to the first of two same-named skills must show"
+        );
     }
 
     #[test]

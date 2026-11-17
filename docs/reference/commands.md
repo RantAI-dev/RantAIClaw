@@ -373,6 +373,10 @@ Skill manifests (`SKILL.md`) support YAML frontmatter, `requires` gating, enviro
 
 In the TUI, `/skills` opens the local skills picker. Press `Ctrl+I` (or Tab in terminals that send Ctrl+I as Tab) on a gated skill row to run its install-deps recipe without leaving the picker.
 
+A running TUI watches the skills directories. When a skill is added, removed or edited on disk, including a change to the body of its `SKILL.md`, the TUI rebuilds the agent, and restarts the channel bots it runs, so the next turn uses the new skills. A change that leaves every skill as it was rebuilds nothing. Only the TUI watches: a daemon that runs without a TUI keeps the skills it loaded when it started until it restarts.
+
+On start the TUI seeds the five starter-pack skills only when the profile's `skills/` directory holds no skill at all. A profile that has any skill is not seeded. That includes the always-on `owner-permissions` skill, which `setup skills` installs and `setup channels` installs too once a channel is configured. A profile that ran channel setup first therefore already holds a skill, and the TUI does not seed the starter pack on its first start. A pack skipped or trimmed in `setup skills` stays that way. `setup skills` asks about the starter pack only when some of its skills are missing, and names the missing ones. When all five are installed it reports that and asks nothing. `setup` without a terminal (stdin is not a terminal) installs the pack without asking.
+
 #### Writing a skill by hand
 
 ```
