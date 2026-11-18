@@ -33,7 +33,10 @@ impl HeartbeatEngine {
             return Ok(());
         }
 
-        let interval_mins = self.config.interval_minutes.max(5);
+        if let Some(message) = self.config.interval_clamp_warning() {
+            warn!("💓 {message}");
+        }
+        let interval_mins = self.config.effective_interval_minutes();
         info!("💓 Heartbeat started: every {} minutes", interval_mins);
 
         let mut interval = time::interval(Duration::from_secs(u64::from(interval_mins) * 60));

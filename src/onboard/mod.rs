@@ -1,4 +1,5 @@
 pub mod branding;
+pub(crate) mod connection_failure;
 pub mod provision;
 pub mod section;
 pub mod wizard;

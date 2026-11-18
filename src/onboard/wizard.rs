@@ -10,6 +10,7 @@ use crate::config::{
 use crate::memory::{
     default_memory_backend_key, memory_backend_profile, selectable_memory_backends,
 };
+use crate::onboard::connection_failure::{print_connection_failure, ConnectionFailure};
 use crate::onboard::ui;
 use crate::providers::{
     canonical_china_provider_name, is_glm_alias, is_glm_cn_alias, is_minimax_alias,
@@ -3854,8 +3855,7 @@ pub(crate) fn setup_channels(existing: ChannelsConfig) -> Result<ChannelsConfig>
                 let thread_result = std::thread::spawn(move || {
                     let client = reqwest::blocking::Client::new();
                     let url = format!("https://api.telegram.org/bot{token_clone}/getMe");
-                    let resp = client.get(&url).send()?;
-                    let ok = resp.status().is_success();
+                    let resp = ConnectionFailure::require_success(client.get(&url).send()?)?;
                     let data: serde_json::Value = resp.json().unwrap_or_default();
                     let bot_name = data
                         .get("result")
@@ -3863,21 +3863,18 @@ pub(crate) fn setup_channels(existing: ChannelsConfig) -> Result<ChannelsConfig>
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("unknown")
                         .to_string();
-                    Ok::<_, reqwest::Error>((ok, bot_name))
+                    Ok::<_, ConnectionFailure>(bot_name)
                 })
                 .join();
-                match thread_result {
-                    Ok(Ok((true, bot_name))) => {
+                match ConnectionFailure::joined(thread_result) {
+                    Ok(bot_name) => {
                         println!(
                             "\r  {} Connected as @{bot_name}        ",
                             style("✅").green().bold()
                         );
                     }
-                    _ => {
-                        println!(
-                            "\r  {} Connection failed — check your token and try again",
-                            style("❌").red().bold()
-                        );
+                    Err(failure) => {
+                        print_connection_failure("bot token", &failure);
                         continue;
                     }
                 }
@@ -3952,32 +3949,30 @@ pub(crate) fn setup_channels(existing: ChannelsConfig) -> Result<ChannelsConfig>
                 let token_clone = token.clone();
                 let thread_result = std::thread::spawn(move || {
                     let client = reqwest::blocking::Client::new();
-                    let resp = client
-                        .get("https://discord.com/api/v10/users/@me")
-                        .header("Authorization", format!("Bot {token_clone}"))
-                        .send()?;
-                    let ok = resp.status().is_success();
+                    let resp = ConnectionFailure::require_success(
+                        client
+                            .get("https://discord.com/api/v10/users/@me")
+                            .header("Authorization", format!("Bot {token_clone}"))
+                            .send()?,
+                    )?;
                     let data: serde_json::Value = resp.json().unwrap_or_default();
                     let bot_name = data
                         .get("username")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("unknown")
                         .to_string();
-                    Ok::<_, reqwest::Error>((ok, bot_name))
+                    Ok::<_, ConnectionFailure>(bot_name)
                 })
                 .join();
-                match thread_result {
-                    Ok(Ok((true, bot_name))) => {
+                match ConnectionFailure::joined(thread_result) {
+                    Ok(bot_name) => {
                         println!(
                             "\r  {} Connected as {bot_name}        ",
                             style("✅").green().bold()
                         );
                     }
-                    _ => {
-                        println!(
-                            "\r  {} Connection failed — check your token and try again",
-                            style("❌").red().bold()
-                        );
+                    Err(failure) => {
+                        print_connection_failure("bot token", &failure);
                         continue;
                     }
                 }
@@ -4056,11 +4051,12 @@ pub(crate) fn setup_channels(existing: ChannelsConfig) -> Result<ChannelsConfig>
                 let token_clone = token.clone();
                 let thread_result = std::thread::spawn(move || {
                     let client = reqwest::blocking::Client::new();
-                    let resp = client
-                        .get("https://slack.com/api/auth.test")
-                        .bearer_auth(&token_clone)
-                        .send()?;
-                    let ok = resp.status().is_success();
+                    let resp = ConnectionFailure::require_success(
+                        client
+                            .get("https://slack.com/api/auth.test")
+                            .bearer_auth(&token_clone)
+                            .send()?,
+                    )?;
                     let data: serde_json::Value = resp.json().unwrap_or_default();
                     let api_ok = data
                         .get("ok")
@@ -4076,25 +4072,22 @@ pub(crate) fn setup_channels(existing: ChannelsConfig) -> Result<ChannelsConfig>
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("unknown error")
                         .to_string();
-                    Ok::<_, reqwest::Error>((ok, api_ok, team, err))
+                    Ok::<_, ConnectionFailure>((api_ok, team, err))
                 })
                 .join();
-                match thread_result {
-                    Ok(Ok((true, true, team, _))) => {
+                match ConnectionFailure::joined(thread_result) {
+                    Ok((true, team, _)) => {
                         println!(
                             "\r  {} Connected to workspace: {team}        ",
                             style("✅").green().bold()
                         );
                     }
-                    Ok(Ok((true, false, _, err))) => {
+                    Ok((false, _, err)) => {
                         println!("\r  {} Slack error: {err}", style("❌").red().bold());
                         continue;
                     }
-                    _ => {
-                        println!(
-                            "\r  {} Connection failed — check your token",
-                            style("❌").red().bold()
-                        );
+                    Err(failure) => {
+                        print_connection_failure("bot token", &failure);
                         continue;
                     }
                 }
@@ -4252,15 +4245,12 @@ pub(crate) fn setup_channels(existing: ChannelsConfig) -> Result<ChannelsConfig>
                 let access_token_clone = access_token.clone();
                 let thread_result = std::thread::spawn(move || {
                     let client = reqwest::blocking::Client::new();
-                    let resp = client
-                        .get(format!("{hs_owned}/_matrix/client/v3/account/whoami"))
-                        .header("Authorization", format!("Bearer {access_token_clone}"))
-                        .send()?;
-                    let ok = resp.status().is_success();
-
-                    if !ok {
-                        return Ok::<_, reqwest::Error>((false, None, None));
-                    }
+                    let resp = ConnectionFailure::require_success(
+                        client
+                            .get(format!("{hs_owned}/_matrix/client/v3/account/whoami"))
+                            .header("Authorization", format!("Bearer {access_token_clone}"))
+                            .send()?,
+                    )?;
 
                     let payload: Value = match resp.json() {
                         Ok(payload) => payload,
@@ -4275,12 +4265,14 @@ pub(crate) fn setup_channels(existing: ChannelsConfig) -> Result<ChannelsConfig>
                         .and_then(|value| value.as_str())
                         .map(|value| value.to_string());
 
-                    Ok::<_, reqwest::Error>((true, user_id, device_id))
+                    Ok::<_, ConnectionFailure>((user_id, device_id))
                 })
                 .join();
 
-                let (detected_user_id, detected_device_id) = match thread_result {
-                    Ok(Ok((true, user_id, device_id))) => {
+                let (detected_user_id, detected_device_id) = match ConnectionFailure::joined(
+                    thread_result,
+                ) {
+                    Ok((user_id, device_id)) => {
                         println!(
                             "\r  {} Connection verified        ",
                             style("✅").green().bold()
@@ -4295,11 +4287,8 @@ pub(crate) fn setup_channels(existing: ChannelsConfig) -> Result<ChannelsConfig>
 
                         (user_id, device_id)
                     }
-                    _ => {
-                        println!(
-                            "\r  {} Connection failed — check homeserver URL and token",
-                            style("❌").red().bold()
-                        );
+                    Err(failure) => {
+                        print_connection_failure("access token", &failure);
                         continue;
                     }
                 };
@@ -4547,28 +4536,27 @@ pub(crate) fn setup_channels(existing: ChannelsConfig) -> Result<ChannelsConfig>
                         "https://graph.facebook.com/v18.0/{}",
                         phone_number_id_clone.trim()
                     );
-                    let resp = client
-                        .get(&url)
-                        .header(
-                            "Authorization",
-                            format!("Bearer {}", access_token_clone.trim()),
-                        )
-                        .send()?;
-                    Ok::<_, reqwest::Error>(resp.status().is_success())
+                    ConnectionFailure::require_success(
+                        client
+                            .get(&url)
+                            .header(
+                                "Authorization",
+                                format!("Bearer {}", access_token_clone.trim()),
+                            )
+                            .send()?,
+                    )?;
+                    Ok::<_, ConnectionFailure>(())
                 })
                 .join();
-                match thread_result {
-                    Ok(Ok(true)) => {
+                match ConnectionFailure::joined(thread_result) {
+                    Ok(()) => {
                         println!(
                             "\r  {} Connected to WhatsApp API        ",
                             style("✅").green().bold()
                         );
                     }
-                    _ => {
-                        println!(
-                            "\r  {} Connection failed — check access token and phone number ID",
-                            style("❌").red().bold()
-                        );
+                    Err(failure) => {
+                        print_connection_failure("access token", &failure);
                         continue;
                     }
                 }
@@ -4631,28 +4619,27 @@ pub(crate) fn setup_channels(existing: ChannelsConfig) -> Result<ChannelsConfig>
                 let thread_result = std::thread::spawn(move || {
                     let client = reqwest::blocking::Client::new();
                     let url = "https://api.linqapp.com/api/partner/v3/phonenumbers";
-                    let resp = client
-                        .get(url)
-                        .header(
-                            "Authorization",
-                            format!("Bearer {}", api_token_clone.trim()),
-                        )
-                        .send()?;
-                    Ok::<_, reqwest::Error>(resp.status().is_success())
+                    ConnectionFailure::require_success(
+                        client
+                            .get(url)
+                            .header(
+                                "Authorization",
+                                format!("Bearer {}", api_token_clone.trim()),
+                            )
+                            .send()?,
+                    )?;
+                    Ok::<_, ConnectionFailure>(())
                 })
                 .join();
-                match thread_result {
-                    Ok(Ok(true)) => {
+                match ConnectionFailure::joined(thread_result) {
+                    Ok(()) => {
                         println!(
                             "\r  {} Connected to Linq API              ",
                             style("✅").green().bold()
                         );
                     }
-                    _ => {
-                        println!(
-                            "\r  {} Connection failed — check API token",
-                            style("❌").red().bold()
-                        );
+                    Err(failure) => {
+                        print_connection_failure("API token", &failure);
                         continue;
                     }
                 }
@@ -4896,18 +4883,17 @@ pub(crate) fn setup_channels(existing: ChannelsConfig) -> Result<ChannelsConfig>
                     .post("https://api.dingtalk.com/v1.0/gateway/connections/open")
                     .json(&body)
                     .send()
+                    .map_err(ConnectionFailure::from)
+                    .and_then(ConnectionFailure::require_success)
                 {
-                    Ok(resp) if resp.status().is_success() => {
+                    Ok(_) => {
                         println!(
                             "\r  {} DingTalk credentials verified        ",
                             style("✅").green().bold()
                         );
                     }
-                    _ => {
-                        println!(
-                            "\r  {} Connection failed — check your credentials",
-                            style("❌").red().bold()
-                        );
+                    Err(failure) => {
+                        print_connection_failure("credentials", &failure);
                         continue;
                     }
                 }
@@ -4962,8 +4948,10 @@ pub(crate) fn setup_channels(existing: ChannelsConfig) -> Result<ChannelsConfig>
                     .post("https://bots.qq.com/app/getAppAccessToken")
                     .json(&body)
                     .send()
+                    .map_err(ConnectionFailure::from)
+                    .and_then(ConnectionFailure::require_success)
                 {
-                    Ok(resp) if resp.status().is_success() => {
+                    Ok(resp) => {
                         let data: serde_json::Value = resp.json().unwrap_or_default();
                         if data.get("access_token").is_some() {
                             println!(
@@ -4978,11 +4966,8 @@ pub(crate) fn setup_channels(existing: ChannelsConfig) -> Result<ChannelsConfig>
                             continue;
                         }
                     }
-                    _ => {
-                        println!(
-                            "\r  {} Connection failed — check your credentials",
-                            style("❌").red().bold()
-                        );
+                    Err(failure) => {
+                        print_connection_failure("credentials", &failure);
                         continue;
                     }
                 }
@@ -5057,18 +5042,13 @@ pub(crate) fn setup_channels(existing: ChannelsConfig) -> Result<ChannelsConfig>
                     let client = reqwest::blocking::Client::builder()
                         .timeout(Duration::from_secs(8))
                         .connect_timeout(Duration::from_secs(4))
-                        .build()
-                        .map_err(|err| format!("failed to build HTTP client: {err}"))?;
+                        .build()?;
                     let body = serde_json::json!({
                         "app_id": app_id_clone,
                         "app_secret": app_secret_clone,
                     });
 
-                    let response = client
-                        .post(endpoint)
-                        .json(&body)
-                        .send()
-                        .map_err(|err| format!("request error: {err}"))?;
+                    let response = client.post(endpoint).json(&body).send()?;
 
                     let status = response.status();
                     let payload: Value = response.json().unwrap_or_default();
@@ -5076,41 +5056,36 @@ pub(crate) fn setup_channels(existing: ChannelsConfig) -> Result<ChannelsConfig>
                         .get("tenant_access_token")
                         .and_then(Value::as_str)
                         .is_some_and(|token| !token.trim().is_empty());
-
-                    if status.is_success() && has_token {
-                        return Ok::<(), String>(());
-                    }
-
                     let detail = payload
                         .get("msg")
                         .or_else(|| payload.get("message"))
                         .and_then(Value::as_str)
-                        .unwrap_or("unknown error");
+                        .map(str::to_string);
 
-                    Err(format!("auth rejected ({status}): {detail}"))
+                    if !status.is_success() {
+                        return Err(ConnectionFailure::Status {
+                            code: status.as_u16(),
+                            detail,
+                        });
+                    }
+                    if has_token {
+                        return Ok::<(), ConnectionFailure>(());
+                    }
+                    Err(ConnectionFailure::Reported(detail.unwrap_or_else(|| {
+                        "the response held no access token".to_string()
+                    })))
                 })
                 .join();
 
-                match thread_result {
-                    Ok(Ok(())) => {
+                match ConnectionFailure::joined(thread_result) {
+                    Ok(()) => {
                         println!(
                             "\r  {} Lark/Feishu credentials verified        ",
                             style("✅").green().bold()
                         );
                     }
-                    Ok(Err(reason)) => {
-                        println!(
-                            "\r  {} Connection failed — check your credentials",
-                            style("❌").red().bold()
-                        );
-                        println!("    {}", style(reason).dim());
-                        continue;
-                    }
-                    Err(_) => {
-                        println!(
-                            "\r  {} Connection failed — check your credentials",
-                            style("❌").red().bold()
-                        );
+                    Err(failure) => {
+                        print_connection_failure("app credentials", &failure);
                         continue;
                     }
                 }

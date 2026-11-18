@@ -1682,7 +1682,7 @@ expression: pretty
           "default": false
         },
         "interval_minutes": {
-          "description": "Interval in minutes between heartbeat pings. Default: `30`.",
+          "description": "Interval in minutes between heartbeat pings. Values below 5 are raised to 5. Default: `30`.",
           "type": "integer",
           "format": "uint32",
           "default": 30,

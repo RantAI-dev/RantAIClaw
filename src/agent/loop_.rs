@@ -2862,7 +2862,7 @@ pub async fn run_with_scope(
             ChatMessage::user(&enriched),
         ];
 
-        let response = in_memory_view(
+        let turn = in_memory_view(
             memory_view.as_ref(),
             run_tool_call_loop(
                 provider.as_ref(),
@@ -2888,12 +2888,17 @@ pub async fn run_with_scope(
                 Some(security.as_ref()),
             ),
         )
-        .await?;
-        final_output = response.clone();
+        .await;
 
+        // Finalize the session whether the turn succeeded or failed: a failed
+        // turn (provider error, auth rejection) must not leave an untitled,
+        // never-ended row in `session list`. The turn's own error is still
+        // returned below.
         if let (Some(store), Some(id)) = (session_store.as_ref(), session_id.as_deref()) {
-            let asst_msg = crate::sessions::Message::assistant(id, &response);
-            let _ = store.append_message(&asst_msg);
+            if let Ok(response) = &turn {
+                let asst_msg = crate::sessions::Message::assistant(id, response);
+                let _ = store.append_message(&asst_msg);
+            }
             // Auto-derive a title from the first user message so
             // `session list` doesn't show a wall of "(untitled)" rows.
             let title = crate::sessions::derive_session_title(&msg);
@@ -2902,6 +2907,8 @@ pub async fn run_with_scope(
             }
             let _ = store.end_session(id);
         }
+        let response = turn?;
+        final_output = response.clone();
 
         // The daemon's stdout is the systemd journal, so the
         // single-shot path's `println!` would write every cron / heartbeat

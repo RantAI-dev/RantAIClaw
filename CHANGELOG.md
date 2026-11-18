@@ -111,6 +111,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `200` with `deleted:false`, and `DELETE /kb/groups/{id}/documents/{doc}` for a document that is
   not in the group answered `200` with `ok:false`. All three now answer `404` and save nothing.
 
+- **`rantaiclaw cron run` exits non-zero when the job fails or the security policy refuses it.** It
+  printed the report and exited `0` in both cases, so a script could not tell that the job did not
+  run. The report is still printed, and the command now also returns an error naming the job.
+
+- **A heartbeat interval below 5 minutes is reported as the 5 it becomes.** `heartbeat.interval_minutes`
+  below the minimum of 5 was raised without a word, and `rantaiclaw status` printed the configured
+  value ("every 1min"). The daemon now logs one warning at startup that names the configured and the
+  effective value, `status` prints the effective interval, and the field's schema description states
+  the minimum. The minimum and the default are unchanged.
+
+- **`rantaiclaw setup mcp` starts a server before it registers it.** The setup path wrote a curated
+  server into `config.toml` without the startup check the terminal flow runs, so a server whose
+  `uvx` or `npx` command could not start was registered and failed at the first agent run. A server
+  that does not answer the startup check is now not registered and is listed as not set up, with the
+  reason.
+
+- **`rantaiclaw doctor models --provider <name>` names the provider when the probe fails.** The error
+  said "Model probe failed for target provider". It now reads "Model probe failed for provider
+  '<name>'" and points at the per-provider result above it.
+
+- **A failed `rantaiclaw agent -m` turn no longer leaves an untitled, unended session.** The early
+  return on the turn's error skipped the title and the end timestamp, so `session list` showed an
+  open "(untitled)" row for every provider error. The session is now titled from the message and
+  ended whether the turn succeeds or fails, and the turn's error is still returned.
+
+- **The channel setup wizard says what the connection test observed.** The wizard no longer
+  answers every failed connection test with "check your token". It tells an HTTP 401 or 403, which
+  means the service rejected the credential, apart from any other HTTP status and from a transport
+  error, and prints the status or the cause. It never prints the token or the request URL, because
+  the Telegram URL carries the bot token.
+
+- **`gateway --help` and `daemon --help` say that a public bind needs `gateway.allow_public_bind`.**
+  The help suggested `--host 0.0.0.0`, which the gateway refuses to start with unless
+  `gateway.allow_public_bind = true` is set. The help also names `gateway.require_pairing`.
+
 ## [0.35.0-alpha] — 2026-11-16
 
 The login-removal and approval release. Six subscription logins are gone and RantaiClaw uses API
