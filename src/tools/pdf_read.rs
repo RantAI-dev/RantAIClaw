@@ -575,6 +575,7 @@ mod tests {
         /// placed 72 points below the top of the page. Offsets and the stream
         /// length are computed, so a parser that trusts them reads the text.
         fn well_formed_pdf_bytes() -> Vec<u8> {
+            use std::fmt::Write as _;
             let content = "BT /F1 12 Tf 72 720 Td (Hello PDF) Tj ET\n";
             let objects = [
                 "<</Type/Catalog/Pages 2 0 R>>".to_string(),
@@ -594,12 +595,14 @@ mod tests {
             let xref_offset = pdf.len();
             let mut table = format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1);
             for offset in &offsets {
-                table.push_str(&format!("{offset:010} 00000 n \n"));
+                writeln!(table, "{offset:010} 00000 n ").unwrap();
             }
-            table.push_str(&format!(
-                "trailer<</Size {}/Root 1 0 R>>\nstartxref\n{xref_offset}\n%%EOF\n",
+            writeln!(
+                table,
+                "trailer<</Size {}/Root 1 0 R>>\nstartxref\n{xref_offset}\n%%EOF",
                 objects.len() + 1
-            ));
+            )
+            .unwrap();
             pdf.extend_from_slice(table.as_bytes());
             pdf
         }
