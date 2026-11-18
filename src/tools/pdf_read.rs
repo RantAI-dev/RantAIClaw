@@ -206,7 +206,9 @@ impl Tool for PdfReadTool {
                 }
             };
 
-            if text.trim().is_empty() {
+            let text = clean_extracted(text);
+
+            if text.is_empty() {
                 return Ok(ToolResult {
                     success: true,
                     // Agent dispatchers currently forward `error` only when `success=false`.
@@ -247,6 +249,19 @@ impl Tool for PdfReadTool {
                 ),
             })
         }
+    }
+}
+
+/// Drop the leading blank lines and spaces the extractor puts before the first
+/// word, so the output starts with the document's text and `max_chars` counts
+/// real text instead of padding. Trailing whitespace is left as extracted.
+#[cfg(feature = "rag-pdf")]
+fn clean_extracted(text: String) -> String {
+    let start = text.len() - text.trim_start().len();
+    if start == 0 {
+        text
+    } else {
+        text[start..].to_string()
     }
 }
 
@@ -554,6 +569,91 @@ mod tests {
             let mut pdf = body.to_vec();
             pdf.extend_from_slice(xref.as_bytes());
             pdf
+        }
+
+        /// A well-formed single-page PDF whose one line of text is "Hello PDF",
+        /// placed 72 points below the top of the page. Offsets and the stream
+        /// length are computed, so a parser that trusts them reads the text.
+        fn well_formed_pdf_bytes() -> Vec<u8> {
+            let content = "BT /F1 12 Tf 72 720 Td (Hello PDF) Tj ET\n";
+            let objects = [
+                "<</Type/Catalog/Pages 2 0 R>>".to_string(),
+                "<</Type/Pages/Kids[3 0 R]/Count 1>>".to_string(),
+                "<</Type/Page/MediaBox[0 0 612 792]/Parent 2 0 R\
+                 /Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>"
+                    .to_string(),
+                format!("<</Length {}>>\nstream\n{content}endstream", content.len()),
+                "<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>".to_string(),
+            ];
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::new();
+            for (i, object) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", i + 1).as_bytes());
+            }
+            let xref_offset = pdf.len();
+            let mut table = format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1);
+            for offset in &offsets {
+                table.push_str(&format!("{offset:010} 00000 n \n"));
+            }
+            table.push_str(&format!(
+                "trailer<</Size {}/Root 1 0 R>>\nstartxref\n{xref_offset}\n%%EOF\n",
+                objects.len() + 1
+            ));
+            pdf.extend_from_slice(table.as_bytes());
+            pdf
+        }
+
+        #[test]
+        fn clean_extracted_drops_leading_blank_lines_and_spaces() {
+            assert_eq!(
+                clean_extracted("\n\n  Hello PDF\n".to_string()),
+                "Hello PDF\n"
+            );
+            assert_eq!(clean_extracted("Hello".to_string()), "Hello");
+            assert_eq!(clean_extracted(" \n\t ".to_string()), "");
+            assert_eq!(clean_extracted(String::new()), "");
+        }
+
+        #[tokio::test]
+        async fn output_starts_with_the_documents_text() {
+            let tmp = TempDir::new().unwrap();
+            tokio::fs::write(tmp.path().join("lead.pdf"), well_formed_pdf_bytes())
+                .await
+                .unwrap();
+
+            let tool = PdfReadTool::new(test_security(tmp.path().to_path_buf()));
+            let result = tool.execute(json!({"path": "lead.pdf"})).await.unwrap();
+
+            assert!(result.success, "extraction failed: {:?}", result.error);
+            assert!(
+                result.output.starts_with("Hello PDF"),
+                "output must start with the text, got {:?}",
+                result.output
+            );
+        }
+
+        #[tokio::test]
+        async fn max_chars_counts_text_not_leading_padding() {
+            let tmp = TempDir::new().unwrap();
+            tokio::fs::write(tmp.path().join("cap.pdf"), well_formed_pdf_bytes())
+                .await
+                .unwrap();
+
+            let tool = PdfReadTool::new(test_security(tmp.path().to_path_buf()));
+            let result = tool
+                .execute(json!({"path": "cap.pdf", "max_chars": 5}))
+                .await
+                .unwrap();
+
+            assert!(result.success, "extraction failed: {:?}", result.error);
+            assert!(
+                result
+                    .output
+                    .starts_with("Hello\n\n... [truncated at 5 chars]"),
+                "the five kept chars must be text, got {:?}",
+                result.output
+            );
         }
 
         #[tokio::test]

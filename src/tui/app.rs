@@ -1768,8 +1768,10 @@ impl TuiApp {
             }
             // Plain Enter — Hermes / Claude Code convention:
             //   * If the autocomplete dropdown is visible and the highlighted
-            //     command differs from what the user typed → complete first;
-            //     a second Enter then fires it. If it already matches, submit.
+            //     command differs from what the user typed → complete it. A
+            //     command that takes no argument then runs in the same press;
+            //     one that takes an argument waits for it. If the typed text
+            //     already matches, submit.
             //   * Otherwise → submit. Period. Both prose and slash commands.
             //
             // Multi-line prompts work via Ctrl+J (handled above) or
@@ -1782,7 +1784,13 @@ impl TuiApp {
                         self.autocomplete.hide();
                         self.submit_input().await?;
                     } else {
+                        let runs_now = selected
+                            .as_deref()
+                            .is_some_and(|name| self.command_registry.takes_no_argument(name));
                         self.complete_selected_command();
+                        if runs_now {
+                            self.submit_input().await?;
+                        }
                     }
                 } else {
                     self.submit_input().await?;
@@ -12299,6 +12307,73 @@ mod tests {
         app.submit_input().await.unwrap();
 
         assert!(matches!(app.state, AppState::Quitting));
+    }
+
+    /// Enter on a typed prefix of a command that takes no argument completes
+    /// and runs it in one press. `/qu` has the single completion `/quit`.
+    #[tokio::test]
+    async fn enter_on_a_partial_no_argument_command_runs_it_in_one_press() {
+        let store = SessionStore::in_memory().expect("store");
+        let mut app = make_app_from_store(store, "test-model");
+
+        app.context.input_buffer = "/qu".to_string();
+        app.refresh_autocomplete();
+        assert_eq!(app.autocomplete.selected(), Some("/quit"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(app.state, AppState::Quitting),
+            "one Enter must complete and run /quit"
+        );
+    }
+
+    /// An alias row of a no-argument command runs too: `/exi` completes to the
+    /// alias `/exit`.
+    #[tokio::test]
+    async fn enter_on_a_partial_alias_of_a_no_argument_command_runs_it() {
+        let store = SessionStore::in_memory().expect("store");
+        let mut app = make_app_from_store(store, "test-model");
+
+        app.context.input_buffer = "/exi".to_string();
+        app.refresh_autocomplete();
+        assert_eq!(app.autocomplete.selected(), Some("/exit"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(matches!(app.state, AppState::Quitting));
+    }
+
+    /// A command that takes an argument keeps the two-step behavior: Enter
+    /// completes the name and leaves the cursor for the argument. `/mod` has
+    /// the single completion `/model`.
+    #[tokio::test]
+    async fn enter_on_a_partial_argument_command_only_completes_the_name() {
+        let store = SessionStore::in_memory().expect("store");
+        let mut app = make_app_from_store(store, "test-model");
+
+        app.context.input_buffer = "/mod".to_string();
+        app.refresh_autocomplete();
+        assert_eq!(app.autocomplete.selected(), Some("/model"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert_eq!(app.context.input_buffer, "/model ");
+        assert!(
+            matches!(app.state, AppState::Ready),
+            "an argument-taking command must wait for its argument"
+        );
+        assert!(
+            app.scrollback_queue.is_empty(),
+            "nothing may have been submitted: {:?}",
+            app.scrollback_queue
+        );
     }
 
     #[tokio::test]

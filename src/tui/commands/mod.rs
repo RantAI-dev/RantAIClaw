@@ -191,6 +191,29 @@ pub trait CommandHandler: Send + Sync {
     fn execute(&self, args: &str, ctx: &mut TuiContext) -> Result<CommandResult>;
 }
 
+/// Commands that ignore their argument and whose usage is the bare name.
+///
+/// The composer reads this list to run a command on a single Enter once the
+/// dropdown has completed its name. A command that takes an argument stays off
+/// it: its name is completed and the composer waits for the argument.
+/// `/insights` and `/continue` are absent on purpose, they read an argument.
+/// A test checks that every name here is registered and shows no arguments in
+/// its usage, so the list cannot drift from the handlers.
+const NO_ARGUMENT_COMMANDS: &[&str] = &[
+    "allowlist",
+    "calls",
+    "channels",
+    "doctor",
+    "mcp",
+    "new",
+    "quit",
+    "retry",
+    "status",
+    "stop",
+    "undo",
+    "usage",
+];
+
 /// Registry of all available commands
 pub struct CommandRegistry {
     commands: HashMap<String, Box<dyn CommandHandler>>,
@@ -256,6 +279,15 @@ impl CommandRegistry {
             self.aliases.insert(alias.to_string(), name.clone());
         }
         self.commands.insert(name, handler);
+    }
+
+    /// Whether `name` (with or without the leading `/`) is a registered command,
+    /// or an alias of one, that takes no argument. Skill rows and unknown names
+    /// are `false`: Enter on those only completes the name.
+    pub fn takes_no_argument(&self, name: &str) -> bool {
+        let name = name.trim_start_matches('/').to_lowercase();
+        let canonical = self.aliases.get(&name).unwrap_or(&name);
+        self.commands.contains_key(canonical) && NO_ARGUMENT_COMMANDS.contains(&canonical.as_str())
     }
 
     pub fn dispatch(&self, input: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
@@ -487,6 +519,41 @@ mod tests {
 
         let result = registry.dispatch("/exit", &mut ctx).unwrap();
         assert!(matches!(result, CommandResult::Quit));
+    }
+
+    #[test]
+    fn takes_no_argument_resolves_aliases_and_rejects_argument_commands() {
+        let registry = CommandRegistry::new();
+        assert!(registry.takes_no_argument("/quit"));
+        assert!(registry.takes_no_argument("quit"));
+        assert!(
+            registry.takes_no_argument("/exit"),
+            "an alias takes the canonical command's answer"
+        );
+        assert!(registry.takes_no_argument("/clear"));
+        assert!(!registry.takes_no_argument("/model"));
+        assert!(!registry.takes_no_argument("/insights"));
+        assert!(!registry.takes_no_argument("/continue"));
+        assert!(
+            !registry.takes_no_argument("/some-installed-skill"),
+            "a skill row or unknown name only completes"
+        );
+    }
+
+    #[test]
+    fn no_argument_list_names_registered_commands_without_arguments() {
+        let registry = CommandRegistry::new();
+        for name in NO_ARGUMENT_COMMANDS {
+            let handler = registry
+                .commands
+                .get(*name)
+                .unwrap_or_else(|| panic!("`{name}` is listed but not registered"));
+            assert_eq!(
+                handler.usage().trim_start_matches('/'),
+                *name,
+                "`{name}` is listed as taking no argument but its usage shows one"
+            );
+        }
     }
 
     #[test]

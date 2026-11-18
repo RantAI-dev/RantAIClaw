@@ -146,6 +146,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The help suggested `--host 0.0.0.0`, which the gateway refuses to start with unless
   `gateway.allow_public_bind = true` is set. The help also names `gateway.require_pairing`.
 
+- **A shell command denied at the approval prompt says it was denied.** After a human answered no
+  (or the prompt timed out), the tool error repeated the policy text raised before the prompt:
+  "Command not allowed by security policy" or "Command requires explicit approval
+  (approved=true)". The model read a one-off refusal as a standing rule, or as an invitation to
+  retry with a flag it cannot set. The error now names the program that was denied:
+  "`<program>` was denied at the approval prompt". A command the policy blocks outright, with
+  nobody asked, keeps the policy text.
+
+- **`pdf_read` output starts with the document's text.** The extractor's leading blank lines and
+  spaces reached the output, and `max_chars` counted them as text. They are dropped before the
+  emptiness check and the truncation. `kb ingest` extracts through its own path and is unchanged.
+
+- **Enter runs a command that takes no argument in one press.** In the TUI, typing a partial
+  command such as `/qu` and pressing Enter only completed the name, and a second Enter ran it.
+  A command that takes no argument (`/quit`, `/new`, `/status`, `/doctor` and the like, and their
+  aliases) now completes and runs on the first Enter. A command that takes an argument, and a
+  skill row, still completes the name and waits.
+
+- **`/insights --days N` honors the window.** The argument was ignored: the panel counted the 100
+  newest sessions whatever their age. `--days N` now counts the sessions that started in the last
+  N days, and `/insights` with no argument counts every session, past the old 100-session cap.
+  A value that is not a positive whole number, or any other argument, answers with the usage
+  line. The `insights` CLI command is unchanged.
+
 ## [0.35.0-alpha] — 2026-11-16
 
 The login-removal and approval release. Six subscription logins are gone and RantaiClaw uses API

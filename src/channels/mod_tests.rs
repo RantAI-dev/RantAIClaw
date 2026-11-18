@@ -5023,8 +5023,8 @@ fn channel_remove_guidance_names_the_resolved_config_path() {
 ///
 /// The CLI enums used to be declared twice (the library's in `lib.rs` and a
 /// second copy in `main.rs`) and this test also compared the two word for
-/// word. Plan 676 deleted the binary's copy — the binary renders the library
-/// enum — so one declaration is left to check.
+/// word. The binary now renders the library's enum, so `lib.rs` holds the only
+/// declaration and there is one place to check.
 #[test]
 fn channel_add_and_remove_long_help_names_the_profile_config() {
     /// Slice the `ChannelCommands` enum body out of `lib.rs`. The body ends
@@ -12670,16 +12670,16 @@ fn count_unquoted(line: &str, needle: char) -> usize {
     count
 }
 
-/// Plan 121's closing invariant: the module's public **function** surface is
-/// exactly the symbols that were reachable from outside `src/channels/` before
-/// the decomposition started. Ten modules now exist where one did; without this
-/// a later extraction can widen the API by accident, one `pub use` at a time.
+/// The module's public **function** surface is exactly the symbols that were
+/// reachable from outside `src/channels/` before the decomposition started.
+/// Ten modules now exist where one did; without this a later extraction can
+/// widen the API by accident, one `pub use` at a time.
 ///
-/// Plan 676 widened the surface deliberately, not by accident: the binary no
-/// longer compiles `src/channels/` as its own crate, so the symbols its CLI
-/// renders (`channel_roster_note`, `locked_channel_key_for_provisioner`) and
-/// the four admin functions it dispatches are reachable from outside the
-/// module. `status` and the `setup`/`channel` gates need them.
+/// The surface was widened on purpose: the binary no longer compiles
+/// `src/channels/` as its own crate, so the symbols its CLI renders
+/// (`channel_roster_note`, `locked_channel_key_for_provisioner`) and the four
+/// admin functions it dispatches are reachable from outside the module.
+/// `status` and the `setup`/`channel` gates need them.
 ///
 /// Channel types (`pub use telegram::TelegramChannel`, …) and the `Channel` /
 /// `SendMessage` traits are deliberately not counted: they were public before

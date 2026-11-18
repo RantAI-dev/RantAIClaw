@@ -555,12 +555,29 @@ impl CommandHandler for InsightsCommand {
         "/insights [--days N]"
     }
 
-    fn execute(&self, _args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
+    fn execute(&self, args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
         use crate::tui::widgets::{InfoPanel, InfoSection};
 
-        let sessions = ctx.session_store.list_sessions(100)?;
-        let total_sessions = sessions.len();
-        let total_messages: i64 = sessions.iter().map(|s| s.message_count).sum();
+        // No argument counts every session; `--days N` (N a positive integer)
+        // counts the sessions that started in the last N days. Anything else
+        // gets the usage line instead of being ignored.
+        let days = match args.split_whitespace().collect::<Vec<_>>().as_slice() {
+            [] => None,
+            ["--days", n] => match n.parse::<u32>() {
+                Ok(days) if days > 0 => Some(days),
+                _ => return Ok(CommandResult::Message(format!("Usage: {}", self.usage()))),
+            },
+            _ => return Ok(CommandResult::Message(format!("Usage: {}", self.usage()))),
+        };
+        let cutoff = days.map(|d| chrono::Utc::now().timestamp() - i64::from(d) * 86_400);
+        let window_label = days.map_or_else(
+            || "all sessions".to_string(),
+            |d| format!("last {d} day{}", if d == 1 { "" } else { "s" }),
+        );
+
+        let stats = ctx.session_store.stats_since(cutoff)?;
+        let total_sessions = stats.total_sessions;
+        let total_messages = stats.total_messages;
         let current_messages = ctx.messages.len();
         let avg_per_session = if total_sessions > 0 {
             (total_messages as f64) / (total_sessions as f64)
@@ -592,6 +609,7 @@ impl CommandHandler for InsightsCommand {
             .with_footer("Esc close · `/usage` for token-level breakdown")
             .section(
                 InfoSection::new("Sessions")
+                    .key_value("Window", window_label)
                     .key_value("Total", total_sessions.to_string())
                     .key_value("Current age", age_label),
             )
@@ -932,6 +950,93 @@ mod tests {
             .unwrap()
             .expect("the command must write persona.toml");
         assert_eq!(persona.preset, crate::persona::PresetId::ConcisePro);
+    }
+
+    /// A context whose store holds one session per `(age_in_days, messages)`
+    /// pair. The rows go in through a second connection, since the store's
+    /// connection is private and `new_session` always stamps "now".
+    fn ctx_with_sessions(dir: &std::path::Path, sessions: &[(i64, i64)]) -> TuiContext {
+        let path = dir.join("sessions.db");
+        let store = crate::sessions::SessionStore::open(&path).expect("open store");
+        let raw = rusqlite::Connection::open(&path).expect("raw connection");
+        let now = chrono::Utc::now().timestamp();
+        for (i, (age_days, messages)) in sessions.iter().enumerate() {
+            raw.execute(
+                "INSERT INTO sessions (id, model, started_at, message_count, source) \
+                 VALUES (?1, 'm', ?2, ?3, 'tui')",
+                rusqlite::params![format!("s{i}"), now - age_days * 86_400, messages],
+            )
+            .expect("insert session");
+        }
+        let mut ctx = test_context();
+        ctx.session_store = store;
+        ctx
+    }
+
+    /// The `key` value of the panel section headed `heading`.
+    fn panel_value(result: &CommandResult, heading: &str, key: &str) -> String {
+        use crate::tui::widgets::InfoRow;
+        let CommandResult::OpenInfoPanel(panel) = result else {
+            panic!("expected an info panel, got {result:?}");
+        };
+        panel
+            .sections
+            .iter()
+            .filter(|s| s.heading.as_deref() == Some(heading))
+            .flat_map(|s| s.rows.iter())
+            .find_map(|row| match row {
+                InfoRow::KeyValue { key: k, value } if k == key => Some(value.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no `{key}` row under `{heading}`"))
+    }
+
+    #[test]
+    fn insights_days_counts_only_sessions_started_inside_the_window() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut ctx = ctx_with_sessions(dir.path(), &[(0, 4), (10, 6)]);
+        let cmd = InsightsCommand;
+
+        let day = cmd.execute("--days 1", &mut ctx).unwrap();
+        assert_eq!(panel_value(&day, "Sessions", "Total"), "1");
+        assert_eq!(panel_value(&day, "Messages", "Total"), "4");
+
+        let month = cmd.execute("--days 30", &mut ctx).unwrap();
+        assert_eq!(panel_value(&month, "Sessions", "Total"), "2");
+        assert_eq!(panel_value(&month, "Messages", "Total"), "10");
+    }
+
+    #[test]
+    fn insights_without_an_argument_counts_every_session_past_one_hundred() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let sessions: Vec<(i64, i64)> = (0..120).map(|i| (i, 1)).collect();
+        let mut ctx = ctx_with_sessions(dir.path(), &sessions);
+
+        let all = InsightsCommand.execute("", &mut ctx).unwrap();
+        assert_eq!(panel_value(&all, "Sessions", "Total"), "120");
+    }
+
+    #[test]
+    fn insights_rejects_a_malformed_window_with_the_usage_text() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut ctx = ctx_with_sessions(dir.path(), &[(0, 1)]);
+        for args in [
+            "--days 0",
+            "--days abc",
+            "--days",
+            "--days -3",
+            "--days 2 extra",
+            "--weeks 3",
+            "7",
+        ] {
+            match InsightsCommand.execute(args, &mut ctx).unwrap() {
+                CommandResult::Message(text) => assert_eq!(
+                    text, "Usage: /insights [--days N]",
+                    "`{args}` must answer with the usage text"
+                ),
+                other => panic!("`{args}` must be rejected, got {other:?}"),
+            }
+        }
     }
 
     #[test]
