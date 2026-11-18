@@ -1148,6 +1148,22 @@ mod tests {
     }
 
     #[test]
+    fn drop_last_exchange_removes_the_user_row_and_its_reply() {
+        let mut ctx = in_memory_context("test-model");
+        ctx.append_user_message("question").expect("append user");
+        ctx.append_assistant_message("answer")
+            .expect("append assistant");
+        let sid = ctx.session_id.clone().expect("session bound on append");
+
+        let removed = ctx.drop_last_exchange().expect("drop");
+
+        assert_eq!(removed, 2, "the user row and the reply after it");
+        assert!(ctx.messages.is_empty(), "screen: {:?}", ctx.messages);
+        let stored = ctx.session_store.get_messages(&sid).expect("messages");
+        assert!(stored.is_empty(), "store: {stored:?}");
+    }
+
+    #[test]
     fn exit_history_navigation_drops_pos_and_stash() {
         let mut ctx = in_memory_context("test-model");
         ctx.push_input_history("alpha");

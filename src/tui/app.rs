@@ -1768,10 +1768,11 @@ impl TuiApp {
             }
             // Plain Enter — Hermes / Claude Code convention:
             //   * If the autocomplete dropdown is visible and the highlighted
-            //     command differs from what the user typed → complete it. A
-            //     command that takes no argument then runs in the same press;
-            //     one that takes an argument waits for it. If the typed text
-            //     already matches, submit.
+            //     command differs from what the user typed → complete it. If
+            //     the dropdown holds exactly one row and that row is a
+            //     read-only command, the same press also runs it. Any other
+            //     completion waits for a second Enter on the fully typed
+            //     name. If the typed text already matches, submit.
             //   * Otherwise → submit. Period. Both prose and slash commands.
             //
             // Multi-line prompts work via Ctrl+J (handled above) or
@@ -1784,9 +1785,16 @@ impl TuiApp {
                         self.autocomplete.hide();
                         self.submit_input().await?;
                     } else {
-                        let runs_now = selected
-                            .as_deref()
-                            .is_some_and(|name| self.command_registry.takes_no_argument(name));
+                        // One press runs a command only when the dropdown holds
+                        // exactly one row and that row is a read-only command.
+                        // `/u` matches `/undo` and `/usage`, and the dropdown
+                        // highlights `/undo`, which deletes the last exchange
+                        // for good, so `/u` only completes the name. Count the
+                        // rows before completing: completing hides the dropdown.
+                        let runs_now = self.autocomplete.suggestion_count() == 1
+                            && selected.as_deref().is_some_and(|name| {
+                                self.command_registry.is_read_only_command(name)
+                            });
                         self.complete_selected_command();
                         if runs_now {
                             self.submit_input().await?;
@@ -12309,10 +12317,191 @@ mod tests {
         assert!(matches!(app.state, AppState::Quitting));
     }
 
-    /// Enter on a typed prefix of a command that takes no argument completes
-    /// and runs it in one press. `/qu` has the single completion `/quit`.
+    /// One Enter on a typed prefix must never run a command that changes the
+    /// conversation. `/u` matches `/undo` and `/usage`, and the dropdown
+    /// highlights the first row — `/undo`, which deletes the last exchange
+    /// from the store for good. The press may only complete the name.
     #[tokio::test]
-    async fn enter_on_a_partial_no_argument_command_runs_it_in_one_press() {
+    async fn enter_on_an_ambiguous_prefix_completes_the_name_and_runs_nothing() {
+        let store = SessionStore::in_memory().expect("store");
+        let mut app = make_app_from_store(store, "test-model");
+
+        // A user row in the store: this is what `/undo` would delete.
+        app.context.append_user_message("hello").expect("append");
+        let session_id = app.context.session_id.clone().expect("session");
+
+        app.context.input_buffer = "/u".to_string();
+        app.refresh_autocomplete();
+        assert_eq!(app.autocomplete.selected(), Some("/undo"));
+        assert_eq!(app.autocomplete.suggestion_count(), 2, "`/u` is ambiguous");
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            app.context.input_buffer.trim(),
+            "/undo",
+            "the press completes the name"
+        );
+        assert!(
+            app.context.messages.iter().any(|m| m.role == "user"),
+            "the exchange must survive: {:?}",
+            app.context.messages
+        );
+        let stored = app
+            .context
+            .session_store
+            .get_messages(&session_id)
+            .expect("messages");
+        assert!(
+            stored.iter().any(|m| m.role == "user"),
+            "the store must be untouched: {stored:?}"
+        );
+    }
+
+    /// `/n` matches only `/new`, and `/new` ends the session: one Enter on
+    /// the prefix may not start a new one.
+    #[tokio::test]
+    async fn enter_on_a_prefix_of_the_new_command_does_not_start_a_new_session() {
+        let store = SessionStore::in_memory().expect("store");
+        let mut app = make_app_from_store(store, "test-model");
+
+        app.context.append_user_message("hello").expect("append");
+        let first_session_id = app.context.session_id.clone().expect("session");
+
+        app.context.input_buffer = "/n".to_string();
+        app.refresh_autocomplete();
+        assert_eq!(app.autocomplete.selected(), Some("/new"));
+        assert_eq!(app.autocomplete.suggestion_count(), 1);
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert_eq!(app.context.input_buffer.trim(), "/new");
+        assert_eq!(
+            app.context.session_id.as_deref(),
+            Some(first_session_id.as_str()),
+            "the session must not be replaced"
+        );
+        assert_eq!(
+            app.context.messages.len(),
+            1,
+            "the conversation must not be cleared"
+        );
+    }
+
+    /// An ambiguous prefix runs nothing, not even a command that only reads:
+    /// `/c` matches `/calls`, `/channels` and more, and the dropdown
+    /// highlights `/calls`. One press may only complete the name.
+    #[tokio::test]
+    async fn enter_on_an_ambiguous_prefix_does_not_run_a_read_only_command() {
+        let store = SessionStore::in_memory().expect("store");
+        let mut app = make_app_from_store(store, "test-model");
+
+        app.context.input_buffer = "/c".to_string();
+        app.refresh_autocomplete();
+        assert_eq!(app.autocomplete.selected(), Some("/calls"));
+        assert!(app.autocomplete.suggestion_count() > 1, "`/c` is ambiguous");
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert_eq!(app.context.input_buffer.trim(), "/calls");
+        assert!(
+            app.scrollback_queue.is_empty(),
+            "the command must not have run: {:?}",
+            app.scrollback_queue
+        );
+    }
+
+    /// A prefix that matches exactly one row and names a command that only
+    /// reads still runs in one press: `/stat` is `/status`, which reports the
+    /// session and changes nothing.
+    #[tokio::test]
+    async fn enter_on_a_unique_prefix_of_a_read_only_command_runs_it() {
+        let store = SessionStore::in_memory().expect("store");
+        let mut app = make_app_from_store(store, "test-model");
+
+        app.context.input_buffer = "/stat".to_string();
+        app.refresh_autocomplete();
+        assert_eq!(app.autocomplete.selected(), Some("/status"));
+        assert_eq!(app.autocomplete.suggestion_count(), 1);
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(
+            app.info_panel.is_some(),
+            "`/status` must have run: the status panel is what it opens"
+        );
+    }
+
+    /// `/help` takes an optional command name, so it is not a read-only
+    /// command: one Enter on its unique prefix only completes the name. The
+    /// bare `/help` opens the picker, and that must wait for a second Enter.
+    #[tokio::test]
+    async fn enter_on_a_unique_prefix_of_help_only_completes_the_name() {
+        let store = SessionStore::in_memory().expect("store");
+        let mut app = make_app_from_store(store, "test-model");
+
+        app.context.input_buffer = "/hel".to_string();
+        app.refresh_autocomplete();
+        assert_eq!(app.autocomplete.selected(), Some("/help"));
+        assert_eq!(app.autocomplete.suggestion_count(), 1);
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert_eq!(app.context.input_buffer.trim(), "/help");
+        assert!(
+            app.list_picker.is_none(),
+            "the picker must not open on the first Enter"
+        );
+    }
+
+    /// The fully typed name still runs: `/undo` + Enter undoes, as it always
+    /// did. What changed is the typed prefix, not the command.
+    #[tokio::test]
+    async fn enter_on_a_fully_typed_command_still_runs_it() {
+        let store = SessionStore::in_memory().expect("store");
+        let mut app = make_app_from_store(store, "test-model");
+
+        app.context.append_user_message("hello").expect("append");
+        let session_id = app.context.session_id.clone().expect("session");
+
+        app.context.input_buffer = "/undo".to_string();
+        app.refresh_autocomplete();
+        assert_eq!(app.autocomplete.selected(), Some("/undo"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(
+            !app.context.messages.iter().any(|m| m.role == "user"),
+            "the exchange must be undone: {:?}",
+            app.context.messages
+        );
+        let stored = app
+            .context
+            .session_store
+            .get_messages(&session_id)
+            .expect("messages");
+        assert!(
+            !stored.iter().any(|m| m.role == "user"),
+            "the store must no longer hold the undone exchange: {stored:?}"
+        );
+    }
+
+    /// `/quit` ends the application, so one Enter on a typed prefix may not
+    /// run it: the press completes the name, and the fully typed name runs.
+    #[tokio::test]
+    async fn enter_on_a_partial_no_argument_command_only_completes_the_name() {
         let store = SessionStore::in_memory().expect("store");
         let mut app = make_app_from_store(store, "test-model");
 
@@ -12324,16 +12513,32 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(
+            app.context.input_buffer.trim(),
+            "/quit",
+            "the press completes the name"
+        );
+        assert!(
+            matches!(app.state, AppState::Ready),
+            "one Enter on a prefix must not quit the application"
+        );
+
+        // The fully typed name still runs.
+        app.context.input_buffer = "/quit".to_string();
+        app.refresh_autocomplete();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
         assert!(
             matches!(app.state, AppState::Quitting),
-            "one Enter must complete and run /quit"
+            "the fully typed name runs"
         );
     }
 
-    /// An alias row of a no-argument command runs too: `/exi` completes to the
-    /// alias `/exit`.
+    /// An alias row of a command that ends the application completes too:
+    /// `/exi` is the alias `/exit`, and `/exit` quits.
     #[tokio::test]
-    async fn enter_on_a_partial_alias_of_a_no_argument_command_runs_it() {
+    async fn enter_on_a_partial_alias_of_a_mutating_command_only_completes_the_name() {
         let store = SessionStore::in_memory().expect("store");
         let mut app = make_app_from_store(store, "test-model");
 
@@ -12345,7 +12550,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(app.state, AppState::Quitting));
+        assert_eq!(app.context.input_buffer.trim(), "/exit");
+        assert!(
+            matches!(app.state, AppState::Ready),
+            "one Enter on a prefix must not quit the application"
+        );
     }
 
     /// A command that takes an argument keeps the two-step behavior: Enter
