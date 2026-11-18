@@ -843,6 +843,102 @@ async fn headless_door_does_not_write_a_memory_row() {
     );
 }
 
+/// The one session row `agent -m` wrote into the door's session store.
+fn only_headless_session(
+    fixture: &super::door_test_support::DoorFixture,
+) -> crate::sessions::Session {
+    let path = crate::profile::ProfileManager::active()
+        .expect("the active profile resolves")
+        .sessions_db_path();
+    let store = crate::sessions::SessionStore::open(&path).expect("the sessions db opens");
+    let sessions = store.list_sessions(10).expect("sessions list");
+    assert_eq!(
+        sessions.len(),
+        1,
+        "the headless turn writes exactly one session (llm requests: {})",
+        fixture.llm.request_count()
+    );
+    store
+        .get_session(&sessions[0].id)
+        .expect("the session reads")
+        .expect("the session exists")
+}
+
+/// A headless `agent -m` turn that succeeds titles its session from the user
+/// message and ends it, so `session list` does not show an open, untitled row.
+#[tokio::test]
+async fn headless_turn_titles_and_ends_its_session() {
+    let fixture = super::door_test_support::DoorFixture::start().await;
+    let message = "summarize the quarterly report";
+
+    crate::memory::MEMORY_VIEW
+        .scope(crate::memory::MemoryView::All, async {
+            let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
+            Box::pin(crate::agent::run(
+                fixture.config.clone(),
+                Some(message.to_string()),
+                None,
+                None,
+                0.0,
+                "cli",
+                true,
+                &mut stdin,
+            ))
+            .await
+            .expect("the headless turn runs against the local server");
+        })
+        .await;
+
+    let session = only_headless_session(&fixture);
+    assert_eq!(session.title.as_deref(), Some(message));
+    assert!(session.ended_at.is_some(), "the session is ended");
+}
+
+/// A headless turn that fails (here: the provider rejects the key with 401)
+/// still titles and ends its session, and still returns the turn's error.
+/// (Fails on base, where the early `?` skipped the title and `end_session`.)
+#[tokio::test]
+async fn failed_headless_turn_still_titles_and_ends_its_session() {
+    let mut fixture = super::door_test_support::DoorFixture::start().await;
+    let message = "why does this turn fail";
+
+    let app = axum::Router::new().fallback(|| async { axum::http::StatusCode::UNAUTHORIZED });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("the rejecting server binds a local port");
+    let addr = listener.local_addr().expect("the bound address");
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    fixture.config.default_provider = Some(format!("custom:http://{addr}"));
+
+    let result = crate::memory::MEMORY_VIEW
+        .scope(crate::memory::MemoryView::All, async {
+            let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
+            Box::pin(crate::agent::run(
+                fixture.config.clone(),
+                Some(message.to_string()),
+                None,
+                None,
+                0.0,
+                "cli",
+                true,
+                &mut stdin,
+            ))
+            .await
+        })
+        .await;
+    server.abort();
+
+    assert!(result.is_err(), "the turn's error is still returned");
+    let session = only_headless_session(&fixture);
+    assert_eq!(session.title.as_deref(), Some(message));
+    assert!(
+        session.ended_at.is_some(),
+        "a failed turn must still end its session"
+    );
+}
+
 /// The console/TUI door drives a turn through `Agent::turn`, which the
 /// console route (`src/gateway/api_v1.rs:717`) reaches when an operator
 /// sends a message from the web UI. The headless door in the sibling test

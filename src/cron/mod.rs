@@ -264,9 +264,14 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
         crate::CronCommands::Run { id } => {
             let handle = tokio::runtime::Handle::try_current()
                 .map_err(|_| anyhow::anyhow!("cron run must execute inside the tokio runtime"))?;
-            let report =
+            let (ok, report) =
                 tokio::task::block_in_place(|| handle.block_on(run_job_report(config, &id)))?;
             println!("{report}");
+            // The report is printed either way, but a job that failed or was
+            // refused by the security policy must not exit 0.
+            if !ok {
+                anyhow::bail!("cron job {id} did not complete successfully");
+            }
             Ok(())
         }
         crate::CronCommands::Runs { id, limit } => {
@@ -330,12 +335,12 @@ fn print_added(job: &CronJob) {
     println!("  Next: {}", job.next_run.to_rfc3339());
 }
 
-/// Force-run a job and return a human report. Reuses the shared manual-run path
+/// Force-run a job and return whether it succeeded plus a human report. Reuses the shared manual-run path
 /// (records run history; does not reschedule/deliver) — same semantics as the
 /// `cron_run` tool and the web `POST /cron/{id}/run`. NOTE: keep this NON-`pub`
 /// (only `handle_command` + the in-module test call it); a `pub` fn returning
 /// `Result` would trip `clippy::missing_errors_doc` under the pedantic gate.
-async fn run_job_report(config: &Config, id: &str) -> Result<String> {
+async fn run_job_report(config: &Config, id: &str) -> Result<(bool, String)> {
     let job = get_job(config, id)?;
     let security =
         crate::security::SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
@@ -346,10 +351,13 @@ async fn run_job_report(config: &Config, id: &str) -> Result<String> {
     // Label matches the recorded run-history status: a policy refusal reads
     // "refused", not "error".
     let status = crate::cron::scheduler::run_status(ok, &output);
-    Ok(format!(
-        "{} cron job {id} ({status})\n{}",
-        if ok { "✅" } else { "✗" },
-        output.trim(),
+    Ok((
+        ok,
+        format!(
+            "{} cron job {id} ({status})\n{}",
+            if ok { "✅" } else { "✗" },
+            output.trim(),
+        ),
     ))
 }
 
@@ -805,7 +813,7 @@ mod tests {
         assert_eq!(printed.len(), 8, "the printed id is eight characters");
 
         // run
-        let report = run_job_report(&config, &printed).await.unwrap();
+        let (_, report) = run_job_report(&config, &printed).await.unwrap();
         assert!(report.contains(&printed), "{report}");
         assert_eq!(list_runs(&config, &job.id, 10).unwrap().len(), 1);
 
@@ -851,7 +859,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let out = run_job_report(&config, &job.id).await.unwrap();
+        let (_, out) = run_job_report(&config, &job.id).await.unwrap();
         assert!(out.contains("ok") || out.contains("cli-run"), "{out}");
         assert_eq!(list_runs(&config, &job.id, 10).unwrap().len(), 1);
     }
@@ -880,9 +888,52 @@ mod tests {
             None,
         )
         .unwrap();
-        let out = run_job_report(&config, &job.id).await.unwrap();
+        let (ok, out) = run_job_report(&config, &job.id).await.unwrap();
+        assert!(!ok, "a refused job is not a success: {out}");
         assert!(out.contains("(refused)"), "{out}");
         assert!(!out.contains("(error)"), "{out}");
+    }
+
+    /// `cron run` prints the report but must exit non-zero when the job was
+    /// refused or failed, so a script or CI step can tell it did not run.
+    /// `handle_command` is the value `main` returns, so an `Err` here is a
+    /// non-zero exit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cli_run_of_a_refused_job_returns_an_error() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.autonomy.allowed_commands = vec!["echo".into()];
+        config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+        let job = make_job(&config, "*/5 * * * *", None, "curl https://example.com");
+
+        let err =
+            handle_command(crate::CronCommands::Run { id: job.id.clone() }, &config).unwrap_err();
+        assert!(err.to_string().contains(&job.id), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cli_run_of_a_failing_job_returns_an_error() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = make_job(
+            &config,
+            "*/5 * * * *",
+            None,
+            "ls always_missing_for_cron_run_test",
+        );
+
+        let err =
+            handle_command(crate::CronCommands::Run { id: job.id.clone() }, &config).unwrap_err();
+        assert!(err.to_string().contains(&job.id), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cli_run_of_a_succeeding_job_returns_ok() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = make_job(&config, "*/5 * * * *", None, "echo fine");
+
+        handle_command(crate::CronCommands::Run { id: job.id.clone() }, &config).unwrap();
     }
 
     #[test]

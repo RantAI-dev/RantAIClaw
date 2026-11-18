@@ -118,7 +118,7 @@ An authed curated server gets its credential through `rantaiclaw setup mcp` (or 
 
 The flow binds its redirect to the login that started it: the authorization URL carries a one-time `state` and an S256 PKCE code challenge, only a callback whose `state` matches is accepted, and the token exchange sends the verifier that challenge was derived from. The listener binds `127.0.0.1:11500` on loopback only, and a request that does not match the active login is answered and ignored rather than treated as the callback.
 
-A server is registered, and reported as authed, only after its credential was actually obtained. A session that cannot show a URL and wait for the browser — a headless run, or the OAuth client id and secret missing from the environment — leaves the server unregistered, and the setup summary names `rantaiclaw setup mcp` as the step that finishes the login. There is no refresh flow yet: the stored access token is used until it expires — roughly an hour for Google — after which re-running `rantaiclaw setup mcp` logs in again.
+A server is registered, and reported as authed, only after its credential was actually obtained and the server answered a startup check (it is started once and sent an `initialize` request, as in the terminal flow). A server that does not start is not registered; the setup summary lists it as not set up, with the reason. A session that cannot show a URL and wait for the browser — a headless run, or the OAuth client id and secret missing from the environment — leaves the server unregistered, and the setup summary names `rantaiclaw setup mcp` as the step that finishes the login. There is no refresh flow yet: the stored access token is used until it expires — roughly an hour for Google — after which re-running `rantaiclaw setup mcp` logs in again.
 
 `setup` writes the config it loaded, to the same file the agent reads: `RANTAICLAW_CONFIG_DIR` if set, otherwise the active profile's `config.toml`.
 
@@ -144,13 +144,15 @@ A server is registered, and reported as authed, only after its credential was ac
 ### `agent`
 
 - `rantaiclaw agent`
-- `rantaiclaw agent -m "Hello"`
+- `rantaiclaw agent -m "Hello"` — records the turn in `sessions.db` with a title from the message and an end timestamp, whether the turn succeeded or failed. A failed turn still exits non-zero with its error
 - `rantaiclaw agent --provider <ID> --model <MODEL> --temperature <0.0-2.0>`
 
 ### `gateway` / `daemon`
 
 - `rantaiclaw gateway [--host <HOST>] [--port <PORT>]`
 - `rantaiclaw daemon [--host <HOST>] [--port <PORT>]`
+
+A `--host` other than loopback (for example `0.0.0.0`) is refused unless `gateway.allow_public_bind = true` is set in `config.toml`. Keep `gateway.require_pairing = true` (the default) so only paired clients are served.
 
 ### `service`
 
@@ -207,7 +209,7 @@ The same `--allow-unverified` flag exists on `rantaiclaw update` and `rantaiclaw
 - `rantaiclaw cron add-every <every_ms> [--agent] [--model <name>] <command|prompt>`
 - `rantaiclaw cron once <delay> [--agent] [--model <name>] <command|prompt>`
 - `rantaiclaw cron update <id> [--expression <expr>] [--tz <IANA_TZ>] [--command <command>] [--name <name>]`
-- `rantaiclaw cron run <id>` — force-run now and record the run (does not reschedule)
+- `rantaiclaw cron run <id>` — force-run now and record the run (does not reschedule). Prints the run report, and exits non-zero when the job failed or the security policy refused it
 - `rantaiclaw cron runs <id> [--limit <n>]` — print recent run history
 - `rantaiclaw cron remove <id>`
 - `rantaiclaw cron pause <id>`
@@ -668,6 +670,8 @@ surfaces cannot disagree.
 |---|---|---|
 | `--provider <PROVIDER>` | Probe one provider instead of all known ones | all |
 | `--use-cache` | Prefer cached catalogs; skip the forced live refresh | `false` |
+
+With `--provider`, the command exits non-zero when that provider's live catalog was not fetched, and the error names the provider (`Model probe failed for provider '<name>': ...`). The per-provider result above the error holds the observed reason.
 
 ### `update`
 

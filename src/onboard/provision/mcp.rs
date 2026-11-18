@@ -75,6 +75,20 @@ impl McpProvisioner {
         config: &mut Config,
         io: ProvisionIo,
     ) -> Result<ProvisionOutcome> {
+        Self::run_with_catalog(NO_AUTH, AUTHED, endpoints, can_wait_for_browser, config, io).await
+    }
+
+    /// [`Self::run_with`] over an explicit server catalog, so a test can offer
+    /// a server whose startup it controls instead of the real `uvx`/`npx`
+    /// ones.
+    async fn run_with_catalog(
+        no_auth: &[CuratedMcpServer],
+        authed: &[CuratedMcpServer],
+        endpoints: &oauth::OAuthEndpoints,
+        can_wait_for_browser: bool,
+        config: &mut Config,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -94,11 +108,11 @@ impl McpProvisioner {
         // Map global index -> server
         let mut server_by_idx: Vec<(&CuratedMcpServer, bool)> = Vec::new(); // (server, is_authed)
 
-        for s in NO_AUTH {
+        for s in no_auth {
             all_options.push(format!("{} (no auth)", s.display_name));
             server_by_idx.push((s, false));
         }
-        for s in AUTHED {
+        for s in authed {
             all_options.push(format!("{} (auth required)", s.display_name));
             server_by_idx.push((s, true));
         }
@@ -110,7 +124,7 @@ impl McpProvisioner {
                 text: format!(
                     "Available: {} curated servers ({} require auth)",
                     server_by_idx.len(),
-                    AUTHED.len()
+                    authed.len()
                 ),
             },
         )
@@ -180,11 +194,14 @@ impl McpProvisioner {
 
             // No credential, no registration: an empty answer or a flow that
             // never finished must not turn into a server entry that only
-            // looks authenticated.
+            // looks authenticated. A credential that was obtained still has
+            // to start the server before it is registered.
             let registered = match credential {
-                Some(c) => setup::credential_env_pairs(server, c)
-                    .and_then(|env| setup::register_mcp(config, server, &env)),
-                None => setup::register_mcp(config, server, &[]),
+                Some(c) => match setup::credential_env_pairs(server, c) {
+                    Ok(env) => validate_then_register(config, server, &env).await,
+                    Err(e) => Err(e),
+                },
+                None => validate_then_register(config, server, &[]).await,
             };
             match registered {
                 Ok(()) => authed_added += 1,
@@ -233,10 +250,10 @@ impl McpProvisioner {
         // Register zero-auth servers
         let mut zero_auth_added = 0;
 
-        for (zero_idx, server) in NO_AUTH.iter().enumerate() {
+        for (zero_idx, server) in no_auth.iter().enumerate() {
             let global_idx = zero_idx;
             if selections.contains(&global_idx) || install_all_zero_auth {
-                match setup::register_mcp(config, server, &[]) {
+                match validate_then_register(config, server, &[]).await {
                     Ok(()) => zero_auth_added += 1,
                     Err(e) => {
                         send(
@@ -287,6 +304,21 @@ impl McpProvisioner {
 
         Ok(ProvisionOutcome::Configured)
     }
+}
+
+/// Start the server once to prove it answers, then register it: the same order
+/// the terminal flow in [`setup`] uses. A server that does not start is not
+/// registered, so a broken `install_command` shows up at setup time, not at
+/// the first agent run.
+async fn validate_then_register(
+    config: &mut Config,
+    server: &CuratedMcpServer,
+    env: &[(String, String)],
+) -> Result<()> {
+    setup::validate_mcp_startup(server, env)
+        .await
+        .map_err(|e| anyhow::anyhow!("startup check failed: {e:#}"))?;
+    setup::register_mcp(config, server, env)
 }
 
 /// The summary note for a selected server whose setup did not finish: what
@@ -357,6 +389,58 @@ mod tests {
             })
             .unwrap_or_default()
     }
+
+    /// A shell one-liner that reads the validator's `initialize` request and
+    /// answers it, the way a started MCP server does.
+    const ANSWERING_SERVER: &[&str] = &[
+        "sh",
+        "-c",
+        r#"read _; printf '{"jsonrpc":"2.0","id":0,"result":{}}\n'"#,
+    ];
+    /// A server whose process exits at once, so the startup check fails.
+    const BROKEN_SERVER: &[&str] = &["sh", "-c", "exit 1"];
+
+    const fn fixture_server(
+        slug: &'static str,
+        install_command: &'static [&'static str],
+        auth: AuthMethod,
+    ) -> CuratedMcpServer {
+        CuratedMcpServer {
+            slug,
+            display_name: slug,
+            summary: "fixture",
+            install_command,
+            auth,
+            env_vars: &[],
+        }
+    }
+
+    const BROKEN_NO_AUTH: &[CuratedMcpServer] = &[fixture_server(
+        "fake-broken",
+        BROKEN_SERVER,
+        AuthMethod::None,
+    )];
+    const ANSWERING_NO_AUTH: &[CuratedMcpServer] = &[fixture_server(
+        "fake-answering",
+        ANSWERING_SERVER,
+        AuthMethod::None,
+    )];
+    const BROKEN_TOKEN: &[CuratedMcpServer] = &[fixture_server(
+        "fake-token-broken",
+        BROKEN_SERVER,
+        AuthMethod::Token {
+            secret_key: "FAKE_TOKEN",
+            hint: "fixture token",
+        },
+    )];
+    const ANSWERING_GOOGLE_DRIVE: &[CuratedMcpServer] = &[fixture_server(
+        "google-drive",
+        ANSWERING_SERVER,
+        AuthMethod::OAuth {
+            provider: OAuthProvider::GoogleDrive,
+            scopes: &["https://www.googleapis.com/auth/drive.readonly"],
+        },
+    )];
 
     /// The URL the provisioner asked the operator to open, if any.
     fn shown_url(events: &[ProvisionEvent]) -> String {
@@ -522,7 +606,7 @@ mod tests {
         let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
         let (resp_tx, resp_rx) = tokio::sync::mpsc::channel(64);
         for response in [
-            crate::onboard::provision::traits::ProvisionResponse::Selection(vec![5]),
+            crate::onboard::provision::traits::ProvisionResponse::Selection(vec![0]),
             crate::onboard::provision::traits::ProvisionResponse::Selection(vec![0]),
             crate::onboard::provision::traits::ProvisionResponse::Text(String::new()),
         ] {
@@ -558,7 +642,9 @@ mod tests {
         });
 
         let mut config = Config::default();
-        let outcome = McpProvisioner::run_with(
+        let outcome = McpProvisioner::run_with_catalog(
+            &[],
+            ANSWERING_GOOGLE_DRIVE,
             &endpoints,
             true,
             &mut config,
@@ -635,5 +721,114 @@ mod tests {
         assert!(summary.contains("0 authed"), "{summary}");
         assert!(summary.contains("not set up"), "{summary}");
         assert!(summary.contains("notion"), "{summary}");
+    }
+
+    /// A zero-auth server whose process does not answer the startup check
+    /// must not be registered, and the operator is told why. (Fails on base,
+    /// where the provision path registered it without starting it.)
+    #[tokio::test]
+    async fn a_zero_auth_server_that_fails_its_startup_check_is_not_registered() {
+        let mut config = Config::default();
+        let transcript = drive_entrypoint(
+            &mut config,
+            vec![Answer::Pick(0), Answer::Pick(0), Answer::Text("")],
+            async |io, config| {
+                McpProvisioner::run_with_catalog(
+                    BROKEN_NO_AUTH,
+                    &[],
+                    &oauth::OAuthEndpoints::google(),
+                    false,
+                    config,
+                    io,
+                )
+                .await
+            },
+        )
+        .await;
+
+        assert!(transcript.configured());
+        assert!(
+            config.mcp_servers.is_empty(),
+            "a server that does not start must not be registered"
+        );
+        let warned = transcript
+            .events
+            .iter()
+            .any(|e| matches!(e, ProvisionEvent::Message { severity: Severity::Warn, text }
+                if text.contains("fake-broken not registered") && text.contains("startup check failed")));
+        assert!(warned, "{:?}", transcript.messages());
+        let summary = done_summary(&transcript.events);
+        assert!(summary.contains("0 zero-auth"), "{summary}");
+    }
+
+    /// The same gate for a token server: the token was typed, but the server
+    /// does not start, so it is reported as not set up and not registered.
+    #[tokio::test]
+    async fn a_token_server_that_fails_its_startup_check_is_not_registered() {
+        let mut config = Config::default();
+        let transcript = drive_entrypoint(
+            &mut config,
+            vec![
+                Answer::Pick(0),
+                Answer::Text("typed-token"),
+                Answer::Pick(0),
+                Answer::Text(""),
+            ],
+            async |io, config| {
+                McpProvisioner::run_with_catalog(
+                    &[],
+                    BROKEN_TOKEN,
+                    &oauth::OAuthEndpoints::google(),
+                    false,
+                    config,
+                    io,
+                )
+                .await
+            },
+        )
+        .await;
+
+        assert!(transcript.configured());
+        assert!(
+            config.mcp_servers.is_empty(),
+            "a server that does not start must not be registered"
+        );
+        let summary = done_summary(&transcript.events);
+        assert!(summary.contains("0 authed"), "{summary}");
+        assert!(summary.contains("not set up"), "{summary}");
+        assert!(summary.contains("fake-token-broken"), "{summary}");
+        assert!(summary.contains("startup check failed"), "{summary}");
+        assert!(
+            !summary.contains("typed-token"),
+            "the summary must not echo the token: {summary}"
+        );
+    }
+
+    /// A server that answers its startup check is registered, so the gate
+    /// does not turn every pick into a refusal.
+    #[tokio::test]
+    async fn a_zero_auth_server_that_passes_its_startup_check_is_registered() {
+        let mut config = Config::default();
+        let transcript = drive_entrypoint(
+            &mut config,
+            vec![Answer::Pick(0), Answer::Pick(0), Answer::Text("")],
+            async |io, config| {
+                McpProvisioner::run_with_catalog(
+                    ANSWERING_NO_AUTH,
+                    &[],
+                    &oauth::OAuthEndpoints::google(),
+                    false,
+                    config,
+                    io,
+                )
+                .await
+            },
+        )
+        .await;
+
+        assert!(transcript.configured());
+        assert!(config.mcp_servers.contains_key("fake-answering"));
+        let summary = done_summary(&transcript.events);
+        assert!(summary.contains("1 zero-auth"), "{summary}");
     }
 }

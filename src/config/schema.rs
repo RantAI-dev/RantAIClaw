@@ -2518,7 +2518,7 @@ pub struct ClassificationRule {
 pub struct HeartbeatConfig {
     /// Enable periodic heartbeat pings. Default: `false`.
     pub enabled: bool,
-    /// Interval in minutes between heartbeat pings. Default: `30`.
+    /// Interval in minutes between heartbeat pings. Values below 5 are raised to 5. Default: `30`.
     pub interval_minutes: u32,
 }
 
@@ -2528,6 +2528,32 @@ impl Default for HeartbeatConfig {
             enabled: false,
             interval_minutes: 30,
         }
+    }
+}
+
+impl HeartbeatConfig {
+    /// Shortest interval the runtime honours, in minutes. A smaller
+    /// `interval_minutes` is raised to this value.
+    pub const MIN_INTERVAL_MINUTES: u32 = 5;
+
+    /// The interval in effect: `interval_minutes`, raised to the minimum.
+    #[must_use]
+    pub fn effective_interval_minutes(&self) -> u32 {
+        self.interval_minutes.max(Self::MIN_INTERVAL_MINUTES)
+    }
+
+    /// The startup warning for a configured interval the runtime raises, or
+    /// `None` when the configured value is used as is.
+    #[must_use]
+    pub fn interval_clamp_warning(&self) -> Option<String> {
+        let effective = self.effective_interval_minutes();
+        (effective != self.interval_minutes).then(|| {
+            format!(
+                "heartbeat.interval_minutes = {} is below the minimum of {}; using {effective} minutes",
+                self.interval_minutes,
+                Self::MIN_INTERVAL_MINUTES
+            )
+        })
     }
 }
 
@@ -14381,5 +14407,40 @@ default_model = "legacy-model"
             memory_md.contains("- **user_lang**: prefers Rust"),
             "the operator's line must stay in MEMORY.md: {memory_md}"
         );
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_interval_tests {
+    use super::HeartbeatConfig;
+
+    fn config(interval_minutes: u32) -> HeartbeatConfig {
+        HeartbeatConfig {
+            enabled: true,
+            interval_minutes,
+        }
+    }
+
+    #[test]
+    fn interval_below_the_minimum_is_raised_and_reported() {
+        let below = config(1);
+        assert_eq!(below.effective_interval_minutes(), 5);
+        let warning = below.interval_clamp_warning().expect("a warning");
+        assert!(warning.contains("= 1 "), "{warning}");
+        assert!(warning.contains("using 5 minutes"), "{warning}");
+    }
+
+    #[test]
+    fn interval_at_or_above_the_minimum_is_used_without_a_warning() {
+        for minutes in [5, 6, 30] {
+            let at_or_above = config(minutes);
+            assert_eq!(at_or_above.effective_interval_minutes(), minutes);
+            assert_eq!(at_or_above.interval_clamp_warning(), None);
+        }
+    }
+
+    #[test]
+    fn the_default_interval_needs_no_warning() {
+        assert_eq!(HeartbeatConfig::default().interval_clamp_warning(), None);
     }
 }

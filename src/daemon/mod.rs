@@ -793,7 +793,10 @@ async fn run_heartbeat_worker(
         observer,
     );
 
-    let interval_mins = config.heartbeat.interval_minutes.max(5);
+    if let Some(message) = config.heartbeat.interval_clamp_warning() {
+        tracing::warn!("{message}");
+    }
+    let interval_mins = config.heartbeat.effective_interval_minutes();
     let mut interval = tokio::time::interval(Duration::from_secs(u64::from(interval_mins) * 60));
 
     loop {

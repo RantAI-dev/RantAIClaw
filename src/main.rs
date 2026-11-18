@@ -311,17 +311,21 @@ Runs the HTTP/WebSocket gateway that accepts incoming webhook events \
 and WebSocket connections. Bind address defaults to the values in \
 your config file (gateway.host / gateway.port).
 
+A host other than loopback is refused unless `gateway.allow_public_bind = true` \
+is set in config.toml. Keep `gateway.require_pairing = true` (the default) \
+so only paired clients are served.
+
 Examples:
   rantaiclaw gateway                  # use config defaults
   rantaiclaw gateway -p 8080          # listen on port 8080
-  rantaiclaw gateway --host 0.0.0.0   # bind to all interfaces
+  rantaiclaw gateway --host 0.0.0.0   # bind to all interfaces; needs gateway.allow_public_bind = true
   rantaiclaw gateway -p 0             # random available port")]
     Gateway {
         /// Port to listen on (use 0 for random available port); defaults to config gateway.port
         #[arg(short, long)]
         port: Option<u16>,
 
-        /// Host to bind to; defaults to config gateway.host
+        /// Host to bind to; defaults to config gateway.host. A non-loopback host also needs `gateway.allow_public_bind = true`
         #[arg(long)]
         host: Option<String>,
     },
@@ -347,7 +351,7 @@ Examples:
         #[arg(short, long)]
         port: Option<u16>,
 
-        /// Host to bind to; defaults to config gateway.host
+        /// Host to bind to; defaults to config gateway.host. A non-loopback host also needs `gateway.allow_public_bind = true`
         #[arg(long)]
         host: Option<String>,
     },
@@ -1682,7 +1686,7 @@ async fn main() -> Result<()> {
                 "Heartbeat",
                 W,
                 &if config.heartbeat.enabled {
-                    format!("every {}min", config.heartbeat.interval_minutes)
+                    format!("every {}min", config.heartbeat.effective_interval_minutes())
                 } else {
                     "disabled".to_string()
                 },
@@ -2519,6 +2523,26 @@ mod tests {
     #[test]
     fn cli_definition_has_no_flag_conflicts() {
         Cli::command().debug_assert();
+    }
+
+    /// The gateway refuses a non-loopback bind without
+    /// `gateway.allow_public_bind`, so the help that suggests `--host 0.0.0.0`
+    /// must say so, on both commands that start the gateway.
+    #[test]
+    fn gateway_and_daemon_help_state_the_public_bind_requirement() {
+        let mut command = Cli::command();
+        command.build();
+        for name in ["gateway", "daemon"] {
+            let help = command
+                .find_subcommand_mut(name)
+                .unwrap_or_else(|| panic!("the {name} subcommand must exist"))
+                .render_long_help()
+                .to_string();
+            assert!(
+                help.contains("gateway.allow_public_bind"),
+                "{name} --help must name the public-bind setting: {help}"
+            );
+        }
     }
 
     /// The profile is named with `--profile`. A `-p` short form would shadow

@@ -239,10 +239,26 @@ pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: b
     // A stale cache is deliberately NOT counted here: `--provider X` asks
     // whether X is reachable, and showing yesterday's list does not answer that.
     if provider_override.is_some() && summary.ok == 0 {
-        anyhow::bail!("Model probe failed for target provider")
+        anyhow::bail!("{}", model_probe_failure_message(provider_override))
     }
 
     Ok(())
+}
+
+/// The error for `doctor models --provider X` when X's live catalog was not
+/// fetched. It names the provider and points at the per-provider result above
+/// it, which holds the observed reason (missing key, HTTP status, transport
+/// error); it does not guess one.
+fn model_probe_failure_message(provider_override: Option<&str>) -> String {
+    match provider_override.map(str::trim).filter(|p| !p.is_empty()) {
+        Some(provider) => format!(
+            "Model probe failed for provider '{provider}': its live model catalog was not \
+             fetched (see the result above)"
+        ),
+        None => "Model probe failed: no provider's live model catalog was fetched (see the \
+                 results above)"
+            .to_string(),
+    }
 }
 
 fn format_error_chain(error: &anyhow::Error) -> String {
@@ -275,6 +291,22 @@ fn truncate_for_display(input: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn model_probe_failure_message_names_the_trimmed_provider() {
+        let message = model_probe_failure_message(Some("  openai "));
+        assert!(message.contains("'openai'"), "{message}");
+        assert!(!message.contains("target provider"), "{message}");
+    }
+
+    #[test]
+    fn model_probe_failure_message_without_a_named_provider_does_not_invent_one() {
+        for blank in [None, Some(""), Some("   ")] {
+            let message = model_probe_failure_message(blank);
+            assert!(!message.contains("''"), "{message}");
+            assert!(message.contains("no provider"), "{message}");
+        }
+    }
 
     #[test]
     fn classify_model_probe_error_marks_unsupported_as_skipped() {
