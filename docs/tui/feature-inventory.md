@@ -29,7 +29,7 @@ takes over.
 
 | Key                       | Behavior                                                                          |
 | ------------------------- | --------------------------------------------------------------------------------- |
-| `Enter`                   | Submit input. If autocomplete is open and selection differs from typed text, completes first; second `Enter` submits. |
+| `Enter`                   | Submit input. If autocomplete is open and selection differs from typed text, it completes the name. A command that takes no argument (for example `/quit`) then runs in the same press; one that takes an argument, or a skill row, waits for a second `Enter`. |
 | `Ctrl+Enter`              | Submit (Kitty-protocol terminals).                                                |
 | `Ctrl+J`                  | Insert newline (multi-line prompt).                                               |
 | `Shift+Enter`             | Insert newline (terminals that pass it through).                                  |
@@ -48,7 +48,7 @@ takes over.
 
 | Widget               | Trigger                                | Navigation                                        | Status |
 | -------------------- | -------------------------------------- | ------------------------------------------------- | ------ |
-| Slash autocomplete   | Typing `/` (with no spaces yet)        | `Up`/`Down` cycle, `Tab` complete, `Enter` complete-then-submit, `Esc` dismiss. Filters by prefix on every keystroke. | ✅ live |
+| Slash autocomplete   | Typing `/` (with no spaces yet)        | `Up`/`Down` cycle, `Tab` complete, `Enter` complete (and run, for a command that takes no argument), `Esc` dismiss. Filters by prefix on every keystroke. | ✅ live |
 | Model picker         | `/model` (no args)                     | `Up`/`Down` navigate (wraps), typing filters the visible rows, `Enter` select, `Esc` cancel. Pre-selects current `provider:model`. Lists each enabled provider's whole catalog (cached models, else the curated list) plus the active model when the catalog lacks it. A `custom:<base-url>` provider lists that endpoint's cached models, and `custom:<url>:<model>` is a valid target. The empty text is true: a configured provider with no known models says so and points at `/model <provider:model>`; with no provider at all it points at `rantaiclaw setup provider`. | ✅ live (added this session) |
 | Help overlay (`/help`)| `/help`                               | **Read-only** — `Esc`/`Tab` accepted by handler but content is now flushed to scrollback as a plain block (no live nav). | ⚠️ degraded — was a tabbed modal pre-inline rewrite, now just dumps to scrollback |
 | Streaming spinner    | While `AppState::Streaming`            | None — passive UI element with Braille frames and live snippet. | ✅ live |
@@ -101,7 +101,7 @@ All commands are dispatched by `src/tui/commands/mod.rs::CommandRegistry`. **Non
 | `/skills`     |            | List available skills.                                     | scrollback    | none |
 | `/skill`      |            | Invoke or inspect a skill by name.                         | scrollback    | `<name> [args]` |
 | `/personality`|            | Show or switch the agent personality.                      | scrollback    | `[name]` |
-| `/insights`   |            | Show session and message statistics.                       | scrollback    | none |
+| `/insights`   |            | Show session and message statistics. No argument counts every session; `--days N` counts the sessions started in the last N days. | scrollback    | `[--days N]` |
 
 ### Model / cost
 

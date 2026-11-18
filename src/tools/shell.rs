@@ -168,6 +168,16 @@ fn blocked_reason_with_remediation(reason: &str) -> String {
     format!("{reason}{BLOCKED_COMMAND_REMEDIATION}")
 }
 
+/// The error after the approval prompt for `label` ended in `Decision::Deny`.
+///
+/// The text describes the answer, not the policy check that raised the prompt:
+/// the `Err` from `validate_command_execution_with` was produced before anyone
+/// was asked, so repeating it would tell the model its request was refused by
+/// policy when it was declined (or timed out) at the prompt.
+fn denied_at_prompt(label: &str) -> String {
+    format!("`{label}` was denied at the approval prompt")
+}
+
 /// What a human's answer to a shell prompt means for the audit trail.
 ///
 /// `Once`, `Session` and `Persist` are all "a person said yes"; `Deny` is "a
@@ -539,7 +549,7 @@ impl Tool for ShellTool {
                                 return Ok(ToolResult {
                                     success: false,
                                     output: String::new(),
-                                    error: Some(reason),
+                                    error: Some(denied_at_prompt(&basename)),
                                 });
                             }
                         }
@@ -574,7 +584,7 @@ impl Tool for ShellTool {
                         let decision = approvals
                             .request_decision_in_scope(
                                 uuid::Uuid::new_v4(),
-                                label,
+                                label.clone(),
                                 command.to_string(),
                                 channel,
                                 reply_target,
@@ -613,7 +623,7 @@ impl Tool for ShellTool {
                                 return Ok(ToolResult {
                                     success: false,
                                     output: String::new(),
-                                    error: Some(reason),
+                                    error: Some(denied_at_prompt(&label)),
                                 });
                             }
                         }
@@ -2111,8 +2121,11 @@ mod tests {
         );
     }
 
+    /// A denial at the unallowed-command prompt reports the denial itself. The
+    /// policy text from the check that raised the prompt must not leak into it,
+    /// or the model reads a human "no" as a standing policy rule.
     #[tokio::test]
-    async fn shell_with_approvals_deny_keeps_original_error() {
+    async fn shell_with_approvals_deny_says_the_command_was_denied_at_the_prompt() {
         let security = supervised_security_only_echo();
         let approvals = Arc::new(PendingApprovals::new(Some(Duration::from_secs(5))));
         security.set_pending(approvals.clone());
@@ -2127,11 +2140,12 @@ mod tests {
 
         let result = tool.execute(json!({"command": "true"})).await.unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("not allowed"));
+        let error = result.error.as_deref().unwrap_or("");
+        assert_eq!(error, "`true` was denied at the approval prompt");
+        assert!(
+            !error.contains("not allowed") && !error.contains("approved=true"),
+            "a denial must not repeat the policy text: {error}"
+        );
         assert!(
             !security
                 .runtime_allowlist_snapshot()
@@ -2140,8 +2154,10 @@ mod tests {
         );
     }
 
+    /// The approval deadline is a `Decision::Deny` too, so a timed-out prompt
+    /// reads the same as a refused one.
     #[tokio::test]
-    async fn shell_with_approvals_timeout_denies() {
+    async fn shell_with_approvals_timeout_reports_denied_at_the_prompt() {
         let security = supervised_security_only_echo();
         let approvals = Arc::new(PendingApprovals::new(Some(Duration::from_millis(50))));
         security.set_pending(approvals.clone());
@@ -2149,11 +2165,69 @@ mod tests {
 
         let result = tool.execute(json!({"command": "true"})).await.unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("not allowed"));
+        let error = result.error.as_deref().unwrap_or("");
+        assert!(
+            error.contains("was denied at the approval prompt") && !error.contains("not allowed"),
+            "a timed-out prompt must report the denial, not the policy text: {error}"
+        );
+    }
+
+    /// The risk-gate prompt has its own Deny arm. Its stale text was the
+    /// "requires explicit approval (approved=true)" reason, which tells the
+    /// model to retry with a flag it cannot use.
+    #[tokio::test]
+    async fn shell_risk_gate_deny_says_the_command_was_denied_at_the_prompt() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let probe = tmp.path().join("rantaiclaw_shell_deny_probe");
+        let security = Arc::new(
+            SecurityPolicy::default()
+                .with_autonomy(AutonomyLevel::Supervised)
+                .with_allowed_commands(vec!["touch".into()])
+                .with_workspace_dir(tmp.path().to_path_buf()),
+        );
+        let approvals = Arc::new(PendingApprovals::new(Some(Duration::from_secs(5))));
+        security.set_pending(approvals.clone());
+        let asked = answer_every_request(approvals, Decision::Deny);
+        let tool = ShellTool::new(security, test_runtime());
+
+        let result = tool
+            .execute(json!({"command": "touch rantaiclaw_shell_deny_probe"}))
+            .await
+            .expect("a denied command returns a result");
+
+        assert_eq!(asked_count(&asked), 1, "the risk gate must have asked");
+        assert!(!result.success);
+        let error = result.error.as_deref().unwrap_or("");
+        assert_eq!(error, "`touch` was denied at the approval prompt");
+        assert!(
+            !error.contains("approved=true") && !error.contains("not allowed"),
+            "a denial must not repeat the policy text: {error}"
+        );
+        assert!(!probe.exists(), "a denied command must not run");
+    }
+
+    /// A hard block asks nobody, so it is not a human decision and keeps the
+    /// policy text.
+    #[tokio::test]
+    async fn shell_hard_block_with_an_approval_channel_keeps_the_policy_text() {
+        let security = supervised_security_only_echo();
+        let approvals = Arc::new(PendingApprovals::new(Some(Duration::from_secs(5))));
+        security.set_pending(approvals.clone());
+        let asked = answer_every_request(approvals, Decision::Once);
+        let tool = ShellTool::new(security, test_runtime());
+
+        let result = tool
+            .execute(json!({"command": "echo $(true)"}))
+            .await
+            .expect("a blocked command returns a result");
+
+        assert!(!result.success);
+        assert_eq!(asked_count(&asked), 0, "a hard block must not ask anyone");
+        let error = result.error.as_deref().unwrap_or("");
+        assert!(
+            error.contains("not allowed by security policy") && !error.contains("denied at the"),
+            "a hard block keeps the policy text: {error}"
+        );
     }
 
     #[tokio::test]
@@ -2274,14 +2348,10 @@ mod tests {
             .expect("cascade should resolve to a result");
 
         assert!(!result.success, "a mid-cascade deny must fail the command");
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("not allowed"),
-            "denied command surfaces the allowlist rejection: {:?}",
-            result.error
+        assert_eq!(
+            result.error.as_deref(),
+            Some("`echo` was denied at the approval prompt"),
+            "the error names the basename whose prompt was denied"
         );
         let allow = security.runtime_allowlist_snapshot();
         assert!(

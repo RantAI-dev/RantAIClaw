@@ -1046,16 +1046,24 @@ impl SessionStore {
     /// correct past any page size (the old path loaded 10,000 rows and counted
     /// them in Rust, freezing at 10,000).
     pub fn stats(&self) -> Result<SessionStats> {
+        self.stats_since(None)
+    }
+
+    /// [`Self::stats`] limited to sessions that started at or after `cutoff`
+    /// (Unix seconds, the unit of `started_at`). `None` counts every session.
+    pub fn stats_since(&self, cutoff: Option<i64>) -> Result<SessionStats> {
         let (total_sessions, total_messages): (i64, i64) = self.conn.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(message_count), 0) FROM sessions",
-            [],
+            "SELECT COUNT(*), COALESCE(SUM(message_count), 0) FROM sessions \
+             WHERE (?1 IS NULL OR started_at >= ?1)",
+            params![cutoff],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         let latest = self
             .conn
             .query_row(
-                "SELECT id, started_at FROM sessions ORDER BY started_at DESC, id DESC LIMIT 1",
-                [],
+                "SELECT id, started_at FROM sessions WHERE (?1 IS NULL OR started_at >= ?1) \
+                 ORDER BY started_at DESC, id DESC LIMIT 1",
+                params![cutoff],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
             )
             .optional()?;
@@ -1851,6 +1859,26 @@ mod tests {
         assert_eq!(stats.total_sessions, 3);
         assert_eq!(stats.total_messages, 6);
         assert!(stats.latest_session_id.is_some());
+    }
+
+    #[test]
+    fn stats_since_counts_only_sessions_started_at_or_after_the_cutoff() {
+        let store = SessionStore::in_memory().unwrap();
+        insert_with_id(&store, "old", 100);
+        insert_with_id(&store, "edge", 200);
+        insert_with_id(&store, "new", 300);
+
+        let all = store.stats_since(None).unwrap();
+        assert_eq!(all.total_sessions, 3);
+
+        let windowed = store.stats_since(Some(200)).unwrap();
+        assert_eq!(windowed.total_sessions, 2, "the cutoff itself is inside");
+        assert_eq!(windowed.latest_session_id.as_deref(), Some("new"));
+
+        let none = store.stats_since(Some(301)).unwrap();
+        assert_eq!(none.total_sessions, 0);
+        assert_eq!(none.total_messages, 0);
+        assert_eq!(none.latest_session_id, None);
     }
 
     #[test]
