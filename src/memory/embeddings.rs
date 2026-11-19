@@ -124,6 +124,20 @@ impl EmbeddingProvider for OpenAiEmbedding {
 
         if !resp.status().is_success() {
             let status = resp.status();
+            // A rejected credential is not an embedding failure the caller can
+            // retry: the operator has to fix the key, and the upstream body
+            // can echo that key back. The marker carries the provider and the
+            // status and nothing else, so no answer and no log line carries
+            // the body.
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::FORBIDDEN
+            {
+                return Err(crate::providers::provider_auth::ProviderAuthError::new(
+                    self.name(),
+                    status.as_u16(),
+                )
+                .into());
+            }
             let text = resp.text().await.unwrap_or_default();
             anyhow::bail!("Embedding API error {status}: {text}");
         }
@@ -270,6 +284,18 @@ impl EmbeddingProvider for MiniMaxEmbedding {
 
         if !resp.status().is_success() {
             let status = resp.status();
+            // The same marker the OpenAI-shaped provider raises: a rejected
+            // credential is the operator's key to fix, and the upstream body
+            // must not travel with it.
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::FORBIDDEN
+            {
+                return Err(crate::providers::provider_auth::ProviderAuthError::new(
+                    self.name(),
+                    status.as_u16(),
+                )
+                .into());
+            }
             let text = resp.text().await.unwrap_or_default();
             anyhow::bail!("Embedding API error {status}: {text}");
         }
@@ -628,6 +654,35 @@ mod tests {
         let p = MiniMaxEmbedding::new("https://api.minimax.io/v1", "key", "", "embo-01", 1536);
         let result = p.embed(&[]).await.unwrap();
         assert!(result.is_empty());
+    }
+
+    /// A MiniMax endpoint that rejects the key answers the provider-auth
+    /// marker, so the store refuses the write instead of degrading it. The
+    /// body the endpoint sent reaches neither the error nor its text.
+    #[tokio::test]
+    async fn minimax_embed_answers_the_provider_auth_marker_on_401() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("the upstream echoes the key"))
+            .mount(&server)
+            .await;
+
+        let p = MiniMaxEmbedding::new(&server.uri(), "rantaiclaw_test_key", "", "embo-01", 1536);
+        let err = p
+            .embed(&["a note about the lantern"])
+            .await
+            .expect_err("a rejected key is an error, not an empty answer");
+
+        assert_eq!(
+            crate::providers::provider_auth_failure_sentence(&err).as_deref(),
+            Some("provider minimax rejected the credential (HTTP 401)"),
+        );
+        let text = format!("{err:#}");
+        assert!(!text.contains("echoes the key"), "{text}");
+        assert!(!text.contains("rantaiclaw_test_key"), "{text}");
     }
 
     #[test]

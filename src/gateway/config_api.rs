@@ -3687,55 +3687,6 @@ impl KnowledgeBody {
     }
 }
 
-/// Probe the configured embedding endpoint with a one-token input so the
-/// probe exercises the REAL path (endpoint + model + key) a KB call will
-/// take. Returns `Err(message)` only on an explicit 4xx auth/validation
-/// rejection — a credential the provider rejects must not be saved (mirrors
-/// the `getMe` probe in `connect_telegram`). Transport errors are NOT fatal:
-/// an operator configuring the KB while offline must still be able to store
-/// a key. The message names the status only; never the key, never the
-/// upstream body.
-///
-/// Endpoint viability verified live (plan 103 open question): OpenRouter's
-/// `/api/v1/embeddings` serves the default `qwen/qwen3-embedding-8b`.
-#[cfg(feature = "kb")]
-async fn probe_embedding_key(kb_cfg: &crate::kb::KbConfig, key: &str) -> Result<(), String> {
-    let body = serde_json::json!({
-        "model": kb_cfg.embedding_model,
-        "input": ["ping"],
-    });
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return Ok(()), // cannot even build a client — do not fail closed
-    };
-    match client
-        .post(&kb_cfg.embedding_base_url)
-        .bearer_auth(key)
-        .json(&body)
-        .send()
-        .await
-    {
-        Ok(resp) => {
-            let status = resp.status();
-            if status.is_client_error() {
-                Err(format!(
-                    "embedding provider rejected the key (http {})",
-                    status.as_u16()
-                ))
-            } else {
-                // 2xx = valid; 5xx = provider trouble, not the key's fault.
-                Ok(())
-            }
-        }
-        // Offline/proxy/DNS: store the key; the KB call path will surface
-        // transport problems where they belong.
-        Err(_) => Ok(()),
-    }
-}
-
 /// Effective source of a resolved key, reported without revealing it.
 #[cfg(feature = "kb")]
 fn knowledge_source(env_var: &str, cfg_val: Option<&str>) -> &'static str {
@@ -3832,8 +3783,17 @@ async fn set_knowledge(
                 None,
             )
             .map_err(|e| err_400(format!("kb config: {e}")))?;
-            let key = crate::kb::KbConfig::resolve_key(&kb_cfg.embedding_api_key);
-            if let Err(msg) = probe_embedding_key(&kb_cfg, &key).await {
+            // The SAME probe `kb enable` uses: it refuses a rejected key, a
+            // vector size the knowledge base does not expect, and an endpoint
+            // that cannot be reached. One probe, so the console and the CLI
+            // cannot disagree about whether a key works.
+            //
+            // `kb_cfg` carries the key the request resolves (the config value,
+            // or `KB_EMBEDDING_API_KEY` / `OPENROUTER_API_KEY` through the
+            // same resolver the embedder uses), so the probe sends exactly the
+            // key a knowledge-base call would send. Its message never carries
+            // the key or the upstream body.
+            if let Err(msg) = crate::kb::axi::activation::probe_embedding(&kb_cfg).await {
                 return Err(err_400(msg));
             }
         } else if body.enabled == Some(true) {

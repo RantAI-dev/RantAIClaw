@@ -37,13 +37,13 @@ use crate::common::ENV_LOCK;
 
 /// Serialises the tests that set process-global config-resolution env vars,
 /// and restores them on drop — including on unwind.
-struct EnvGuard {
+pub(crate) struct EnvGuard {
     _lock: tokio::sync::MutexGuard<'static, ()>,
     prev: Vec<(&'static str, Option<std::ffi::OsString>)>,
 }
 
 impl EnvGuard {
-    async fn acquire() -> Self {
+    pub(crate) async fn acquire() -> Self {
         let guard = ENV_LOCK.lock().await;
         // Start from a known state: a previous panicking test may have leaked.
         let prev = CONFIG_ENV_VARS
@@ -67,10 +67,11 @@ impl Drop for EnvGuard {
 }
 
 /// The process-global variables these tests own.
-const CONFIG_ENV_VARS: [&str; 4] = [
+pub(crate) const CONFIG_ENV_VARS: [&str; 5] = [
     "RANTAICLAW_CONFIG_DIR",
     "KB_EMBEDDING_BASE_URL",
     "KB_EMBEDDING_API_KEY",
+    "KB_EMBEDDING_DIM",
     "OPENROUTER_API_KEY",
 ];
 
@@ -85,13 +86,13 @@ use rantaiclaw::gateway::build_gateway_router;
 
 /// Deterministic bearer token paired into every test gateway. Not a real
 /// credential — used only to exercise the auth-gated/hermetic code paths.
-const TEST_TOKEN: &str = "test-not-a-real-token";
+pub(crate) const TEST_TOKEN: &str = "test-not-a-real-token";
 
 /// A minimal, hermetic `Config` rooted at a temp workspace: pairing required
 /// with a single deterministic token, default (sqlite) memory backend under
 /// the temp dir, and a provider that resolves no credential in this test
 /// environment — so `build_gateway_router` builds fully offline.
-fn test_config(workspace: &std::path::Path) -> Config {
+pub(crate) fn test_config(workspace: &std::path::Path) -> Config {
     let mut cfg = Config {
         workspace_dir: workspace.to_path_buf(),
         config_path: workspace.join("config.toml"),
@@ -106,7 +107,7 @@ fn test_config(workspace: &std::path::Path) -> Config {
 /// (OS-assigned port). Returns the base URL clients should hit. The server
 /// task lives for the remainder of the current tokio runtime, which
 /// `#[tokio::test]` tears down at the end of each test.
-async fn spawn_test_gateway(config: Config) -> String {
+pub(crate) async fn spawn_test_gateway(config: Config) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("binding 127.0.0.1:0 should succeed");
@@ -551,6 +552,9 @@ async fn knowledge_put_activates_with_an_openrouter_env_key_and_agrees_with_get(
     let _env = EnvGuard::acquire().await;
     std::env::set_var("RANTAICLAW_CONFIG_DIR", config_dir.path());
     std::env::set_var("KB_EMBEDDING_BASE_URL", embed.uri());
+    // The probe checks the vector size the knowledge base expects, so the
+    // fake endpoint answers with a vector of that size.
+    std::env::set_var("KB_EMBEDDING_DIM", "2");
     std::env::set_var("OPENROUTER_API_KEY", "rantaiclaw_openrouter_key");
     let base_url = spawn_test_gateway(test_config(workspace.path())).await;
     let client = reqwest::Client::new();
@@ -638,6 +642,139 @@ async fn knowledge_rejected_key_is_never_persisted() {
     assert_eq!(got["enabled"], false, "{got}");
 }
 
+/// The strict probe refuses an embedding endpoint that answers with vectors of
+/// a size the knowledge base does not expect: `kb enable` refuses it, so the
+/// console must refuse it too. A key saved here would fail every later
+/// knowledge-base call with a dimension mismatch.
+#[tokio::test]
+async fn knowledge_put_refuses_an_embedding_endpoint_with_the_wrong_vector_size() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let embed = MockServer::start().await;
+    // Two dimensions, while the knowledge base expects `KB_EMBEDDING_DIM`.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [ { "embedding": [0.1, 0.2] } ]
+        })))
+        .mount(&embed)
+        .await;
+
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let config_dir = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::acquire().await;
+    std::env::set_var("RANTAICLAW_CONFIG_DIR", config_dir.path());
+    std::env::set_var("KB_EMBEDDING_BASE_URL", embed.uri());
+    std::env::set_var("KB_EMBEDDING_DIM", "16");
+    let base_url = spawn_test_gateway(test_config(workspace.path())).await;
+
+    let resp = reqwest::Client::new()
+        .put(format!("{base_url}/api/v1/config/knowledge"))
+        .bearer_auth(TEST_TOKEN)
+        .json(&serde_json::json!({
+            "embedding_api_key": "rantaiclaw_good_key",
+            "enabled": true
+        }))
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("json");
+
+    let got: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base_url}/api/v1/config/knowledge"))
+        .bearer_auth(TEST_TOKEN)
+        .send()
+        .await
+        .expect("get")
+        .json()
+        .await
+        .expect("json");
+
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{body}");
+    let detail = body["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains(
+            "the embedding endpoint returns 2-dimension vectors but KB_EMBEDDING_DIM is 16"
+        ),
+        "the refusal names both sizes: {body}"
+    );
+    assert!(
+        !detail.contains("rantaiclaw_good_key"),
+        "key must never surface: {body}"
+    );
+    assert_eq!(
+        got["embedding_configured"], false,
+        "a refused key must not persist: {got}"
+    );
+    assert_eq!(got["enabled"], false, "{got}");
+}
+
+/// An embedding endpoint that cannot be reached is refused too. The strict
+/// probe cannot tell a working endpoint from a dead one, so the console does
+/// not write a key it cannot use — the same answer `kb enable` gives.
+#[tokio::test]
+async fn knowledge_put_refuses_an_unreachable_embedding_endpoint() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let config_dir = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::acquire().await;
+    std::env::set_var("RANTAICLAW_CONFIG_DIR", config_dir.path());
+    // A port nothing listens on: the listener is bound, its port is taken and
+    // the listener is dropped again, so the port is closed.
+    let closed_port = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        port
+    };
+    std::env::set_var(
+        "KB_EMBEDDING_BASE_URL",
+        format!("http://127.0.0.1:{closed_port}/v1/embeddings"),
+    );
+    let base_url = spawn_test_gateway(test_config(workspace.path())).await;
+
+    let resp = reqwest::Client::new()
+        .put(format!("{base_url}/api/v1/config/knowledge"))
+        .bearer_auth(TEST_TOKEN)
+        .json(&serde_json::json!({
+            "embedding_api_key": "rantaiclaw_good_key",
+            "enabled": true
+        }))
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("json");
+
+    let got: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base_url}/api/v1/config/knowledge"))
+        .bearer_auth(TEST_TOKEN)
+        .send()
+        .await
+        .expect("get")
+        .json()
+        .await
+        .expect("json");
+
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{body}");
+    let detail = body["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("could not reach the embedding endpoint"),
+        "the refusal says why: {body}"
+    );
+    assert!(
+        !detail.contains("rantaiclaw_good_key"),
+        "key must never surface: {body}"
+    );
+    assert_eq!(
+        got["embedding_configured"], false,
+        "an unreachable endpoint must not persist the key: {got}"
+    );
+    assert_eq!(got["enabled"], false, "{got}");
+}
+
 #[tokio::test]
 async fn knowledge_accepted_key_activates_and_deactivate_keeps_it() {
     use wiremock::matchers::method;
@@ -656,6 +793,9 @@ async fn knowledge_accepted_key_activates_and_deactivate_keeps_it() {
     let _env = EnvGuard::acquire().await;
     std::env::set_var("RANTAICLAW_CONFIG_DIR", config_dir.path());
     std::env::set_var("KB_EMBEDDING_BASE_URL", embed.uri());
+    // The probe checks the vector size the knowledge base expects, so the
+    // fake endpoint answers with a vector of that size.
+    std::env::set_var("KB_EMBEDDING_DIM", "2");
     let base_url = spawn_test_gateway(test_config(workspace.path())).await;
     let client = reqwest::Client::new();
 

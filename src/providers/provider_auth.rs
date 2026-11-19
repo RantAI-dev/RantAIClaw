@@ -57,7 +57,7 @@ pub(crate) fn provider_auth_failure(error: &anyhow::Error) -> Option<&ProviderAu
 
 /// `id` with the `user:password@` part of a URL authority and any query or
 /// fragment removed. An id that is not a URL comes back as it was.
-fn without_userinfo_and_query(id: &str) -> String {
+pub(crate) fn without_userinfo_and_query(id: &str) -> String {
     let id = id.split(['?', '#']).next().unwrap_or(id);
     let Some(scheme_end) = id.find("://") else {
         return id.to_string();
