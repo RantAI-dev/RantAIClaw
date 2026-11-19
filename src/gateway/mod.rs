@@ -2591,9 +2591,9 @@ async fn handle_webhook(
             // carries the provider and the status, never the upstream body —
             // the body can echo the credential back.
             if let Some(sentence) = providers::provider_auth_failure_sentence(&e) {
-                let text = providers::scrub_secret_patterns(&sentence);
-                tracing::warn!(detail = %text, "Webhook: the provider rejected the credential");
-                let (status, body) = api_v1::provider_auth_failed_value(text);
+                let reason = providers::scrub_secret_patterns(&sentence);
+                tracing::warn!(detail = %reason, "Webhook: the provider rejected the credential");
+                let (status, body) = api_v1::provider_auth_failed_value(reason);
                 return (status, Json(body));
             }
             let err = serde_json::json!({"error": "LLM request failed"});
@@ -3334,9 +3334,9 @@ async fn handle_trigger_webhook(
             // rejected the credential is a 502, and the body names the
             // provider and the status, never the upstream body.
             if let Some(sentence) = providers::provider_auth_failure_sentence(&e) {
-                let text = providers::scrub_secret_patterns(&sentence);
-                tracing::warn!(detail = %text, "Trigger webhook: the provider rejected the credential");
-                let (status, body) = api_v1::provider_auth_failed_value(text);
+                let reason = providers::scrub_secret_patterns(&sentence);
+                tracing::warn!(detail = %reason, "Trigger webhook: the provider rejected the credential");
+                let (status, body) = api_v1::provider_auth_failed_value(reason);
                 return (status, Json(body));
             }
             let err = serde_json::json!({"error": "Trigger execution failed"});
