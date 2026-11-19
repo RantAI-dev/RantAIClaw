@@ -162,11 +162,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spaces reached the output, and `max_chars` counted them as text. They are dropped before the
   emptiness check and the truncation. `kb ingest` extracts through its own path and is unchanged.
 
-- **Enter runs a command that takes no argument in one press.** In the TUI, typing a partial
-  command such as `/qu` and pressing Enter only completed the name, and a second Enter ran it.
-  A command that takes no argument (`/quit`, `/new`, `/status`, `/doctor` and the like, and their
-  aliases) now completes and runs on the first Enter. A command that takes an argument, and a
-  skill row, still completes the name and waits.
+- **One Enter on a partial command runs it only when the command is read-only.** `/new`, `/quit`,
+  `/retry`, `/stop` and `/undo` run only when typed in full. A partial that matches several
+  commands, such as `/u` (`/undo` and `/usage`), completes the name and waits for a second Enter.
+  A partial that matches exactly one read-only command, such as `/stat`, runs it on one Enter.
 
 - **`/insights --days N` honors the window.** The argument was ignored: the panel counted the 100
   newest sessions whatever their age. `--days N` now counts the sessions that started in the last

@@ -193,12 +193,11 @@ pub trait CommandHandler: Send + Sync {
 
 /// Commands that ignore their argument and whose usage is the bare name.
 ///
-/// The composer reads this list to run a command on a single Enter once the
-/// dropdown has completed its name. A command that takes an argument stays off
-/// it: its name is completed and the composer waits for the argument.
-/// `/insights` and `/continue` are absent on purpose, they read an argument.
-/// A test checks that every name here is registered and shows no arguments in
-/// its usage, so the list cannot drift from the handlers.
+/// A command that takes an argument stays off it: its name is completed and
+/// the composer waits for the argument. `/insights`, `/continue` and `/help`
+/// are absent on purpose, they read an argument (`/help` an optional command
+/// name). A test checks that every name here is registered and shows no
+/// arguments in its usage, so the list cannot drift from the handlers.
 const NO_ARGUMENT_COMMANDS: &[&str] = &[
     "allowlist",
     "calls",
@@ -211,6 +210,21 @@ const NO_ARGUMENT_COMMANDS: &[&str] = &[
     "status",
     "stop",
     "undo",
+    "usage",
+];
+
+/// The subset of [`NO_ARGUMENT_COMMANDS`] that only reads: it reports what it
+/// finds and changes nothing. Only these may run on a single Enter on a typed
+/// prefix. The rest — `/new`, `/quit`, `/retry`, `/stop` and `/undo` — change
+/// or end the conversation, so a prefix for one of them only completes the
+/// name, and the command waits for a second Enter on the fully typed name.
+const READ_ONLY_NO_ARGUMENT_COMMANDS: &[&str] = &[
+    "allowlist",
+    "calls",
+    "channels",
+    "doctor",
+    "mcp",
+    "status",
     "usage",
 ];
 
@@ -281,13 +295,29 @@ impl CommandRegistry {
         self.commands.insert(name, handler);
     }
 
+    /// The registered command a typed name stands for: an alias resolves to
+    /// the canonical command it stands for, anything else stands for itself.
+    fn canonical_name(&self, name: &str) -> String {
+        let name = name.trim_start_matches('/').to_lowercase();
+        self.aliases.get(&name).cloned().unwrap_or(name)
+    }
+
     /// Whether `name` (with or without the leading `/`) is a registered command,
     /// or an alias of one, that takes no argument. Skill rows and unknown names
     /// are `false`: Enter on those only completes the name.
     pub fn takes_no_argument(&self, name: &str) -> bool {
-        let name = name.trim_start_matches('/').to_lowercase();
-        let canonical = self.aliases.get(&name).unwrap_or(&name);
-        self.commands.contains_key(canonical) && NO_ARGUMENT_COMMANDS.contains(&canonical.as_str())
+        let canonical = self.canonical_name(name);
+        self.commands.contains_key(&canonical) && NO_ARGUMENT_COMMANDS.contains(&canonical.as_str())
+    }
+
+    /// Whether `name` (with or without the leading `/`) is a registered
+    /// command, or an alias of one, that only reads state: it reports what it
+    /// finds and changes nothing. An alias takes the canonical command's
+    /// answer, so an alias of a read-only command is read-only too.
+    pub fn is_read_only_command(&self, name: &str) -> bool {
+        let canonical = self.canonical_name(name);
+        self.commands.contains_key(&canonical)
+            && READ_ONLY_NO_ARGUMENT_COMMANDS.contains(&canonical.as_str())
     }
 
     pub fn dispatch(&self, input: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
@@ -543,7 +573,10 @@ mod tests {
     #[test]
     fn no_argument_list_names_registered_commands_without_arguments() {
         let registry = CommandRegistry::new();
-        for name in NO_ARGUMENT_COMMANDS {
+        for name in NO_ARGUMENT_COMMANDS
+            .iter()
+            .chain(READ_ONLY_NO_ARGUMENT_COMMANDS)
+        {
             let handler = registry
                 .commands
                 .get(*name)
@@ -554,6 +587,51 @@ mod tests {
                 "`{name}` is listed as taking no argument but its usage shows one"
             );
         }
+        for name in READ_ONLY_NO_ARGUMENT_COMMANDS {
+            assert!(
+                NO_ARGUMENT_COMMANDS.contains(name),
+                "`{name}` is read-only but is not a no-argument command"
+            );
+        }
+    }
+
+    /// A handler standing in for a read-only command, with an alias of its
+    /// own, so the read-only lookup can be asked about the alias.
+    struct ReadOnlyProbe;
+
+    impl CommandHandler for ReadOnlyProbe {
+        fn name(&self) -> &str {
+            "status"
+        }
+        fn aliases(&self) -> Vec<&str> {
+            vec!["st"]
+        }
+        fn description(&self) -> &str {
+            "probe"
+        }
+        fn execute(&self, _args: &str, _ctx: &mut TuiContext) -> Result<CommandResult> {
+            Ok(CommandResult::Message("probe".to_string()))
+        }
+    }
+
+    /// The read-only lookup resolves an alias to the command it stands for,
+    /// so an alias of a read-only command keeps its read-only standing.
+    #[test]
+    fn read_only_lookup_resolves_aliases_to_their_canonical_command() {
+        let mut registry = CommandRegistry::new();
+        registry.register(Box::new(ReadOnlyProbe));
+
+        assert!(registry.is_read_only_command("/status"));
+        assert!(
+            registry.is_read_only_command("/st"),
+            "an alias takes the canonical command's answer"
+        );
+        assert!(!registry.is_read_only_command("/undo"));
+        assert!(!registry.is_read_only_command("/exit"));
+        assert!(
+            !registry.is_read_only_command("/some-installed-skill"),
+            "a skill row or unknown name is not a read-only command"
+        );
     }
 
     #[test]

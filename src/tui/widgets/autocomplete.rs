@@ -73,6 +73,12 @@ impl Autocomplete {
             .map(|(name, _)| name.as_str())
     }
 
+    /// How many rows the dropdown currently holds. One row means the typed
+    /// prefix named a single command; more means the prefix is ambiguous.
+    pub fn suggestion_count(&self) -> usize {
+        self.suggestions.len()
+    }
+
     pub fn next(&mut self) {
         if self.suggestions.is_empty() {
             return;
