@@ -361,8 +361,8 @@ impl ReliableProvider {
         if let Some((primary, _)) = self.providers.first() {
             // The ids can be `custom:` endpoints with userinfo or a query;
             // the notice is printed, so strip them as the logs do.
-            let primary = crate::providers::provider_auth::without_userinfo_and_query(primary);
-            let answered = crate::providers::provider_auth::without_userinfo_and_query(answered);
+            let primary = without_userinfo_and_query(primary);
+            let answered = without_userinfo_and_query(answered);
             announce(&primary, &answered);
         }
     }
@@ -2856,7 +2856,7 @@ mod tests {
         let announced = seen.lock().clone();
         assert_eq!(announced.len(), 1);
         let (primary, answered) = &announced[0];
-        assert!(!primary.contains("secret") && !primary.contains("abc"));
+        assert_eq!(primary, "custom:https://primary.example/v1");
         assert_eq!(answered, "fallback");
     }
 

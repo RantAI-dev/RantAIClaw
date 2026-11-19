@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `custom:` provider id is printed without its userinfo or query.** A `custom:` endpoint can
+  carry a password or a key in its URL. The failover notice, which is printed, and the provider
+  log fields now show the id without them.
+
 - **Every gateway route that calls a provider answers a rejected credential with `502
   provider_auth_failed`.** The `POST /webhook` and `POST /triggers/{path}` doors answered `500`
   ("LLM request failed" and "Trigger execution failed"), so a caller could not tell a wrong key
