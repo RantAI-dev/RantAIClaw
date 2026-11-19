@@ -2586,6 +2586,16 @@ async fn handle_webhook(
                 });
 
             tracing::error!("Webhook provider error: {}", sanitized);
+            // A provider that rejected the credential is a 502, not a 500:
+            // the gateway worked and the upstream refused the key. The answer
+            // carries the provider and the status, never the upstream body —
+            // the body can echo the credential back.
+            if let Some(sentence) = providers::provider_auth_failure_sentence(&e) {
+                let text = providers::scrub_secret_patterns(&sentence);
+                tracing::warn!(detail = %text, "Webhook: the provider rejected the credential");
+                let (status, body) = api_v1::provider_auth_failed_value(text);
+                return (status, Json(body));
+            }
             let err = serde_json::json!({"error": "LLM request failed"});
             (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
         }
@@ -3320,6 +3330,15 @@ async fn handle_trigger_webhook(
         Err(e) => {
             let sanitized = providers::sanitize_api_error(&e.to_string());
             tracing::error!("Trigger webhook error: {sanitized}");
+            // The same answer the `/webhook` door gives: a provider that
+            // rejected the credential is a 502, and the body names the
+            // provider and the status, never the upstream body.
+            if let Some(sentence) = providers::provider_auth_failure_sentence(&e) {
+                let text = providers::scrub_secret_patterns(&sentence);
+                tracing::warn!(detail = %text, "Trigger webhook: the provider rejected the credential");
+                let (status, body) = api_v1::provider_auth_failed_value(text);
+                return (status, Json(body));
+            }
             let err = serde_json::json!({"error": "Trigger execution failed"});
             (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
         }
@@ -5900,6 +5919,74 @@ mod tests {
     const WEBHOOK_SOUL_CANARY: &str = "bot-soul-canary-63e1";
     const RECALL_CALL: &str = "<tool_call>\n{\"name\":\"memory_recall\",\"arguments\":{\"query\":\"lantern\"}}\n</tool_call>";
 
+    /// Why a provider failed a turn.
+    #[derive(Clone, Copy)]
+    enum ProviderFailure {
+        /// The provider rejected the credential it was sent: the marker the
+        /// gateway classifies as a provider-auth failure.
+        RejectedCredential,
+        /// The provider failed for a reason of its own.
+        ServerFault,
+    }
+
+    /// A provider whose every turn fails, so a test can drive a door with the
+    /// failure a real provider would produce.
+    struct FailingProvider {
+        failure: ProviderFailure,
+    }
+
+    impl FailingProvider {
+        /// The provider refused the credential it was sent.
+        fn rejecting_the_credential() -> Self {
+            Self {
+                failure: ProviderFailure::RejectedCredential,
+            }
+        }
+
+        /// The provider failed for a reason that is not the credential.
+        fn failing_outright() -> Self {
+            Self {
+                failure: ProviderFailure::ServerFault,
+            }
+        }
+
+        /// The error the turn fails with. The rejected-credential case carries
+        /// the SAME marker the provider wrapper raises, so the gateway has one
+        /// classifier and not a second one.
+        fn error(&self) -> anyhow::Error {
+            match self.failure {
+                ProviderFailure::RejectedCredential => anyhow::Error::new(
+                    crate::providers::provider_auth::ProviderAuthError::new("test-provider", 401),
+                ),
+                ProviderFailure::ServerFault => {
+                    anyhow::anyhow!("the provider failed for a reason of its own")
+                }
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for FailingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Err(self.error())
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[crate::providers::ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Err(self.error())
+        }
+    }
+
     /// A model asking to read an owner file through `file_read`.
     fn read_call(path: &str) -> String {
         format!(
@@ -5957,10 +6044,19 @@ mod tests {
         (run.system, run.rest)
     }
 
-    /// The same drive, keeping the store and the workspace so a test reads what
-    /// the turn left in them. The tools are the real `memory_recall`,
-    /// `memory_store`, `memory_forget` and `file_read`.
-    async fn webhook_door_run(trigger: bool, all_view: bool, tool_call: &str) -> WebhookRun {
+    /// Drives a webhook door over a store that holds a note about the lantern,
+    /// owner files in the workspace, and the real `memory_recall` tool. Returns
+    /// the response the caller would receive, the store and the workspace the
+    /// turn ran against. With `all_view` the handler runs under the `All` view
+    /// as a control; a webhook does not set a view itself.
+    ///
+    /// The provider is the caller's, so a test can drive the door with a
+    /// provider that answers and with one that fails.
+    async fn webhook_door_answer(
+        trigger: bool,
+        all_view: bool,
+        provider: Arc<dyn Provider>,
+    ) -> (axum::response::Response, Arc<dyn Memory>, tempfile::TempDir) {
         let (_env, _audit) = crate::test_env::redirect_audit_temp().await;
         let home = tempfile::tempdir().expect("temp home");
         let _home = crate::test_env::HomeGuard::set(home.path());
@@ -5992,9 +6088,6 @@ mod tests {
             .unwrap();
         let memory: Arc<dyn Memory> = Arc::new(sqlite);
         let kept_memory = Arc::clone(&memory);
-
-        let provider_impl = Arc::new(RecallingProvider::new(tool_call.to_string()));
-        let provider: Arc<dyn Provider> = provider_impl.clone();
         let tools_memory = Arc::clone(&memory);
         let mut config = Config {
             workspace_dir: workspace.path().to_path_buf(),
@@ -6065,7 +6158,7 @@ mod tests {
         };
 
         let run = async {
-            let response = if trigger {
+            if trigger {
                 handle_trigger_webhook(
                     State(state),
                     test_connect_info(),
@@ -6086,17 +6179,28 @@ mod tests {
                 )
                 .await
                 .into_response()
-            };
-            assert_eq!(response.status(), StatusCode::OK);
+            }
         };
-        if all_view {
+        let response = if all_view {
             crate::memory::MEMORY_VIEW
                 .scope(crate::memory::MemoryView::All, run)
-                .await;
+                .await
         } else {
-            run.await;
-        }
+            run.await
+        };
 
+        (response, kept_memory, workspace)
+    }
+
+    /// The same drive, keeping the store and the workspace so a test reads what
+    /// the turn left in them. The tools are the real `memory_recall`,
+    /// `memory_store`, `memory_forget` and `file_read`.
+    async fn webhook_door_run(trigger: bool, all_view: bool, tool_call: &str) -> WebhookRun {
+        let provider_impl = Arc::new(RecallingProvider::new(tool_call.to_string()));
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let (response, memory, workspace) = webhook_door_answer(trigger, all_view, provider).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
         let seen = provider_impl.seen.lock().clone();
         assert_eq!(seen.len(), 2, "one tool round, then the answer");
         let flat = |keep_system: bool| {
@@ -6110,7 +6214,7 @@ mod tests {
         WebhookRun {
             system: flat(true),
             rest: flat(false),
-            memory: kept_memory,
+            memory,
             workspace,
         }
     }
@@ -6147,6 +6251,74 @@ mod tests {
         );
         assert!(!system.contains(WEBHOOK_USER_CANARY), "{system}");
         assert!(!system.contains(WEBHOOK_MEMORY_CANARY), "{system}");
+    }
+
+    /// The body a door answered, as text.
+    async fn door_body(response: axum::response::Response) -> String {
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    /// A provider that rejected the credential is a 502, not a 500: the
+    /// gateway worked and the upstream refused the key. The answer names the
+    /// provider and the status, and carries neither the upstream body nor the
+    /// key.
+    #[tokio::test]
+    async fn the_webhook_door_answers_502_when_the_provider_rejects_the_credential() {
+        let (response, _memory, _workspace) = webhook_door_answer(
+            false,
+            false,
+            Arc::new(FailingProvider::rejecting_the_credential()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = door_body(response).await;
+        assert!(body.contains("provider_auth_failed"), "{body}");
+        assert!(body.contains("test-provider"), "{body}");
+        assert!(body.contains("401"), "{body}");
+    }
+
+    /// The trigger door answers the same failure the same way.
+    #[tokio::test]
+    async fn the_trigger_webhook_door_answers_502_when_the_provider_rejects_the_credential() {
+        let (response, _memory, _workspace) = webhook_door_answer(
+            true,
+            false,
+            Arc::new(FailingProvider::rejecting_the_credential()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = door_body(response).await;
+        assert!(body.contains("provider_auth_failed"), "{body}");
+        assert!(body.contains("test-provider"), "{body}");
+        assert!(body.contains("401"), "{body}");
+    }
+
+    /// The control: a provider that failed for a reason of its own is still a
+    /// 500, so the 502 above is the credential and not the failure.
+    #[tokio::test]
+    async fn the_webhook_door_answers_500_when_the_provider_fails_outright() {
+        let (response, _memory, _workspace) =
+            webhook_door_answer(false, false, Arc::new(FailingProvider::failing_outright())).await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = door_body(response).await;
+        assert!(body.contains("LLM request failed"), "{body}");
+        assert!(!body.contains("provider_auth_failed"), "{body}");
+    }
+
+    /// The same control on the trigger door.
+    #[tokio::test]
+    async fn the_trigger_webhook_door_answers_500_when_the_provider_fails_outright() {
+        let (response, _memory, _workspace) =
+            webhook_door_answer(true, false, Arc::new(FailingProvider::failing_outright())).await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = door_body(response).await;
+        assert!(body.contains("Trigger execution failed"), "{body}");
+        assert!(!body.contains("provider_auth_failed"), "{body}");
     }
 
     /// The tool-level counterpart: a webhook turn has no view, so `file_read`

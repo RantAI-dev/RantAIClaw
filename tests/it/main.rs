@@ -37,6 +37,7 @@ mod cross_root_marker;
 mod dev_root_redirect;
 mod dockerignore_test;
 mod doctor_checks;
+mod gateway_provider_auth;
 mod kb;
 mod mcp_client_transport;
 mod mcp_pool_lifetime;

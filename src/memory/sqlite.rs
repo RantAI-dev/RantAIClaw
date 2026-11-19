@@ -986,9 +986,19 @@ impl Memory for SqliteMemory {
         // still keyword-searchable, and its provenance columns stay NULL, which is
         // exactly what a later re-embedding pass looks for. Documented departure
         // from fail-fast, announced in the log rather than silent.
+        //
+        // A REJECTED CREDENTIAL is the one failure that does not degrade. The
+        // provider refused the key, so the operator has to fix it, and until they
+        // do every write lands without a vector — silently, and for good. The
+        // failure travels to the caller instead, which answers it as what it is
+        // (the gateway answers `502 provider_auth_failed`); the key itself and
+        // the upstream body stay out of the answer and out of the log.
         let embedding_bytes = match self.get_or_compute_embedding(content).await {
             Ok(emb) => emb.map(|e| vector::vec_to_bytes(&e)),
             Err(e) => {
+                if crate::providers::provider_auth_failure_sentence(&e).is_some() {
+                    return Err(e);
+                }
                 tracing::warn!(
                     "embedding unavailable, storing memory without a vector: {}",
                     super::sanitize::loggable_error(&e)

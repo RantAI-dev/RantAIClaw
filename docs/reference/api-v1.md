@@ -77,9 +77,12 @@ Non-2xx responses share one shape:
 `internal_error`, which carries the sanitized error text).
 
 - `nothing_to_apply` is a config write whose body names no field to change. It saves nothing.
-- `provider_auth_failed` is a chat turn whose provider answered `401` or `403` to the credential
+- `provider_auth_failed` is a provider that answered `401` or `403` to the credential
   it was sent. The `detail` names the provider id and the upstream status, never the credential
   and never the body the provider wrote. The operator fixes the key outside the gateway.
+  Every route that calls a provider answers it the same way: the chat routes, the
+  `POST /webhook` and `POST /triggers/{path}` doors (which sit outside `/api/v1` but share
+  this error shape), and `POST /api/v1/memory` when the embedding provider rejects the key.
 - The config write routes (`/config/*`, `/secrets`, `/channels/*` and the MCP server route) refuse
   a request body that names a field the route does not know. The answer is `400 bad_request`, and
   `detail` names the field. A body that is not valid JSON gets the same `400`. These checks run
@@ -921,6 +924,9 @@ should check the encoded size and say so plainly rather than surfacing a bare
     `session_id` stays in the database.
 - **Response** `201`: `{ "key": "office", "stored": true, "notes": [] }`. `notes`
   lists what the screen changed in `content`, and is empty when nothing changed.
+- When semantic search is configured, the write embeds the note. A provider that rejects the
+  embedding key answers `502 provider_auth_failed` and the note is **not** stored; an embedding
+  outage that is not a rejected credential still stores the note, without a vector.
 - **Response** `409` — the key already belongs to another memory place. A key keeps
   the place it was first stored in, so a request with a different `session_id`
   (including none, against a scoped row) fails and changes nothing:
@@ -932,7 +938,8 @@ should check the encoded size and say so plainly rather than surfacing a bare
   ```
   Choose another key. Writing the same key from the same place replaces the note.
 - **Status codes**: `201`, `400` (`invalid_content` for blank content,
-  `rejected_content` for content the screen refuses), `401`, `409`, `500`.
+  `rejected_content` for content the screen refuses), `401`, `409`, `500`,
+  `502` (`provider_auth_failed` when the embedding provider rejects the key).
 
 ### GET /api/v1/memory/{key}
 
@@ -1343,10 +1350,15 @@ no stored arg is taken as written.
 - **PUT request**: `{ "enabled": true, "embedding_api_key": "...", "vision_api_key": "..." }`, all optional.
   An omitted key is left alone. **An empty string deletes the key.**
 - **Response** `200`: `{ "enabled": true, "embedding_configured": true, "vision_configured": false, "source": "..." }`
-- Enabling probes the embedding key before persisting, so a bad key fails the request rather
-  than being written and failing later. A key from `KB_EMBEDDING_API_KEY` or `OPENROUTER_API_KEY`
-  counts as an embedding key for activation and for `embedding_configured`, the same as `GET`.
-- **Status codes**: `200`, `400` (an unknown field, or `{}`: `nothing_to_apply`), `401`, `500`.
+- Enabling probes the embedding endpoint before persisting, so a bad key fails the request rather
+  than being written and failing later. The probe is the one `rantaiclaw kb enable` uses: it
+  embeds one short string and refuses the request when the endpoint answers with an error status
+  (the `detail` names the status), when it answers with vectors of a size other than
+  `KB_EMBEDDING_DIM` (the `detail` names both sizes), or when it cannot be reached. A key from `KB_EMBEDDING_API_KEY` or
+  `OPENROUTER_API_KEY` counts as an embedding key for activation and for `embedding_configured`,
+  the same as `GET`.
+- **Status codes**: `200`, `400` (an unknown field, or `{}`: `nothing_to_apply`; a refused
+  embedding probe), `401`, `500`.
 
 ### POST / DELETE /api/v1/config/mcp_servers/{name}
 

@@ -1,5 +1,5 @@
 use super::local_refusal::is_local_refusal;
-use super::provider_auth::ProviderAuthError;
+use super::provider_auth::{without_userinfo_and_query, ProviderAuthError};
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamOptions, StreamResult,
 };
@@ -227,8 +227,11 @@ fn push_failure(
     reason: &str,
     error_detail: &str,
 ) {
+    // The name is a `custom:` URL the operator typed, so userinfo and query
+    // come out before it reaches the attempt log or the aggregate error.
+    let provider = without_userinfo_and_query(provider_name);
     failures.push(format!(
-        "provider={provider_name} model={model} attempt {attempt}/{max_attempts}: {reason}; error={error_detail}"
+        "provider={provider} model={model} attempt {attempt}/{max_attempts}: {reason}; error={error_detail}"
     ));
 }
 
@@ -356,7 +359,11 @@ impl ReliableProvider {
             return;
         }
         if let Some((primary, _)) = self.providers.first() {
-            announce(primary, answered);
+            // The ids can be `custom:` endpoints with userinfo or a query;
+            // the notice is printed, so strip them as the logs do.
+            let primary = crate::providers::provider_auth::without_userinfo_and_query(primary);
+            let answered = crate::providers::provider_auth::without_userinfo_and_query(answered);
+            announce(&primary, &answered);
         }
     }
 
@@ -395,9 +402,12 @@ impl Provider for ReliableProvider {
 
     async fn warmup(&self) -> anyhow::Result<()> {
         for (name, provider) in &self.providers {
-            tracing::info!(provider = name, "Warming up provider connection pool");
+            tracing::info!(
+                provider = %without_userinfo_and_query(name),
+                "Warming up provider connection pool"
+            );
             if provider.warmup().await.is_err() {
-                tracing::warn!(provider = name, "Warmup failed (non-fatal)");
+                tracing::warn!(provider = %without_userinfo_and_query(name), "Warmup failed (non-fatal)");
             }
         }
         Ok(())
@@ -435,7 +445,7 @@ impl Provider for ReliableProvider {
                         Ok(resp) => {
                             if attempt > 0 || *current_model != model {
                                 tracing::info!(
-                                    provider = provider_name,
+                                    provider = %without_userinfo_and_query(provider_name),
                                     model = *current_model,
                                     attempt,
                                     original_model = model,
@@ -467,7 +477,7 @@ impl Provider for ReliableProvider {
 
                             if non_retryable {
                                 tracing::warn!(
-                                    provider = provider_name,
+                                    provider = %without_userinfo_and_query(provider_name),
                                     model = *current_model,
                                     error = %error_detail,
                                     "Non-retryable error, moving on"
@@ -488,7 +498,7 @@ impl Provider for ReliableProvider {
                             if attempt < self.max_retries {
                                 let wait = self.compute_backoff(backoff_ms, &e);
                                 tracing::warn!(
-                                    provider = provider_name,
+                                    provider = %without_userinfo_and_query(provider_name),
                                     model = *current_model,
                                     attempt = attempt + 1,
                                     backoff_ms = wait,
@@ -504,7 +514,7 @@ impl Provider for ReliableProvider {
                 }
 
                 tracing::warn!(
-                    provider = provider_name,
+                    provider = %without_userinfo_and_query(provider_name),
                     model = *current_model,
                     "Exhausted retries, trying next provider/model"
                 );
@@ -556,7 +566,7 @@ impl Provider for ReliableProvider {
                         Ok(resp) => {
                             if attempt > 0 || *current_model != model {
                                 tracing::info!(
-                                    provider = provider_name,
+                                    provider = %without_userinfo_and_query(provider_name),
                                     model = *current_model,
                                     attempt,
                                     original_model = model,
@@ -588,7 +598,7 @@ impl Provider for ReliableProvider {
 
                             if non_retryable {
                                 tracing::warn!(
-                                    provider = provider_name,
+                                    provider = %without_userinfo_and_query(provider_name),
                                     model = *current_model,
                                     error = %error_detail,
                                     "Non-retryable error, moving on"
@@ -609,7 +619,7 @@ impl Provider for ReliableProvider {
                             if attempt < self.max_retries {
                                 let wait = self.compute_backoff(backoff_ms, &e);
                                 tracing::warn!(
-                                    provider = provider_name,
+                                    provider = %without_userinfo_and_query(provider_name),
                                     model = *current_model,
                                     attempt = attempt + 1,
                                     backoff_ms = wait,
@@ -625,7 +635,7 @@ impl Provider for ReliableProvider {
                 }
 
                 tracing::warn!(
-                    provider = provider_name,
+                    provider = %without_userinfo_and_query(provider_name),
                     model = *current_model,
                     "Exhausted retries, trying next provider/model"
                 );
@@ -670,7 +680,7 @@ impl Provider for ReliableProvider {
                         Ok(resp) => {
                             if attempt > 0 || *current_model != model {
                                 tracing::info!(
-                                    provider = provider_name,
+                                    provider = %without_userinfo_and_query(provider_name),
                                     model = *current_model,
                                     attempt,
                                     original_model = model,
@@ -702,7 +712,7 @@ impl Provider for ReliableProvider {
 
                             if non_retryable {
                                 tracing::warn!(
-                                    provider = provider_name,
+                                    provider = %without_userinfo_and_query(provider_name),
                                     model = *current_model,
                                     error = %error_detail,
                                     "Non-retryable error, moving on"
@@ -723,7 +733,7 @@ impl Provider for ReliableProvider {
                             if attempt < self.max_retries {
                                 let wait = self.compute_backoff(backoff_ms, &e);
                                 tracing::warn!(
-                                    provider = provider_name,
+                                    provider = %without_userinfo_and_query(provider_name),
                                     model = *current_model,
                                     attempt = attempt + 1,
                                     backoff_ms = wait,
@@ -739,7 +749,7 @@ impl Provider for ReliableProvider {
                 }
 
                 tracing::warn!(
-                    provider = provider_name,
+                    provider = %without_userinfo_and_query(provider_name),
                     model = *current_model,
                     "Exhausted retries, trying next provider/model"
                 );
@@ -880,7 +890,7 @@ impl Provider for ReliableProvider {
                         Ok(resp) => {
                             if attempt > 0 || *current_model != model {
                                 tracing::info!(
-                                    provider = provider_name,
+                                    provider = %without_userinfo_and_query(provider_name),
                                     model = *current_model,
                                     attempt,
                                     original_model = model,
@@ -912,7 +922,7 @@ impl Provider for ReliableProvider {
 
                             if non_retryable {
                                 tracing::warn!(
-                                    provider = provider_name,
+                                    provider = %without_userinfo_and_query(provider_name),
                                     model = *current_model,
                                     error = %error_detail,
                                     "Non-retryable error, moving on"
@@ -933,7 +943,7 @@ impl Provider for ReliableProvider {
                             if attempt < self.max_retries {
                                 let wait = self.compute_backoff(backoff_ms, &e);
                                 tracing::warn!(
-                                    provider = provider_name,
+                                    provider = %without_userinfo_and_query(provider_name),
                                     model = *current_model,
                                     attempt = attempt + 1,
                                     backoff_ms = wait,
@@ -949,7 +959,7 @@ impl Provider for ReliableProvider {
                 }
 
                 tracing::warn!(
-                    provider = provider_name,
+                    provider = %without_userinfo_and_query(provider_name),
                     model = *current_model,
                     "Exhausted retries, trying next provider/model"
                 );
@@ -1012,7 +1022,7 @@ impl Provider for ReliableProvider {
                 while let Some(chunk) = stream.next().await {
                     if let Err(ref e) = chunk {
                         tracing::warn!(
-                            provider = provider_clone,
+                            provider = %without_userinfo_and_query(&provider_clone),
                             model = current_model,
                             "Streaming error: {e}"
                         );
@@ -2808,6 +2818,46 @@ mod tests {
             *seen.lock(),
             vec![("primary".to_string(), "fallback".to_string())]
         );
+    }
+
+    /// A `custom:` id with userinfo and a query is announced without them: the
+    /// notice is printed, so the credential-bearing parts must not reach it.
+    #[tokio::test]
+    async fn failover_announcement_strips_userinfo_and_query_from_custom_ids() {
+        let (seen, announce) = recording_announcer();
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "custom:https://user:secret@primary.example/v1?key=abc".into(),
+                    Box::new(MockProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "primary down",
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(MockProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response: "from fallback",
+                        error: "fallback down",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        )
+        .with_failover_announce(announce);
+
+        let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
+        assert_eq!(result, "from fallback");
+        let announced = seen.lock().clone();
+        assert_eq!(announced.len(), 1);
+        let (primary, answered) = &announced[0];
+        assert!(!primary.contains("secret") && !primary.contains("abc"));
+        assert_eq!(answered, "fallback");
     }
 
     /// The primary answers: nothing is announced.

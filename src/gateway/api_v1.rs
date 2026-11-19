@@ -140,6 +140,7 @@ fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode, 
     }
 }
 
+/// The body every non-2xx answer of this module carries.
 #[derive(Debug, Serialize)]
 struct ErrorBody {
     error: String,
@@ -318,6 +319,22 @@ fn err_provider_auth_failed(msg: impl Into<String>) -> (StatusCode, Json<ErrorBo
             detail: Some(msg.into()),
         }),
     )
+}
+
+/// The provider-auth failure as the plain JSON value the gateway's other
+/// routes answer with.
+///
+/// The same [`ErrorBody`] the api_v1 routes answer, converted once, so a
+/// client reads one error shape on every route. The conversion cannot fail —
+/// the body holds strings and a list of strings — so the fallback is only a
+/// safety net that keeps a handler from panicking.
+pub(crate) fn provider_auth_failed_value(
+    msg: impl Into<String>,
+) -> (StatusCode, serde_json::Value) {
+    let (status, Json(body)) = err_provider_auth_failed(msg);
+    let value = serde_json::to_value(&body)
+        .unwrap_or_else(|_| serde_json::json!({"error": crate::providers::PROVIDER_AUTH_FAILED}));
+    (status, value)
 }
 
 /// Map an agent build/run failure to a response. A failure the caller has to
@@ -2536,9 +2553,20 @@ async fn memory_create(
             ),
         )
         .await
-        .map_err(|e| match e.downcast_ref::<crate::memory::KeyInUse>() {
-            Some(in_use) => err_409(in_use.to_string()),
-            None => err_500(e),
+        .map_err(|e| {
+            // A provider that rejected the credential is a 502, not a 500:
+            // the gateway worked and the upstream refused the key. The
+            // sentence names the provider and the status, never the upstream
+            // body — the body can echo the credential back.
+            if let Some(sentence) = crate::providers::provider_auth_failure_sentence(&e) {
+                let text = crate::providers::scrub_secret_patterns(&sentence);
+                tracing::warn!(detail = %text, "memory write failed: the provider rejected the credential");
+                return err_provider_auth_failed(text);
+            }
+            match e.downcast_ref::<crate::memory::KeyInUse>() {
+                Some(in_use) => err_409(in_use.to_string()),
+                None => err_500(e),
+            }
         })?;
     refresh_memory_projection(&state);
 
