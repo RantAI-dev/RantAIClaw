@@ -215,6 +215,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   section of the wizard now runs when the starter pack is only partly installed, and it installs
   only the missing skills.
 
+- **`status` shows the heartbeat interval the runtime uses.** A configured interval below five
+  minutes prints as five minutes, the value the daemon runs with.
+
 ## [0.35.0-alpha] — 2026-11-16
 
 The login-removal and approval release. Six subscription logins are gone and RantaiClaw uses API

@@ -515,6 +515,8 @@ Extract, chunk, embed, and store a file.
 
 An unknown `--group` name exits `1` with a TOON `error[not_found]` block naming the group, before the file is read or embedded, and nothing is stored. `--group` takes names here; the HTTP ingest takes group ids.
 
+A corrupt file exits `1` with `error[unprocessable_document]`, and a down extractor exits `1` with `error[extractor_unavailable]`. The codes match the HTTP ingest; see [kb.md](kb.md).
+
 Supported file types depend on feature flags — see [kb.md](kb.md#ingest-a-document).
 
 #### `kb list`
