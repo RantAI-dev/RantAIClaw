@@ -395,7 +395,7 @@ TUI never sees the pasted bytes.
 `/skill edit` accepts either the display name or the directory name, and
 **only opens skills you wrote yourself**. A ClawHub, bundled, git, or
 local-path skill is refused, naming what manages it. A hand edit to a bundled
-`SKILL.md` survives `setup`. `setup` never overwrites an existing skill directory,
+`SKILL.md` survives `setup`. `setup` never replaces an existing skill directory,
 and it recreates a bundled skill from the pack only when that directory is
 missing. Two refreshes rewrite an installed bundled `SKILL.md` in place: the
 stale tool-name lines left by an old rename, and the old guest passage of

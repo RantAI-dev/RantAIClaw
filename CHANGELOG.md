@@ -199,8 +199,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   line. The `insights` CLI command is unchanged.
 
 - **A failed extraction says whether the document or the extractor failed.** When the primary
-  and the fallback extractor both fail, the error keeps both causes. When the primary is down,
-  the answer is an unavailable extractor, not an unprocessable document.
+  and the fallback extractor both fail, the error keeps both causes. When the primary is down
+  and the fallback fails too, the answer is an unavailable extractor, not an unprocessable document.
 
 - **Image ingest answers `502 extractor_unavailable` when the vision service is down.** The body
   no longer carries the upstream URL. A malformed vision answer is an upstream failure too, and so
@@ -210,13 +210,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   down extractor prints `extractor_unavailable`. Both exit with code 1. Other failures keep their
   current answer.
 
-- **The headless setup hint names only flags that exist.** A headless `setup skills` run prints a
-  hint that names `--non-interactive`, not the removed `--starter-pack` and `--skip`. The skills
+- **The skills section's headless hint names only flags that exist.** The hint names
+  `--non-interactive`, not the removed `--starter-pack` and `--skip`. The skills
   section of the wizard now runs when the starter pack is only partly installed, and it installs
   only the missing skills.
-
-- **`status` shows the heartbeat interval the runtime uses.** A configured interval below five
-  minutes prints as five minutes, the value the daemon runs with.
 
 ## [0.35.0-alpha] — 2026-11-16
 
