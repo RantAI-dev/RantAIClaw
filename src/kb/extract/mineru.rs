@@ -82,7 +82,7 @@ impl Extractor for MineruExtractor {
             .await
             .map_err(|e| KbError::ExtractorUnavailable {
                 extractor: "MineruExtractor".into(),
-                message: e.to_string(),
+                message: e.without_url().to_string(),
             })?;
 
         let status = res.status();

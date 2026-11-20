@@ -14,7 +14,7 @@ use anyhow::Result;
 use crate::config::Config;
 use crate::onboard::section::{SetupContext, SetupSection};
 use crate::profile::Profile;
-use crate::skills::bundled::{self, STARTER_PACK};
+use crate::skills::bundled;
 
 /// The command an operator runs instead, shown when the section could not
 /// prompt.
@@ -24,8 +24,8 @@ use crate::skills::bundled::{self, STARTER_PACK};
 /// without this text being touched, and the command installs the
 /// always-on core skill on top of the starter pack.
 const HEADLESS_HINT: &str =
-    "rantaiclaw setup skills --starter-pack         # install the bundled skills\n  \
-     rantaiclaw setup skills --skip                  # skip skills setup entirely";
+    "rantaiclaw setup skills --non-interactive   # install the bundled skills\n  \
+     rantaiclaw setup skills --help              # list the options";
 
 pub struct SkillsSection;
 
@@ -39,11 +39,10 @@ impl SetupSection for SkillsSection {
     }
 
     fn is_already_configured(&self, profile: &Profile, _: &Config) -> bool {
-        // "Already configured" = at least one starter-pack skill is on disk.
-        // Wave 3's orchestrator will use this to offer the [skip / reconfigure]
-        // prompt.
-        let dir = profile.skills_dir();
-        STARTER_PACK.iter().any(|s| dir.join(s.slug).exists())
+        // "Already configured" = every starter-pack skill is on disk, the same
+        // rule the provisioner uses to skip its install question. Wave 3's
+        // orchestrator will use this to offer the [skip / reconfigure] prompt.
+        bundled::starter_pack_missing(profile).is_empty()
     }
 
     fn run(&self, ctx: &mut SetupContext) -> Result<()> {
@@ -100,7 +99,7 @@ mod tests {
         let s = SkillsSection;
         assert_eq!(s.name(), "skills");
         assert!(s.description().contains("starter pack"));
-        assert!(s.headless_hint().contains("--starter-pack"));
+        assert!(s.headless_hint().contains("--non-interactive"));
     }
 
     /// True when `text` states how many skills something holds.
@@ -170,8 +169,8 @@ mod tests {
                 "{line:?}"
             );
         }
-        assert!(lines[0].contains("--starter-pack"), "{hint:?}");
-        assert!(lines[1].contains("--skip"), "{hint:?}");
+        assert!(lines[0].contains("--non-interactive"), "{hint:?}");
+        assert!(lines[1].contains("--help"), "{hint:?}");
 
         assert!(s.description().contains("starter pack"));
         assert!(s.description().contains("ClawHub"));
@@ -199,6 +198,21 @@ mod tests {
             assert!(!installed.is_empty());
             let s = SkillsSection;
             assert!(s.is_already_configured(&profile, &cfg));
+        });
+    }
+
+    /// One starter-pack skill on disk is not a configured pack. The
+    /// provisioner still offers the missing skills in that state, so the
+    /// section must not report the pack as done.
+    #[test]
+    fn is_already_configured_false_when_the_starter_pack_is_partly_installed() {
+        with_home(|| {
+            let profile = crate::profile::ProfileManager::ensure_default().unwrap();
+            let cfg = Config::default();
+            let first = bundled::STARTER_PACK[0].slug;
+            std::fs::create_dir_all(profile.skills_dir().join(first)).unwrap();
+            let s = SkillsSection;
+            assert!(!s.is_already_configured(&profile, &cfg));
         });
     }
 }

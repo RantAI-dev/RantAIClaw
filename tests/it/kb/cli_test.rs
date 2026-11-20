@@ -1292,3 +1292,58 @@ async fn kb_ingest_unknown_group_errors_before_embedding_and_stores_nothing() {
     let docs = store.list_documents(None).await.unwrap();
     assert!(docs.is_empty(), "no document may be stored: {docs:?}");
 }
+
+/// A corrupt file is the caller's own input: `kb ingest` prints
+/// `unprocessable_document` (as the gateway answers 422) and exits 1.
+#[tokio::test]
+async fn kb_ingest_of_a_corrupt_file_prints_unprocessable_document_and_exits_1() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("kb.db");
+    let pdf = tmp.path().join("corrupt.pdf");
+    std::fs::write(&pdf, b"not a pdf at all").unwrap();
+
+    let (code, stdout, _stderr) = run_kb_with_env(
+        &db,
+        &["ingest", pdf.to_str().unwrap()],
+        &[
+            ("KB_EXTRACT_PRIMARY", "unpdf"),
+            ("KB_EXTRACT_FALLBACK", "unpdf"),
+        ],
+    );
+    assert_eq!(code, 1, "a corrupt file must exit 1: {stdout}");
+    assert!(stdout.contains("unprocessable_document"), "got: {stdout}");
+    assert!(!stdout.contains("internal"), "got: {stdout}");
+}
+
+/// The vision service is down: `kb ingest` prints `extractor_unavailable`
+/// (as the gateway answers 502), exits 1, and leaves out the endpoint URL.
+#[tokio::test]
+async fn kb_ingest_with_the_vision_service_down_prints_extractor_unavailable_and_exits_1() {
+    // Bind, note the port, release it: nothing listens there afterwards.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("kb.db");
+    let png = tmp.path().join("scan.png");
+    std::fs::write(&png, b"\x89PNG\r\n\x1a\n rantaiclaw image").unwrap();
+    let vision_url = format!("http://127.0.0.1:{port}/rantaiclaw_vision_probe");
+
+    let (code, stdout, _stderr) = run_kb_with_env(
+        &db,
+        &["ingest", png.to_str().unwrap()],
+        &[
+            ("KB_EXTRACT_VISION_BASE_URL", vision_url.as_str()),
+            ("KB_EXTRACT_VISION_API_KEY", "rantaiclaw_test_vision_key"),
+        ],
+    );
+    assert_eq!(code, 1, "a dead extractor must exit 1: {stdout}");
+    assert!(stdout.contains("extractor_unavailable"), "got: {stdout}");
+    assert!(!stdout.contains("internal"), "got: {stdout}");
+    assert!(
+        !stdout.contains("http") && !stdout.contains("127.0.0.1"),
+        "the answer must not carry the endpoint URL: {stdout}"
+    );
+}

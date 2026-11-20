@@ -783,6 +783,12 @@ where
     })
 }
 
+/// The period between heartbeat ticks: the effective interval, so a configured
+/// value below the minimum never sets a shorter period.
+fn heartbeat_period(heartbeat: &crate::config::HeartbeatConfig) -> Duration {
+    Duration::from_secs(u64::from(heartbeat.effective_interval_minutes()) * 60)
+}
+
 async fn run_heartbeat_worker(
     config: Config,
     observer: std::sync::Arc<dyn crate::observability::Observer>,
@@ -796,8 +802,7 @@ async fn run_heartbeat_worker(
     if let Some(message) = config.heartbeat.interval_clamp_warning() {
         tracing::warn!("{message}");
     }
-    let interval_mins = config.heartbeat.effective_interval_minutes();
-    let mut interval = tokio::time::interval(Duration::from_secs(u64::from(interval_mins) * 60));
+    let mut interval = tokio::time::interval(heartbeat_period(&config.heartbeat));
 
     loop {
         interval.tick().await;
@@ -850,6 +855,23 @@ fn has_supervised_channels(config: &Config) -> bool {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// The heartbeat worker ticks at the effective interval. A configured
+    /// `interval_minutes = 1` is raised to the 5-minute minimum, so the period
+    /// is 300 s. The worker loop runs forever, so the period is checked through
+    /// the helper the worker builds its interval from.
+    #[test]
+    fn heartbeat_period_raises_a_one_minute_interval_to_five_minutes() {
+        let heartbeat = crate::config::HeartbeatConfig {
+            enabled: true,
+            interval_minutes: 1,
+        };
+        assert_eq!(
+            heartbeat_period(&heartbeat),
+            Duration::from_secs(5 * 60),
+            "the worker must tick every 5 minutes, not every configured minute"
+        );
+    }
 
     /// The daemon serves the profile the config loader resolves: the
     /// environment first, then the active-profile marker. A daemon that read

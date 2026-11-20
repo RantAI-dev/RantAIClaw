@@ -135,7 +135,9 @@ pub fn build_extractor(cfg: &KbConfig, sentinel: &str) -> KbResult<Box<dyn Extra
 }
 
 /// Run `primary.extract`; if it returns `Err`, log + retry with `fallback`.
-/// Errors out only when both backends fail.
+/// Errors out only when both backends fail, and then with both causes, so an
+/// upstream outage on the primary is not hidden behind a document error from
+/// the fallback.
 ///
 /// Port of `extractors/index.ts:58-71`.
 pub async fn extract_with_fallback(
@@ -143,18 +145,34 @@ pub async fn extract_with_fallback(
     primary: &dyn Extractor,
     fallback: &dyn Extractor,
 ) -> KbResult<ExtractionResult> {
-    match primary.extract(bytes).await {
+    let primary_err = match primary.extract(bytes).await {
+        Ok(r) => return Ok(r),
+        Err(e) => e,
+    };
+    let msg = primary_err.to_string();
+    let truncated: String = msg.chars().take(120).collect();
+    tracing::warn!(
+        primary = primary.name(),
+        fallback = fallback.name(),
+        "primary extractor failed ({}); falling back",
+        truncated
+    );
+    match fallback.extract(bytes).await {
         Ok(r) => Ok(r),
-        Err(e) => {
-            let msg = e.to_string();
-            let truncated: String = msg.chars().take(120).collect();
-            tracing::warn!(
-                primary = primary.name(),
-                fallback = fallback.name(),
-                "primary extractor failed ({}); falling back",
-                truncated
-            );
-            fallback.extract(bytes).await
+        Err(fallback_err) => {
+            let p_msg: String = primary_err.to_string().chars().take(150).collect();
+            let f_msg: String = fallback_err.to_string().chars().take(150).collect();
+            Err(KbError::extraction_failed(
+                format!("Fallback({}+{})", primary.name(), fallback.name()),
+                format!(
+                    "Both extractors failed: primary({}): {}; fallback({}): {}",
+                    primary.name(),
+                    p_msg,
+                    fallback.name(),
+                    f_msg
+                ),
+                vec![primary_err, fallback_err],
+            ))
         }
     }
 }

@@ -48,7 +48,7 @@ This reference is derived from the current CLI surface (`rantaiclaw --help`).
 | `personality` | Show, list, or set the active persona preset, name and timezone |
 | `profile` | Create, clone, switch, and delete profiles |
 | `session` | Browse, search, and rename past sessions |
-| `insights` | Cumulative session/message statistics (CLI parity for the TUI `/insights`) |
+| `insights` | Cumulative session/message statistics over all sessions. Takes no flags. The TUI `/insights [--days N]` counts only sessions started inside the last N days. |
 | `rollback` | Restore config and binary from a pre-update snapshot |
 | `uninstall` | Remove profile data, optionally the binary |
 
@@ -394,11 +394,18 @@ TUI never sees the pasted bytes.
 
 `/skill edit` accepts either the display name or the directory name, and
 **only opens skills you wrote yourself**. A ClawHub, bundled, git, or
-local-path skill is refused, naming what manages it: editing one loses the
-work silently, since a bundled skill is re-seeded by the next `setup` run and
-a vendor-managed one by its installer. Which skills those are is recorded in
-a `.origin.json` marker written at install time; skills that predate the
-marker are classified from their directory's shape.
+local-path skill is refused, naming what manages it. A hand edit to a bundled
+`SKILL.md` survives `setup`. `setup` never replaces an existing skill directory,
+and it recreates a bundled skill from the pack only when that directory is
+missing. Two refreshes rewrite an installed bundled `SKILL.md` in place: the
+stale tool-name lines left by an old rename, and the old guest passage of
+`owner-permissions`. Each rewrites only the lines it names, only while they
+still match the shipped text, and keeps the file as it was in `SKILL.md.bak`.
+A `SKILL.md.bak` that already exists stops the refresh, so the stale lines stay
+until that backup is removed.
+A vendor-managed one is reinstalled by its installer. Which skills those are
+is recorded in a `.origin.json` marker written at install time; skills that
+predate the marker are classified from their directory's shape.
 
 Whatever you save is validated before it replaces anything: frontmatter must
 parse and carry a non-empty `name:`, and for an edit that name must be
@@ -507,6 +514,8 @@ Extract, chunk, embed, and store a file.
 | `--json` | Emit JSON instead of TOON | `false` |
 
 An unknown `--group` name exits `1` with a TOON `error[not_found]` block naming the group, before the file is read or embedded, and nothing is stored. `--group` takes names here; the HTTP ingest takes group ids.
+
+A corrupt file exits `1` with `error[unprocessable_document]`, and a down extractor exits `1` with `error[extractor_unavailable]`. The codes match the HTTP ingest; see [kb.md](kb.md).
 
 Supported file types depend on feature flags — see [kb.md](kb.md#ingest-a-document).
 
