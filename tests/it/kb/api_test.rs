@@ -1267,6 +1267,50 @@ async fn kb_upload_answers_502_when_the_extractor_service_is_down() {
     );
 }
 
+async fn upload_image(base_url: &str, bytes: &[u8]) -> reqwest::Response {
+    let form = reqwest::multipart::Form::new().part(
+        "file",
+        reqwest::multipart::Part::bytes(bytes.to_vec()).file_name("scan.png"),
+    );
+    reqwest::Client::new()
+        .post(format!("{base_url}/api/v1/kb/documents"))
+        .multipart(form)
+        .send()
+        .await
+        .expect("request")
+}
+
+/// The vision service is down during image ingest: 502 `extractor_unavailable`,
+/// and the answer does not carry the vision endpoint's URL.
+#[tokio::test]
+async fn kb_image_upload_answers_502_without_the_vision_url_when_the_service_is_down() {
+    // Bind, note the port, release it: nothing listens there afterwards.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let h = start_harness(|_store| Box::pin(async move {})).await;
+    let vision_url = format!("http://127.0.0.1:{port}/rantaiclaw_vision_probe");
+    let _env = ExtractorEnv::set(&[
+        ("KB_EXTRACT_VISION_BASE_URL", vision_url.as_str()),
+        ("KB_EXTRACT_VISION_API_KEY", "rantaiclaw_test_vision_key"),
+    ]);
+
+    let resp = upload_image(&h.base_url, b"\x89PNG\r\n\x1a\n rantaiclaw image").await;
+    let status = resp.status();
+    let raw = resp.text().await.expect("body text");
+    assert_eq!(status, 502, "a vision outage is a 502, got {status}: {raw}");
+    let body: Value = serde_json::from_str(&raw).expect("json body");
+    assert_eq!(body["error"], "extractor_unavailable", "{body}");
+    assert!(
+        !raw.contains("http")
+            && !raw.contains("127.0.0.1")
+            && !raw.contains("rantaiclaw_vision_probe"),
+        "the answer must not carry the upstream URL: {raw}"
+    );
+}
+
 #[tokio::test]
 async fn kb_ingest_bogus_group_field_404s_before_storing() {
     // Plan 099 step 2: group ids are validated BEFORE staging/embedding, so

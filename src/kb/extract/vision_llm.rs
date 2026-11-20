@@ -200,7 +200,7 @@ async fn send_single_pdf_call(args: SendCallArgs<'_>) -> KbResult<ExtractionResu
             // Single-call path historically surfaced just `{e}`; segment path
             // surfaced `[VisionLlmExtractor segment N/M] {e}`. Both are
             // preserved by `prefix`.
-            message: format!("{prefix}{e}"),
+            message: format!("{prefix}{}", e.without_url()),
         })?;
     let took_ms = elapsed_ms(t0);
 

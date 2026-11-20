@@ -21,7 +21,7 @@ use rantaiclaw::kb::extract::text_layer_signals::{
 };
 use rantaiclaw::kb::extract::unpdf::UnpdfExtractor;
 use rantaiclaw::kb::extract::vision_llm::VisionLlmExtractor;
-use rantaiclaw::kb::extract::{ExtractionResult, Extractor};
+use rantaiclaw::kb::extract::{extract_with_fallback, ExtractionResult, Extractor};
 use rantaiclaw::kb::{KbConfig, KbError, KbResult};
 
 // ----- fixture helpers ---------------------------------------------------
@@ -805,6 +805,44 @@ async fn hybrid_aggregate_is_upstream_when_the_structural_service_is_down() {
     );
 }
 
+/// The primary service is down and the fallback then fails on the document.
+/// The answer must say the upstream failed, and must keep both causes.
+#[tokio::test]
+async fn extract_with_fallback_answers_upstream_when_primary_is_down_and_fallback_fails() {
+    let primary = CannedExtractor::unavailable("mineru", "connection refused");
+    let fallback = CannedExtractor::err("unpdf", "invalid file header");
+    let err = extract_with_fallback(b"unused", &primary, &fallback)
+        .await
+        .expect_err("must fail");
+    assert!(
+        matches!(err, KbError::ExtractorUnavailable { .. }),
+        "a down primary service is an upstream failure, got: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("connection refused"),
+        "primary cause lost: {msg}"
+    );
+    assert!(
+        msg.contains("invalid file header"),
+        "fallback cause lost: {msg}"
+    );
+}
+
+/// Both extractors read the document and failed: the document is at fault.
+#[tokio::test]
+async fn extract_with_fallback_blames_the_document_when_both_extractors_read_it() {
+    let primary = CannedExtractor::err("mineru", "bad page tree");
+    let fallback = CannedExtractor::err("unpdf", "invalid file header");
+    let err = extract_with_fallback(b"unused", &primary, &fallback)
+        .await
+        .expect_err("must fail");
+    assert!(
+        matches!(err, KbError::Extraction { .. }),
+        "two document failures are a document failure, got: {err:?}"
+    );
+}
+
 #[tokio::test]
 async fn hybrid_merges_both_outputs() {
     let structural = Box::new(CannedExtractor::ok(
@@ -967,6 +1005,76 @@ async fn ocr_ollama_extractor_surfaces_endpoint_errors() {
     );
     let msg = err.to_string();
     assert!(msg.contains("500"), "error must include status code: {msg}");
+}
+
+/// A base URL on a local port that nothing listens on, so the request fails at
+/// the transport. The reqwest error carries that URL, and the extractor error
+/// must not.
+fn closed_local_url(path: &str) -> String {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    format!("http://127.0.0.1:{port}{path}")
+}
+
+#[tokio::test]
+async fn mineru_transport_failure_keeps_the_url_out_of_the_error() {
+    let ext = MineruExtractor::new(closed_local_url("")).unwrap();
+    let err = ext
+        .extract(b"%PDF-1.5\n")
+        .await
+        .expect_err("a refused connection must fail");
+    assert!(
+        matches!(err, KbError::ExtractorUnavailable { .. }),
+        "a refused connection is an upstream failure, got: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("127.0.0.1") && !msg.contains("/extract"),
+        "the error must not carry the sidecar URL: {msg}"
+    );
+}
+
+#[cfg(feature = "kb-ocr")]
+#[tokio::test]
+async fn ocr_ollama_transport_failure_keeps_the_url_out_of_the_error() {
+    use rantaiclaw::kb::extract::ocr_ollama::OllamaOcrExtractor;
+
+    let ext = OllamaOcrExtractor::new(closed_local_url("/api/generate"), "llava");
+    let err = ext
+        .extract(b"\x89PNG")
+        .await
+        .expect_err("a refused connection must fail");
+    assert!(
+        matches!(err, KbError::ExtractorUnavailable { .. }),
+        "a refused connection is an upstream failure, got: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("127.0.0.1") && !msg.contains("/api/generate"),
+        "the error must not carry the endpoint URL: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn vision_llm_transport_failure_keeps_the_url_out_of_the_error() {
+    let cfg = vision_cfg(closed_local_url("/chat"));
+    let ext = VisionLlmExtractor::with_options(cfg, "rantaiclaw/test-model".into(), 100, 5, 2);
+    let err = ext
+        .extract(&make_pdf(2))
+        .await
+        .expect_err("a refused connection must fail");
+    assert!(
+        matches!(err, KbError::ExtractorUnavailable { .. }),
+        "a refused connection is an upstream failure, got: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("127.0.0.1") && !msg.contains("/chat"),
+        "the error must not carry the vision URL: {msg}"
+    );
 }
 
 // ----- live integration (skipped unless OPENROUTER_API_KEY set) ----------

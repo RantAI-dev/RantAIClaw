@@ -123,7 +123,7 @@ impl Extractor for OllamaOcrExtractor {
             .await
             .map_err(|e| KbError::ExtractorUnavailable {
                 extractor: "OllamaOcrExtractor".into(),
-                message: e.to_string(),
+                message: e.without_url().to_string(),
             })?;
 
         let status = res.status();

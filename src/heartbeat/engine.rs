@@ -109,6 +109,67 @@ impl HeartbeatEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Counts the heartbeat ticks the engine reports to its observer.
+    #[derive(Default)]
+    struct HeartbeatTickCounter {
+        ticks: AtomicUsize,
+    }
+
+    impl Observer for HeartbeatTickCounter {
+        fn record_event(&self, event: &ObserverEvent) {
+            if matches!(event, ObserverEvent::HeartbeatTick) {
+                self.ticks.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        fn record_metric(&self, _metric: &crate::observability::traits::ObserverMetric) {}
+
+        fn name(&self) -> &str {
+            "heartbeat-tick-counter"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// `interval_minutes = 1` is raised to the 5-minute minimum, so the loop
+    /// ticks at 0 s and 300 s. A loop that read the raw field would tick at
+    /// 0, 60, 120, 180 and 240 s before the 299 s check.
+    #[tokio::test(start_paused = true)]
+    async fn run_ticks_at_the_effective_minimum_interval() {
+        let dir = tempfile::TempDir::new().expect("temp workspace");
+        let counter = Arc::new(HeartbeatTickCounter::default());
+        let observer: Arc<dyn Observer> = counter.clone();
+        let engine = HeartbeatEngine::new(
+            HeartbeatConfig {
+                enabled: true,
+                interval_minutes: 1,
+            },
+            dir.path().to_path_buf(),
+            observer,
+        );
+
+        let handle = tokio::spawn(async move { engine.run().await });
+
+        time::sleep(Duration::from_secs(299)).await;
+        assert_eq!(
+            counter.ticks.load(Ordering::SeqCst),
+            1,
+            "only the immediate tick may fire before 299 s"
+        );
+
+        time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            counter.ticks.load(Ordering::SeqCst),
+            2,
+            "the second tick fires at the 5-minute mark"
+        );
+
+        handle.abort();
+    }
 
     #[test]
     fn parse_tasks_basic() {

@@ -307,6 +307,110 @@ async fn process_image_makes_openrouter_vision_call() {
     );
 }
 
+/// A vision endpoint that answers 503 on every attempt is an upstream failure
+/// once the retries run out. The error must not carry the endpoint's URL.
+#[tokio::test]
+async fn process_image_answers_extractor_unavailable_after_the_vision_retries_run_out() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("rantaiclaw_upstream_detail"))
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let cfg = make_kb_cfg(format!("{}/chat", server.uri()));
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("rantaiclaw_scan.png");
+    std::fs::write(&img, tiny_png_bytes()).unwrap();
+
+    let err = process_file(&cfg, &img, ProcessingOptions::default())
+        .await
+        .expect_err("a vision service that stays down must fail");
+    assert!(
+        matches!(err, KbError::ExtractorUnavailable { .. }),
+        "a 5xx after retries is an upstream failure, got: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        !msg.contains(&server.uri()),
+        "the error must not carry the vision URL: {msg}"
+    );
+    assert!(
+        !msg.contains("rantaiclaw_upstream_detail"),
+        "the error must not copy the upstream body: {msg}"
+    );
+    assert!(
+        msg.contains("503"),
+        "the error keeps the status code: {msg}"
+    );
+}
+
+/// A vision endpoint that refuses the connection is an upstream failure. The
+/// reqwest error carries the endpoint URL, and the error must not keep it.
+#[tokio::test]
+async fn process_image_transport_failure_is_upstream_and_keeps_no_url() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let url = format!("http://127.0.0.1:{port}/rantaiclaw_vision_probe");
+    let cfg = make_kb_cfg(url.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("rantaiclaw_scan.png");
+    std::fs::write(&img, tiny_png_bytes()).unwrap();
+
+    let err = process_file(&cfg, &img, ProcessingOptions::default())
+        .await
+        .expect_err("a vision endpoint that refuses connections must fail");
+    assert!(
+        matches!(err, KbError::ExtractorUnavailable { .. }),
+        "a refused connection is an upstream failure, got: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("127.0.0.1") && !msg.contains("rantaiclaw_vision_probe"),
+        "the error must not carry the vision URL: {msg}"
+    );
+}
+
+/// A vision endpoint that answers 200 with a body that is not the expected
+/// JSON is an upstream failure, not a raw transport error.
+#[tokio::test]
+async fn process_image_malformed_vision_answer_is_upstream() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("<html>not json</html>"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let cfg = make_kb_cfg(format!("{}/chat", server.uri()));
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("rantaiclaw_scan.png");
+    std::fs::write(&img, tiny_png_bytes()).unwrap();
+
+    let err = process_file(&cfg, &img, ProcessingOptions::default())
+        .await
+        .expect_err("an undecodable vision answer must fail");
+    assert!(
+        matches!(err, KbError::ExtractorUnavailable { .. }),
+        "an undecodable upstream answer is an upstream failure, got: {err:?}"
+    );
+    assert!(
+        !err.to_string().contains(&server.uri()),
+        "the error must not carry the vision URL: {err}"
+    );
+}
+
 // ----- task 6.1: pdf dispatch -------------------------------------------
 
 #[tokio::test]

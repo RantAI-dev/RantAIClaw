@@ -178,7 +178,7 @@ async fn post_with_retry(
         let resp = match send_result {
             Ok(r) => r,
             Err(e) => {
-                last_err = Some(KbError::Http(e));
+                last_err = Some(vision_unavailable(e.without_url().to_string()));
                 if attempt < MAX_RETRIES {
                     sleep(backoff_for(attempt)).await;
                     continue;
@@ -201,13 +201,19 @@ async fn post_with_retry(
                 sleep(backoff_for(attempt)).await;
                 continue;
             }
+            if status.is_server_error() {
+                return Err(vision_unavailable(format!("status {}", status.as_u16())));
+            }
             return Err(KbError::ChatApi {
                 status: status.as_u16(),
                 body: body_text,
             });
         }
 
-        let parsed: ChatResponse = resp.json().await?;
+        let parsed: ChatResponse = resp
+            .json()
+            .await
+            .map_err(|e| vision_unavailable(format!("response parse: {}", e.without_url())))?;
         let description = parsed
             .choices
             .into_iter()
@@ -222,6 +228,18 @@ async fn post_with_retry(
 
 fn is_transient(status: u16) -> bool {
     status >= 500 || status == 429
+}
+
+/// The name of the extractor in an upstream error. The endpoint URL stays
+/// out of every error built here: a reqwest error carries it, and the caller
+/// may print the error, so it is removed with `without_url` first.
+const VISION_EXTRACTOR: &str = "VisionImageExtractor";
+
+fn vision_unavailable(message: String) -> KbError {
+    KbError::ExtractorUnavailable {
+        extractor: VISION_EXTRACTOR.into(),
+        message,
+    }
 }
 
 fn backoff_for(attempt: u32) -> Duration {

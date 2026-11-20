@@ -1682,15 +1682,7 @@ async fn main() -> Result<()> {
                 println!("  {}", rantaiclaw::cli_style::warn(&note));
             }
             rantaiclaw::cli_style::field("Runtime", W, &config.runtime.kind.to_string());
-            rantaiclaw::cli_style::field(
-                "Heartbeat",
-                W,
-                &if config.heartbeat.enabled {
-                    format!("every {}min", config.heartbeat.effective_interval_minutes())
-                } else {
-                    "disabled".to_string()
-                },
-            );
+            rantaiclaw::cli_style::field("Heartbeat", W, &heartbeat_status(&config.heartbeat));
             let effective_memory_backend =
                 rantaiclaw::memory::effective_memory_backend_name(&config.memory.backend);
             rantaiclaw::cli_style::field("Memory", W, &effective_memory_backend);
@@ -2284,8 +2276,31 @@ fn handle_auth_command_removed(_args: &[String]) -> Result<()> {
     std::process::exit(rantaiclaw::AUTH_COMMAND_REMOVED_EXIT_CODE);
 }
 
+/// The `status` line for the heartbeat. It shows the interval the runtime
+/// honours, so a configured value below the minimum is not printed as is.
+fn heartbeat_status(heartbeat: &rantaiclaw::config::HeartbeatConfig) -> String {
+    if heartbeat.enabled {
+        format!("every {}min", heartbeat.effective_interval_minutes())
+    } else {
+        "disabled".to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::heartbeat_status;
+
+    /// `status` prints the minimum interval, not the configured one. A
+    /// configured `interval_minutes = 1` is shown as `every 5min`.
+    #[test]
+    fn status_shows_the_heartbeat_interval_raised_to_the_minimum() {
+        let heartbeat = rantaiclaw::config::HeartbeatConfig {
+            enabled: true,
+            interval_minutes: 1,
+        };
+        assert_eq!(heartbeat_status(&heartbeat), "every 5min");
+    }
+
     #[cfg(feature = "tui")]
     use super::boot_model_label;
     use super::{headless_choice, unusable_provider_after_headless_setup, HeadlessChoice};

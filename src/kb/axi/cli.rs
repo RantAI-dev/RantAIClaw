@@ -36,7 +36,7 @@ use crate::kb::retrieve::format::format_context_for_prompt;
 use crate::kb::retrieve::{RetrieveOptions, Retriever, SourceRef};
 use crate::kb::store::sqlite::SqliteStore;
 use crate::kb::store::{Graph, IntelligenceStore, KbStore};
-use crate::kb::{Document, DocumentId, KbConfig, KbGroupSummary, KbResult, SearchResult};
+use crate::kb::{Document, DocumentId, KbConfig, KbError, KbGroupSummary, KbResult, SearchResult};
 
 /// Per-chunk preview width in the TOON `chunks` table. The table is a
 /// machine-readable index; the full chunk text reaches the agent through the
@@ -385,8 +385,24 @@ async fn cmd_ingest(
         }
     };
 
-    // 1. Extract content from disk.
-    let processed = process_file(cfg, &path, ProcessingOptions::default()).await?;
+    // 1. Extract content from disk. A failure here is an answer, not an internal
+    //    fault: the same two codes the gateway answers with (422 and 502).
+    let processed = match process_file(cfg, &path, ProcessingOptions::default()).await {
+        Ok(processed) => processed,
+        Err(e @ KbError::Extraction { .. }) => {
+            print_error_toon("unprocessable_document", &e.to_string());
+            return Ok(1);
+        }
+        Err(KbError::ExtractorUnavailable { extractor, message }) => {
+            tracing::warn!(target: "kb::ingest", %extractor, "extractor upstream failed: {message}");
+            print_error_toon(
+                "extractor_unavailable",
+                &format!("the {extractor} extractor upstream is unreachable or returned an error"),
+            );
+            return Ok(1);
+        }
+        Err(e) => return Err(e),
+    };
 
     // 2. Pick a title — explicit override, else the file stem, else the
     //    full path string as last resort.
