@@ -20,6 +20,10 @@ pub struct Extracted {
     /// zero entities means extraction FAILED — it does not mean the document
     /// has no entities. Callers must be able to tell those apart.
     pub failed_chunks: usize,
+    /// True when the chat endpoint refused the API key (401 or 403) on at
+    /// least one chunk. Callers that answer synchronously use it to report a
+    /// rejected key as such instead of as a generic extraction failure.
+    pub provider_auth_rejected: bool,
     /// First failure reason, for operator-facing display. Never contains the
     /// upstream body or any credential.
     pub first_error: Option<String>,

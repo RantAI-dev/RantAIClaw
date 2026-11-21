@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
 
+use crate::kb::error::is_auth_rejection_status;
 use crate::kb::intelligence::extract::{EntityRelationExtractor, Extracted};
 use crate::kb::intelligence::types::{EntityType, RelationType};
 use crate::kb::KbResult;
@@ -54,6 +55,9 @@ enum ChunkOutcome {
         relations: Vec<(String, String, RelationType, f32)>,
     },
     Failed(String),
+    /// The chat endpoint answered 401 or 403 for this chunk. Kept apart from
+    /// `Failed` so the caller can report a rejected key as such.
+    AuthRejected(String),
 }
 
 impl CombinedLlmExtractor {
@@ -89,7 +93,12 @@ impl CombinedLlmExtractor {
                 status = status.as_u16(),
                 "LLM extractor: non-success response, skipping chunk"
             );
-            return ChunkOutcome::Failed(format!("http {}", status.as_u16()));
+            let reason = format!("http {}", status.as_u16());
+            return if is_auth_rejection_status(status.as_u16()) {
+                ChunkOutcome::AuthRejected(reason)
+            } else {
+                ChunkOutcome::Failed(reason)
+            };
         }
 
         let chat_resp: ChatResponse = match resp.json().await {
@@ -276,6 +285,11 @@ impl EntityRelationExtractor for CombinedLlmExtractor {
                 }
                 ChunkOutcome::Failed(reason) => {
                     out.failed_chunks += 1;
+                    out.first_error.get_or_insert(reason);
+                }
+                ChunkOutcome::AuthRejected(reason) => {
+                    out.failed_chunks += 1;
+                    out.provider_auth_rejected = true;
                     out.first_error.get_or_insert(reason);
                 }
             }

@@ -223,6 +223,143 @@ async fn provider_auth_error_never_echoes_custom_endpoint_userinfo_or_query() {
     );
 }
 
+/// A cron run of an agent job whose turn the provider rejects answers
+/// `502 provider_auth_failed`, the same body the chat routes answer, and the
+/// run history keeps the failed run.
+///
+/// The job retries once (`scheduler_retries = 1`), so the history holds one
+/// row per attempt: two rows, both `error`. The retry policy is unchanged on
+/// the manual path, and the count shows it.
+#[tokio::test]
+async fn a_cron_run_of_an_agent_job_answers_502_when_the_provider_rejects_the_key() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(401).set_body_string("the upstream echoes the credential"),
+        )
+        .mount(&provider)
+        .await;
+
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let config_dir = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::acquire().await;
+    std::env::set_var("RANTAICLAW_CONFIG_DIR", config_dir.path());
+    let mut config = test_config(workspace.path());
+    config.default_provider = Some(format!("custom:{}", provider.uri()));
+    config.default_model = Some("test-model".to_string());
+    config.api_key = Some("rantaiclaw_test_key".to_string());
+    config.reliability.scheduler_retries = 1;
+    let base_url = spawn_test_gateway(config).await;
+    let client = reqwest::Client::new();
+
+    let created: serde_json::Value = client
+        .post(format!("{base_url}/api/v1/cron"))
+        .bearer_auth(TEST_TOKEN)
+        .json(&serde_json::json!({
+            "schedule": { "kind": "cron", "expr": "0 9 * * *" },
+            "prompt": "summarise the lantern notes"
+        }))
+        .send()
+        .await
+        .expect("create")
+        .json()
+        .await
+        .expect("json");
+    let id = created["id"].as_str().expect("job id").to_string();
+
+    let resp = client
+        .post(format!("{base_url}/api/v1/cron/{id}/run"))
+        .bearer_auth(TEST_TOKEN)
+        .send()
+        .await
+        .expect("run");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("json");
+
+    assert_eq!(status, reqwest::StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body["error"], "provider_auth_failed", "{body}");
+    let detail = body["detail"].as_str().unwrap_or_default();
+    assert!(detail.contains("401"), "the status is named: {body}");
+    assert!(
+        !detail.contains("the upstream echoes"),
+        "the upstream body must never surface: {body}"
+    );
+    assert!(
+        !detail.contains("rantaiclaw_test_key"),
+        "the key must never surface: {body}"
+    );
+
+    let runs: serde_json::Value = client
+        .get(format!("{base_url}/api/v1/cron/{id}/runs"))
+        .bearer_auth(TEST_TOKEN)
+        .send()
+        .await
+        .expect("runs")
+        .json()
+        .await
+        .expect("json");
+    let runs = runs["runs"].as_array().expect("runs array");
+    assert_eq!(runs.len(), 2, "one history row per attempt: {runs:?}");
+    assert!(
+        runs.iter().all(|run| run["status"] == "error"),
+        "the failed run stays in the history as an error: {runs:?}"
+    );
+}
+
+/// The control for the test above: an agent job that fails for a reason that
+/// is not a rejected credential keeps the `200 {success:false, output}` answer.
+/// No provider is configured, so the turn fails before any request is sent.
+#[tokio::test]
+async fn a_cron_run_of_an_agent_job_without_a_provider_key_answers_200_not_502() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let config_dir = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::acquire().await;
+    std::env::set_var("RANTAICLAW_CONFIG_DIR", config_dir.path());
+    let base_url = spawn_test_gateway(test_config(workspace.path())).await;
+    let client = reqwest::Client::new();
+
+    let created: serde_json::Value = client
+        .post(format!("{base_url}/api/v1/cron"))
+        .bearer_auth(TEST_TOKEN)
+        .json(&serde_json::json!({
+            "schedule": { "kind": "cron", "expr": "0 9 * * *" },
+            "prompt": "summarise the lantern notes"
+        }))
+        .send()
+        .await
+        .expect("create")
+        .json()
+        .await
+        .expect("json");
+    let id = created["id"].as_str().expect("job id").to_string();
+
+    let resp = client
+        .post(format!("{base_url}/api/v1/cron/{id}/run"))
+        .bearer_auth(TEST_TOKEN)
+        .send()
+        .await
+        .expect("run");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("json");
+
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+    assert_eq!(body["success"], false, "{body}");
+    assert!(
+        body["output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("agent job failed:"),
+        "the failure text is unchanged: {body}"
+    );
+    assert!(
+        body.get("error").is_none(),
+        "a non-auth failure has no error code: {body}"
+    );
+}
+
 /// Output the gateway writes during a test, so a test can read the log lines.
 #[derive(Clone, Default)]
 struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);

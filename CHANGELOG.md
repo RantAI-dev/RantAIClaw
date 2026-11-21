@@ -18,21 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carry a password or a key in its URL. The failover notice, which is printed, and the provider
   log fields now show the id without them.
 
-- **Every gateway route that calls a provider answers a rejected credential with `502
-  provider_auth_failed`.** The `POST /webhook` and `POST /triggers/{path}` doors answered `500`
-  ("LLM request failed" and "Trigger execution failed"), so a caller could not tell a wrong key
-  from a provider that failed for its own reasons. They now answer `502` with the same error code
-  and the same body the `/api/v1` chat routes answer, naming the provider and the upstream status.
-  The answer never carries the upstream body or the key. A provider failure that is not a rejected
-  credential is still a `500`.
-
-- **A memory write reports a rejected embedding key.** The store degraded every embedding failure
-  to a note without a vector, so a wrong embedding key let every write succeed silently without
-  semantic search. A provider that rejects the credential now reaches the caller. The answer to
-  `POST /api/v1/memory` is `502 provider_auth_failed`, and the note is not stored. The
-  `memory_store` agent tool returns an error and saves nothing, where it used to save the note
-  without a vector. An embedding outage that is not a rejected credential still degrades to a note
-  without a vector, as before.
+- **A provider's rejected key answers `502 provider_auth_failed` on the chat routes, the `POST /webhook` and `POST /triggers/{path}` doors, the KB search, ingest (for a rejected embedding key only) and re-extract routes, the `POST /api/v1/memory` write, and the cron run of an agent job.** The webhook and trigger doors answered `500` before, so a caller could not tell a wrong key from a provider that failed for its own reasons. The chat and cron answers name the provider id and the upstream status, the KB answers name only the service, and no answer carries the upstream body or the key. A memory write with a rejected embedding key stores no note, and the `memory_store` agent tool returns an error where it used to save the note without a vector. An embedding outage that is not a rejected credential still degrades to a note without a vector. Memory search (`GET /api/v1/memory?q=`) keeps keyword-only results with `200` by design, because a failed recall would read as "the agent has no memory".
 
 - **`PUT /api/v1/config/knowledge` uses the probe of `kb enable`.** The probe refuses the request
   with `400` when the embedding endpoint answers with an error status, such as a rejected key, when

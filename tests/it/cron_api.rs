@@ -235,6 +235,46 @@ async fn cron_run_honours_an_operator_supplied_approval() {
     );
 }
 
+/// A shell job that fails when run answers `200 {success:false, output}`, not a
+/// 502. Only an agent job's rejected provider key answers 502.
+#[tokio::test]
+async fn a_failing_shell_job_run_still_answers_200_with_success_false() {
+    let ws = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(ws.path());
+    cfg.autonomy.allowed_commands = vec!["touch".into()];
+    let base = spawn_test_gateway(cfg).await;
+    let client = reqwest::Client::new();
+
+    let created: serde_json::Value = client
+        .post(format!("{base}/api/v1/cron"))
+        .bearer_auth(TEST_TOKEN)
+        .json(&serde_json::json!({
+            "schedule": { "kind": "cron", "expr": "0 9 * * *" },
+            "command": "touch /nonexistent-dir-for-cron-run/marker"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+
+    let resp = client
+        .post(format!("{base}/api/v1/cron/{id}/run?approved=true"))
+        .bearer_auth(TEST_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+    assert_eq!(body["success"], false, "{body}");
+    assert!(body.get("output").is_some(), "{body}");
+    assert!(body.get("error").is_none(), "{body}");
+}
+
 /// Every mutating cron endpoint refuses while the cron feature switch is
 /// off, with the same words every other door uses. The read endpoints stay
 /// open, so an operator can still inspect dormant jobs.
