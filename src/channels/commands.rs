@@ -278,7 +278,8 @@ pub(crate) fn build_models_help_response(
     let _ = writeln!(
         response,
         "Current provider: `{}`\nCurrent model: `{}`",
-        current.provider, current.model
+        providers::without_userinfo_and_query(&current.provider),
+        current.model
     );
     if access.may_switch_route() {
         let _ = writeln!(response, "\nSwitch model with `{prefix}model <model-id>`.");
@@ -286,10 +287,11 @@ pub(crate) fn build_models_help_response(
 
     let cached_models = routing::load_cached_model_preview(workspace_dir, &current.provider);
     if cached_models.is_empty() {
+        let provider = providers::without_userinfo_and_query(&current.provider);
         let _ = writeln!(
             response,
             "\nNo cached model list found for `{}`. Ask the operator to run `rantaiclaw models refresh --provider {}`.",
-            current.provider, current.provider
+            provider, provider
         );
     } else {
         let _ = writeln!(
@@ -314,7 +316,8 @@ pub(crate) fn build_providers_help_response(
     let _ = writeln!(
         response,
         "Current provider: `{}`\nCurrent model: `{}`",
-        current.provider, current.model
+        providers::without_userinfo_and_query(&current.provider),
+        current.model
     );
     if access.may_switch_route() {
         let _ = writeln!(
@@ -350,6 +353,7 @@ pub(crate) fn build_providers_help_response(
 /// in a group one member typed `/model`, the model changed for everybody, and
 /// the bot then told them the change was theirs alone.
 fn provider_switched_message(provider: &str, model: &str, prefix: &str) -> String {
+    let provider = providers::without_userinfo_and_query(provider);
     format!(
         "Provider switched to `{provider}` for this conversation. In a group chat that applies \
          to everyone here. Current model is `{model}`.\nUse `{prefix}model <model-id>` to set a \
@@ -360,6 +364,7 @@ fn provider_switched_message(provider: &str, model: &str, prefix: &str) -> Strin
 /// The reply to a successful `/model <model-id>`. Same scope, same reason as
 /// [`provider_switched_message`].
 fn model_switched_message(model: &str, provider: &str) -> String {
+    let provider = providers::without_userinfo_and_query(provider);
     format!(
         "Model switched to `{model}` for provider `{provider}` in this conversation. In a group \
          chat that applies to everyone here."
@@ -496,15 +501,20 @@ pub(crate) async fn handle_runtime_command_if_needed(
                             provider_switched_message(&provider_name, &current.model, prefix)
                         }
                         Err(err) => {
-                            let safe_err = providers::sanitize_api_error(&err.to_string());
+                            // URLs leave before the length cut, so the cut cannot leave half of one.
+                            let safe_err = providers::sanitize_api_error(
+                                &crate::logging::redact_urls(&err.to_string()),
+                            );
                             format!(
-                            "Failed to initialize provider `{provider_name}`. Route unchanged.\nDetails: {safe_err}"
+                            "Failed to initialize provider `{}`. Route unchanged.\nDetails: {safe_err}",
+                            providers::without_userinfo_and_query(&provider_name)
                         )
                         }
                     }
                 }
                 None => format!(
-                    "Unknown provider `{raw_provider}`. Use `{prefix}models` to list valid providers."
+                    "Unknown provider `{}`. Use `{prefix}models` to list valid providers.",
+                    providers::without_userinfo_and_query(&raw_provider)
                 ),
             }
         }
@@ -606,6 +616,47 @@ mod tests {
 
         let model = model_switched_message("claude-opus-5", "anthropic");
         assert!(model.contains("`claude-opus-5`") && model.contains("`anthropic`"));
+    }
+
+    /// A custom provider id can carry an endpoint URL with userinfo and a
+    /// query. The reply names the provider, so it must show neither.
+    #[test]
+    fn a_switch_reply_omits_the_endpoint_userinfo_and_query() {
+        let id = "custom:https://user:secret@example.com/v1?key=abc";
+        for reply in [
+            provider_switched_message(id, "m", "/"),
+            model_switched_message("m", id),
+        ] {
+            assert!(
+                !reply.contains("secret") && !reply.contains("key=abc"),
+                "the reply carries the endpoint userinfo or query: {reply}"
+            );
+            assert!(reply.contains("example.com/v1"), "{reply}");
+        }
+    }
+
+    /// With no cached model list, the `/models` reply names the current provider
+    /// twice, in the line and in the refresh hint. Both mentions drop the
+    /// endpoint userinfo and query.
+    #[test]
+    fn a_models_reply_without_cached_list_omits_the_endpoint_userinfo_and_query() {
+        let owner = CommandAccess {
+            sender_is_owner: true,
+            is_direct: true,
+        };
+        let current = ChannelRouteSelection {
+            provider: "custom:https://user:secret@example.com/v1?key=abc".to_string(),
+            model: "m".to_string(),
+        };
+        let workspace = tempfile::TempDir::new().expect("temp workspace");
+
+        let reply = build_models_help_response(&current, workspace.path(), "/", owner);
+
+        assert!(
+            !reply.contains("secret") && !reply.contains("key=abc"),
+            "the reply carries the endpoint userinfo or query: {reply}"
+        );
+        assert!(reply.contains("example.com/v1"), "{reply}");
     }
 
     /// Guards the file rather than the two functions: a third command added

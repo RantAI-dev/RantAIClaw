@@ -263,7 +263,8 @@ impl GeminiProvider {
         let response = self
             .build_generate_content_request(&url, &request)?
             .send()
-            .await?;
+            .await
+            .map_err(|e| e.without_url())?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -383,8 +384,10 @@ impl Provider for GeminiProvider {
         self.http_client()
             .get(&url)
             .send()
-            .await?
-            .error_for_status()?;
+            .await
+            .map_err(|e| e.without_url())?
+            .error_for_status()
+            .map_err(|e| e.without_url())?;
         Ok(())
     }
 }

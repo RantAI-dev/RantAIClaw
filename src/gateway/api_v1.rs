@@ -176,7 +176,11 @@ fn err_500(e: anyhow::Error) -> (StatusCode, Json<ErrorBody>) {
     // handlers already scrub separately, and scrubbing twice is idempotent.
     let full = format!("{e:#}");
     tracing::error!(error = %full, "api_v1 internal error");
-    let detail = crate::providers::sanitize_api_error(&redact_profile_paths(&full));
+    // URL userinfo and query come out before `sanitize_api_error` cuts the text
+    // to its length bound, so a cut cannot leave part of a credential behind.
+    let detail = crate::providers::sanitize_api_error(&crate::logging::redact_urls(
+        &redact_profile_paths(&full),
+    ));
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(ErrorBody {
@@ -216,23 +220,25 @@ pub(crate) fn redact_profile_paths(s: &str) -> String {
 }
 
 fn err_404(msg: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
+    let msg: String = msg.into();
     (
         StatusCode::NOT_FOUND,
         Json(ErrorBody {
             error: "not_found".into(),
             matches: None,
-            detail: Some(msg.into()),
+            detail: Some(crate::logging::redact_urls(&msg)),
         }),
     )
 }
 
 fn err_400(msg: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
+    let msg: String = msg.into();
     (
         StatusCode::BAD_REQUEST,
         Json(ErrorBody {
             error: "bad_request".into(),
             matches: None,
-            detail: Some(msg.into()),
+            detail: Some(crate::logging::redact_urls(&msg)),
         }),
     )
 }
@@ -280,16 +286,19 @@ fn classify_turn_failure(error: &anyhow::Error) -> TurnFailure {
             .downcast_ref::<crate::agent::NoModelConfigured>()
             .is_some()
     }) {
-        return TurnFailure::Client(crate::providers::sanitize_api_error(&format!("{error:#}")));
+        return TurnFailure::Client(crate::providers::sanitize_api_error(
+            &crate::logging::redact_urls(&format!("{error:#}")),
+        ));
     }
     // A provider name the factory does not know follows from the config
-    // alone: the caller has to name a provider that exists.
+    // alone: the caller has to name a provider that exists. The name is
+    // caller text, so URL userinfo and query come out of it first.
     if let Some(config_error) = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<crate::providers::ProviderConfigError>())
     {
         return TurnFailure::Client(crate::providers::scrub_secret_patterns(
-            &config_error.to_string(),
+            &crate::logging::redact_urls(&config_error.to_string()),
         ));
     }
     // A refusal decided before anything was sent: the sentence names what to
@@ -303,7 +312,11 @@ fn classify_turn_failure(error: &anyhow::Error) -> TurnFailure {
     if let Some(sentence) = crate::providers::provider_auth_failure_sentence(error) {
         return TurnFailure::ProviderAuth(crate::providers::scrub_secret_patterns(&sentence));
     }
-    TurnFailure::Server(crate::providers::sanitize_api_error(&format!("{error:#}")))
+    // URL userinfo and query come out before the length bound cuts the text,
+    // so a cut cannot leave part of a credential behind.
+    TurnFailure::Server(crate::providers::sanitize_api_error(
+        &crate::logging::redact_urls(&format!("{error:#}")),
+    ))
 }
 
 /// `502` for a provider that rejected the credential it was sent.
@@ -311,12 +324,13 @@ fn classify_turn_failure(error: &anyhow::Error) -> TurnFailure {
 /// A bad gateway, not a 500: the gateway worked and the upstream refused it. The
 /// code is its own, so the console can tell the operator to fix the key.
 fn err_provider_auth_failed(msg: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
+    let msg: String = msg.into();
     (
         StatusCode::BAD_GATEWAY,
         Json(ErrorBody {
             error: crate::providers::PROVIDER_AUTH_FAILED.into(),
             matches: None,
-            detail: Some(msg.into()),
+            detail: Some(crate::logging::redact_urls(&msg)),
         }),
     )
 }
@@ -357,23 +371,25 @@ fn map_agent_error(e: anyhow::Error) -> (StatusCode, Json<ErrorBody>) {
 /// content routes for a skill someone else manages: 404 would be a lie, since
 /// the same caller can list and read its metadata.
 fn err_403(msg: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
+    let msg: String = msg.into();
     (
         StatusCode::FORBIDDEN,
         Json(ErrorBody {
             error: "forbidden".into(),
             matches: None,
-            detail: Some(msg.into()),
+            detail: Some(crate::logging::redact_urls(&msg)),
         }),
     )
 }
 
 fn err_409(msg: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
+    let msg: String = msg.into();
     (
         StatusCode::CONFLICT,
         Json(ErrorBody {
             error: "conflict".into(),
             matches: None,
-            detail: Some(msg.into()),
+            detail: Some(crate::logging::redact_urls(&msg)),
         }),
     )
 }
@@ -3158,8 +3174,11 @@ async fn provider_models_refresh(
         "age_secs": cat.age_secs,
         "count": count,
         "refreshed": refresh_err.is_none(),
-        "detail": refresh_err
-            .map(|e| crate::providers::scrub_secret_patterns(&format!("{e:#}"))),
+        // The chain can carry the caller's `custom:` id with its userinfo and
+        // query, so the URLs in it are redacted as well as the token patterns.
+        "detail": refresh_err.map(|e| {
+            crate::logging::redact_urls(&crate::providers::scrub_secret_patterns(&format!("{e:#}")))
+        }),
     })))
 }
 
@@ -4014,6 +4033,125 @@ mod tests {
         let detail = body["detail"].as_str().expect("detail text");
         assert!(detail.contains("401"), "detail: {detail}");
         assert!(!detail.contains("MARKER_VALUE"), "detail: {detail}");
+    }
+
+    /// A port nothing listens on: bind, note the port, release it.
+    fn closed_loopback_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind a loopback port")
+            .local_addr()
+            .expect("local address")
+            .port()
+    }
+
+    /// In-memory `tracing` sink for the refresh tests.
+    #[derive(Clone, Default)]
+    struct RefreshLogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl RefreshLogBuffer {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().expect("buffer lock").clone()).expect("utf-8 log")
+        }
+    }
+
+    impl std::io::Write for RefreshLogBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("buffer lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for RefreshLogBuffer {
+        type Writer = Self;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// A configured `custom:` endpoint whose host is down fails its refresh.
+    /// The warning log and the response detail may name the endpoint, but
+    /// never its userinfo or its query string.
+    #[tokio::test]
+    async fn provider_models_refresh_log_and_detail_drop_the_id_userinfo_and_query() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _no_proxy = loopback_no_proxy();
+        let provider_id = format!(
+            "custom:http://user:secret@127.0.0.1:{}/v1?key=abc",
+            closed_loopback_port()
+        );
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let state = test_state();
+        {
+            let mut config = state.config.lock();
+            config.workspace_dir = workspace.path().to_path_buf();
+            config
+                .provider_api_keys
+                .insert(provider_id.clone(), "stored-key-for-test-0000".into());
+        }
+        let logs = RefreshLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(crate::logging::RedactingMakeWriter::new(logs.clone()))
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .finish();
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let Json(body) = provider_models_refresh(State(state), HeaderMap::new(), Path(provider_id))
+            .await
+            .expect("a failed refresh is still a 200");
+
+        assert_eq!(body["refreshed"], false, "body: {body}");
+        let log = logs.contents();
+        assert!(
+            log.contains("model refresh failed"),
+            "the warning reached the captured log: {log}"
+        );
+        let detail = body["detail"].as_str().expect("detail text");
+        for (surface, text) in [
+            ("log", log.as_str()),
+            ("detail", detail),
+            ("body", &body.to_string()),
+        ] {
+            assert!(!text.contains("secret"), "{surface} names userinfo: {text}");
+            assert!(
+                !text.contains("key=abc"),
+                "{surface} names the query: {text}"
+            );
+        }
+    }
+
+    /// Control for the test above: a plain id is logged as it is, so the scrub
+    /// removes only what is secret. `gemini` refuses before any request when no
+    /// key is set, which keeps the test off the network.
+    #[tokio::test]
+    async fn provider_models_refresh_log_names_a_plain_provider_id() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let state = test_state();
+        state.config.lock().workspace_dir = workspace.path().to_path_buf();
+        let logs = RefreshLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(crate::logging::RedactingMakeWriter::new(logs.clone()))
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .finish();
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let Json(body) =
+            provider_models_refresh(State(state), HeaderMap::new(), Path("gemini".to_string()))
+                .await
+                .expect("a failed refresh is still a 200");
+
+        assert_eq!(body["refreshed"], false, "body: {body}");
+        let log = logs.contents();
+        assert!(log.contains("provider=gemini"), "log: {log}");
     }
 
     #[tokio::test]
@@ -9938,5 +10076,110 @@ mod tests {
             reply_anchor: None,
             is_direct: false,
         }
+    }
+
+    /// Every shared error constructor that takes caller text scrubs a raw
+    /// provider id before the body is serialized: no userinfo, no query
+    /// string, and the host stays. The test loops over all of them, so
+    /// removing the scrub from any one of them fails here.
+    #[tokio::test]
+    async fn error_bodies_drop_userinfo_and_query_from_a_raw_provider_id() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        // `err_500` reads the active profile to redact its paths; a temp home
+        // keeps that read off the operator's real config.
+        let _restore = HomeGuard::set(tmp.path());
+
+        let raw = "custom:https://user:secret@host/v1?key=abc";
+        let bodies = [
+            ("err_400", err_400(raw)),
+            ("err_404", err_404(raw)),
+            ("err_403", err_403(raw)),
+            ("err_409", err_409(raw)),
+            ("err_500", err_500(anyhow::anyhow!("{raw}"))),
+            ("err_provider_auth_failed", err_provider_auth_failed(raw)),
+        ];
+        for (name, (_status, Json(body))) in bodies {
+            let wire = serde_json::to_string(&body).expect("serialize error body");
+            assert!(!wire.contains("secret"), "{name} leaked userinfo: {wire}");
+            assert!(!wire.contains("key=abc"), "{name} leaked the query: {wire}");
+            assert!(wire.contains("host/v1"), "{name} dropped the host: {wire}");
+        }
+    }
+
+    /// A URL whose userinfo straddles the 200-character length bound must not
+    /// leave a partial credential in the body. The URL is redacted whole before
+    /// the text is cut, so the cut never sees a half-written userinfo.
+    #[tokio::test]
+    async fn turn_failure_body_redacts_a_url_cut_by_the_length_limit() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+
+        // 177 filler characters and `custom:` put `https://` at character 184.
+        // `user:sec` then ends at character 200, so the cut lands inside the
+        // userinfo.
+        let text = format!(
+            "{}custom:https://user:secret@host/v1?key=abc",
+            "x".repeat(177)
+        );
+        let (_status, Json(body)) = map_agent_error(anyhow::anyhow!("{text}"));
+        let detail = body.detail.unwrap_or_default();
+        assert!(!detail.contains("secret"), "leaked userinfo: {detail}");
+        assert!(!detail.contains("key=abc"), "leaked the query: {detail}");
+        assert!(
+            !detail.contains("user:sec"),
+            "leaked a partial userinfo: {detail}"
+        );
+    }
+
+    /// A provider name that carries a URL with userinfo and a query goes back to
+    /// the client as message text, so the text carries neither part.
+    #[test]
+    fn turn_failure_text_redacts_an_unknown_provider_name() {
+        let error = anyhow::Error::new(crate::providers::ProviderConfigError::UnknownProvider {
+            name: "foo:https://user:secret@host/v1?key=abc".to_string(),
+            guidance: "Run `rantaiclaw providers` to list them.".to_string(),
+        });
+
+        let failure = classify_turn_failure(&error);
+        let text = failure.text();
+
+        assert!(
+            !text.contains("secret"),
+            "userinfo reached the client: {text}"
+        );
+        assert!(
+            !text.contains("key=abc"),
+            "query reached the client: {text}"
+        );
+        assert!(text.contains("host/v1"), "host was removed: {text}");
+    }
+
+    /// The factory cuts an unknown name at 64 characters. The name is 40 `p`
+    /// characters and then a URL with userinfo, so the cut lands inside the
+    /// password. Userinfo must come out before the cut, or the kept part
+    /// carries `user:sec` past the redactor.
+    #[test]
+    fn turn_failure_text_redacts_a_name_cut_by_the_length_bound() {
+        let name = format!(
+            "{}custom:https://user:secretpassword@host/v1",
+            "p".repeat(40)
+        );
+        let error = crate::providers::create_provider(&name, None)
+            .err()
+            .expect("an unknown provider name is refused");
+
+        let failure = classify_turn_failure(&error);
+        let text = failure.text();
+
+        assert!(
+            !text.contains("secret"),
+            "userinfo reached the client: {text}"
+        );
+        assert!(
+            !text.contains("user:sec"),
+            "a cut inside userinfo reached the client: {text}"
+        );
     }
 }

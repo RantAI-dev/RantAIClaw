@@ -361,6 +361,7 @@ pub(crate) fn provider_init_failure_message(
     safe_err: &str,
     prefix: &str,
 ) -> String {
+    let provider = providers::without_userinfo_and_query(provider);
     format!(
         "⚠️ Failed to initialize provider `{provider}`. Please run `{prefix}models` to choose \
          another provider.\nDetails: {safe_err}"
@@ -1067,7 +1068,9 @@ pub(crate) async fn process_channel_message(
     {
         Ok(provider) => provider,
         Err(err) => {
-            let safe_err = providers::sanitize_api_error(&err.to_string());
+            // URLs leave before the length cut, so the cut cannot leave half of one.
+            let safe_err =
+                providers::sanitize_api_error(&crate::logging::redact_urls(&err.to_string()));
             let message = provider_init_failure_message(
                 &route.provider,
                 &safe_err,
@@ -1805,7 +1808,9 @@ pub(crate) async fn process_channel_message(
                 &history_key,
                 ChatMessage::assistant(FAILED_TURN_MARKER),
             );
-            let safe_err = providers::sanitize_api_error(&format!("{e:#}"));
+            // URLs leave before the length cut, so the cut cannot leave half of one.
+            let safe_err =
+                providers::sanitize_api_error(&crate::logging::redact_urls(&format!("{e:#}")));
             let reply = with_noted_line(format!("⚠️ Error: {safe_err}"), &saved_notes);
             sender_text
                 .end_failed_turn(

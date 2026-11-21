@@ -1,4 +1,5 @@
 use super::traits::{Observer, ObserverEvent, ObserverMetric};
+use crate::providers::provider_auth::without_userinfo_and_query;
 use opentelemetry::metrics::{Counter, Gauge, Histogram};
 use opentelemetry::trace::{Span, SpanKind, Status, Tracer};
 use opentelemetry::{global, KeyValue};
@@ -179,7 +180,7 @@ impl Observer for OtelObserver {
                 self.agent_starts.add(
                     1,
                     &[
-                        KeyValue::new("provider", provider.clone()),
+                        KeyValue::new("provider", without_userinfo_and_query(provider)),
                         KeyValue::new("model", model.clone()),
                     ],
                 );
@@ -196,7 +197,7 @@ impl Observer for OtelObserver {
             } => {
                 let secs = duration.as_secs_f64();
                 let attrs = [
-                    KeyValue::new("provider", provider.clone()),
+                    KeyValue::new("provider", without_userinfo_and_query(provider)),
                     KeyValue::new("model", model.clone()),
                     KeyValue::new("success", success.to_string()),
                 ];
@@ -212,7 +213,7 @@ impl Observer for OtelObserver {
                         .with_kind(SpanKind::Internal)
                         .with_start_time(start_time)
                         .with_attributes(vec![
-                            KeyValue::new("provider", provider.clone()),
+                            KeyValue::new("provider", without_userinfo_and_query(provider)),
                             KeyValue::new("model", model.clone()),
                             KeyValue::new("success", *success),
                             KeyValue::new("duration_s", secs),
@@ -243,7 +244,7 @@ impl Observer for OtelObserver {
                         .with_kind(SpanKind::Internal)
                         .with_start_time(start_time)
                         .with_attributes(vec![
-                            KeyValue::new("provider", provider.clone()),
+                            KeyValue::new("provider", without_userinfo_and_query(provider)),
                             KeyValue::new("model", model.clone()),
                             KeyValue::new("duration_s", secs),
                         ]),
@@ -259,7 +260,7 @@ impl Observer for OtelObserver {
                 self.agent_duration.record(
                     secs,
                     &[
-                        KeyValue::new("provider", provider.clone()),
+                        KeyValue::new("provider", without_userinfo_and_query(provider)),
                         KeyValue::new("model", model.clone()),
                     ],
                 );

@@ -36,7 +36,6 @@ use anyhow::{bail, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use std::io::{IsTerminal, Write};
 use tracing::info;
-use tracing_subscriber::fmt;
 
 /// The model label the TUI starts with, for `rantaiclaw chat`.
 ///
@@ -1190,25 +1189,11 @@ async fn main() -> Result<()> {
         None
     };
 
-    if let Some(file) = log_file {
-        let subscriber = fmt::Subscriber::builder()
-            .with_env_filter(env_filter)
-            .with_writer(std::sync::Mutex::new(file))
-            .with_ansi(false)
-            .finish();
-        tracing::subscriber::set_global_default(subscriber)
-            .expect("setting default subscriber failed");
-    } else {
-        // Non-TTY (piped/CI) or `RANTAICLAW_LOG_STDERR=1`: write logs to stderr so
-        // stdout stays clean for piped/scripted output. `fmt`'s default writer is
-        // stdout, which would otherwise corrupt piped command output.
-        let subscriber = fmt::Subscriber::builder()
-            .with_env_filter(env_filter)
-            .with_writer(std::io::stderr)
-            .finish();
-        tracing::subscriber::set_global_default(subscriber)
-            .expect("setting default subscriber failed");
-    }
+    // Without a log file (non-TTY, piped/CI, or `RANTAICLAW_LOG_STDERR=1`) the
+    // subscriber writes to stderr, so stdout stays clean for piped output.
+    // `build_subscriber` owns both writers and their redaction.
+    let subscriber = rantaiclaw::logging::build_subscriber(env_filter, log_file);
+    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
     // ── Wave-3 Setup orchestrator ───────────────────────────────────
     //
@@ -2130,6 +2115,15 @@ async fn main() -> Result<()> {
             .await
         {
             Ok(code) => std::process::exit(code),
+            Err(rantaiclaw::kb::KbError::Http(e)) => {
+                // The upstream's URL stays out of stdout; the cause goes to the log.
+                tracing::warn!(target: "kb::cli", error = %e, "upstream request failed");
+                println!(
+                    "error[1]{{code,message}}:\n  {}",
+                    rantaiclaw::kb::axi::cli::upstream_unreachable_line()
+                );
+                std::process::exit(1);
+            }
             Err(e) => {
                 println!("error[1]{{code,message}}:\n  internal,{e}");
                 std::process::exit(1);

@@ -1,4 +1,5 @@
 use super::traits::{Observer, ObserverEvent, ObserverMetric};
+use crate::providers::provider_auth::without_userinfo_and_query;
 use std::any::Any;
 
 /// Human-readable progress observer for interactive CLI sessions.
@@ -24,7 +25,9 @@ impl Observer for VerboseObserver {
                 eprintln!("> Thinking");
                 eprintln!(
                     "> Send (provider={}, model={}, messages={})",
-                    provider, model, messages_count
+                    without_userinfo_and_query(provider),
+                    model,
+                    messages_count
                 );
             }
             ObserverEvent::LlmResponse {

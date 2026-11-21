@@ -265,11 +265,11 @@ impl ProviderCapabilityError {
         match self.capability.as_str() {
             "vision" => format!(
                 "The current provider ({}) cannot read images. Send `{}model <id>` to switch to a vision-capable model.",
-                self.provider, prefix,
+                crate::providers::without_userinfo_and_query(&self.provider), prefix,
             ),
             other => format!(
                 "The current provider ({}) does not support {}. Send `{}model <id>` to switch.",
-                self.provider, other, prefix,
+                crate::providers::without_userinfo_and_query(&self.provider), other, prefix,
             ),
         }
     }

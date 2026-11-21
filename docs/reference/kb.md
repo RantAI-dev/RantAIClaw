@@ -212,6 +212,7 @@ Errors from a document upload or a search, by who can fix them:
 - `unprocessable_document` (422) — the extractor read the file and could not make sense of it, for example a corrupt PDF. Send a different file.
 - `extractor_unavailable` (502) — the extractor service the document went to (MinerU, an OCR or vision endpoint) is down or answered with an error. The document may be fine; retry later. The answer names the extractor and leaves out what the upstream wrote.
 - `embedding_upstream` (502) / `chat_upstream` (502) — the embedding or chat endpoint answered with an error status.
+- `upstream_unreachable` (502) — the embedding or chat endpoint did not answer: the request failed before any response arrived. The answer reads "the upstream model service did not answer; check its base URL and that it is running".
 - `dimension_mismatch` (409) — a vector's size disagrees with the size the store was created with, for example because the embedding model changed. The answer reads "expected N, got M". Set `KB_EMBEDDING_DIM` to the store's size, or start a new database.
 
 

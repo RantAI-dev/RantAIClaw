@@ -436,7 +436,9 @@ pub fn scrub_secret_patterns(input: &str) -> String {
 
 /// Sanitize API error text by scrubbing secrets and truncating length.
 pub fn sanitize_api_error(input: &str) -> String {
-    let scrubbed = scrub_secret_patterns(input);
+    // Redact URLs before truncating: a URL cut at the limit loses its `@`,
+    // and the log writer would then pass the start of its password through.
+    let scrubbed = scrub_secret_patterns(&crate::logging::redact_urls(input));
 
     if scrubbed.chars().count() <= MAX_API_ERROR_CHARS {
         return scrubbed;
@@ -525,6 +527,10 @@ pub fn local_refusal_text(error: &anyhow::Error) -> Option<&str> {
 
 /// The code a surface reports when a provider rejects the credential.
 pub use provider_auth::PROVIDER_AUTH_FAILED;
+
+/// Strips the userinfo and query from a provider id before the id is printed,
+/// logged or answered. The binary's CLI output reaches it through this path.
+pub use provider_auth::without_userinfo_and_query;
 
 /// What happened when a provider rejected the credential `error` ends in:
 /// the provider id and the upstream status, no credential and no upstream
@@ -1102,7 +1108,12 @@ fn create_provider_with_url_and_options(
         // A name no factory knows follows from the config file alone, so it is
         // a `ProviderConfigError`: a caller may treat it as fatal.
         _ => Err(ProviderConfigError::UnknownProvider {
-            name: bounded_name(name, MAX_UNKNOWN_PROVIDER_NAME_CHARS),
+            // Userinfo and query come out before the cut. A cut inside a
+            // password would leave text the redactor cannot match.
+            name: bounded_name(
+                &without_userinfo_and_query(name),
+                MAX_UNKNOWN_PROVIDER_NAME_CHARS,
+            ),
             guidance: "Check README for supported providers or run `rantaiclaw onboard --interactive` to reconfigure.\n\
              Tip: Use \"custom:https://your-api.com\" for OpenAI-compatible endpoints.\n\
              Tip: Use \"anthropic-custom:https://your-api.com\" for Anthropic-compatible endpoints."
@@ -2925,6 +2936,20 @@ pub(crate) mod tests {
         let input = format!("{} sk-abcdef123456 {}", "a".repeat(190), "b".repeat(190));
         let result = sanitize_api_error(&input);
         assert!(!result.contains("sk-abcdef123456"));
+        assert!(result.len() <= 203);
+    }
+
+    /// A URL that straddles the length limit is redacted before the cut, so
+    /// no prefix of its password survives the truncation.
+    #[test]
+    fn sanitize_redacts_a_url_before_truncating_it() {
+        let input = format!(
+            "{} https://user:secretpassword@host/v1?key=abc tail",
+            "a".repeat(180)
+        );
+        let result = sanitize_api_error(&input);
+        assert!(!result.contains("user:"), "{result}");
+        assert!(!result.contains("secret"), "{result}");
         assert!(result.len() <= 203);
     }
 

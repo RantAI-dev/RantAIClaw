@@ -57,28 +57,45 @@ pub(crate) fn provider_auth_failure(error: &anyhow::Error) -> Option<&ProviderAu
 
 /// `id` with the `user:password@` part of a URL authority and any query or
 /// fragment removed. An id that is not a URL comes back as it was.
-pub(crate) fn without_userinfo_and_query(id: &str) -> String {
-    let id = id.split(['?', '#']).next().unwrap_or(id);
+pub fn without_userinfo_and_query(id: &str) -> String {
+    // Userinfo goes first, up to the last `@` before the first `/`, so a `?`
+    // or `#` inside a password is removed with the password. The query and
+    // fragment go after that.
+    let cut_query = |s: &str| s.split(['?', '#']).next().unwrap_or(s).to_string();
     let Some(scheme_end) = id.find("://") else {
-        return id.to_string();
+        return cut_query(id);
     };
     let authority_start = scheme_end + "://".len();
     let rest = &id[authority_start..];
     let authority_len = rest.find('/').unwrap_or(rest.len());
-    match rest[..authority_len].rfind('@') {
-        Some(at) => format!(
-            "{}{}{}",
-            &id[..authority_start],
-            &rest[at + 1..authority_len],
-            &rest[authority_len..]
-        ),
-        None => id.to_string(),
-    }
+    let host_start = rest[..authority_len].rfind('@').map_or(0, |at| at + 1);
+    cut_query(&format!(
+        "{}{}",
+        &id[..authority_start],
+        &rest[host_start..]
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_id_whose_password_holds_a_question_mark_or_hash_loses_the_whole_password() {
+        assert_eq!(
+            without_userinfo_and_query("custom:https://u:pa?ss@h/v1?key=abc"),
+            "custom:https://h/v1"
+        );
+        assert_eq!(
+            without_userinfo_and_query("custom:https://u:pa#ss@h/v1"),
+            "custom:https://h/v1"
+        );
+        assert_eq!(without_userinfo_and_query("openrouter"), "openrouter");
+        assert_eq!(
+            without_userinfo_and_query("custom:https://h/v1?key=abc"),
+            "custom:https://h/v1"
+        );
+    }
 
     #[test]
     fn the_text_names_the_code_the_provider_and_the_status() {

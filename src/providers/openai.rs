@@ -321,7 +321,8 @@ impl Provider for OpenAiProvider {
             .header("Authorization", format!("Bearer {credential}"))
             .json(&request)
             .send()
-            .await?;
+            .await
+            .map_err(|e| e.without_url())?;
 
         if !response.status().is_success() {
             return Err(super::api_error("OpenAI", response).await);
@@ -362,7 +363,8 @@ impl Provider for OpenAiProvider {
             .header("Authorization", format!("Bearer {credential}"))
             .json(&native_request)
             .send()
-            .await?;
+            .await
+            .map_err(|e| e.without_url())?;
 
         if !response.status().is_success() {
             return Err(super::api_error("OpenAI", response).await);
@@ -419,7 +421,8 @@ impl Provider for OpenAiProvider {
             .header("Authorization", format!("Bearer {credential}"))
             .json(&native_request)
             .send()
-            .await?;
+            .await
+            .map_err(|e| e.without_url())?;
 
         if !response.status().is_success() {
             return Err(super::api_error("OpenAI", response).await);
@@ -441,8 +444,10 @@ impl Provider for OpenAiProvider {
                 .get(format!("{}/models", self.base_url))
                 .header("Authorization", format!("Bearer {credential}"))
                 .send()
-                .await?
-                .error_for_status()?;
+                .await
+                .map_err(|e| e.without_url())?
+                .error_for_status()
+                .map_err(|e| e.without_url())?;
         }
         Ok(())
     }

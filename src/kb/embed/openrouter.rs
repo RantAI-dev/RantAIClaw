@@ -135,7 +135,7 @@ pub(in crate::kb::embed) async fn embed_via_http(
             Ok(r) => r,
             Err(e) => {
                 // Network/transport errors mirror TS catch — retry up to MAX.
-                last_err = Some(KbError::Http(e));
+                last_err = Some(KbError::from(e));
                 if attempt < MAX_RETRIES {
                     sleep(backoff_for(attempt)).await;
                     continue;
@@ -306,5 +306,42 @@ fn truncate(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         format!("{}…", &s[..max])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::embed_via_http;
+    use reqwest::Client;
+    use serde_json::json;
+
+    /// A transport failure from the embedding endpoint names no URL. The
+    /// embedder's error is what the API logs and the CLI reports, and an
+    /// endpoint can carry userinfo or a query key.
+    #[tokio::test]
+    async fn embed_transport_failure_names_no_endpoint_url() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind a loopback port")
+            .local_addr()
+            .expect("local address")
+            .port();
+        let url = format!("http://user:secret@127.0.0.1:{port}/v1/embeddings?key=abc");
+        let client = Client::builder().no_proxy().build().expect("client");
+
+        let err = embed_via_http(
+            &client,
+            &url,
+            Some("test-key"),
+            &json!({ "input": ["probe"] }),
+            4,
+        )
+        .await
+        .expect_err("nothing listens on the port");
+
+        let text = err.to_string();
+        assert!(
+            !text.contains("secret") && !text.contains("key=abc") && !text.contains("127.0.0.1"),
+            "the embedder error names the endpoint URL: {text}"
+        );
     }
 }

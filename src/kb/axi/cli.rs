@@ -1056,6 +1056,16 @@ async fn cmd_set_enabled(enabled: bool) -> KbResult<i32> {
     }
 }
 
+/// The row the CLI prints under `error[1]{code,message}:` when the upstream
+/// model service did not answer. The detail names the service without its URL,
+/// so the endpoint never reaches stdout.
+pub fn upstream_unreachable_line() -> String {
+    format!(
+        "upstream_unreachable,{}",
+        crate::kb::error::UPSTREAM_UNREACHABLE_DETAIL
+    )
+}
+
 fn print_error_toon(code: &str, message: &str) {
     let row = serde_json::json!({ "code": code, "message": message });
     print!(
@@ -1153,5 +1163,18 @@ mod tests {
         };
         let v: serde_json::Value = serde_json::from_str(&super::graph_to_json(&g)).unwrap();
         assert_eq!(v["edges"][0]["weight"], 3);
+    }
+
+    #[test]
+    fn upstream_unreachable_line_is_the_fixed_text_without_an_endpoint() {
+        let line = super::upstream_unreachable_line();
+        assert_eq!(
+            line,
+            "upstream_unreachable,the upstream model service did not answer; check its base URL and that it is running"
+        );
+        assert!(
+            !line.contains("://") && !line.contains("secret") && !line.contains("key=abc"),
+            "the CLI line names the endpoint: {line}"
+        );
     }
 }

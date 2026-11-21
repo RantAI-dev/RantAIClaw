@@ -509,7 +509,7 @@ impl Provider for AnthropicProvider {
 
         request = self.apply_auth(request, credential);
 
-        let response = request.send().await?;
+        let response = request.send().await.map_err(|e| e.without_url())?;
 
         if !response.status().is_success() {
             return Err(super::api_error("Anthropic", response).await);
@@ -550,7 +550,11 @@ impl Provider for AnthropicProvider {
             .header("content-type", "application/json")
             .json(&native_request);
 
-        let response = self.apply_auth(req, credential).send().await?;
+        let response = self
+            .apply_auth(req, credential)
+            .send()
+            .await
+            .map_err(|e| e.without_url())?;
         if !response.status().is_success() {
             return Err(super::api_error("Anthropic", response).await);
         }
@@ -619,7 +623,7 @@ impl Provider for AnthropicProvider {
             request = self.apply_auth(request, credential);
             // Send a minimal request; the goal is TLS + HTTP/2 setup, not a valid response.
             // Anthropic has no lightweight GET endpoint, so we accept any non-network error.
-            let _ = request.send().await?;
+            let _ = request.send().await.map_err(|e| e.without_url())?;
         }
         Ok(())
     }

@@ -6253,11 +6253,7 @@ fn install_tui_tracing() {
     // already installed it, so this is the common case.
     crate::logging::install_log_bridge();
     let filter = crate::logging::default_env_filter();
-    let subscriber = tracing_subscriber::fmt::Subscriber::builder()
-        .with_env_filter(filter)
-        .with_writer(std::sync::Mutex::new(file))
-        .with_ansi(false)
-        .finish();
+    let subscriber = crate::logging::build_subscriber(filter, Some(file));
 
     // `set_global_default` returns Err if a subscriber is already set; we
     // happily swallow that — main()'s subscriber would have been less
