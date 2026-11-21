@@ -279,30 +279,52 @@ fn next_url_start(rest: &[u8]) -> Option<usize> {
 /// without their query string or fragment. The scheme, the host and the path
 /// stay, so an operator still sees which endpoint failed. Userinfo goes first,
 /// up to the last `@` before the first `/`, so a `?` or `#` inside a password
-/// is removed with the password.
+/// is removed with the password. Two URLs joined without whitespace (`,`, `;`,
+/// `)(`) are redacted one after the other. Once a query or fragment starts,
+/// the rest of the token goes with it, including any URL inside the query
+/// (`?redirect=https://u:p@g/x&key=abc`). The loop is iterative and each byte
+/// is visited a bounded number of times, so a token full of `://` costs linear
+/// time and no stack.
 fn redact_url(scheme: &[u8], rest: &[u8]) -> Vec<u8> {
-    let (this, next) = match next_url_start(rest) {
-        Some(at) => rest.split_at(at),
-        None => (rest, &rest[rest.len()..]),
-    };
-    let (authority, path) = match this.iter().position(|&b| b == b'/') {
-        Some(slash) => this.split_at(slash),
-        None => (this, &this[this.len()..]),
-    };
-    let host = match authority.iter().rposition(|&b| b == b'@') {
-        Some(at) => &authority[at + 1..],
-        None => authority,
-    };
-    let query_at = |part: &[u8]| part.iter().position(|&b| b == b'?' || b == b'#');
-    let mut out = match query_at(host) {
-        Some(q) => [scheme, &host[..q]].concat(),
-        None => match query_at(path) {
-            Some(q) => [scheme, host, &path[..q]].concat(),
-            None => [scheme, host, path].concat(),
-        },
-    };
-    out.extend_from_slice(&redact_urls_in_bytes(next));
-    out
+    let mut out = Vec::with_capacity(scheme.len() + rest.len());
+    let mut scheme = scheme;
+    let mut rest = rest;
+    loop {
+        let (this, next) = match next_url_start(rest) {
+            Some(at) => rest.split_at(at),
+            None => (rest, &rest[rest.len()..]),
+        };
+        let (authority, path) = match this.iter().position(|&b| b == b'/') {
+            Some(slash) => this.split_at(slash),
+            None => (this, &this[this.len()..]),
+        };
+        let host = match authority.iter().rposition(|&b| b == b'@') {
+            Some(at) => &authority[at + 1..],
+            None => authority,
+        };
+        let query_at = |part: &[u8]| part.iter().position(|&b| b == b'?' || b == b'#');
+        out.extend_from_slice(scheme);
+        if let Some(q) = query_at(host) {
+            out.extend_from_slice(&host[..q]);
+            return out;
+        }
+        out.extend_from_slice(host);
+        if let Some(q) = query_at(path) {
+            out.extend_from_slice(&path[..q]);
+            return out;
+        }
+        out.extend_from_slice(path);
+        if next.is_empty() {
+            return out;
+        }
+        // `next` starts with a scheme that `next_url_start` found before `://`.
+        let sep = next
+            .windows(3)
+            .position(|w| w == b"://")
+            .expect("next_url_start points at a scheme followed by ://");
+        scheme = &next[..sep + 3];
+        rest = &next[sep + 3..];
+    }
 }
 
 /// Redacts every URL in `bytes` and returns the bytes otherwise unchanged.
@@ -659,8 +681,8 @@ mod tests {
     }
 
     /// Two URLs with no whitespace between them are two URLs: the second
-    /// loses its userinfo and query too. A separator glued to a query (`|`
-    /// after `?key=abc`) goes with the query.
+    /// loses its userinfo and query too. Everything after a query, here
+    /// `|http://v:y@k/z` after `?key=abc`, goes with the query.
     #[test]
     fn url_redaction_splits_urls_joined_without_whitespace() {
         let redacted = redact_urls(
@@ -672,7 +694,7 @@ mod tests {
         assert_eq!(
             redacted,
             "a custom:https://h/v1,custom:https://g/v1 b\n\
-             c https://h/x;https://g/yhttp://k/z d\n\
+             c https://h/x;https://g/y d\n\
              e (https://h/x)(https://g/y) f\n"
         );
         assert!(!redacted.contains("w:x") && !redacted.contains("v:y"));
@@ -691,6 +713,34 @@ mod tests {
             redacted,
             "a https://h/v1 b\nc https://h/v1 d\ne https://h b\n"
         );
+    }
+
+    /// A URL inside a query is part of the query and goes with it, so its
+    /// userinfo and the parameters after it never reach the log.
+    #[test]
+    fn url_redaction_drops_a_url_inside_a_query() {
+        let redacted = redact_urls(
+            "a https://h/v1?redirect=https://u:p@g/x&key=abc b\n\
+             c https://h/v1?cb=x://y&key=abc d\n\
+             e https://h/v1?key=abc#frag://x&k2=def f\n\
+             g https://h?r=https://u:p@g h\n",
+        );
+
+        assert_eq!(
+            redacted,
+            "a https://h/v1 b\nc https://h/v1 d\ne https://h/v1 f\ng https://h h\n"
+        );
+    }
+
+    /// A token packed with `://` is redacted without recursion, so a long
+    /// line cannot exhaust the stack of the thread that logs it.
+    #[test]
+    fn url_redaction_handles_a_token_with_thousands_of_schemes() {
+        let line = format!("a {} b\n", "x://u:p@h/".repeat(20_000));
+        let redacted = redact_urls(&line);
+
+        assert!(!redacted.contains("u:p"));
+        assert!(redacted.starts_with("a x://h/x://h/") && redacted.ends_with(" b\n"));
     }
 
     /// A flush between the two halves of a URL emits nothing: the writer keeps

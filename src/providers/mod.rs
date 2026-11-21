@@ -436,7 +436,9 @@ pub fn scrub_secret_patterns(input: &str) -> String {
 
 /// Sanitize API error text by scrubbing secrets and truncating length.
 pub fn sanitize_api_error(input: &str) -> String {
-    let scrubbed = scrub_secret_patterns(input);
+    // Redact URLs before truncating: a URL cut at the limit loses its `@`,
+    // and the log writer would then pass the start of its password through.
+    let scrubbed = scrub_secret_patterns(&crate::logging::redact_urls(input));
 
     if scrubbed.chars().count() <= MAX_API_ERROR_CHARS {
         return scrubbed;
@@ -2934,6 +2936,20 @@ pub(crate) mod tests {
         let input = format!("{} sk-abcdef123456 {}", "a".repeat(190), "b".repeat(190));
         let result = sanitize_api_error(&input);
         assert!(!result.contains("sk-abcdef123456"));
+        assert!(result.len() <= 203);
+    }
+
+    /// A URL that straddles the length limit is redacted before the cut, so
+    /// no prefix of its password survives the truncation.
+    #[test]
+    fn sanitize_redacts_a_url_before_truncating_it() {
+        let input = format!(
+            "{} https://user:secretpassword@host/v1?key=abc tail",
+            "a".repeat(180)
+        );
+        let result = sanitize_api_error(&input);
+        assert!(!result.contains("user:"), "{result}");
+        assert!(!result.contains("secret"), "{result}");
         assert!(result.len() <= 203);
     }
 
