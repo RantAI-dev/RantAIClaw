@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - The email channel uses `lettre` 0.11.24, which fixes six advisories in 0.11.23 (RUSTSEC-2026-0560 to RUSTSEC-2026-0565). The one that reaches RantaiClaw directly is RUSTSEC-2026-0560: on a STARTTLS connection (port 587, the default for `starttls_relay`), a man-in-the-middle could append forged replies to the cleartext `STARTTLS` answer and make a rejected message look accepted. The others cover SMTP command injection through bare LF or CR, an address with a quoted local part sent to a different mailbox, and panics or unbounded memory on a malicious server's reply.
+- Log lines, observer events and metric labels no longer carry the userinfo or the query string of a provider id or endpoint URL; gateway error bodies and KB errors no longer carry them either. A KB embedding or chat call that gets no response now answers `502 upstream_unreachable` instead of `500 internal_error`, and the KB CLI prints a fixed line for it.
 
 ### Fixed
 

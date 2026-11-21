@@ -10,8 +10,11 @@ pub enum KbError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// A transport failure talking to an upstream service. Built only through
+    /// [`From<reqwest::Error>`], which drops the request URL: an endpoint may
+    /// carry userinfo or a query key, and this error reaches logs and answers.
     #[error("http error: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(reqwest::Error),
 
     #[error("embedding api error: status={status} body={body}")]
     EmbeddingApi { status: u16, body: String },
@@ -60,6 +63,19 @@ pub enum KbError {
     Other(String),
 }
 
+/// The fixed words for a transport failure, in an answer or on the CLI. They
+/// name the upstream without its URL, so the endpoint never leaves the process.
+pub const UPSTREAM_UNREACHABLE_DETAIL: &str =
+    "the upstream model service did not answer; check its base URL and that it is running";
+
+impl From<reqwest::Error> for KbError {
+    /// Keeps the kind of failure (connect, timeout, decode) and drops the URL
+    /// that reqwest prints with it.
+    fn from(err: reqwest::Error) -> Self {
+        KbError::Http(err.without_url())
+    }
+}
+
 impl KbError {
     /// The error for an extractor that failed on every attempt, built from
     /// the errors of the extractors it tried.
@@ -83,5 +99,48 @@ impl KbError {
             Some(other) => other,
             None => KbError::Extraction { extractor, message },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KbError;
+
+    /// A transport error from a request to a closed loopback port, sent to a
+    /// URL that carries userinfo and a query key.
+    async fn closed_port_request_error() -> reqwest::Error {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind a loopback port")
+            .local_addr()
+            .expect("local address")
+            .port();
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("client")
+            .get(format!("http://user:secret@127.0.0.1:{port}/v1?key=abc"))
+            .send()
+            .await
+            .expect_err("nothing listens on the port")
+    }
+
+    #[tokio::test]
+    async fn transport_error_converts_without_the_url_it_was_sent_to() {
+        let raw = closed_port_request_error().await;
+        assert!(
+            raw.to_string().contains("key=abc"),
+            "precondition: the raw error names the URL: {raw}"
+        );
+
+        let err = KbError::from(raw);
+        let text = err.to_string();
+        assert!(
+            !text.contains("secret") && !text.contains("key=abc") && !text.contains("127.0.0.1"),
+            "the KB error names the endpoint URL: {text}"
+        );
+        assert!(
+            matches!(&err, KbError::Http(e) if e.is_connect()),
+            "the kind of failure is kept: {err:?}"
+        );
     }
 }

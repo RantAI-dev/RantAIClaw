@@ -1267,6 +1267,42 @@ async fn kb_upload_answers_502_when_the_extractor_service_is_down() {
     );
 }
 
+/// An embedding endpoint that is down answers 502 `upstream_unreachable`, and
+/// the answer names neither the host nor the userinfo or query of the URL.
+#[tokio::test]
+async fn kb_search_answers_502_without_the_embedding_url_when_the_endpoint_is_down() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let h = start_harness(|_store| Box::pin(async move {})).await;
+    let embedding_url = format!("http://user:secret@127.0.0.1:{port}/v1?key=abc");
+    let _env = ExtractorEnv::set(&[
+        ("KB_EMBEDDING_BASE_URL", embedding_url.as_str()),
+        ("NO_PROXY", "127.0.0.1,localhost"),
+        ("no_proxy", "127.0.0.1,localhost"),
+    ]);
+
+    let resp = reqwest::Client::new()
+        .post(format!("{}/api/v1/kb/search", h.base_url))
+        .json(&serde_json::json!({ "query": "rantaiclaw_probe" }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(
+        resp.status(),
+        502,
+        "an unreachable embedding endpoint is a 502"
+    );
+    let body: Value = resp.json().await.expect("json body");
+    assert_eq!(body["error"], "upstream_unreachable", "{body}");
+    let text = body.to_string();
+    for needle in ["127.0.0.1", "secret", "key=abc"] {
+        assert!(!text.contains(needle), "the answer names {needle}: {text}");
+    }
+}
+
 async fn upload_image(base_url: &str, bytes: &[u8]) -> reqwest::Response {
     let form = reqwest::multipart::Form::new().part(
         "file",

@@ -913,7 +913,7 @@ fn sse_bytes_to_chunks(
         match response.error_for_status_ref() {
             Ok(_) => {}
             Err(e) => {
-                let _ = tx.send(Err(StreamError::Http(e))).await;
+                let _ = tx.send(Err(StreamError::Http(e.without_url()))).await;
                 return;
             }
         }
@@ -963,7 +963,7 @@ fn sse_bytes_to_chunks(
                     }
                 }
                 Err(e) => {
-                    let _ = tx.send(Err(StreamError::Http(e))).await;
+                    let _ = tx.send(Err(StreamError::Http(e.without_url()))).await;
                     break;
                 }
             }
@@ -1153,7 +1153,8 @@ impl OpenAiCompatibleProvider {
         let response = self
             .apply_auth_header(self.http_client().post(&url).json(&request), credential)
             .send()
-            .await?;
+            .await
+            .map_err(|e| e.without_url())?;
 
         if !response.status().is_success() {
             let error = response.text().await?;
@@ -1480,6 +1481,7 @@ impl Provider for OpenAiCompatibleProvider {
             .apply_auth_header(self.http_client().post(&url).json(&request), credential)
             .send()
             .await
+            .map_err(|e| e.without_url())
         {
             Ok(response) => response,
             Err(chat_error) => {
@@ -1581,6 +1583,7 @@ impl Provider for OpenAiCompatibleProvider {
             .apply_auth_header(self.http_client().post(&url).json(&request), credential)
             .send()
             .await
+            .map_err(|e| e.without_url())
         {
             Ok(response) => response,
             Err(chat_error) => {
@@ -1690,6 +1693,7 @@ impl Provider for OpenAiCompatibleProvider {
             .apply_auth_header(self.http_client().post(&url).json(&request), credential)
             .send()
             .await
+            .map_err(|e| e.without_url())
         {
             Ok(response) => response,
             Err(error) => {
@@ -1776,6 +1780,7 @@ impl Provider for OpenAiCompatibleProvider {
             )
             .send()
             .await
+            .map_err(|e| e.without_url())
         {
             Ok(response) => response,
             Err(chat_error) => {
@@ -1915,7 +1920,8 @@ impl Provider for OpenAiCompatibleProvider {
         let mut response = send(Some(IncludeUsage {
             include_usage: true,
         }))
-        .await?;
+        .await
+        .map_err(|e| e.without_url())?;
         // An endpoint that rejects `stream_options` must still stream: retry
         // once without the field. The turn then reports no usage.
         if response.status() == reqwest::StatusCode::BAD_REQUEST {
@@ -1925,7 +1931,7 @@ impl Provider for OpenAiCompatibleProvider {
                     "{} rejected stream_options; retrying the stream without usage reporting",
                     self.name
                 );
-                response = send(None).await?;
+                response = send(None).await.map_err(|e| e.without_url())?;
             } else {
                 anyhow::bail!(
                     "{} API error ({}): {}",
@@ -1973,7 +1979,7 @@ impl Provider for OpenAiCompatibleProvider {
         // Usage arrives on the final chunk, when the endpoint sent one.
         let mut usage: Option<ProviderUsage> = None;
         while let Some(item) = bytes_stream.next().await {
-            let bytes = item?;
+            let bytes = item.map_err(|e| e.without_url())?;
             push_decoded(&mut pending, &bytes, &mut buffer);
             while let Some(pos) = buffer.find('\n') {
                 let line: String = buffer.drain(..=pos).collect();
@@ -2158,7 +2164,7 @@ impl Provider for OpenAiCompatibleProvider {
             req_builder = req_builder.header("Accept", "text/event-stream");
 
             // Send request
-            let response = match req_builder.send().await {
+            let response = match req_builder.send().await.map_err(|e| e.without_url()) {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = tx.send(Err(StreamError::Http(e))).await;
@@ -2205,7 +2211,8 @@ impl Provider for OpenAiCompatibleProvider {
             let _ = self
                 .apply_auth_header(self.http_client().get(&url), &credential)
                 .send()
-                .await?;
+                .await
+                .map_err(|e| e.without_url())?;
         }
         Ok(())
     }
@@ -2254,6 +2261,83 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Venice API key not set"));
+    }
+
+    /// A loopback port nothing listens on, so a request to it fails at connect.
+    fn closed_loopback_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind a loopback port")
+            .local_addr()
+            .expect("local address")
+            .port()
+    }
+
+    /// The error text must hold neither the userinfo nor the query of the
+    /// endpoint, as sent and after the sanitizer the chat paths apply before
+    /// logging.
+    fn assert_no_endpoint_userinfo_or_query(text: &str) {
+        let sanitized = crate::providers::sanitize_api_error(text);
+        for surface in [text, sanitized.as_str()] {
+            assert!(
+                !surface.contains("secret") && !surface.contains("key=abc"),
+                "the error text carries the endpoint userinfo or query: {surface}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_transport_error_omits_endpoint_userinfo_and_query() {
+        let url = format!(
+            "http://user:secret@127.0.0.1:{}/v1?key=abc",
+            closed_loopback_port()
+        );
+        let p = OpenAiCompatibleProvider::new_no_responses_fallback(
+            "custom",
+            &url,
+            Some("test-token"),
+            AuthStyle::Bearer,
+        );
+        let err = p
+            .chat_with_system(None, "hello", "model", 0.7)
+            .await
+            .expect_err("nothing listens on the port");
+        assert_no_endpoint_userinfo_or_query(&err.to_string());
+    }
+
+    #[tokio::test]
+    async fn responses_fallback_transport_error_omits_endpoint_userinfo_and_query() {
+        let url = format!(
+            "http://user:secret@127.0.0.1:{}/v1?key=abc",
+            closed_loopback_port()
+        );
+        let p =
+            OpenAiCompatibleProvider::new("custom", &url, Some("test-token"), AuthStyle::Bearer);
+        let err = p
+            .chat_with_system(None, "hello", "model", 0.7)
+            .await
+            .expect_err("nothing listens on the port");
+        assert_no_endpoint_userinfo_or_query(&err.to_string());
+    }
+
+    #[tokio::test]
+    async fn stream_transport_error_omits_endpoint_userinfo_and_query() {
+        let url = format!(
+            "http://user:secret@127.0.0.1:{}/v1?key=abc",
+            closed_loopback_port()
+        );
+        let p = OpenAiCompatibleProvider::new_no_responses_fallback(
+            "custom",
+            &url,
+            Some("test-token"),
+            AuthStyle::Bearer,
+        );
+        let mut stream =
+            p.stream_chat_with_system(None, "hello", "model", 0.7, StreamOptions::new(true));
+        let text = match stream.next().await {
+            Some(Err(error)) => error.to_string(),
+            _ => panic!("a refused connection must reach the stream as an error"),
+        };
+        assert_no_endpoint_userinfo_or_query(&text);
     }
 
     #[test]

@@ -363,8 +363,15 @@ impl ApiError {
 }
 
 impl From<ApiError> for (StatusCode, Json<ErrorBody>) {
+    /// Every KB error body passes through here, so the detail is scrubbed here
+    /// once. The details come from config and upstream error text, and those
+    /// can carry an endpoint URL with userinfo or a query string.
     fn from(err: ApiError) -> Self {
-        (err.status, Json(err.body))
+        let mut body = err.body;
+        body.detail = body
+            .detail
+            .map(|detail| crate::logging::redact_urls(&detail));
+        (err.status, Json(body))
     }
 }
 
@@ -372,7 +379,8 @@ impl From<KbError> for ApiError {
     /// Map kb errors to HTTP status codes. NotFound → 404, Config /
     /// UnsupportedFileType → 400, a document the extractor cannot read → 422,
     /// a vector size that disagrees with the store → 409, embedding / chat /
-    /// extractor upstream → 502, anything else → 500 (a length mismatch is an
+    /// extractor upstream and a transport failure to one of them → 502,
+    /// anything else → 500 (a length mismatch is an
     /// internal invariant, not something the caller can fix). Detail surfaces
     /// the error's `Display` rendering, except for upstream errors, which name
     /// only the upstream; we never log raw API keys because KbError variants
@@ -444,6 +452,18 @@ impl From<KbError> for ApiError {
                     detail: Some(format!("upstream chat API returned status {status}")),
                 },
             },
+            KbError::Http(e) => {
+                // The cause (connect, timeout, decode) goes to the log. The
+                // answer names only the upstream: the error holds no URL.
+                tracing::warn!(target: "kb::api", error = %e, "upstream request failed");
+                Self {
+                    status: StatusCode::BAD_GATEWAY,
+                    body: ErrorBody {
+                        error: "upstream_unreachable".into(),
+                        detail: Some(crate::kb::error::UPSTREAM_UNREACHABLE_DETAIL.into()),
+                    },
+                }
+            }
             other => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 body: ErrorBody {
@@ -1742,6 +1762,25 @@ mod tests {
         assert!(guard.is_none());
     }
 
+    /// A KB error detail that names an endpoint with userinfo and a query
+    /// string leaves the body without either. The host stays, so the caller can
+    /// still see which upstream failed.
+    #[test]
+    fn kb_error_body_drops_userinfo_and_query_from_an_endpoint() {
+        let raw = "custom:https://user:secret@host/v1?key=abc";
+        let (status, Json(body)): (StatusCode, Json<ErrorBody>) =
+            ApiError::bad_request(format!("embedding endpoint {raw} is not configured")).into();
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let wire = serde_json::to_string(&body).expect("serialize error body");
+        assert!(
+            !wire.contains("secret"),
+            "userinfo reached the body: {wire}"
+        );
+        assert!(!wire.contains("key=abc"), "query reached the body: {wire}");
+        assert!(wire.contains("host/v1"), "host was removed: {wire}");
+    }
+
     fn mapped(err: KbError) -> (StatusCode, String, String) {
         let api = ApiError::from(err);
         (
@@ -1869,6 +1908,19 @@ mod tests {
         assert_eq!(resp.stale_chunks, 4);
         assert!(!resp.in_sync);
         assert_eq!(resp.by_model.len(), 3);
+    }
+
+    /// Control for the transport mapping: an answer from the embedding service
+    /// with an error status keeps its own code, whatever the status is.
+    #[test]
+    fn embedding_api_error_status_still_answers_embedding_upstream() {
+        let (status, code, detail) = mapped(KbError::EmbeddingApi {
+            status: 500,
+            body: "upstream body".into(),
+        });
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(code, "embedding_upstream");
+        assert_eq!(detail, "upstream embedding API returned status 500");
     }
 
     #[test]

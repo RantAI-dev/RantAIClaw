@@ -1,4 +1,5 @@
 use super::traits::{Observer, ObserverEvent, ObserverMetric};
+use crate::providers::provider_auth::without_userinfo_and_query;
 use prometheus::{
     Encoder, Histogram, HistogramOpts, HistogramVec, IntCounterVec, Registry, TextEncoder,
 };
@@ -137,8 +138,10 @@ impl Observer for PrometheusObserver {
     fn record_event(&self, event: &ObserverEvent) {
         match event {
             ObserverEvent::AgentStart { provider, model } => {
+                // The label value is the provider id without URL userinfo or query.
+                let provider = without_userinfo_and_query(provider);
                 self.agent_starts
-                    .with_label_values(&[provider, model])
+                    .with_label_values(&[&provider, model])
                     .inc();
             }
             ObserverEvent::AgentEnd {
@@ -149,8 +152,9 @@ impl Observer for PrometheusObserver {
                 cost_usd: _,
             } => {
                 // Agent duration is recorded via the histogram with provider/model labels
+                let provider = without_userinfo_and_query(provider);
                 self.agent_duration
-                    .with_label_values(&[provider, model])
+                    .with_label_values(&[&provider, model])
                     .observe(duration.as_secs_f64());
             }
             ObserverEvent::ToolCallStart { tool: _ }
@@ -358,6 +362,52 @@ mod tests {
         let output = obs.encode();
         assert!(output.contains(r#"rantaiclaw_errors_total{component="provider"} 2"#));
         assert!(output.contains(r#"rantaiclaw_errors_total{component="channels"} 1"#));
+    }
+
+    #[test]
+    fn prometheus_backend_drops_userinfo_and_query_from_provider_label() {
+        let obs = PrometheusObserver::new();
+        let provider = "custom:https://user:secret@host/v1?key=abc";
+        obs.record_event(&ObserverEvent::AgentStart {
+            provider: provider.into(),
+            model: "claude-sonnet".into(),
+        });
+        obs.record_event(&ObserverEvent::AgentEnd {
+            provider: provider.into(),
+            model: "claude-sonnet".into(),
+            duration: Duration::from_millis(5),
+            tokens_used: None,
+            cost_usd: None,
+        });
+
+        let output = obs.encode();
+        assert!(
+            !output.contains("secret"),
+            "the password reached the metrics text: {output}"
+        );
+        assert!(
+            !output.contains("key=abc"),
+            "the query reached the metrics text: {output}"
+        );
+        assert!(
+            output.contains("custom:https://host/v1"),
+            "the scrubbed provider is the label value: {output}"
+        );
+    }
+
+    #[test]
+    fn prometheus_backend_keeps_a_plain_provider_label() {
+        let obs = PrometheusObserver::new();
+        obs.record_event(&ObserverEvent::AgentStart {
+            provider: "openrouter".into(),
+            model: "claude-sonnet".into(),
+        });
+
+        let output = obs.encode();
+        assert!(
+            output.contains(r#"provider="openrouter""#),
+            "a provider id is exposed as it was: {output}"
+        );
     }
 
     /// The three metrics with no emitter are deliberately not in the registry:

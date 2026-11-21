@@ -72,7 +72,8 @@ Non-2xx responses share one shape:
 ```
 
 `error` is one of `unauthorized` (401), `bad_request` (400), `nothing_to_apply` (400),
-`not_found` (404), `conflict` (409), `internal_error` (500), `provider_auth_failed` (502).
+`not_found` (404), `conflict` (409), `internal_error` (500), `provider_auth_failed` (502),
+`upstream_unreachable` (502).
 `detail` is present when the handler has more to say (it is always present for
 `internal_error`, which carries the sanitized error text).
 
@@ -83,6 +84,8 @@ Non-2xx responses share one shape:
   Every route that calls a provider answers it the same way: the chat routes, the
   `POST /webhook` and `POST /triggers/{path}` doors (which sit outside `/api/v1` but share
   this error shape), and `POST /api/v1/memory` when the embedding provider rejects the key.
+- `upstream_unreachable` is a KB embedding or chat endpoint that did not answer (502). The `detail`
+  names the service without its URL. See `docs/reference/kb.md` for the KB routes.
 - The config write routes (`/config/*`, `/secrets`, `/channels/*` and the MCP server route) refuse
   a request body that names a field the route does not know. The answer is `400 bad_request`, and
   `detail` names the field. A body that is not valid JSON gets the same `400`. These checks run

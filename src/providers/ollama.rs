@@ -364,7 +364,7 @@ impl OllamaProvider {
             }
         }
 
-        let response = request_builder.send().await?;
+        let response = request_builder.send().await.map_err(|e| e.without_url())?;
         let status = response.status();
         tracing::debug!("Ollama response status: {}", status);
 
