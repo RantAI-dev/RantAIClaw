@@ -233,19 +233,18 @@ pub fn install_log_bridge() {
 }
 
 /// Matches one URL: a scheme, `://`, then the rest of the token. The token ends
-/// at whitespace, a double quote, a backtick, an angle bracket, or a square
-/// bracket or curly brace. A square-bracket pair that holds an IPv6 literal
-/// (`[::1]`) stays in the token, so the port and the query after it are
-/// matched. Single quotes and parentheses stay in the token, because RFC 3986
-/// allows them in userinfo, so a password that holds one is redacted whole. A
-/// URL inside a sentence keeps the text after it.
+/// at whitespace, a double quote, a backtick or an angle bracket. Square
+/// brackets and curly braces stay in the token: an IPv6 literal (`[::1]`) is
+/// part of the host, and a query such as `?filter[type]=x&key=abc` must be
+/// matched whole, or the part after the first `[` would reach the log. Single
+/// quotes and parentheses stay in the token too, because RFC 3986 allows them
+/// in userinfo, so a password that holds one is redacted whole. A URL inside a
+/// sentence keeps the text after it.
 fn url_regex() -> &'static regex::bytes::Regex {
     static URL: OnceLock<regex::bytes::Regex> = OnceLock::new();
     URL.get_or_init(|| {
-        regex::bytes::Regex::new(
-            r#"(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]*://)(?P<rest>(?:\[[0-9A-Fa-f:.]*\]|[^\s"`<>\[\]{}])*)"#,
-        )
-        .expect("URL pattern is a valid regex")
+        regex::bytes::Regex::new(r#"(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]*://)(?P<rest>[^\s"`<>]*)"#)
+            .expect("URL pattern is a valid regex")
     })
 }
 
@@ -608,6 +607,18 @@ mod tests {
             redacted,
             "a http://[::1]:8080/v1 b\nc http://[::1]:8080/v1 d\n"
         );
+    }
+
+    /// A query that holds square or curly brackets is dropped whole. Stopping
+    /// the URL at the first bracket would leave `[type]=x&key=abc` in the log.
+    #[test]
+    fn url_redaction_drops_a_query_that_holds_brackets() {
+        let redacted = redact_urls(
+            "a https://host/v1/?filter[type]=x&key=abc b\n\
+             c https://user:pw@host/v1?q={k}&key=abc d\n",
+        );
+
+        assert_eq!(redacted, "a https://host/v1/ b\nc https://host/v1 d\n");
     }
 
     /// A flush between the two halves of a URL emits nothing: the writer keeps
