@@ -28,6 +28,8 @@ pub struct IntelligenceSummary {
     /// Chunks the extractor failed on. Non-zero with zero entities means
     /// extraction FAILED, not "no entities" (plan 109).
     pub failed_chunks: usize,
+    /// The chat endpoint refused the API key on at least one chunk (401 or 403).
+    pub provider_auth_rejected: bool,
     /// First failure reason (short, no upstream body, no credential).
     pub error: Option<String>,
 }
@@ -166,6 +168,7 @@ pub async fn extract_document_intelligence(
         entities: unique_entities,
         relations: relations.len(),
         failed_chunks: llm.failed_chunks,
+        provider_auth_rejected: llm.provider_auth_rejected,
         error: llm.first_error,
     })
 }

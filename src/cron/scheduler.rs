@@ -241,12 +241,41 @@ pub async fn run_job_manual(
     observer: Option<&Arc<dyn crate::observability::Observer>>,
     mcp: Option<&Arc<crate::mcp::discover::McpPoolHandle>>,
 ) -> (bool, String) {
+    let outcome = run_job_manual_outcome(config, security, job, observer, mcp).await;
+    (outcome.success, outcome.output)
+}
+
+/// What a manual run reports to a caller that answers over HTTP. `success` and
+/// `output` are the same pair `run_job_manual` returns. The extra field lets
+/// the caller tell a rejected provider credential from any other failure.
+pub struct ManualRunOutcome {
+    pub success: bool,
+    pub output: String,
+    /// `Some` when the run's last attempt failed because the provider rejected
+    /// the credential: the sentence naming the provider and the status. It comes
+    /// from the typed error, never from `output`.
+    pub provider_auth_sentence: Option<String>,
+}
+
+/// The manual run behind `run_job_manual`, with the typed failure kept.
+/// Records the run exactly as `run_job_manual` does.
+pub async fn run_job_manual_outcome(
+    config: &Config,
+    security: &SecurityPolicy,
+    job: &CronJob,
+    observer: Option<&Arc<dyn crate::observability::Observer>>,
+    mcp: Option<&Arc<crate::mcp::discover::McpPoolHandle>>,
+) -> ManualRunOutcome {
     // Claim the shared in-flight registry so a second "run now" (or an overlapping
     // scheduled tick) can't double-execute the same job. The guard releases the
     // claim on drop, including on panic/cancel. An already-running job returns a
     // clear message and records no run row (it never executed).
     let Some(_guard) = InFlightGuard::claim(&job.id) else {
-        return (false, format!("cron job '{}' is already running", job.id));
+        return ManualRunOutcome {
+            success: false,
+            output: format!("cron job '{}' is already running", job.id),
+            provider_auth_sentence: None,
+        };
     };
     let (success, output, attempts) = execute_job_now(config, security, job, observer, mcp).await;
     // Record each attempt as its own row (a manual run does not deliver).
@@ -257,7 +286,20 @@ pub async fn run_job_manual(
     if let Err(e) = record_last_run(config, &job.id, finished_at, success, &output) {
         tracing::warn!(job_id = %job.id, error = %e, "failed to record cron last-run fields");
     }
-    (success, output)
+    // The last attempt is the run's answer, so only its failure can name a
+    // rejected credential. An earlier attempt that failed does not.
+    let provider_auth_sentence = if success {
+        None
+    } else {
+        attempts
+            .last()
+            .and_then(|a| a.provider_auth_sentence.clone())
+    };
+    ManualRunOutcome {
+        success,
+        output,
+        provider_auth_sentence,
+    }
 }
 
 /// One execution attempt of a cron job, with its own timing and outcome. The
@@ -271,6 +313,10 @@ pub struct AttemptOutcome {
     finished_at: DateTime<Utc>,
     success: bool,
     output: String,
+    /// Set when this attempt failed because the provider rejected the
+    /// credential: the sentence naming the provider and the status, taken from
+    /// the typed error. `None` for every other attempt.
+    provider_auth_sentence: Option<String>,
 }
 
 async fn execute_job_with_retry(
@@ -287,8 +333,11 @@ async fn execute_job_with_retry(
 
     for attempt in 0..=retries {
         let started_at = Utc::now();
-        let (success, output) = match job.job_type {
-            JobType::Shell => run_job_command(config, security, job).await,
+        let (success, output, provider_auth_sentence) = match job.job_type {
+            JobType::Shell => {
+                let (success, output) = run_job_command(config, security, job).await;
+                (success, output, None)
+            }
             JobType::Agent => {
                 with_timeout(
                     Duration::from_secs(AGENT_JOB_TIMEOUT_SECS),
@@ -304,6 +353,7 @@ async fn execute_job_with_retry(
             finished_at,
             success,
             output: output.clone(),
+            provider_auth_sentence,
         });
         last_output = output;
 
@@ -501,11 +551,12 @@ async fn run_agent_job(
     job: &CronJob,
     observer: Option<&Arc<dyn crate::observability::Observer>>,
     mcp: Option<&Arc<crate::mcp::discover::McpPoolHandle>>,
-) -> (bool, String) {
+) -> (bool, String, Option<String>) {
     if !security.can_act() {
         return (
             false,
             "blocked by security policy: autonomy is read-only".to_string(),
+            None,
         );
     }
 
@@ -513,6 +564,7 @@ async fn run_agent_job(
         return (
             false,
             "blocked by security policy: rate limit exceeded".to_string(),
+            None,
         );
     }
 
@@ -520,6 +572,7 @@ async fn run_agent_job(
         return (
             false,
             "blocked by security policy: action budget exhausted".to_string(),
+            None,
         );
     }
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
@@ -570,8 +623,17 @@ async fn run_agent_job(
             } else {
                 response
             },
+            None,
         ),
-        Err(e) => (false, format!("agent job failed: {e}")),
+        Err(e) => {
+            // The typed error is read here, before it is flattened into text.
+            let provider_auth_sentence = crate::providers::provider_auth_failure_sentence(&e);
+            (
+                false,
+                format!("agent job failed: {e}"),
+                provider_auth_sentence,
+            )
+        }
     }
 }
 
@@ -985,13 +1047,14 @@ fn path_is_forbidden(security: &SecurityPolicy, s: &str) -> bool {
 /// inner timeout of their own, unlike shell jobs).
 async fn with_timeout(
     timeout: Duration,
-    fut: impl std::future::Future<Output = (bool, String)>,
-) -> (bool, String) {
+    fut: impl std::future::Future<Output = (bool, String, Option<String>)>,
+) -> (bool, String, Option<String>) {
     match time::timeout(timeout, fut).await {
         Ok(result) => result,
         Err(_) => (
             false,
             format!("agent job timed out after {}s", timeout.as_secs_f64()),
+            None,
         ),
     }
 }
@@ -1404,7 +1467,7 @@ mod tests {
         job.origin_chat = origin.map(|(_, chat)| chat.to_string());
         let security =
             SecurityPolicy::from_config(&fixture.config.autonomy, &fixture.config.workspace_dir);
-        let (ok, output) = run_agent_job(&fixture.config, &security, &job, None, None).await;
+        let (ok, output, _) = run_agent_job(&fixture.config, &security, &job, None, None).await;
         assert!(ok, "the job ran against the local server: {output}");
     }
 
@@ -1457,7 +1520,7 @@ mod tests {
         job.origin_chat = Some("chat-a".into());
         let security =
             SecurityPolicy::from_config(&fixture.config.autonomy, &fixture.config.workspace_dir);
-        let (ok, output) = run_agent_job(&fixture.config, &security, &job, None, None).await;
+        let (ok, output, _) = run_agent_job(&fixture.config, &security, &job, None, None).await;
         assert!(ok, "the job ran against the local server: {output}");
         fixture.assert_no_note_was_sent();
     }
@@ -1477,7 +1540,7 @@ mod tests {
         job.session_target = SessionTarget::Main;
         let security =
             SecurityPolicy::from_config(&fixture.config.autonomy, &fixture.config.workspace_dir);
-        let (ok, output) = run_agent_job(&fixture.config, &security, &job, None, None).await;
+        let (ok, output, _) = run_agent_job(&fixture.config, &security, &job, None, None).await;
         assert!(ok, "the job ran against the local server: {output}");
         assert!(
             !output.starts_with("[Used tools:"),
@@ -1536,7 +1599,7 @@ mod tests {
         job.session_target = SessionTarget::Main;
         let security =
             SecurityPolicy::from_config(&fixture.config.autonomy, &fixture.config.workspace_dir);
-        let (ok, output) = run_agent_job(&fixture.config, &security, &job, None, None).await;
+        let (ok, output, _) = run_agent_job(&fixture.config, &security, &job, None, None).await;
         assert!(
             ok,
             "the cron agent job ran against the local server: {output}"
@@ -1568,6 +1631,7 @@ mod tests {
             finished_at: finished,
             success,
             output: output.to_string(),
+            provider_auth_sentence: None,
         }]
     }
 
@@ -1976,6 +2040,7 @@ mod tests {
                 finished_at: t0 + ChronoDuration::milliseconds(5),
                 success: false,
                 output: "boom".into(),
+                provider_auth_sentence: None,
             },
             AttemptOutcome {
                 attempt: 2,
@@ -1983,6 +2048,7 @@ mod tests {
                 finished_at: t0 + ChronoDuration::milliseconds(305),
                 success: true,
                 output: "ok".into(),
+                provider_auth_sentence: None,
             },
         ];
         let success =
@@ -2101,7 +2167,7 @@ mod tests {
         job.prompt = Some("Say hello".into());
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = run_agent_job(&config, &security, &job, None, None).await;
+        let (success, output, _) = run_agent_job(&config, &security, &job, None, None).await;
         assert!(!success);
         assert!(output.contains("agent job failed:"));
     }
@@ -2116,7 +2182,7 @@ mod tests {
         job.prompt = Some("Say hello".into());
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = run_agent_job(&config, &security, &job, None, None).await;
+        let (success, output, _) = run_agent_job(&config, &security, &job, None, None).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("read-only"));
@@ -2132,7 +2198,7 @@ mod tests {
         job.prompt = Some("Say hello".into());
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = run_agent_job(&config, &security, &job, None, None).await;
+        let (success, output, _) = run_agent_job(&config, &security, &job, None, None).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("rate limit exceeded"));
@@ -2479,9 +2545,9 @@ mod tests {
 
     #[tokio::test]
     async fn with_timeout_reports_timeout_for_slow_job() {
-        let (ok, msg) = with_timeout(Duration::from_millis(20), async {
+        let (ok, msg, _) = with_timeout(Duration::from_millis(20), async {
             time::sleep(Duration::from_secs(30)).await;
-            (true, "should not finish".to_string())
+            (true, "should not finish".to_string(), None)
         })
         .await;
         assert!(!ok);
@@ -2490,8 +2556,8 @@ mod tests {
 
     #[tokio::test]
     async fn with_timeout_passes_through_fast_job() {
-        let (ok, msg) = with_timeout(Duration::from_secs(5), async {
-            (true, "quick".to_string())
+        let (ok, msg, _) = with_timeout(Duration::from_secs(5), async {
+            (true, "quick".to_string(), None)
         })
         .await;
         assert!(ok);

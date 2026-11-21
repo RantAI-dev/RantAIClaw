@@ -39,6 +39,7 @@ use tower_http::timeout::TimeoutLayer;
 use crate::gateway::AppState;
 use crate::kb::chunk::{smart_chunk_document, SmartChunkOptions};
 use crate::kb::embed::{self, EmbeddingProvider};
+use crate::kb::error::is_auth_rejection_status;
 use crate::kb::file::{detect_file_type, process_file, ProcessingOptions};
 use crate::kb::intelligence::extract::llm::CombinedLlmExtractor;
 use crate::kb::intelligence::types::{Entity, Relation};
@@ -330,7 +331,26 @@ struct ApiError {
     body: ErrorBody,
 }
 
+/// Fixed sentences for a rejected API key. They name the service and the key
+/// and never the upstream body, which can echo the credential back.
+const EMBEDDING_KEY_REJECTED_DETAIL: &str =
+    "the embedding provider rejected the API key; check the key";
+const CHAT_KEY_REJECTED_DETAIL: &str = "the chat provider rejected the API key; check the key";
+
 impl ApiError {
+    /// 502 for an upstream that refused the credential it was sent. The body
+    /// has the same shape as the `provider_auth_failed` answer of the agent
+    /// chat route: an error code and a detail, with no list field.
+    fn provider_auth_failed(detail: &str) -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            body: ErrorBody {
+                error: crate::providers::PROVIDER_AUTH_FAILED.into(),
+                detail: Some(detail.into()),
+            },
+        }
+    }
+
     fn service_unavailable(code: &str, detail: String) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -438,6 +458,9 @@ impl From<KbError> for ApiError {
                     )),
                 },
             },
+            KbError::EmbeddingApi { status, .. } if is_auth_rejection_status(status) => {
+                Self::provider_auth_failed(EMBEDDING_KEY_REJECTED_DETAIL)
+            }
             KbError::EmbeddingApi { status, .. } => Self {
                 status: StatusCode::BAD_GATEWAY,
                 body: ErrorBody {
@@ -445,6 +468,9 @@ impl From<KbError> for ApiError {
                     detail: Some(format!("upstream embedding API returned status {status}")),
                 },
             },
+            KbError::ChatApi { status, .. } if is_auth_rejection_status(status) => {
+                Self::provider_auth_failed(CHAT_KEY_REJECTED_DETAIL)
+            }
             KbError::ChatApi { status, .. } => Self {
                 status: StatusCode::BAD_GATEWAY,
                 body: ErrorBody {
@@ -1155,6 +1181,12 @@ async fn re_extract_document(
     // — re-extract is the synchronous, operator-initiated path where the
     // truth can actually be delivered (plan 109).
     if !chunk_refs.is_empty() && summary.failed_chunks >= chunk_refs.len() {
+        // The chat endpoint refused the key on the chunks it failed: the same
+        // provider_auth_failed answer as the other routes, not a generic
+        // extraction failure.
+        if summary.provider_auth_rejected {
+            return Err(ApiError::provider_auth_failed(CHAT_KEY_REJECTED_DETAIL).into());
+        }
         let reason = summary
             .error
             .clone()
@@ -1956,6 +1988,30 @@ mod tests {
                 },
                 StatusCode::BAD_GATEWAY,
                 "chat_upstream",
+            ),
+            (
+                KbError::EmbeddingApi {
+                    status: 401,
+                    body: "x".into(),
+                },
+                StatusCode::BAD_GATEWAY,
+                "provider_auth_failed",
+            ),
+            (
+                KbError::EmbeddingApi {
+                    status: 403,
+                    body: "x".into(),
+                },
+                StatusCode::BAD_GATEWAY,
+                "provider_auth_failed",
+            ),
+            (
+                KbError::ChatApi {
+                    status: 401,
+                    body: "x".into(),
+                },
+                StatusCode::BAD_GATEWAY,
+                "provider_auth_failed",
             ),
             (
                 KbError::Other("x".into()),

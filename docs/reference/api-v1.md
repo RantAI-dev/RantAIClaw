@@ -78,12 +78,7 @@ Non-2xx responses share one shape:
 `internal_error`, which carries the sanitized error text).
 
 - `nothing_to_apply` is a config write whose body names no field to change. It saves nothing.
-- `provider_auth_failed` is a provider that answered `401` or `403` to the credential
-  it was sent. The `detail` names the provider id and the upstream status, never the credential
-  and never the body the provider wrote. The operator fixes the key outside the gateway.
-  Every route that calls a provider answers it the same way: the chat routes, the
-  `POST /webhook` and `POST /triggers/{path}` doors (which sit outside `/api/v1` but share
-  this error shape), and `POST /api/v1/memory` when the embedding provider rejects the key.
+- `provider_auth_failed` is a provider that answered `401` or `403` to the credential it was sent. The chat and cron routes name the provider id and the upstream status in the `detail`; the KB routes name the service only, with a fixed sentence. Never the key and never the upstream body. The operator fixes the key outside the gateway. The routes that answer it are the chat routes, the `POST /webhook` and `POST /triggers/{path}` doors (which sit outside `/api/v1` but share this error shape), `POST /api/v1/kb/search`, the KB ingest route `POST /api/v1/kb/documents` (for a rejected embedding key, because the embedding call runs synchronously on that route, which answers 502; a rejected chat key during the detached extraction is logged and the ingest still answers `200`, because extraction runs in the background), `POST /api/v1/kb/documents/{id}/re-extract` (when every chunk fails and the chat endpoint refused the key; a partial failure still answers `200`), `POST /api/v1/memory` when the embedding provider rejects the key, and `POST /api/v1/cron/{id}/run` for an agent job. A shell job under cron run still answers `200` with `success:false`. The one deliberate exception is `GET /api/v1/memory?q=` (see the memory route below).
 - `upstream_unreachable` is a KB embedding or chat endpoint that did not answer (502). The `detail`
   names the service without its URL. See `docs/reference/kb.md` for the KB routes.
 - The config write routes (`/config/*`, `/secrets`, `/channels/*` and the MCP server route) refuse
@@ -847,6 +842,10 @@ should check the encoded size and say so plainly rather than surfacing a bare
     and selects that conversation's notes; absent keeps the unfiltered read.
     Applies to both list and `q` recall. The `total` count reflects the
     filtered set.
+  - A `q` search keeps keyword-only results with `200` when the embedding
+    provider rejects its key or cannot be reached. It does not answer
+    `502 provider_auth_failed`, because a failed recall would read as "the
+    agent has no memory". The response carries no new field for this.
 - **Response** `200`:
   ```json
   {

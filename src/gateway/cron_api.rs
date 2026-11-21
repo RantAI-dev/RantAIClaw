@@ -514,19 +514,24 @@ async fn run_cron(
 
     // The gateway's own observer, so a run started from the console shows up in
     // the `/metrics` this same process serves.
-    let (success, output) =
-        // The gateway already keeps a pool for its chat path; a manually
-        // triggered job reuses it rather than spawning a second set.
-        cron::scheduler::run_job_manual(
-            &cfg,
-            &security,
-            &job,
-            Some(&state.observer),
-            Some(&state.mcp),
-        )
-        .await;
+    // The gateway already keeps a pool for its chat path; a manually
+    // triggered job reuses it rather than spawning a second set.
+    let outcome = cron::scheduler::run_job_manual_outcome(
+        &cfg,
+        &security,
+        &job,
+        Some(&state.observer),
+        Some(&state.mcp),
+    )
+    .await;
+    // The run is already in the history. A rejected credential answers 502 with
+    // the same body the chat routes use, so the console can say which key to fix.
+    if let Some(sentence) = outcome.provider_auth_sentence {
+        let (status, body) = super::api_v1::provider_auth_failed_value(sentence);
+        return Err((status, Json(body)));
+    }
     Ok(Json(
-        json!({ "id": job.id, "success": success, "output": output }),
+        json!({ "id": job.id, "success": outcome.success, "output": outcome.output }),
     ))
 }
 

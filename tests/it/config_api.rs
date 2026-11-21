@@ -66,13 +66,19 @@ impl Drop for EnvGuard {
     }
 }
 
-/// The process-global variables these tests own.
-pub(crate) const CONFIG_ENV_VARS: [&str; 5] = [
+/// The process-global variables these tests own. The provider key variables
+/// are cleared too, so a test that expects no provider key holds on a machine
+/// that exports one.
+pub(crate) const CONFIG_ENV_VARS: [&str; 9] = [
     "RANTAICLAW_CONFIG_DIR",
     "KB_EMBEDDING_BASE_URL",
     "KB_EMBEDDING_API_KEY",
     "KB_EMBEDDING_DIM",
     "OPENROUTER_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "RANTAICLAW_API_KEY",
+    "API_KEY",
 ];
 
 fn clear_config_env() {

@@ -1303,6 +1303,78 @@ async fn kb_search_answers_502_without_the_embedding_url_when_the_endpoint_is_do
     }
 }
 
+/// An embedding endpoint that rejects the key answers 502 `provider_auth_failed`,
+/// the same code `/api/v1/agent/chat` uses, and the answer never echoes the
+/// upstream body.
+#[tokio::test]
+async fn kb_search_with_rejected_embedding_key_answers_provider_auth_failed() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let embedding = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("upstream-echo-sentinel"))
+        .mount(&embedding)
+        .await;
+
+    let h = start_harness(|_store| Box::pin(async move {})).await;
+    let _env = ExtractorEnv::set(&[
+        ("KB_EMBEDDING_BASE_URL", embedding.uri().as_str()),
+        ("NO_PROXY", "127.0.0.1,localhost"),
+        ("no_proxy", "127.0.0.1,localhost"),
+    ]);
+
+    let resp = reqwest::Client::new()
+        .post(format!("{}/api/v1/kb/search", h.base_url))
+        .json(&serde_json::json!({ "query": "rantaiclaw_probe" }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 502, "a rejected embedding key is a 502");
+    let body: Value = resp.json().await.expect("json body");
+    assert_eq!(body["error"], "provider_auth_failed", "{body}");
+    let text = body.to_string();
+    assert!(
+        !text.contains("upstream-echo-sentinel"),
+        "the answer echoes the upstream body: {text}"
+    );
+    assert!(
+        !text.contains("could not reach"),
+        "the console matches this phrase as a network error: {text}"
+    );
+}
+
+/// Control: a server error from the embedding endpoint is not a rejected key,
+/// so the answer keeps `embedding_upstream`.
+#[tokio::test]
+async fn kb_search_with_embedding_server_error_keeps_embedding_upstream() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let embedding = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&embedding)
+        .await;
+
+    let h = start_harness(|_store| Box::pin(async move {})).await;
+    let _env = ExtractorEnv::set(&[
+        ("KB_EMBEDDING_BASE_URL", embedding.uri().as_str()),
+        ("NO_PROXY", "127.0.0.1,localhost"),
+        ("no_proxy", "127.0.0.1,localhost"),
+    ]);
+
+    let resp = reqwest::Client::new()
+        .post(format!("{}/api/v1/kb/search", h.base_url))
+        .json(&serde_json::json!({ "query": "rantaiclaw_probe" }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 502);
+    let body: Value = resp.json().await.expect("json body");
+    assert_eq!(body["error"], "embedding_upstream", "{body}");
+}
+
 async fn upload_image(base_url: &str, bytes: &[u8]) -> reqwest::Response {
     let form = reqwest::multipart::Form::new().part(
         "file",
@@ -1386,12 +1458,13 @@ async fn re_extract_total_failure_returns_502_not_zero_entities() {
     // Plan 109: a wholly-failed extraction used to return
     // 200 { entities: 0 } — indistinguishable from a document with no
     // entities. Re-extract is synchronous, so the truth can be delivered.
+    // A rejected chat key answers provider_auth_failed, not extraction_failed.
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let chat = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(401))
+        .respond_with(ResponseTemplate::new(401).set_body_string("upstream-echo-sentinel"))
         .mount(&chat)
         .await;
 
@@ -1422,13 +1495,55 @@ async fn re_extract_total_failure_returns_502_not_zero_entities() {
         "total extraction failure must not present as success"
     );
     let body: Value = resp.json().await.expect("json body");
-    assert_eq!(body["error"], "extraction_failed");
+    assert_eq!(body["error"], "provider_auth_failed", "{body}");
     let detail = body["detail"].as_str().unwrap_or_default();
-    assert!(detail.contains("http 401"), "reason surfaces: {body}");
     assert!(
-        !detail.contains("test-embedding-key"),
-        "credential must never surface: {body}"
+        detail.contains("API key"),
+        "the answer tells the operator to check the key: {body}"
     );
+    for needle in ["test-embedding-key", "upstream-echo-sentinel", "http 401"] {
+        assert!(!body.to_string().contains(needle), "{needle} leaks: {body}");
+    }
+}
+
+/// Control for the 401 case above: a chat endpoint that fails with a server
+/// error is not a rejected key, so the answer keeps `extraction_failed`.
+#[tokio::test]
+async fn re_extract_chat_server_error_keeps_extraction_failed() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let chat = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&chat)
+        .await;
+
+    let h = start_harness(|store| {
+        Box::pin(async move {
+            let mut doc = sample_doc("rantaiclaw_doc_xe", "Doc XE");
+            doc.content = "Alice works at TechCorp on embedded systems.".into();
+            store.create_document(&doc).await.unwrap();
+        })
+    })
+    .await;
+    std::env::set_var("KB_OPENROUTER_CHAT_URL", chat.uri());
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "{}/api/v1/kb/documents/rantaiclaw_doc_xe/re-extract",
+            h.base_url
+        ))
+        .send()
+        .await
+        .expect("request");
+    std::env::remove_var("KB_OPENROUTER_CHAT_URL");
+    assert_eq!(resp.status(), 502);
+    let body: Value = resp.json().await.expect("json body");
+    assert_eq!(body["error"], "extraction_failed", "{body}");
+    let detail = body["detail"].as_str().unwrap_or_default();
+    assert!(detail.contains("http 500"), "reason surfaces: {body}");
 }
 
 #[tokio::test]
