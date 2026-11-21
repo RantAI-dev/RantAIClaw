@@ -8,6 +8,7 @@
 //! - Header sanitization (handled by axum/hyper)
 
 pub mod api_v1;
+pub(crate) mod client_provider_id;
 pub mod config_api;
 pub mod cron_api;
 pub mod task_handlers;

@@ -31,6 +31,7 @@ use serde_json::json;
 #[cfg(feature = "whatsapp-web")]
 use std::convert::Infallible;
 
+use super::client_provider_id::client_provider_id;
 use super::AppState;
 use crate::config::api_url::{looks_like_api_key, validate_api_url};
 use crate::config::schema::{
@@ -656,7 +657,11 @@ async fn set_model(
         let new_provider = if p.trim().is_empty() {
             None
         } else {
-            Some(p.trim().to_string())
+            // A client may send the redacted form `/status` shows. Store the
+            // configured id, so the switch does not save a form that cannot be
+            // called. The ids are the ones this write would save.
+            let id = client_provider_id(&cfg, p.trim()).map_err(err_400)?;
+            Some(id)
         };
         switch_active_provider(&mut cfg, new_provider);
     }
@@ -8336,6 +8341,81 @@ mod tests {
         let json = serde_json::from_slice(&bytes)
             .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(&bytes).into()));
         (status, json)
+    }
+
+    /// The `/status` form of a configured endpoint cannot be called, so a switch
+    /// to it must store the configured id, not the form.
+    #[tokio::test]
+    async fn config_model_write_stores_the_configured_id_for_a_status_form() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let configured = "custom:http://user:secret@127.0.0.1:9/v1?key=abc";
+        let mut config = Config::default();
+        config.config_path = tmp.path().join("config.toml");
+        config.workspace_dir = tmp.path().join("workspace");
+        config.default_provider = Some(configured.into());
+        config.save().await.expect("write the starting config");
+        let state = console_state(config);
+
+        let (status, resp) = call(
+            &state,
+            "PUT",
+            "/api/v1/config/model",
+            Some(r#"{"provider":"custom:http://127.0.0.1:9/v1"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        assert_eq!(resp["default_provider"], configured, "{resp}");
+        let saved = std::fs::read_to_string(tmp.path().join("config.toml")).expect("saved config");
+        assert!(saved.contains(configured), "saved config: {saved}");
+    }
+
+    /// A `/status` form that names two configured providers is refused with 400,
+    /// and the saved config is left as it was.
+    #[tokio::test]
+    async fn config_model_write_refuses_a_status_form_that_names_two_configured_providers() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.config_path = tmp.path().join("config.toml");
+        config.workspace_dir = tmp.path().join("workspace");
+        config.default_provider =
+            Some("custom:http://first-user:first-secret@127.0.0.1:9/v1?key=abc".into());
+        config
+            .model_routes
+            .push(crate::config::schema::ModelRouteConfig {
+                hint: "fast".into(),
+                provider: "custom:http://second-user:second-secret@127.0.0.1:9/v1?key=abc".into(),
+                model: "m".into(),
+                api_key: None,
+            });
+        config.save().await.expect("write the starting config");
+        let path = config.config_path.clone();
+        let before = std::fs::read(&path).expect("starting config");
+        let state = console_state(config);
+
+        let (status, resp) = call(
+            &state,
+            "PUT",
+            "/api/v1/config/model",
+            Some(r#"{"provider":"custom:http://127.0.0.1:9/v1"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+        let detail = resp["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("more than one configured provider"),
+            "{detail}"
+        );
+        assert!(
+            !detail.contains("secret") && !detail.contains("key=abc"),
+            "{detail}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("config after the refusal"),
+            before,
+            "a refused write saves nothing"
+        );
     }
 
     /// A misspelled key used to reach `apply_secrets` with both fields `None`,

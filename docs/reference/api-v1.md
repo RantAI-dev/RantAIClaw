@@ -165,6 +165,7 @@ tokens, session ids, or paths.
   and it is `null` when the profile has no preset. The `autonomy` level alone
   cannot tell Manual from Smart: both are `Supervised` and differ only in
   `always_ask`.
+  The `provider` field is the configured default provider id with its userinfo and query removed; send it back to the models, refresh and chat routes and the gateway resolves it to the configured id.
 - **Status codes**: `200`, `401`.
 
 ### GET /api/v1/doctor
@@ -200,6 +201,7 @@ tokens, session ids, or paths.
   the async runtime). The three live checks (`provider.ping`, `channels.auth`,
   `mcp.startup`) are not run in brief mode; their names are returned in
   `skipped` so a client can say so rather than imply an all-green gateway.
+  Every string in the response has URL userinfo and query removed.
 - **Status codes**: `200`, `401`.
 
 ---
@@ -230,8 +232,11 @@ tokens, session ids, or paths.
   same rule as the models-refresh route; an unconfigured id is refused with
   `400` before any agent runs. When the body switches to a provider other
   than the configured `default_provider`, the top-level `api_key` does not
-  follow the switch — the named provider resolves only its own
-  `provider_api_keys` entry and env key.
+  follow the switch: the named provider resolves only its own
+  `provider_api_keys` entry and env key. The id may be the redacted form
+  that `/status` shows (no userinfo, no query): the gateway maps it back to
+  the one configured provider it came from. When two configured ids redact
+  to the same form, the turn is refused with `400` and nothing runs.
 - **`message` is the user's words.** Anything a client adds for rendering or
   context travels in its own field, and only `message` is persisted. A client
   that appends its own instructions to `message` gets them stored as part of the
@@ -274,9 +279,10 @@ tokens, session ids, or paths.
   `source = "api"`; a failed or empty-answer turn is not persisted (no
   session is created/appended).
 - **Status codes**: `200`, `400` (empty `message`, no model configured, a provider
-  name that does not exist, or a refusal the provider decided locally — a missing
+  name that does not exist, a redacted provider id that matches more than one
+  configured provider, or a refusal the provider decided locally, such as a missing
   Gemini or AWS Bedrock credential, an Ollama `:cloud` model, a removed
-  subscription login, an Anthropic setup-token — with the fix named in the body),
+  subscription login or an Anthropic setup-token, with the fix named in the body),
   `401`,
   `502` (`provider_auth_failed`: the provider answered `401` or `403` to the credential it was
   sent, and the body names the provider id and that status; the 502 JSON route always carries
@@ -1198,7 +1204,8 @@ is created first.
   the curated fallback list) or `"curated"` (no cache entry). `age_secs` is
   `null` when `source` is `"curated"`. This never makes a network call — see
   the refresh endpoint below for that.
-- **Status codes**: `200`, `401`.
+  The id may be the redacted form from `/status`; the gateway resolves it to the configured provider, and answers `400` when it matches more than one configured provider.
+- **Status codes**: `200`, `400` (the provider id matches more than one configured provider), `401`.
 
 ### POST /api/v1/providers/{id}/models/refresh
 
@@ -1231,7 +1238,7 @@ is created first.
     "detail": "present only when refreshed is false — the fetch error"
   }
   ```
-- **Status codes**: `200`, `401`, `500` (only if the refresh task itself
+- **Status codes**: `200`, `400` (the provider id matches more than one configured provider), `401`, `500` (only if the refresh task itself
   panics — not for an ordinary fetch failure).
 
 ---
@@ -1301,8 +1308,10 @@ no stored arg is taken as written.
 - **`warning`** is present only when the request sets `provider` and the new provider has no usable
   credential, or is a removed subscription login. The switch is still saved. Channels and chat
   cannot use that provider until a key is added. The field is absent otherwise.
-- **Status codes**: `200`, `400` (an unknown field, or a body with none of `provider`, `model`,
-  `temperature`: `nothing_to_apply`), `401`, `500`.
+- The `provider` field may be the redacted form from `/status`; the gateway resolves it to the configured provider, and answers `400` when it matches more than one configured provider.
+- **Status codes**: `200`, `400` (an unknown field, a body with none of `provider`, `model`,
+  `temperature`: `nothing_to_apply`, or a `provider` id that matches more than one configured
+  provider), `401`, `500`.
 
 ### PUT /api/v1/config/autonomy
 

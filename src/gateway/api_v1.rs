@@ -30,7 +30,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
+use super::client_provider_id::client_provider_id;
 use super::AppState;
+use crate::providers::without_userinfo_and_query;
 
 /// Build the `/api/v1/*` router. Mounted via `.merge()` from the main gateway
 /// router so it shares state, body limit, and timeout middleware.
@@ -516,12 +518,18 @@ async fn status(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
     let cfg = state.config.lock();
-    Ok(Json(serde_json::json!({
+    // The provider id is shown without its userinfo and query: a `custom:` id
+    // can carry a password or a key in either part.
+    let mut response = serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         // Mirror the `build` field from `/api/v1/version` so a consumer that
         // only calls `/status` still has enough to detect a binary drift.
         "build": option_env!("RANTAICLAW_BUILD_ID").unwrap_or("unknown"),
-        "provider": cfg.default_provider.clone().unwrap_or_default(),
+        "provider": cfg
+            .default_provider
+            .as_deref()
+            .map(without_userinfo_and_query)
+            .unwrap_or_default(),
         "model": cfg.default_model.clone().unwrap_or_default(),
         "memory_backend": cfg.memory.backend,
         "autonomy": format!("{:?}", cfg.autonomy.level),
@@ -543,7 +551,9 @@ async fn status(
         "workspace_dir": cfg.workspace_dir.display().to_string(),
         "paired": state.pairing.is_paired(),
         "runtime": crate::health::snapshot_json(),
-    })))
+    });
+    redact_response_strings(&mut response);
+    Ok(Json(response))
 }
 
 async fn doctor(
@@ -576,9 +586,28 @@ async fn doctor(
     // `skipped` names the live checks (provider.ping, channels.auth,
     // mcp.startup) that brief mode does not run, so the console can say so
     // instead of implying an all-green gateway.
-    Ok(Json(
-        serde_json::json!({ "results": summary, "skipped": run.skipped }),
-    ))
+    let mut response = serde_json::json!({ "results": summary, "skipped": run.skipped });
+    redact_response_strings(&mut response);
+    Ok(Json(response))
+}
+
+/// Redacts the userinfo and query of every URL in the string values of a
+/// response, in place. Object keys, numbers and booleans stay as they are.
+///
+/// The check messages print the provider ids and endpoints the operator
+/// configured, and those can carry a password or a key. Scrubbing the response
+/// here covers every message without touching each check.
+fn redact_response_strings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => {
+            *text = crate::logging::redact_urls(text.as_str());
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(redact_response_strings),
+        serde_json::Value::Object(fields) => {
+            fields.values_mut().for_each(redact_response_strings);
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1505,7 +1534,10 @@ fn chat_config_from_body(
 ) -> Result<crate::config::Config, (StatusCode, Json<ErrorBody>)> {
     let mut config = state.config.lock().clone();
     let original_default_provider = config.default_provider.clone();
-    if let Some(p) = body.provider.clone() {
+    if let Some(sent) = body.provider.clone() {
+        // A client may send the redacted form `/status` shows. Resolve it to the
+        // configured id before the guard, the key rule and the switch below.
+        let p = client_provider_id(&config, &sent).map_err(err_400)?;
         // The provider id arrives in the request body, so it is caller-chosen:
         // a `custom:` / `anthropic-custom:` id the operator has not configured
         // is refused before any agent is built or any request is made.
@@ -3111,7 +3143,13 @@ async fn provider_models(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
-    let workspace_dir = state.config.lock().workspace_dir.clone();
+    // The id may be the redacted form `/status` shows. Resolve it before the
+    // cache key is computed, so the catalog is read under the configured id.
+    let (workspace_dir, id) = {
+        let config = state.config.lock();
+        let id = client_provider_id(&config, &id).map_err(err_400)?;
+        (config.workspace_dir.clone(), id)
+    };
     let cat = crate::onboard::wizard::provider_model_catalog(&workspace_dir, &id);
     let count = cat.models.len();
     Ok(Json(serde_json::json!({
@@ -3137,6 +3175,9 @@ async fn provider_models_refresh(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
     let config = state.config.lock().clone();
+    // The id may be the redacted form `/status` shows. Resolve it first, so the
+    // guard and the refresh below both see the configured id.
+    let id = client_provider_id(&config, &id).map_err(err_400)?;
     // The id arrives on the URL path, so it is caller-chosen. A `custom:` /
     // `anthropic-custom:` id the operator has not configured must be refused
     // with 400 here — `run_models_refresh` would otherwise send the stored
@@ -3999,6 +4040,267 @@ mod tests {
             assert_eq!(entries[0]["provider"], expected_redacted, "cache: {raw}");
         }
         mock.assert();
+    }
+
+    /// `GET .../models` takes the id `/status` shows, which keeps the host's
+    /// case. The cache key lowercases the host, so only the configured id finds
+    /// the cache that the refresh wrote.
+    #[tokio::test]
+    async fn provider_models_reads_the_cache_of_a_configured_id_named_by_its_status_form() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let configured = "custom:http://user:secret@LOCALHOST:9/v1?key=abc";
+        let state = test_state();
+        {
+            let mut config = state.config.lock();
+            config.workspace_dir = workspace.path().to_path_buf();
+            config.default_provider = Some(configured.to_string());
+        }
+        let state_dir = workspace.path().join("state");
+        std::fs::create_dir_all(&state_dir).expect("state dir");
+        let cache = serde_json::json!({
+            "entries": [{
+                "provider": "custom:http://localhost:9/v1",
+                "fetched_at_unix": 0,
+                "models": ["model-a"],
+            }]
+        });
+        std::fs::write(state_dir.join("models_cache.json"), cache.to_string())
+            .expect("write cache");
+
+        // What `/status` shows for the configured id.
+        let shown = "custom:http://LOCALHOST:9/v1";
+        let Ok(Json(response)) =
+            provider_models(State(state), HeaderMap::new(), Path(shown.to_string())).await
+        else {
+            panic!("a configured id named by its status form must answer");
+        };
+        assert_eq!(response["source"], "cache", "response: {response}");
+        assert_eq!(
+            response["models"],
+            serde_json::json!(["model-a"]),
+            "response: {response}"
+        );
+        assert_eq!(
+            response["provider"], "custom:http://localhost:9/v1",
+            "response: {response}"
+        );
+        let text = response.to_string();
+        assert!(
+            !text.contains("secret") && !text.contains("key=abc"),
+            "response echoed a secret: {text}"
+        );
+    }
+
+    /// `POST .../models/refresh` with the `/status` form of a configured endpoint
+    /// refreshes that endpoint, sending the credential the operator stored for it.
+    #[tokio::test]
+    async fn provider_models_refresh_fetches_a_configured_id_named_by_its_status_form() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _proxy = loopback_no_proxy();
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", mockito::Matcher::Any)
+            // reqwest sends the URL's userinfo as a Basic header ahead of the
+            // Bearer key, so the match looks at every Authorization value.
+            .match_request(|req| {
+                req.header("authorization")
+                    .iter()
+                    .any(|value| value.to_str().ok() == Some("Bearer key-for-test-0000"))
+            })
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"model-a"}]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let base = format!("{}/v1", server.url());
+        let configured = format!(
+            "custom:{}?key=abc",
+            base.replacen("http://", "http://user:secret@", 1)
+        );
+        let shown = format!("custom:{base}");
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let state = test_state();
+        {
+            let mut config = state.config.lock();
+            config.workspace_dir = workspace.path().to_path_buf();
+            config.default_provider = Some(configured.clone());
+            config
+                .provider_api_keys
+                .insert(configured, "key-for-test-0000".into());
+        }
+
+        let Ok(Json(response)) =
+            provider_models_refresh(State(state), HeaderMap::new(), Path(shown.clone())).await
+        else {
+            panic!("a configured id named by its status form must refresh");
+        };
+        assert_eq!(response["refreshed"], true, "response: {response}");
+        assert_eq!(response["provider"], shown, "response: {response}");
+        mock.assert();
+    }
+
+    /// `POST /agent/chat` with the `/status` form of the configured endpoint
+    /// answers through that endpoint, sending the credential the operator stored.
+    #[tokio::test]
+    async fn agent_chat_sync_answers_through_a_configured_id_named_by_its_status_form() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _proxy = loopback_no_proxy();
+        let home = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(home.path());
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", mockito::Matcher::Any)
+            .match_request(|req| {
+                req.header("authorization")
+                    .iter()
+                    .any(|value| value.to_str().ok() == Some("Bearer key-for-test-0000"))
+            })
+            .with_status(200)
+            .with_body(
+                r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"pong"},"finish_reason":"stop"}]}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let base = format!("{}/v1", server.url());
+        let configured = format!(
+            "custom:{}?key=abc",
+            base.replacen("http://", "http://user:secret@", 1)
+        );
+        let shown = format!("custom:{base}");
+        let state = test_state();
+        {
+            let mut config = state.config.lock();
+            config.default_provider = Some(configured.clone());
+            config
+                .provider_api_keys
+                .insert(configured, "key-for-test-0000".into());
+        }
+
+        let Ok(Json(reply)) = agent_chat_sync(
+            State(state),
+            HeaderMap::new(),
+            Json(ChatRequestBody {
+                message: "ping".into(),
+                model: None,
+                provider: Some(shown),
+                temperature: None,
+                session_id: None,
+                context: None,
+                render_mode: None,
+            }),
+        )
+        .await
+        else {
+            panic!("a configured id named by its status form must answer");
+        };
+        assert_eq!(reply.text, "pong");
+        mock.assert();
+    }
+
+    /// Two configured ids that redact to one `/status` form cannot be told apart.
+    /// The refresh refuses that form with a fixed detail and sends no request.
+    #[tokio::test]
+    async fn provider_models_refresh_refuses_a_status_form_that_names_two_configured_providers() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let _proxy = loopback_no_proxy();
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"model-a"}]}"#)
+            .expect(0)
+            .create_async()
+            .await;
+        let base = format!("{}/v1", server.url());
+        let first = format!(
+            "custom:{}?key=abc",
+            base.replacen("http://", "http://first-user:first-secret@", 1)
+        );
+        let second = format!(
+            "custom:{}?key=abc",
+            base.replacen("http://", "http://second-user:second-secret@", 1)
+        );
+        let state = test_state();
+        {
+            let mut config = state.config.lock();
+            config.default_provider = Some(first);
+            config
+                .model_routes
+                .push(crate::config::schema::ModelRouteConfig {
+                    hint: "fast".into(),
+                    provider: second,
+                    model: "m".into(),
+                    api_key: None,
+                });
+        }
+
+        let Err((status, Json(body))) = provider_models_refresh(
+            State(state),
+            HeaderMap::new(),
+            Path(format!("custom:{base}")),
+        )
+        .await
+        else {
+            panic!("an ambiguous status form must be refused");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let detail = body.detail.expect("refusal detail");
+        assert!(
+            detail.contains("more than one configured provider"),
+            "detail: {detail}"
+        );
+        assert!(
+            !detail.contains("secret") && !detail.contains("key=abc") && !detail.contains("user"),
+            "detail echoed a secret: {detail}"
+        );
+        mock.assert();
+    }
+
+    /// The same ambiguity on the model list: a 400 with the fixed detail,
+    /// not a catalog read under one of the two ids.
+    #[tokio::test]
+    async fn provider_models_refuses_a_status_form_that_names_two_configured_providers() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let state = test_state();
+        {
+            let mut config = state.config.lock();
+            config.workspace_dir = workspace.path().to_path_buf();
+            config.default_provider =
+                Some("custom:http://first-user:first-secret@127.0.0.1:9/v1?key=abc".into());
+            config
+                .model_routes
+                .push(crate::config::schema::ModelRouteConfig {
+                    hint: "fast".into(),
+                    provider: "custom:http://second-user:second-secret@127.0.0.1:9/v1?key=abc"
+                        .into(),
+                    model: "m".into(),
+                    api_key: None,
+                });
+        }
+
+        let Err((status, Json(body))) = provider_models(
+            State(state),
+            HeaderMap::new(),
+            Path("custom:http://127.0.0.1:9/v1".to_string()),
+        )
+        .await
+        else {
+            panic!("an ambiguous status form must be refused");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let detail = body.detail.expect("refusal detail");
+        assert!(
+            detail.contains("more than one configured provider"),
+            "detail: {detail}"
+        );
+        assert!(
+            !detail.contains("secret") && !detail.contains("key=abc") && !detail.contains("user"),
+            "detail echoed a secret: {detail}"
+        );
     }
 
     /// `detail` is shown in the console, which hides `api_url` secrets
@@ -6348,6 +6650,139 @@ mod tests {
         assert_eq!(
             json["autonomy_preset"], "strict",
             "the marker decides, not the config"
+        );
+    }
+
+    /// A provider id with userinfo and a query, as an operator may have typed it.
+    const CREDENTIALED_PROVIDER_ID: &str = "custom:http://user:secret@host/v1?key=abc";
+
+    #[tokio::test]
+    async fn status_shows_the_provider_id_without_userinfo_or_query() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+        let _profile_name = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
+        let state = test_state();
+        state.config.lock().default_provider = Some(CREDENTIALED_PROVIDER_ID.to_string());
+
+        let response = status(State(state), HeaderMap::new())
+            .await
+            .expect("status ok")
+            .into_response();
+        let text = response_text(response).await;
+        let json: serde_json::Value = serde_json::from_str(&text).expect("json body");
+        assert_eq!(
+            json["provider"], "custom:http://host/v1",
+            "response: {text}"
+        );
+        assert!(
+            !text.contains("secret") && !text.contains("key=abc"),
+            "status echoed a credential: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_names_the_provider_without_userinfo_or_query() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+        let _profile_name = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
+        let _credentials = crate::test_env::CredentialEnvScrub::new();
+        let state = test_state();
+        state.config.lock().default_provider = Some(CREDENTIALED_PROVIDER_ID.to_string());
+
+        let response = doctor(State(state), HeaderMap::new())
+            .await
+            .expect("doctor ok")
+            .into_response();
+        let text = response_text(response).await;
+        // The credential check prints the provider id, so the redacted form
+        // must appear. Without it, the test would pass on a check that never
+        // printed the id.
+        assert!(
+            text.contains("custom:http://host/v1"),
+            "a check should name the redacted provider: {text}"
+        );
+        assert!(
+            !text.contains("secret") && !text.contains("key=abc"),
+            "doctor echoed a credential: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_and_doctor_keep_a_plain_provider_id_and_their_keys() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+        let _profile_name = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
+        let _credentials = crate::test_env::CredentialEnvScrub::new();
+        let state = test_state();
+        state.config.lock().default_provider = Some("openrouter".to_string());
+
+        let response = status(State(state.clone()), HeaderMap::new())
+            .await
+            .expect("status ok")
+            .into_response();
+        let json: serde_json::Value =
+            serde_json::from_str(&response_text(response).await).expect("json body");
+        assert_eq!(json["provider"], "openrouter");
+        for key in ["version", "build", "model", "autonomy", "runtime", "paired"] {
+            assert!(json.get(key).is_some(), "status lost `{key}`: {json}");
+        }
+
+        let response = doctor(State(state), HeaderMap::new())
+            .await
+            .expect("doctor ok")
+            .into_response();
+        let json: serde_json::Value =
+            serde_json::from_str(&response_text(response).await).expect("json body");
+        assert!(json["skipped"].is_array(), "doctor lost `skipped`: {json}");
+        let results = json["results"].as_array().expect("results array");
+        let names: Vec<&str> = results
+            .iter()
+            .map(|result| result["name"].as_str().expect("check name"))
+            .collect();
+        assert!(
+            names.contains(&"config.provider_key"),
+            "doctor lost the provider key check: {names:?}"
+        );
+        for result in results {
+            for key in [
+                "name",
+                "category",
+                "severity",
+                "message",
+                "hint",
+                "duration_ms",
+            ] {
+                assert!(result.get(key).is_some(), "check lost `{key}`: {result}");
+            }
+        }
+    }
+
+    #[test]
+    fn redact_response_strings_scrubs_urls_in_every_string_and_keeps_the_rest() {
+        let mut value = serde_json::json!({
+            "message": "credential for custom:http://user:secret@host/v1?key=abc is refused",
+            "items": ["see https://u:p@example.com/a?token=t", 7, true, null],
+            "nested": {"https://keep.example/?q=1": {"url": "custom:http://u:p@h/x"}},
+            "count": 3,
+        });
+
+        redact_response_strings(&mut value);
+
+        assert_eq!(
+            value["message"],
+            "credential for custom:http://host/v1 is refused"
+        );
+        assert_eq!(value["items"][0], "see https://example.com/a");
+        assert_eq!(value["items"][1], 7);
+        assert_eq!(value["items"][2], true);
+        assert!(value["items"][3].is_null());
+        assert_eq!(value["count"], 3);
+        assert_eq!(
+            value["nested"]["https://keep.example/?q=1"]["url"],
+            "custom:http://h/x"
         );
     }
 
