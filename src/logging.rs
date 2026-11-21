@@ -238,8 +238,9 @@ pub fn install_log_bridge() {
 /// part of the host, and a query such as `?filter[type]=x&key=abc` must be
 /// matched whole, or the part after the first `[` would reach the log. Single
 /// quotes and parentheses stay in the token too, because RFC 3986 allows them
-/// in userinfo, so a password that holds one is redacted whole. A URL inside a
-/// sentence keeps the text after it.
+/// in userinfo, so a password that holds one is redacted whole. Text after the
+/// token is kept; punctuation glued to a query, such as a closing `)`, goes
+/// with the query.
 fn url_regex() -> &'static regex::bytes::Regex {
     static URL: OnceLock<regex::bytes::Regex> = OnceLock::new();
     URL.get_or_init(|| {
@@ -248,24 +249,60 @@ fn url_regex() -> &'static regex::bytes::Regex {
     })
 }
 
-/// Rebuilds one URL without its userinfo (`user:pass@`) and without its query
-/// string or fragment (everything from the first `?` or `#`). The scheme and
-/// the host and path stay, so an operator still sees which endpoint failed.
+fn is_scheme_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'+' | b'.' | b'-')
+}
+
+/// Where the next URL starts inside `rest`, if one does: the first `://` with
+/// a scheme in front of it. Two URLs joined by `,`, `;`, `|` or `)(` form one
+/// token, and each must be redacted on its own.
+fn next_url_start(rest: &[u8]) -> Option<usize> {
+    let mut from = 0;
+    while let Some(off) = rest[from..].windows(3).position(|w| w == b"://") {
+        let colon = from + off;
+        let mut start = colon;
+        while start > 0 && is_scheme_byte(rest[start - 1]) {
+            start -= 1;
+        }
+        while start < colon && !rest[start].is_ascii_alphabetic() {
+            start += 1;
+        }
+        if start < colon {
+            return Some(start);
+        }
+        from = colon + 3;
+    }
+    None
+}
+
+/// Rebuilds the URLs in one token without their userinfo (`user:pass@`) and
+/// without their query string or fragment. The scheme, the host and the path
+/// stay, so an operator still sees which endpoint failed. Userinfo goes first,
+/// up to the last `@` before the first `/`, so a `?` or `#` inside a password
+/// is removed with the password.
 fn redact_url(scheme: &[u8], rest: &[u8]) -> Vec<u8> {
-    let without_query = match rest.iter().position(|&b| b == b'?' || b == b'#') {
-        Some(end) => &rest[..end],
-        None => rest,
+    let (this, next) = match next_url_start(rest) {
+        Some(at) => rest.split_at(at),
+        None => (rest, &rest[rest.len()..]),
     };
-    let (authority, path) = match without_query.iter().position(|&b| b == b'/') {
-        Some(slash) => without_query.split_at(slash),
-        None => (without_query, &without_query[without_query.len()..]),
+    let (authority, path) = match this.iter().position(|&b| b == b'/') {
+        Some(slash) => this.split_at(slash),
+        None => (this, &this[this.len()..]),
     };
-    // Userinfo ends at the last `@` of the authority. A host never holds `@`.
     let host = match authority.iter().rposition(|&b| b == b'@') {
         Some(at) => &authority[at + 1..],
         None => authority,
     };
-    [scheme, host, path].concat()
+    let query_at = |part: &[u8]| part.iter().position(|&b| b == b'?' || b == b'#');
+    let mut out = match query_at(host) {
+        Some(q) => [scheme, &host[..q]].concat(),
+        None => match query_at(path) {
+            Some(q) => [scheme, host, &path[..q]].concat(),
+            None => [scheme, host, path].concat(),
+        },
+    };
+    out.extend_from_slice(&redact_urls_in_bytes(next));
+    out
 }
 
 /// Redacts every URL in `bytes` and returns the bytes otherwise unchanged.
@@ -619,6 +656,41 @@ mod tests {
         );
 
         assert_eq!(redacted, "a https://host/v1/ b\nc https://host/v1 d\n");
+    }
+
+    /// Two URLs with no whitespace between them are two URLs: the second
+    /// loses its userinfo and query too. A separator glued to a query (`|`
+    /// after `?key=abc`) goes with the query.
+    #[test]
+    fn url_redaction_splits_urls_joined_without_whitespace() {
+        let redacted = redact_urls(
+            "a custom:https://u:p@h/v1,custom:https://w:x@g/v1 b\n\
+             c https://u:p@h/x;https://w:x@g/y?key=abc|http://v:y@k/z d\n\
+             e (https://u:p@h/x)(https://w:x@g/y) f\n",
+        );
+
+        assert_eq!(
+            redacted,
+            "a custom:https://h/v1,custom:https://g/v1 b\n\
+             c https://h/x;https://g/yhttp://k/z d\n\
+             e (https://h/x)(https://g/y) f\n"
+        );
+        assert!(!redacted.contains("w:x") && !redacted.contains("v:y"));
+    }
+
+    /// A `?` or `#` inside a password does not end the userinfo early.
+    #[test]
+    fn url_redaction_removes_a_password_that_holds_a_question_mark_or_hash() {
+        let redacted = redact_urls(
+            "a https://u:pa?ss@h/v1?key=abc b\n\
+             c https://u:pa#ss@h/v1 d\n\
+             e https://h?next=/a b\n",
+        );
+
+        assert_eq!(
+            redacted,
+            "a https://h/v1 b\nc https://h/v1 d\ne https://h b\n"
+        );
     }
 
     /// A flush between the two halves of a URL emits nothing: the writer keeps
