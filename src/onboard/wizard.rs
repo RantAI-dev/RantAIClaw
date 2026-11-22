@@ -2461,6 +2461,17 @@ pub enum StaleCacheReason {
     ProviderReturnedEmpty,
 }
 
+/// The line `run_models_refresh` prints after a live fetch. The gateway's
+/// refresh route reaches it too, and stdout is the daemon's journal, which the
+/// tracing writer's URL redaction does not cover, so the id goes out without
+/// its userinfo or query.
+fn refreshed_models_line(provider_name: &str, count: usize) -> String {
+    format!(
+        "Refreshed '{}' model cache with {count} models.",
+        crate::providers::without_userinfo_and_query(provider_name)
+    )
+}
+
 pub fn run_models_refresh(
     config: &Config,
     provider_override: Option<&str>,
@@ -2520,11 +2531,7 @@ pub fn run_models_refresh(
     match fetch_live_models_for_provider(&provider_name, &api_key, provider_api_url) {
         Ok(models) if !models.is_empty() => {
             cache_live_models_for_provider(&config.workspace_dir, &provider_name, &models)?;
-            println!(
-                "Refreshed '{}' model cache with {} models.",
-                provider_name,
-                models.len()
-            );
+            println!("{}", refreshed_models_line(&provider_name, models.len()));
             let count = models.len();
             print_model_preview(&models);
             Ok(ModelRefreshOutcome::FetchedLive { count })
@@ -2544,7 +2551,10 @@ pub fn run_models_refresh(
                 });
             }
 
-            anyhow::bail!("Provider '{}' returned an empty model list", provider_name)
+            anyhow::bail!(
+                "Provider '{}' returned an empty model list",
+                crate::providers::without_userinfo_and_query(&provider_name)
+            )
         }
         Err(error) => {
             if let Some(stale_cache) =
@@ -2552,7 +2562,7 @@ pub fn run_models_refresh(
             {
                 println!(
                     "Live refresh failed ({}). Falling back to stale cache (updated {} ago):",
-                    error,
+                    crate::logging::redact_urls(&error.to_string()),
                     humanize_age(stale_cache.age_secs)
                 );
                 print_model_preview(&stale_cache.models);
@@ -8223,6 +8233,19 @@ mod tests {
         .unwrap()
         .expect("a read with the raw id finds the redacted entry");
         assert_eq!(cached.models, vec!["legacy-model-b".to_string()]);
+    }
+
+    #[test]
+    fn refreshed_models_line_drops_the_userinfo_and_query_of_a_custom_id() {
+        let line = refreshed_models_line("custom:http://user:secret@127.0.0.1:9/v1?key=abc", 3);
+        assert_eq!(
+            line,
+            "Refreshed 'custom:http://127.0.0.1:9/v1' model cache with 3 models."
+        );
+        assert_eq!(
+            refreshed_models_line("openrouter", 2),
+            "Refreshed 'openrouter' model cache with 2 models."
+        );
     }
 
     #[test]
