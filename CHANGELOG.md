@@ -7,11 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.36.0-alpha] — 2026-11-22
+
+The provider-key release. A provider id or endpoint URL no longer carries its userinfo or query at
+any sink: logs, metrics, error bodies, `/status`, `/doctor`, the knowledge base and the onboarding
+refresh line. A provider that rejects the key answers `502 provider_auth_failed` on every route
+that calls it, and the console says the key was rejected instead of reporting an outage. A single
+Enter in the TUI runs a partial command only when that command is read-only. The console pin moves
+from `v0.3.32` to `v0.3.33`.
+
+**Rolls back to v0.35.0-alpha without a manual fix.** The config schema stays at **40** and the
+sessions store stays at **3**, so a config and a sessions file that this binary writes load on
+v0.35.0-alpha. No migration runs on the first start.
+
 ### Security
 
 - `POST /api/v1/providers/{id}/models/refresh` no longer prints a `custom:` provider id with its userinfo or query to stdout, which is the daemon's journal under systemd. The "Refreshed ... model cache" line, the stale-cache fallback line and the empty-list error now show the id without them.
 - **GET /api/v1/status and GET /api/v1/doctor no longer answer the userinfo or the query of a provider id or endpoint URL.** The status `provider` is the id without them, and every string in the doctor answer is scrubbed the same way. A client that sends that redacted id back to the models, refresh, chat or config model routes gets the configured provider, or a 400 when the redacted form matches more than one configured provider. /config and /secrets are unchanged.
 - The email channel uses `lettre` 0.11.24, which fixes six advisories in 0.11.23 (RUSTSEC-2026-0560 to RUSTSEC-2026-0565). The one that reaches RantaiClaw directly is RUSTSEC-2026-0560: on a STARTTLS connection (port 587, the default for `starttls_relay`), a man-in-the-middle could append forged replies to the cleartext `STARTTLS` answer and make a rejected message look accepted. The others cover SMTP command injection through bare LF or CR, an address with a quoted local part sent to a different mailbox, and panics or unbounded memory on a malicious server's reply.
+- The CI security audit waives six RustSec advisories until 2026-12-15, each with its reason in `deny.toml` and `.github/workflows/sec-audit.yml`. RUSTSEC-2026-0543 and RUSTSEC-2026-0555 flag `chrono` 0.4.45 and `chrono-tz` 0.10.4 as unmaintained, with no patched version. RUSTSEC-2026-0545, -0546, -0547 and -0548 affect `zip` 8.6.0, which only `docx-rs` reaches, behind the opt-in `kb-office` feature. No code in `src` calls the affected APIs. No crate is bumped for these waivers.
 - Log lines, observer events and metric labels no longer carry the userinfo or the query string of a provider id or endpoint URL; gateway error bodies and KB errors no longer carry them either. A KB embedding or chat call that gets no response now answers `502 upstream_unreachable` instead of `500 internal_error`, and the KB CLI prints a fixed line for it. One limit: a password with an unescaped `/`, `<`, `>`, `"` or backtick, which RFC 3986 does not allow in userinfo, can still be cut short in a log line; percent-encode such characters.
 
 ### Fixed
