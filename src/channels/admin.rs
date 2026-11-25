@@ -703,10 +703,16 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
             );
             Ok(())
         }
-        // Guidance, not failure. These bailed, so a script wrapping
-        // `rantaiclaw channel add` saw a non-zero exit for what is an
-        // informational outcome.
+        // Guidance, not failure, for a type in the catalog. These bailed, so a
+        // script wrapping `rantaiclaw channel add` saw a non-zero exit for what
+        // is an informational outcome. An unknown type is a usage error.
         crate::ChannelCommands::Add { channel_type } => {
+            if !CHANNEL_CATALOG
+                .iter()
+                .any(|(key, _, _, _)| *key == channel_type.as_str())
+            {
+                anyhow::bail!("Unknown channel type '{channel_type}': not in the channel catalog");
+            }
             println!("{}", channel_add_guidance(&channel_type));
             Ok(())
         }
