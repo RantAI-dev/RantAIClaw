@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- `url` 2.5.9 fixes RUSTSEC-2026-0592: `Url::origin()` overflowed the stack on nested `blob:` URLs in 2.5.8. `form_urlencoded` moves from 1.2.2 to 1.2.3 with it.
+
 ## [0.36.0-alpha] — 2026-11-22
 
 The provider-key release. A provider id or endpoint URL no longer carries its userinfo or query at
