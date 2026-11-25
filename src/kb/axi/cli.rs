@@ -1075,6 +1075,16 @@ pub fn provider_auth_failed_line(detail: &str) -> String {
     format!("provider_auth_failed,{detail}")
 }
 
+/// The row the CLI prints under `error[1]{code,message}:` when an upstream
+/// embedding or chat endpoint answered with an error status that is not a
+/// rejected key: the same code and words the gateway's `embedding_upstream`
+/// and `chat_upstream` answers carry. Only the status is interpolated, so
+/// the upstream body — which can echo the credential back — and the URL
+/// never reach stdout.
+pub fn upstream_api_status_line(service: &str, status: u16) -> String {
+    format!("{service}_upstream,upstream {service} API returned status {status}")
+}
+
 fn print_error_toon(code: &str, message: &str) {
     let row = serde_json::json!({ "code": code, "message": message });
     print!(
@@ -1199,6 +1209,25 @@ mod tests {
         assert_eq!(
             chat,
             "provider_auth_failed,the chat provider rejected the API key; check the key"
+        );
+        assert!(
+            !embedding.contains("://") && !chat.contains("://"),
+            "the CLI line names the endpoint: {embedding} / {chat}"
+        );
+    }
+
+    #[test]
+    fn upstream_api_status_line_names_the_status_and_never_the_body() {
+        let embedding = super::upstream_api_status_line("embedding", 500);
+        let chat = super::upstream_api_status_line("chat", 429);
+        assert_eq!(
+            embedding,
+            "embedding_upstream,upstream embedding API returned status 500"
+        );
+        assert_eq!(chat, "chat_upstream,upstream chat API returned status 429");
+        assert!(
+            !embedding.contains("body=") && !chat.contains("body="),
+            "the CLI line carries the upstream body: {embedding} / {chat}"
         );
         assert!(
             !embedding.contains("://") && !chat.contains("://"),

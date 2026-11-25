@@ -2150,6 +2150,24 @@ async fn main() -> Result<()> {
                 );
                 std::process::exit(1);
             }
+            // Any other upstream status is the upstream's own failure: the
+            // answer names the service and the status, and carries neither
+            // the upstream body — which can echo the credential back — nor
+            // a URL.
+            Err(rantaiclaw::kb::KbError::EmbeddingApi { status, .. }) => {
+                println!(
+                    "error[1]{{code,message}}:\n  {}",
+                    rantaiclaw::kb::axi::cli::upstream_api_status_line("embedding", status)
+                );
+                std::process::exit(1);
+            }
+            Err(rantaiclaw::kb::KbError::ChatApi { status, .. }) => {
+                println!(
+                    "error[1]{{code,message}}:\n  {}",
+                    rantaiclaw::kb::axi::cli::upstream_api_status_line("chat", status)
+                );
+                std::process::exit(1);
+            }
             Err(e) => {
                 println!("error[1]{{code,message}}:\n  internal,{e}");
                 std::process::exit(1);
