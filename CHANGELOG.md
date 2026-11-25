@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.37.0-alpha] — 2026-11-25
+
+Sync chat and config-model answers no longer carry a provider id's userinfo or query, and a rejected key now reads as a rejected key on the knowledge base CLI, in cron which records one failed run per click, and on the console. Unknown channel and cron ids exit non-zero, and OpenTelemetry posts each signal to its own path with a one-shot `agent -m` run flushing before exit. A `custom:` base with a query now reaches the right path.
+
+**Rolls back to v0.36.0-alpha without a manual fix.** The config schema stays at **40** and the sessions store stays at **3**, so a config and a sessions file that this binary writes load on v0.36.0-alpha. No migration runs on the first start.
+
 ### Security
 
 - **The sync chat answer and the config model answer no longer carry a provider id's userinfo or query.** `POST /api/v1/agent/chat` without an SSE `Accept` answers `provider` as `/status` shows it, and `PUT /api/v1/config/model` answers `default_provider` and its no-key `warning` the same way. A client that sends the redacted form back still resolves to the configured provider, and the second turn of a chat reaches the same endpoint with the stored key. `/config` and `/secrets` are unchanged.
