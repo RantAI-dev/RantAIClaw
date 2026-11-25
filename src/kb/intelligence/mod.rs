@@ -26,7 +26,7 @@ pub struct IntelligenceSummary {
     pub entities: usize,
     pub relations: usize,
     /// Chunks the extractor failed on. Non-zero with zero entities means
-    /// extraction FAILED, not "no entities" (plan 109).
+    /// extraction FAILED, not "no entities".
     pub failed_chunks: usize,
     /// The chat endpoint refused the API key on at least one chunk (401 or 403).
     pub provider_auth_rejected: bool,
@@ -38,9 +38,13 @@ fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// Idempotent: clears the document's prior mentions/relations, runs extraction
-/// (LLM + regex pattern), resolves entities globally by canonical key, then stores
-/// mentions + relations. `_resolution` is the strategy string (currently only "exact").
+/// Idempotent: runs extraction (LLM + regex pattern) first, resolves entities
+/// globally by canonical key, then — only once the new batch exists — clears
+/// the document's prior mentions/relations and stores the new ones, so a
+/// failed extraction leaves the stored graph exactly as it was. A wholly
+/// failed LLM run (every chunk failed) is a failure, not an empty graph: the
+/// stored graph is kept and only the failure summary returned.
+/// `_resolution` is the strategy string (currently only "exact").
 pub async fn extract_document_intelligence(
     store: &dyn IntelligenceStore,
     extractor: &dyn EntityRelationExtractor,
@@ -48,8 +52,22 @@ pub async fn extract_document_intelligence(
     chunks: &[&str],
     _resolution: &str,
 ) -> KbResult<IntelligenceSummary> {
-    // Idempotent re-extract: drop this doc's prior mentions/relations first.
-    store.delete_document_intelligence(document_id).await?;
+    // Extraction first: every fallible step runs BEFORE the store is touched,
+    // so the old graph is replaced only once a new one actually exists.
+    let llm = extractor.extract(chunks).await?;
+
+    // A TOTAL failure is not a successful extraction of nothing:
+    // return the failure summary and keep the old graph. Deleting first would
+    // wipe it before the re-extract route can answer 502 extraction_failed.
+    if !chunks.is_empty() && llm.failed_chunks >= chunks.len() {
+        return Ok(IntelligenceSummary {
+            entities: 0,
+            relations: 0,
+            failed_chunks: llm.failed_chunks,
+            provider_auth_rejected: llm.provider_auth_rejected,
+            error: llm.first_error,
+        });
+    }
 
     let mut entity_id_by_name: HashMap<String, String> = HashMap::new();
     let mut entities: Vec<Entity> = Vec::new();
@@ -60,7 +78,6 @@ pub async fn extract_document_intelligence(
     // `m.chunk_index = c.chunk_index`, and a NULL index never matches, so a
     // document-level mention is invisible to retrieval (the pre-fix state:
     // only pattern entities could ever surface a chunk).
-    let llm = extractor.extract(chunks).await?;
     for (chunk_index, name, ty, conf) in &llm.entities {
         let id = new_id();
         entities.push(Entity {
@@ -146,6 +163,12 @@ pub async fn extract_document_intelligence(
         );
     }
 
+    // Replace: drop this doc's prior mentions/relations, then store the new
+    // batch — reached only when extraction succeeded. The delete and the
+    // write are two transactions (the store offers no combined one); if
+    // `store_intelligence` fails in between, the old graph is already gone.
+    // Keep the pair adjacent: that is the smallest window the store allows.
+    store.delete_document_intelligence(document_id).await?;
     // One transactional round-trip for the whole batch. The store resolves
     // each entity's provisional id to its surviving (canonical_key-deduped)
     // id and remaps mentions/relations accordingly — see
