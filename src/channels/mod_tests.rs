@@ -4976,6 +4976,39 @@ async fn channel_add_reports_guidance_without_failing() {
     assert!(text.contains("onboard"), "points at the command that works");
 }
 
+/// Guidance is only an informational outcome for a type the catalog knows.
+/// A type that is not in the catalog is a usage error and must exit non-zero.
+#[tokio::test]
+async fn channel_add_unknown_type_returns_error() {
+    let config = Config::default();
+    let err = admin::handle_command(
+        crate::ChannelCommands::Add {
+            channel_type: "nosuch".to_string(),
+        },
+        &config,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(err.to_string().contains("nosuch"), "{err}");
+}
+
+/// A name that is not in the channel catalog is a usage error for `channel remove`.
+#[tokio::test]
+async fn channel_remove_unknown_name_returns_error() {
+    let config = Config::default();
+    let err = admin::handle_command(
+        crate::ChannelCommands::Remove {
+            name: "nosuch".to_string(),
+        },
+        &config,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(err.to_string().contains("nosuch"), "{err}");
+}
+
 /// Same for `channel remove`.
 #[tokio::test]
 async fn channel_remove_reports_guidance_without_failing() {

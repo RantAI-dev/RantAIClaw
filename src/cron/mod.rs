@@ -363,6 +363,9 @@ async fn run_job_report(config: &Config, id: &str) -> Result<(bool, String)> {
 
 fn runs_report(config: &Config, id: &str, limit: usize) -> Result<String> {
     use std::fmt::Write as _;
+    // The CLI must refuse an id that names no job. The gateway reads runs
+    // through `list_runs` directly, so its empty-history contract is unchanged.
+    get_job(config, id)?;
     let runs = list_runs(config, id, limit)?;
     if runs.is_empty() {
         return Ok(format!("No run history for cron job {id}."));
@@ -959,6 +962,25 @@ mod tests {
         record_run(&config, &job.id, Utc::now(), Utc::now(), "ok", Some("x"), 3).unwrap();
         let text = runs_report(&config, &job.id, 10).unwrap();
         assert!(text.contains(&job.id) || text.contains("ok"), "{text}");
+    }
+
+    /// The CLI must refuse an id that names no job, while the gateway's
+    /// `GET /api/v1/cron/{id}/runs` keeps reporting empty history for it.
+    #[test]
+    fn cli_runs_unknown_id_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let err = handle_command(
+            crate::CronCommands::Runs {
+                id: "nosuchjob".to_string(),
+                limit: 10,
+            },
+            &config,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("nosuchjob"), "{err}");
     }
 
     #[test]

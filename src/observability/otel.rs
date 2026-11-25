@@ -1,13 +1,27 @@
 use super::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::providers::provider_auth::without_userinfo_and_query;
+use opentelemetry::metrics::MeterProvider as _;
 use opentelemetry::metrics::{Counter, Gauge, Histogram};
-use opentelemetry::trace::{Span, SpanKind, Status, Tracer};
+use opentelemetry::trace::{Span, SpanKind, Status, Tracer, TracerProvider as _};
 use opentelemetry::{global, KeyValue};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use std::any::Any;
 use std::time::SystemTime;
+
+/// Builds the OTLP/HTTP URL for one signal.
+///
+/// The HTTP exporter posts to the endpoint verbatim, so the signal path must be
+/// part of it. A value that already ends with `signal_path` is used as it is.
+fn signal_endpoint(base: &str, signal_path: &str) -> String {
+    let trimmed = base.trim_end_matches('/');
+    if trimmed.ends_with(signal_path) {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}{signal_path}")
+    }
+}
 
 /// OpenTelemetry-backed observer — exports traces and metrics via OTLP.
 pub struct OtelObserver {
@@ -42,7 +56,7 @@ impl OtelObserver {
         // ── Trace exporter ──────────────────────────────────────
         let span_exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_http()
-            .with_endpoint(endpoint)
+            .with_endpoint(signal_endpoint(endpoint, "/v1/traces"))
             .build()
             .map_err(|e| format!("Failed to create OTLP span exporter: {e}"))?;
 
@@ -60,7 +74,7 @@ impl OtelObserver {
         // ── Metric exporter ─────────────────────────────────────
         let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
             .with_http()
-            .with_endpoint(endpoint)
+            .with_endpoint(signal_endpoint(endpoint, "/v1/metrics"))
             .build()
             .map_err(|e| format!("Failed to create OTLP metric exporter: {e}"))?;
 
@@ -80,7 +94,9 @@ impl OtelObserver {
         global::set_meter_provider(meter_provider);
 
         // ── Create metric instruments ────────────────────────────
-        let meter = global::meter("rantaiclaw");
+        // Instruments come from this observer's own provider. The global one is
+        // replaced by every observer built in the process.
+        let meter = meter_provider_clone.meter("rantaiclaw");
 
         let agent_starts = meter
             .u64_counter("rantaiclaw.agent.starts")
@@ -173,7 +189,7 @@ impl OtelObserver {
 
 impl Observer for OtelObserver {
     fn record_event(&self, event: &ObserverEvent) {
-        let tracer = global::tracer("rantaiclaw");
+        let tracer = self.tracer_provider.tracer("rantaiclaw");
 
         match event {
             ObserverEvent::AgentStart { provider, model } => {
@@ -519,6 +535,85 @@ mod tests {
         obs.record_metric(&ObserverMetric::TokensUsed(0));
         obs.record_metric(&ObserverMetric::ActiveSessions(0));
         obs.record_metric(&ObserverMetric::QueueDepth(0));
+    }
+
+    #[test]
+    fn signal_endpoint_appends_signal_path_to_base() {
+        assert_eq!(
+            signal_endpoint("http://collector:4318", "/v1/traces"),
+            "http://collector:4318/v1/traces"
+        );
+        assert_eq!(
+            signal_endpoint("http://collector:4318/", "/v1/metrics"),
+            "http://collector:4318/v1/metrics"
+        );
+    }
+
+    #[test]
+    fn signal_endpoint_keeps_a_value_that_already_has_the_path() {
+        assert_eq!(
+            signal_endpoint("http://collector:4318/v1/traces", "/v1/traces"),
+            "http://collector:4318/v1/traces"
+        );
+    }
+
+    /// Accepts connections on a loopback port and reports each request line.
+    fn spawn_mock_collector() -> (u16, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock collector");
+        let port = listener.local_addr().expect("local addr").port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let _ = tx.send(head.lines().next().unwrap_or_default().to_string());
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        (port, rx)
+    }
+
+    #[test]
+    fn traces_and_metrics_post_to_their_own_signal_paths() {
+        let (port, requests) = spawn_mock_collector();
+        let obs = OtelObserver::new(
+            Some(&format!("http://127.0.0.1:{port}")),
+            Some("rantaiclaw-test"),
+        )
+        .expect("observer creation with a valid endpoint");
+        obs.record_event(&ObserverEvent::LlmResponse {
+            provider: "test".to_string(),
+            model: "test-model".to_string(),
+            duration: Duration::from_millis(5),
+            success: true,
+            error_message: None,
+        });
+        obs.record_metric(&ObserverMetric::ActiveSessions(1));
+        obs.flush();
+
+        let mut seen = Vec::new();
+        while let Ok(line) = requests.recv_timeout(Duration::from_secs(10)) {
+            seen.push(line);
+            if seen.iter().any(|l| l.contains("/v1/traces"))
+                && seen.iter().any(|l| l.contains("/v1/metrics"))
+            {
+                break;
+            }
+        }
+        assert!(
+            seen.iter().any(|l| l.starts_with("POST /v1/traces ")),
+            "no trace POST to /v1/traces, saw {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|l| l.starts_with("POST /v1/metrics ")),
+            "no metric POST to /v1/metrics, saw {seen:?}"
+        );
     }
 
     #[test]
