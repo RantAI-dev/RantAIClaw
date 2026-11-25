@@ -37,6 +37,7 @@ use crate::config::api_url::{looks_like_api_key, validate_api_url};
 use crate::config::schema::{
     DiscordConfig, LarkConfig, McpServerConfig, SlackConfig, TelegramConfig,
 };
+use crate::providers::without_userinfo_and_query;
 use crate::security::AutonomyLevel;
 
 /// Build the `/api/v1/config*` router. Merged alongside `api_v1::router()` so
@@ -618,13 +619,17 @@ fn provider_switch_warning(cfg: &crate::config::Config, provider_changed: bool) 
         return None;
     }
     let provider = cfg.default_provider.as_deref()?;
+    // The warning is answered to the console, so it names the provider in the
+    // form /status shows. Credential checks below still use the configured id;
+    // only the interpolated name is redacted.
+    let shown_provider = without_userinfo_and_query(provider);
     // A provider whose subscription login was removed is not waiting for a
     // key: the key belongs to a different provider, and the refusal names
     // it. "No API key found" would send the operator after a key that cannot
     // help.
     if let Some(sentence) = crate::providers::removed_login_refusal(provider) {
         return Some(format!(
-            "Channels and chat can't use '{provider}': {sentence}"
+            "Channels and chat can't use '{shown_provider}': {sentence}"
         ));
     }
     // Ask the same question the send path asks, with the same inputs: the
@@ -637,7 +642,7 @@ fn provider_switch_warning(cfg: &crate::config::Config, provider_changed: bool) 
         return None;
     }
     Some(format!(
-        "No API key found for '{provider}'. If it needs one, channels and chat \
+        "No API key found for '{shown_provider}'. If it needs one, channels and chat \
          can't use it until you add it in Configuration."
     ))
 }
@@ -677,7 +682,7 @@ async fn set_model(
     }
     let warning = provider_switch_warning(&cfg, provider_changed);
     let mut resp = json!({
-        "default_provider": cfg.default_provider,
+        "default_provider": cfg.default_provider.as_deref().map(without_userinfo_and_query),
         "default_model": cfg.default_model,
         "default_temperature": cfg.default_temperature,
     });
@@ -8344,12 +8349,14 @@ mod tests {
     }
 
     /// The `/status` form of a configured endpoint cannot be called, so a switch
-    /// to it must store the configured id, not the form.
+    /// to it must store the configured id, not the form. The answer shows the
+    /// operator the redacted form instead.
     #[tokio::test]
     async fn config_model_write_stores_the_configured_id_for_a_status_form() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
         let tmp = tempfile::TempDir::new().unwrap();
         let configured = "custom:http://user:secret@127.0.0.1:9/v1?key=abc";
+        let shown = "custom:http://127.0.0.1:9/v1";
         let mut config = Config::default();
         config.config_path = tmp.path().join("config.toml");
         config.workspace_dir = tmp.path().join("workspace");
@@ -8365,9 +8372,47 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{resp}");
-        assert_eq!(resp["default_provider"], configured, "{resp}");
+        assert_eq!(resp["default_provider"], shown, "{resp}");
         let saved = std::fs::read_to_string(tmp.path().join("config.toml")).expect("saved config");
         assert!(saved.contains(configured), "saved config: {saved}");
+    }
+
+    /// The model-switch warning is shown in the console. It has to name a
+    /// configured endpoint as `/status` does, without its userinfo or query.
+    #[tokio::test]
+    async fn config_model_write_warning_does_not_echo_provider_userinfo_or_query() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _scrub = crate::test_env::CredentialEnvScrub::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let configured = "custom:http://user:secret@127.0.0.1:9/v1?key=abc";
+        let shown = "custom:http://127.0.0.1:9/v1";
+        let mut config = Config::default();
+        config.config_path = tmp.path().join("config.toml");
+        config.workspace_dir = tmp.path().join("workspace");
+        config.default_provider = Some(configured.into());
+        config.api_key = None;
+        config.save().await.expect("write the starting config");
+        let state = console_state(config);
+
+        let (status, resp) = call(
+            &state,
+            "PUT",
+            "/api/v1/config/model",
+            Some(r#"{"provider":"custom:http://127.0.0.1:9/v1"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        assert_eq!(resp["default_provider"], shown, "{resp}");
+        let warning = resp["warning"]
+            .as_str()
+            .expect("a warning for a provider with no credential");
+        assert!(warning.contains(shown), "{warning}");
+        assert!(
+            !warning.contains("secret")
+                && !warning.contains("key=abc")
+                && !warning.contains("user"),
+            "the warning echoed provider userinfo or query: {warning}"
+        );
     }
 
     /// A `/status` form that names two configured providers is refused with 400,
