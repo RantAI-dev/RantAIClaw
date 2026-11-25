@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `rantaiclaw channel add <type>` now exits non-zero and names the type when it is not in the channel catalog. A catalog type still prints the `onboard` guidance and exits 0.
+- `rantaiclaw channel add <type>` and `rantaiclaw channel remove <name>` now exit non-zero and name the value when it is not in the channel catalog. A catalog value still prints the guidance and exits 0.
 - `rantaiclaw cron runs <id>` now exits non-zero with the not-found error when no job has that id, instead of printing an empty history and exiting 0. The gateway's `GET /api/v1/cron/{id}/runs` keeps reporting an empty history.
 
 ## [0.36.0-alpha] — 2026-11-22
