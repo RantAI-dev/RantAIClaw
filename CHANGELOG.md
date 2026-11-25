@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `rantaiclaw channel add <type>` and `rantaiclaw channel remove <name>` now exit non-zero and name the value when it is not in the channel catalog. A catalog value still prints the guidance and exits 0.
 - `rantaiclaw cron runs <id>` now exits non-zero with the not-found error when no job has that id, instead of printing an empty history and exiting 0. The gateway's `GET /api/v1/cron/{id}/runs` keeps reporting an empty history.
+- OpenTelemetry (`observability-otel`) posts traces to `<otel_endpoint>/v1/traces` and metrics to `<otel_endpoint>/v1/metrics`. Both used to post to the bare endpoint. A value that already ends with the signal path is used as it is.
+- A one-shot `agent -m` run flushes its spans and metrics before it returns, so the OTel collector receives the run's data.
 
 ## [0.36.0-alpha] — 2026-11-22
 
