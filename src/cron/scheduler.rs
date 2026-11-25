@@ -347,6 +347,7 @@ async fn execute_job_with_retry(
             }
         };
         let finished_at = Utc::now();
+        let auth_rejected = provider_auth_sentence.is_some();
         attempts.push(AttemptOutcome {
             attempt: attempt + 1,
             started_at,
@@ -363,6 +364,13 @@ async fn execute_job_with_retry(
 
         if last_output.starts_with("blocked by security policy:") {
             // Deterministic policy violations are not retryable.
+            return (false, last_output, attempts);
+        }
+
+        if auth_rejected {
+            // A provider that rejected the credential will reject it again:
+            // a retry cannot heal a wrong key. Stop after this attempt, on
+            // the manual and scheduled paths alike.
             return (false, last_output, attempts);
         }
 

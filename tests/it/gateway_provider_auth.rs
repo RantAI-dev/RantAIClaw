@@ -227,9 +227,10 @@ async fn provider_auth_error_never_echoes_custom_endpoint_userinfo_or_query() {
 /// `502 provider_auth_failed`, the same body the chat routes answer, and the
 /// run history keeps the failed run.
 ///
-/// The job retries once (`scheduler_retries = 1`), so the history holds one
-/// row per attempt: two rows, both `error`. The retry policy is unchanged on
-/// the manual path, and the count shows it.
+/// A rejected key cannot heal on retry, so the job stops after the first
+/// attempt: exactly one history row, `error`, though `scheduler_retries = 1`
+/// would allow two. A failure that is not a rejected credential keeps the
+/// retries — the test below is its control.
 #[tokio::test]
 async fn a_cron_run_of_an_agent_job_answers_502_when_the_provider_rejects_the_key() {
     use wiremock::matchers::method;
@@ -302,10 +303,88 @@ async fn a_cron_run_of_an_agent_job_answers_502_when_the_provider_rejects_the_ke
         .await
         .expect("json");
     let runs = runs["runs"].as_array().expect("runs array");
-    assert_eq!(runs.len(), 2, "one history row per attempt: {runs:?}");
+    assert_eq!(
+        runs.len(),
+        1,
+        "a rejected key is never retried: one history row: {runs:?}"
+    );
     assert!(
         runs.iter().all(|run| run["status"] == "error"),
         "the failed run stays in the history as an error: {runs:?}"
+    );
+}
+
+/// The control for the retry change: a provider that fails for a reason that
+/// is not a rejected credential (HTTP 500) keeps its retries. With
+/// `scheduler_retries = 1` the run history holds one row per attempt: two
+/// rows, both `error`, and the run answers `200 {success:false}` as before.
+#[tokio::test]
+async fn a_cron_run_of_an_agent_job_against_a_500_provider_still_records_every_retry() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("the provider is down"))
+        .mount(&provider)
+        .await;
+
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let config_dir = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::acquire().await;
+    std::env::set_var("RANTAICLAW_CONFIG_DIR", config_dir.path());
+    let mut config = test_config(workspace.path());
+    config.default_provider = Some(format!("custom:{}", provider.uri()));
+    config.default_model = Some("test-model".to_string());
+    config.api_key = Some("rantaiclaw_test_key".to_string());
+    config.reliability.scheduler_retries = 1;
+    let base_url = spawn_test_gateway(config).await;
+    let client = reqwest::Client::new();
+
+    let created: serde_json::Value = client
+        .post(format!("{base_url}/api/v1/cron"))
+        .bearer_auth(TEST_TOKEN)
+        .json(&serde_json::json!({
+            "schedule": { "kind": "cron", "expr": "0 9 * * *" },
+            "prompt": "summarise the lantern notes"
+        }))
+        .send()
+        .await
+        .expect("create")
+        .json()
+        .await
+        .expect("json");
+    let id = created["id"].as_str().expect("job id").to_string();
+
+    let resp = client
+        .post(format!("{base_url}/api/v1/cron/{id}/run"))
+        .bearer_auth(TEST_TOKEN)
+        .send()
+        .await
+        .expect("run");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("json");
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+    assert_eq!(body["success"], false, "{body}");
+
+    let runs: serde_json::Value = client
+        .get(format!("{base_url}/api/v1/cron/{id}/runs"))
+        .bearer_auth(TEST_TOKEN)
+        .send()
+        .await
+        .expect("runs")
+        .json()
+        .await
+        .expect("json");
+    let runs = runs["runs"].as_array().expect("runs array");
+    assert_eq!(
+        runs.len(),
+        2,
+        "a failure that is not a rejected key keeps its retries: {runs:?}"
+    );
+    assert!(
+        runs.iter().all(|run| run["status"] == "error"),
+        "every attempt failed: {runs:?}"
     );
 }
 
