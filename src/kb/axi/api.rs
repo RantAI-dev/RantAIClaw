@@ -331,10 +331,6 @@ struct ApiError {
     body: ErrorBody,
 }
 
-/// Fixed sentences for a rejected API key live in `kb::error` beside the
-/// unreachable-upstream sentence, so the gateway and the CLI print the same
-/// words for the same refusal.
-
 impl ApiError {
     /// 502 for an upstream that refused the credential it was sent. The body
     /// has the same shape as the `provider_auth_failed` answer of the agent
