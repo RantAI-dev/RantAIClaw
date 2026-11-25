@@ -1450,3 +1450,50 @@ async fn kb_ingest_with_a_500_embedding_endpoint_prints_the_status_without_the_b
         "the answer must not carry the endpoint URL: {stdout}"
     );
 }
+
+/// A 2xx answer whose JSON is the wrong shape — compat layers serve
+/// `{"error": …}` with 200 — is the upstream's failure: `kb ingest` prints
+/// the fixed diagnostic, exits non-zero, and carries neither the upstream
+/// payload — which can echo the credential back — nor the endpoint URL.
+#[tokio::test]
+async fn kb_ingest_with_a_malformed_200_embedding_answer_prints_a_fixed_diagnostic() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "error": "the upstream echoed the credential" }),
+            ),
+        )
+        .mount(&server)
+        .await;
+
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("kb.db");
+    let md = tmp.path().join("doc.md");
+    std::fs::write(
+        &md,
+        "# Note\nOne short paragraph about lanterns, long enough to embed.",
+    )
+    .unwrap();
+    let uri = server.uri();
+    let mock_env = [("KB_EMBEDDING_BASE_URL", uri.as_str())];
+
+    let (code, stdout, _stderr) =
+        run_kb_with_env(&db, &["ingest", md.to_str().unwrap()], &mock_env);
+    assert_ne!(code, 0, "a malformed answer must exit non-zero: {stdout}");
+    assert!(
+        stdout.contains("Invalid embedding response structure"),
+        "the fixed diagnostic is printed: {stdout}"
+    );
+    assert!(
+        !stdout.contains("the upstream echoed the credential"),
+        "the upstream payload must never surface: {stdout}"
+    );
+    assert!(
+        !stdout.contains("http") && !stdout.contains("127.0.0.1"),
+        "the answer must not carry the endpoint URL: {stdout}"
+    );
+}
