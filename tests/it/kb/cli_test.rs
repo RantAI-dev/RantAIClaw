@@ -1341,7 +1341,15 @@ async fn kb_ingest_with_the_vision_service_down_prints_extractor_unavailable_and
     );
     assert_eq!(code, 1, "a dead extractor must exit 1: {stdout}");
     assert!(stdout.contains("extractor_unavailable"), "got: {stdout}");
+    assert!(
+        stdout.contains("the vision service upstream is unreachable"),
+        "the answer names the service: {stdout}"
+    );
     assert!(!stdout.contains("internal"), "got: {stdout}");
+    assert!(
+        !stdout.contains("VisionImageExtractor") && !stdout.contains(" extractor upstream"),
+        "a Rust type name must not reach the answer: {stdout}"
+    );
     assert!(
         !stdout.contains("http") && !stdout.contains("127.0.0.1"),
         "the answer must not carry the endpoint URL: {stdout}"

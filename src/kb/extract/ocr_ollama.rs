@@ -98,7 +98,7 @@ impl OllamaOcrExtractor {
 #[async_trait]
 impl Extractor for OllamaOcrExtractor {
     fn name(&self) -> &str {
-        "OllamaOcrExtractor"
+        "OCR service"
     }
 
     /// `image_bytes` must be image data (PNG/JPEG/GIF/WebP/etc.), not a PDF —
@@ -122,7 +122,7 @@ impl Extractor for OllamaOcrExtractor {
             .send()
             .await
             .map_err(|e| KbError::ExtractorUnavailable {
-                extractor: "OllamaOcrExtractor".into(),
+                extractor: "OCR service".into(),
                 message: e.without_url().to_string(),
             })?;
 
@@ -131,7 +131,7 @@ impl Extractor for OllamaOcrExtractor {
             let body_text = res.text().await.unwrap_or_default();
             let truncated: String = body_text.chars().take(300).collect();
             return Err(KbError::ExtractorUnavailable {
-                extractor: "OllamaOcrExtractor".into(),
+                extractor: "OCR service".into(),
                 message: format!("ollama OCR endpoint {}: {}", status.as_u16(), truncated),
             });
         }
@@ -140,7 +140,7 @@ impl Extractor for OllamaOcrExtractor {
             res.json()
                 .await
                 .map_err(|e| KbError::ExtractorUnavailable {
-                    extractor: "OllamaOcrExtractor".into(),
+                    extractor: "OCR service".into(),
                     message: format!("response parse: {e}"),
                 })?;
 

@@ -397,7 +397,7 @@ async fn cmd_ingest(
             tracing::warn!(target: "kb::ingest", %extractor, "extractor upstream failed: {message}");
             print_error_toon(
                 "extractor_unavailable",
-                &format!("the {extractor} extractor upstream is unreachable or returned an error"),
+                &format!("the {extractor} upstream is unreachable or returned an error"),
             );
             return Ok(1);
         }

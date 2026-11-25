@@ -62,7 +62,7 @@ impl MineruExtractor {
 #[async_trait]
 impl Extractor for MineruExtractor {
     fn name(&self) -> &str {
-        "MineruExtractor"
+        "MinerU service"
     }
 
     async fn extract(&self, pdf_bytes: &[u8]) -> KbResult<ExtractionResult> {
@@ -81,7 +81,7 @@ impl Extractor for MineruExtractor {
             .send()
             .await
             .map_err(|e| KbError::ExtractorUnavailable {
-                extractor: "MineruExtractor".into(),
+                extractor: "MinerU service".into(),
                 message: e.without_url().to_string(),
             })?;
 
@@ -90,7 +90,7 @@ impl Extractor for MineruExtractor {
             let body = res.text().await.unwrap_or_default();
             let truncated: String = body.chars().take(300).collect();
             return Err(KbError::ExtractorUnavailable {
-                extractor: "MineruExtractor".into(),
+                extractor: "MinerU service".into(),
                 message: format!("mineru sidecar {}: {}", status.as_u16(), truncated),
             });
         }
@@ -99,7 +99,7 @@ impl Extractor for MineruExtractor {
             .json()
             .await
             .map_err(|e| KbError::ExtractorUnavailable {
-                extractor: "MineruExtractor".into(),
+                extractor: "MinerU service".into(),
                 message: format!("response parse: {e}"),
             })?;
 

@@ -442,7 +442,7 @@ impl From<KbError> for ApiError {
                     body: ErrorBody {
                         error: "extractor_unavailable".into(),
                         detail: Some(format!(
-                            "the {extractor} extractor upstream is unreachable or returned an error"
+                            "the {extractor} upstream is unreachable or returned an error"
                         )),
                     },
                 }

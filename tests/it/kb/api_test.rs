@@ -1262,8 +1262,15 @@ async fn kb_upload_answers_502_when_the_extractor_service_is_down() {
     assert!(
         body["detail"]
             .as_str()
-            .is_some_and(|d| d.contains("extractor upstream")),
-        "the answer says it is the upstream: {body}"
+            .is_some_and(|d| d.contains("MinerU service") && d.contains("upstream is unreachable")),
+        "the answer names the MinerU service: {body}"
+    );
+    assert!(
+        !body["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("MineruExtractor"),
+        "a Rust type name must not reach the answer: {body}"
     );
 }
 
@@ -1411,6 +1418,16 @@ async fn kb_image_upload_answers_502_without_the_vision_url_when_the_service_is_
     assert_eq!(status, 502, "a vision outage is a 502, got {status}: {raw}");
     let body: Value = serde_json::from_str(&raw).expect("json body");
     assert_eq!(body["error"], "extractor_unavailable", "{body}");
+    assert!(
+        body["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("the vision service upstream is unreachable")),
+        "the answer names the vision service: {body}"
+    );
+    assert!(
+        !raw.contains("VisionImageExtractor"),
+        "a Rust type name must not reach the answer: {raw}"
+    );
     assert!(
         !raw.contains("http")
             && !raw.contains("127.0.0.1")
