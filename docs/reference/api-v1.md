@@ -275,6 +275,7 @@ tokens, session ids, or paths.
     "session_id": "the session this turn was persisted to"
   }
   ```
+  The `provider` field in the sync answer is the id without userinfo or query, the same form `/status` shows; send it back as the request `provider` on a later turn and the gateway resolves it to the configured provider.
   A completed, non-empty turn is persisted to `sessions.db` with
   `source = "api"`; a failed or empty-answer turn is not persisted (no
   session is created/appended).
@@ -1309,6 +1310,7 @@ no stored arg is taken as written.
   credential, or is a removed subscription login. The switch is still saved. Channels and chat
   cannot use that provider until a key is added. The field is absent otherwise.
 - The `provider` field may be the redacted form from `/status`; the gateway resolves it to the configured provider, and answers `400` when it matches more than one configured provider.
+- The answer's `default_provider` and `warning` are the id without userinfo or query, the same form `/status` shows; a client that sends `default_provider` back as the request `provider` resolves to the configured provider.
 - **Status codes**: `200`, `400` (an unknown field, a body with none of `provider`, `model`,
   `temperature`: `nothing_to_apply`, or a `provider` id that matches more than one configured
   provider), `401`, `500`.

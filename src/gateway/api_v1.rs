@@ -811,10 +811,11 @@ async fn agent_chat_sync(
 
     let config = chat_config_from_body(&state, &body)?;
 
-    let provider = config
-        .default_provider
-        .clone()
-        .unwrap_or_else(|| "openrouter".to_string());
+    // The answer names the provider for the client to send back on the next
+    // turn. Show the form /status uses, never the configured id's userinfo or
+    // query; the resolver maps this form back when the client sends it.
+    let provider =
+        without_userinfo_and_query(config.default_provider.as_deref().unwrap_or("openrouter"));
     let model = config
         .default_model
         .clone()
@@ -4142,6 +4143,8 @@ mod tests {
 
     /// `POST /agent/chat` with the `/status` form of the configured endpoint
     /// answers through that endpoint, sending the credential the operator stored.
+    /// The answer names the provider without its userinfo or query, and a client
+    /// that copies that name back still reaches the same endpoint.
     #[tokio::test]
     async fn agent_chat_sync_answers_through_a_configured_id_named_by_its_status_form() {
         let _env = crate::test_env::ENV_LOCK.lock().await;
@@ -4161,7 +4164,7 @@ mod tests {
             .with_body(
                 r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"pong"},"finish_reason":"stop"}]}"#,
             )
-            .expect(1)
+            .expect(2)
             .create_async()
             .await;
         let base = format!("{}/v1", server.url());
@@ -4180,12 +4183,12 @@ mod tests {
         }
 
         let Ok(Json(reply)) = agent_chat_sync(
-            State(state),
+            State(state.clone()),
             HeaderMap::new(),
             Json(ChatRequestBody {
                 message: "ping".into(),
                 model: None,
-                provider: Some(shown),
+                provider: Some(shown.clone()),
                 temperature: None,
                 session_id: None,
                 context: None,
@@ -4197,6 +4200,42 @@ mod tests {
             panic!("a configured id named by its status form must answer");
         };
         assert_eq!(reply.text, "pong");
+        assert_eq!(
+            reply.provider, shown,
+            "the answer must name the provider as /status shows it"
+        );
+        assert!(
+            !reply.provider.contains("secret") && !reply.provider.contains("key=abc"),
+            "the answer echoed provider userinfo or query: {}",
+            reply.provider
+        );
+        assert_eq!(
+            without_userinfo_and_query("openrouter"),
+            "openrouter",
+            "control: a plain provider id stays unchanged"
+        );
+
+        // A client that copies the redacted value from the answer back into a
+        // second turn still reaches the same endpoint with its stored credential.
+        let Ok(Json(second)) = agent_chat_sync(
+            State(state),
+            HeaderMap::new(),
+            Json(ChatRequestBody {
+                message: "ping".into(),
+                model: None,
+                provider: Some(reply.provider),
+                temperature: None,
+                session_id: None,
+                context: None,
+                render_mode: None,
+            }),
+        )
+        .await
+        else {
+            panic!("a redacted id copied from the answer must still answer");
+        };
+        assert_eq!(second.text, "pong");
+        assert_eq!(second.provider, shown);
         mock.assert();
     }
 

@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **The sync chat answer and the config model answer no longer carry a provider id's userinfo or query.** `POST /api/v1/agent/chat` without an SSE `Accept` answers `provider` as `/status` shows it, and `PUT /api/v1/config/model` answers `default_provider` and its no-key `warning` the same way. A client that sends the redacted form back still resolves to the configured provider, and the second turn of a chat reaches the same endpoint with the stored key. `/config` and `/secrets` are unchanged.
 - `url` 2.5.9 fixes RUSTSEC-2026-0592: `Url::origin()` overflowed the stack on nested `blob:` URLs in 2.5.8. `form_urlencoded` moves from 1.2.2 to 1.2.3 with it.
 
 ## [0.36.0-alpha] — 2026-11-22
