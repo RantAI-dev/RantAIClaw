@@ -92,7 +92,7 @@ Notes on `api_url`:
 | Key | Default | Purpose |
 |---|---|---|
 | `backend` | `none` | Observability backend: `none`, `noop`, `log`, `prometheus`, `otel`, `opentelemetry`, or `otlp` |
-| `otel_endpoint` | `http://localhost:4318` | OTLP HTTP endpoint used when backend is `otel` |
+| `otel_endpoint` | `http://localhost:4318` | OTLP HTTP base endpoint used when backend is `otel`. Traces go to `<base>/v1/traces` and metrics to `<base>/v1/metrics`; a value that already ends with the signal path is used as it is |
 | `otel_service_name` | `rantaiclaw` | Service name emitted to OTLP collector |
 
 Notes:

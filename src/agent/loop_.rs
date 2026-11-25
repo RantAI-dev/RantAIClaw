@@ -2604,6 +2604,50 @@ fn build_tool_instructions_with_example(tools_registry: &[Box<dyn Tool>], exampl
     instructions
 }
 
+/// Flushes an observer when dropped. `run_with_scope` holds one for an observer
+/// it created, so the flush runs on every return path, including errors.
+struct FlushOnReturn(Arc<dyn Observer>);
+
+impl Drop for FlushOnReturn {
+    fn drop(&mut self) {
+        self.0.flush();
+    }
+}
+
+#[cfg(test)]
+mod flush_on_return_tests {
+    use super::*;
+    use crate::observability::traits::{ObserverEvent, ObserverMetric};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct CountingObserver {
+        flushes: AtomicUsize,
+    }
+
+    impl Observer for CountingObserver {
+        fn record_event(&self, _event: &ObserverEvent) {}
+        fn record_metric(&self, _metric: &ObserverMetric) {}
+        fn flush(&self) {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+        }
+        fn name(&self) -> &str {
+            "counting"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn dropping_the_guard_flushes_the_observer_once() {
+        let counting = Arc::new(CountingObserver::default());
+        let observer: Arc<dyn Observer> = counting.clone();
+        drop(FlushOnReturn(observer));
+        assert_eq!(counting.flushes.load(Ordering::SeqCst), 1);
+    }
+}
+
 // ── CLI Entrypoint ───────────────────────────────────────────────────────
 // Wires up all subsystems (observer, runtime, security, memory, tools,
 // provider, hardware RAG, peripherals) and enters either single-shot or
@@ -2658,8 +2702,13 @@ pub async fn run_with_scope(
     crate::config::legacy_logins::remove_legacy_login_files(&config);
 
     // ── Wire up agnostic subsystems ──────────────────────────────
+    let owns_observer = observer.is_none();
     let observer: Arc<dyn Observer> = observer
         .unwrap_or_else(|| Arc::from(observability::create_observer(&config.observability)));
+    // A one-shot run owns its observer. Flushing on return exports the spans and
+    // metrics a batch exporter still holds before the process exits. A caller
+    // that passed its own observer keeps flushing it on its own schedule.
+    let _flush_owned_observer = owns_observer.then(|| FlushOnReturn(observer.clone()));
     // The daily token ceiling for this run. Cron and the heartbeat come through
     // here, and they are the unattended paths the ceiling exists for.
     let ledger = crate::cost::ledger_for(&config);
