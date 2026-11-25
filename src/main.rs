@@ -2124,6 +2124,32 @@ async fn main() -> Result<()> {
                 );
                 std::process::exit(1);
             }
+            // A service that refused the key (HTTP 401 or 403) is the
+            // operator's to fix, so it gets the same code and fixed sentence
+            // the gateway's `provider_auth_failed` answers carry — never the
+            // upstream body, which can echo the credential back.
+            Err(rantaiclaw::kb::KbError::EmbeddingApi { status, .. })
+                if rantaiclaw::kb::error::is_auth_rejection_status(status) =>
+            {
+                println!(
+                    "error[1]{{code,message}}:\n  {}",
+                    rantaiclaw::kb::axi::cli::provider_auth_failed_line(
+                        rantaiclaw::kb::error::EMBEDDING_KEY_REJECTED_DETAIL
+                    )
+                );
+                std::process::exit(1);
+            }
+            Err(rantaiclaw::kb::KbError::ChatApi { status, .. })
+                if rantaiclaw::kb::error::is_auth_rejection_status(status) =>
+            {
+                println!(
+                    "error[1]{{code,message}}:\n  {}",
+                    rantaiclaw::kb::axi::cli::provider_auth_failed_line(
+                        rantaiclaw::kb::error::CHAT_KEY_REJECTED_DETAIL
+                    )
+                );
+                std::process::exit(1);
+            }
             Err(e) => {
                 println!("error[1]{{code,message}}:\n  internal,{e}");
                 std::process::exit(1);

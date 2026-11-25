@@ -331,11 +331,9 @@ struct ApiError {
     body: ErrorBody,
 }
 
-/// Fixed sentences for a rejected API key. They name the service and the key
-/// and never the upstream body, which can echo the credential back.
-const EMBEDDING_KEY_REJECTED_DETAIL: &str =
-    "the embedding provider rejected the API key; check the key";
-const CHAT_KEY_REJECTED_DETAIL: &str = "the chat provider rejected the API key; check the key";
+/// Fixed sentences for a rejected API key live in `kb::error` beside the
+/// unreachable-upstream sentence, so the gateway and the CLI print the same
+/// words for the same refusal.
 
 impl ApiError {
     /// 502 for an upstream that refused the credential it was sent. The body
@@ -459,7 +457,7 @@ impl From<KbError> for ApiError {
                 },
             },
             KbError::EmbeddingApi { status, .. } if is_auth_rejection_status(status) => {
-                Self::provider_auth_failed(EMBEDDING_KEY_REJECTED_DETAIL)
+                Self::provider_auth_failed(crate::kb::error::EMBEDDING_KEY_REJECTED_DETAIL)
             }
             KbError::EmbeddingApi { status, .. } => Self {
                 status: StatusCode::BAD_GATEWAY,
@@ -469,7 +467,7 @@ impl From<KbError> for ApiError {
                 },
             },
             KbError::ChatApi { status, .. } if is_auth_rejection_status(status) => {
-                Self::provider_auth_failed(CHAT_KEY_REJECTED_DETAIL)
+                Self::provider_auth_failed(crate::kb::error::CHAT_KEY_REJECTED_DETAIL)
             }
             KbError::ChatApi { status, .. } => Self {
                 status: StatusCode::BAD_GATEWAY,
@@ -1185,7 +1183,9 @@ async fn re_extract_document(
         // provider_auth_failed answer as the other routes, not a generic
         // extraction failure.
         if summary.provider_auth_rejected {
-            return Err(ApiError::provider_auth_failed(CHAT_KEY_REJECTED_DETAIL).into());
+            return Err(
+                ApiError::provider_auth_failed(crate::kb::error::CHAT_KEY_REJECTED_DETAIL).into(),
+            );
         }
         let reason = summary
             .error
