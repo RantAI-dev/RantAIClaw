@@ -533,8 +533,9 @@ pub use provider_auth::PROVIDER_AUTH_FAILED;
 pub use provider_auth::without_userinfo_and_query;
 
 /// What happened when a provider rejected the credential `error` ends in:
-/// the provider id and the upstream status, no credential and no upstream
-/// body. `None` for any other failure.
+/// the credential's subject — a redacted provider id or a role phrase such
+/// as `the embedding provider` — and the upstream status, no credential and
+/// no upstream body. `None` for any other failure.
 ///
 /// The public door to the `provider_auth` module, for a caller that must
 /// answer this failure differently from a server fault.
