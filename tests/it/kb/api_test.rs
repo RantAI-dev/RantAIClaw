@@ -1563,6 +1563,125 @@ async fn re_extract_chat_server_error_keeps_extraction_failed() {
     assert!(detail.contains("http 500"), "reason surfaces: {body}");
 }
 
+/// The point of a synchronous 502: the operator can retry. A re-extract that
+/// fails on the chat endpoint must not have cost the document its stored
+/// graph — the console's Entities tab must still show what was there before.
+#[tokio::test]
+async fn re_extract_chat_server_error_keeps_the_stored_graph() {
+    use rantaiclaw::kb::intelligence::types::{
+        Entity, EntityMention, EntityType, ExtractSource, Relation, RelationType,
+    };
+    use rantaiclaw::kb::store::IntelligenceStore;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let chat = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&chat)
+        .await;
+
+    let h = start_harness(|store| {
+        Box::pin(async move {
+            let mut doc = sample_doc("rantaiclaw_doc_xg", "Doc XG");
+            doc.content = "Alice works at TechCorp on embedded systems.".into();
+            store.create_document(&doc).await.unwrap();
+            // The graph a previous successful extraction left behind: two
+            // entities, one relation — exactly what the bug turned into zero.
+            store
+                .store_intelligence(
+                    "rantaiclaw_doc_xg",
+                    &[
+                        Entity {
+                            id: "prov_xg_alice".into(),
+                            canonical_key: "alice:Person".into(),
+                            name: "Alice".into(),
+                            entity_type: EntityType::Person,
+                            confidence: 0.9,
+                            metadata: serde_json::json!({}),
+                        },
+                        Entity {
+                            id: "prov_xg_techcorp".into(),
+                            canonical_key: "techcorp:Organization".into(),
+                            name: "TechCorp".into(),
+                            entity_type: EntityType::Organization,
+                            confidence: 0.95,
+                            metadata: serde_json::json!({}),
+                        },
+                    ],
+                    &[
+                        EntityMention {
+                            id: "m_xg_alice".into(),
+                            entity_id: "prov_xg_alice".into(),
+                            document_id: "rantaiclaw_doc_xg".into(),
+                            chunk_index: Some(0),
+                            context: None,
+                            source: ExtractSource::Llm,
+                        },
+                        EntityMention {
+                            id: "m_xg_techcorp".into(),
+                            entity_id: "prov_xg_techcorp".into(),
+                            document_id: "rantaiclaw_doc_xg".into(),
+                            chunk_index: Some(0),
+                            context: None,
+                            source: ExtractSource::Llm,
+                        },
+                    ],
+                    &[Relation {
+                        id: "r_xg".into(),
+                        source_entity_id: "prov_xg_alice".into(),
+                        target_entity_id: "prov_xg_techcorp".into(),
+                        relation_type: RelationType::WorksFor,
+                        confidence: 0.85,
+                        document_id: "rantaiclaw_doc_xg".into(),
+                        metadata: serde_json::json!({}),
+                    }],
+                )
+                .await
+                .expect("seed graph");
+        })
+    })
+    .await;
+    std::env::set_var("KB_OPENROUTER_CHAT_URL", chat.uri());
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "{}/api/v1/kb/documents/rantaiclaw_doc_xg/re-extract",
+            h.base_url
+        ))
+        .send()
+        .await
+        .expect("request");
+    std::env::remove_var("KB_OPENROUTER_CHAT_URL");
+    assert_eq!(resp.status(), 502, "a chat outage answers 502");
+    let body: Value = resp.json().await.expect("json body");
+    assert_eq!(body["error"], "extraction_failed", "{body}");
+
+    // The failure answer must not have deleted the document's graph: the
+    // read the console does still returns the old entities and relation.
+    let graph: Value = reqwest::get(format!(
+        "{}/api/v1/kb/documents/rantaiclaw_doc_xg/intelligence",
+        h.base_url
+    ))
+    .await
+    .expect("request")
+    .json()
+    .await
+    .expect("json body");
+    assert_eq!(
+        graph["entities"].as_array().map(Vec::len),
+        Some(2),
+        "a failed re-extract must keep the old entities: {graph}"
+    );
+    assert_eq!(
+        graph["relations"].as_array().map(Vec::len),
+        Some(1),
+        "a failed re-extract must keep the old relations: {graph}"
+    );
+    assert_eq!(graph["stats"]["total_entities"], 2, "{graph}");
+}
+
 #[tokio::test]
 async fn re_extract_success_still_returns_200_with_zero_failed() {
     // Control for the 502 above: a working extraction stays a 200 and now

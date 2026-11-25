@@ -848,6 +848,164 @@ async fn store_intelligence_reingest_idempotent() {
 }
 
 #[tokio::test]
+async fn failed_reextract_keeps_the_stored_graph() {
+    use async_trait::async_trait;
+    use rantaiclaw::kb::intelligence::extract::{EntityRelationExtractor, Extracted};
+    use rantaiclaw::kb::intelligence::extract_document_intelligence;
+    use rantaiclaw::kb::store::sqlite::SqliteStore;
+    use rantaiclaw::kb::store::IntelligenceStore;
+    use tempfile::TempDir;
+
+    // The extraction that built the graph the document carries.
+    struct CannedExtractor;
+    #[async_trait]
+    impl EntityRelationExtractor for CannedExtractor {
+        async fn extract(&self, _c: &[&str]) -> rantaiclaw::kb::KbResult<Extracted> {
+            Ok(Extracted {
+                entities: vec![
+                    (0, "Alice".into(), EntityType::Person, 0.9),
+                    (0, "TechCorp".into(), EntityType::Organization, 0.95),
+                ],
+                relations: vec![(
+                    "Alice".into(),
+                    "TechCorp".into(),
+                    RelationType::WorksFor,
+                    0.85,
+                )],
+                ..Default::default()
+            })
+        }
+    }
+
+    // The extractor reports failure the hard way (an Err). The document's
+    // stored graph must survive it untouched.
+    struct ExplodingExtractor;
+    #[async_trait]
+    impl EntityRelationExtractor for ExplodingExtractor {
+        async fn extract(&self, _c: &[&str]) -> rantaiclaw::kb::KbResult<Extracted> {
+            Err(rantaiclaw::kb::KbError::Other(
+                "extraction upstream failed".into(),
+            ))
+        }
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
+        .await
+        .unwrap();
+
+    extract_document_intelligence(&store, &CannedExtractor, "d_fail", &["chunk one"], "exact")
+        .await
+        .unwrap();
+    let (entities, relations) = store.intelligence_for_document("d_fail").await.unwrap();
+    assert_eq!(entities.len(), 2, "seed graph present before the failure");
+    assert_eq!(relations.len(), 1, "seed graph present before the failure");
+
+    let result = extract_document_intelligence(
+        &store,
+        &ExplodingExtractor,
+        "d_fail",
+        &["chunk one"],
+        "exact",
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "a failed extractor must report failure, got {:?}",
+        result
+    );
+
+    let (entities, relations) = store.intelligence_for_document("d_fail").await.unwrap();
+    assert_eq!(
+        entities.len(),
+        2,
+        "a failed re-extract must keep the old entities: {entities:?}"
+    );
+    assert_eq!(
+        relations.len(),
+        1,
+        "a failed re-extract must keep the old relations: {relations:?}"
+    );
+}
+
+#[tokio::test]
+async fn successful_reextract_replaces_the_graph_completely() {
+    use async_trait::async_trait;
+    use rantaiclaw::kb::intelligence::extract::{EntityRelationExtractor, Extracted};
+    use rantaiclaw::kb::intelligence::extract_document_intelligence;
+    use rantaiclaw::kb::store::sqlite::SqliteStore;
+    use rantaiclaw::kb::store::IntelligenceStore;
+    use tempfile::TempDir;
+
+    // First extraction: two entities and one relation.
+    struct FirstPassExtractor;
+    #[async_trait]
+    impl EntityRelationExtractor for FirstPassExtractor {
+        async fn extract(&self, _c: &[&str]) -> rantaiclaw::kb::KbResult<Extracted> {
+            Ok(Extracted {
+                entities: vec![
+                    (0, "Alice".into(), EntityType::Person, 0.9),
+                    (0, "TechCorp".into(), EntityType::Organization, 0.95),
+                ],
+                relations: vec![(
+                    "Alice".into(),
+                    "TechCorp".into(),
+                    RelationType::WorksFor,
+                    0.85,
+                )],
+                ..Default::default()
+            })
+        }
+    }
+
+    // Second extraction succeeds with DIFFERENT content: one entity, no
+    // relations. Replacement — not a merge — must leave exactly that.
+    struct SecondPassExtractor;
+    #[async_trait]
+    impl EntityRelationExtractor for SecondPassExtractor {
+        async fn extract(&self, _c: &[&str]) -> rantaiclaw::kb::KbResult<Extracted> {
+            Ok(Extracted {
+                entities: vec![(0, "NQRust".into(), EntityType::Product, 0.9)],
+                relations: vec![],
+                ..Default::default()
+            })
+        }
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
+        .await
+        .unwrap();
+
+    extract_document_intelligence(&store, &FirstPassExtractor, "d_re", &["chunk one"], "exact")
+        .await
+        .unwrap();
+
+    extract_document_intelligence(
+        &store,
+        &SecondPassExtractor,
+        "d_re",
+        &["chunk one"],
+        "exact",
+    )
+    .await
+    .unwrap();
+
+    let (entities, relations) = store.intelligence_for_document("d_re").await.unwrap();
+    assert_eq!(
+        entities.len(),
+        1,
+        "a successful re-extract must replace the graph, not merge with it: {entities:?}"
+    );
+    assert_eq!(entities[0].name, "NQRust", "the new extraction survives");
+    assert_eq!(
+        relations.len(),
+        0,
+        "the old relation must not survive a successful replacement: {relations:?}"
+    );
+}
+
+#[tokio::test]
 async fn relations_survive_entity_name_case_mismatch() {
     // Plan 094: entity dedup lowercases via canonical_key, but relation
     // wiring matched raw names — "techcorp" in a relation vs "TechCorp" in

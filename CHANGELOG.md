@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A failed knowledge-base re-extract keeps the document's old entity graph.** `POST /api/v1/kb/documents/{id}/re-extract` (and the same step behind `kb ingest`) deleted a document's stored entities and relations before asking the model for new ones, so a chat-endpoint outage answered `502 extraction_failed` and wiped the document's graph to zero in the same stroke. Extraction now completes before the store is touched: a wholly failed run answers 502 with the old graph intact — the retry the 502 promises is a real one — and a successful re-extract still replaces the old graph completely.
+
 ## [0.37.0-alpha] — 2026-11-25
 
 Sync chat and config-model answers no longer carry a provider id's userinfo or query, and a rejected key now reads as a rejected key on the knowledge base CLI, in cron which records one failed run per click, and on the console. Unknown channel and cron ids exit non-zero, and OpenTelemetry posts each signal to its own path with a one-shot `agent -m` run flushing before exit. A `custom:` base with a query now reaches the right path.
