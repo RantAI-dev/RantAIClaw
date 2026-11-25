@@ -633,6 +633,15 @@ pub(crate) fn channel_add_guidance(channel_type: &str) -> String {
     format!("Channel type '{channel_type}' — use `rantaiclaw onboard` to configure channels")
 }
 
+/// Refuses a channel name or type that is not in [`CHANNEL_CATALOG`]. Such a
+/// value is a usage error, not guidance.
+fn ensure_catalog_channel(channel: &str) -> Result<()> {
+    if CHANNEL_CATALOG.iter().any(|(key, _, _, _)| *key == channel) {
+        return Ok(());
+    }
+    anyhow::bail!("Unknown channel '{channel}': not in the channel catalog")
+}
+
 /// Guidance for `channel remove`. See [`channel_add_guidance`].
 ///
 /// Names the config actually in use — the loaded config's path, else the
@@ -703,14 +712,16 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
             );
             Ok(())
         }
-        // Guidance, not failure. These bailed, so a script wrapping
-        // `rantaiclaw channel add` saw a non-zero exit for what is an
-        // informational outcome.
+        // Guidance, not failure, for a type in the catalog. These bailed, so a
+        // script wrapping `rantaiclaw channel add` saw a non-zero exit for what
+        // is an informational outcome. An unknown type is a usage error.
         crate::ChannelCommands::Add { channel_type } => {
+            ensure_catalog_channel(&channel_type)?;
             println!("{}", channel_add_guidance(&channel_type));
             Ok(())
         }
         crate::ChannelCommands::Remove { name } => {
+            ensure_catalog_channel(&name)?;
             println!("{}", channel_remove_guidance(&name, config));
             Ok(())
         }
