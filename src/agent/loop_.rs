@@ -2614,40 +2614,6 @@ impl Drop for FlushOnReturn {
     }
 }
 
-#[cfg(test)]
-mod flush_on_return_tests {
-    use super::*;
-    use crate::observability::traits::{ObserverEvent, ObserverMetric};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    #[derive(Default)]
-    struct CountingObserver {
-        flushes: AtomicUsize,
-    }
-
-    impl Observer for CountingObserver {
-        fn record_event(&self, _event: &ObserverEvent) {}
-        fn record_metric(&self, _metric: &ObserverMetric) {}
-        fn flush(&self) {
-            self.flushes.fetch_add(1, Ordering::SeqCst);
-        }
-        fn name(&self) -> &str {
-            "counting"
-        }
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-    }
-
-    #[test]
-    fn dropping_the_guard_flushes_the_observer_once() {
-        let counting = Arc::new(CountingObserver::default());
-        let observer: Arc<dyn Observer> = counting.clone();
-        drop(FlushOnReturn(observer));
-        assert_eq!(counting.flushes.load(Ordering::SeqCst), 1);
-    }
-}
-
 // ── CLI Entrypoint ───────────────────────────────────────────────────────
 // Wires up all subsystems (observer, runtime, security, memory, tools,
 // provider, hardware RAG, peripherals) and enters either single-shot or
@@ -8924,5 +8890,39 @@ Let me check the result."#;
         assert!(compacted_on.is_empty());
         assert_eq!(provider.calls(), 0);
         assert_eq!(history.len() - 1, 10);
+    }
+}
+
+#[cfg(test)]
+mod flush_on_return_tests {
+    use super::*;
+    use crate::observability::traits::{ObserverEvent, ObserverMetric};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct CountingObserver {
+        flushes: AtomicUsize,
+    }
+
+    impl Observer for CountingObserver {
+        fn record_event(&self, _event: &ObserverEvent) {}
+        fn record_metric(&self, _metric: &ObserverMetric) {}
+        fn flush(&self) {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+        }
+        fn name(&self) -> &str {
+            "counting"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn dropping_the_guard_flushes_the_observer_once() {
+        let counting = Arc::new(CountingObserver::default());
+        let observer: Arc<dyn Observer> = counting.clone();
+        drop(FlushOnReturn(observer));
+        assert_eq!(counting.flushes.load(Ordering::SeqCst), 1);
     }
 }
