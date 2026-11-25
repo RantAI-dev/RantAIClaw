@@ -12,19 +12,34 @@ pub const PROVIDER_AUTH_FAILED: &str = "provider_auth_failed";
 
 /// A provider answered 401 or 403 to the credential it was sent.
 ///
-/// It carries the provider id and the status, and nothing the provider wrote:
-/// the upstream body can echo the credential back, and the id is stripped of
-/// URL userinfo and query because a `custom:` id is a URL the operator typed.
+/// It carries the sentence's noun phrase and the status, and nothing the
+/// provider wrote: the upstream body can echo the credential back, and the
+/// phrase is built from the provider id stripped of URL userinfo and query,
+/// because a `custom:` id is a URL the operator typed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProviderAuthError {
-    provider: String,
+    /// The noun phrase the sentence names: `provider <id>` for a configured
+    /// provider, or a role phrase such as `the embedding provider` when one
+    /// hardcoded transport serves whichever endpoint the operator configured.
+    subject: String,
     status: u16,
 }
 
 impl ProviderAuthError {
     pub(crate) fn new(provider: &str, status: u16) -> Self {
         Self {
-            provider: without_userinfo_and_query(provider),
+            subject: format!("provider {}", without_userinfo_and_query(provider)),
+            status,
+        }
+    }
+
+    /// The memory store's embedding provider refused the credential it was
+    /// sent. The store talks to any OpenAI-compatible endpoint through one
+    /// transport with a fixed id, so the sentence names the role instead of
+    /// an id that may not be the service the operator configured.
+    pub(crate) fn embedding(status: u16) -> Self {
+        Self {
+            subject: "the embedding provider".to_string(),
             status,
         }
     }
@@ -32,8 +47,8 @@ impl ProviderAuthError {
     /// What happened, without the code: the sentence an operator reads.
     pub(crate) fn sentence(&self) -> String {
         format!(
-            "provider {} rejected the credential (HTTP {})",
-            self.provider, self.status
+            "{} rejected the credential (HTTP {})",
+            self.subject, self.status
         )
     }
 }

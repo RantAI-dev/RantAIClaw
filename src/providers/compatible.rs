@@ -71,13 +71,33 @@ fn is_full_chat_endpoint(base_url: &str) -> bool {
 /// `/models`. A bare origin gets `<origin>/models`, as chat gets
 /// `<origin>/chat/completions`.
 pub(crate) fn models_url_for_base(base_url: &str) -> String {
-    let base = base_url.trim_end_matches('/');
-    let root = if is_full_chat_endpoint(base) {
-        base.strip_suffix("/chat/completions").unwrap_or(base)
-    } else {
-        base
-    };
-    format!("{root}/models")
+    url_from_base(base_url, |path| {
+        // A full chat endpoint's /models sits beside the chat path, not under it.
+        let path = path.strip_suffix("/chat/completions").unwrap_or(path);
+        format!("{path}/models")
+    })
+}
+
+/// Build a URL from `base_url` by mapping its PATH with `path_for`, which
+/// receives the base's path with trailing slashes trimmed. The query and the
+/// userinfo a `custom:` base carries stay where they belong — a query is not
+/// part of the path, so `custom:http://host/v1?key=abc` requests
+/// `/v1/chat/completions?key=abc`, not `/v1?key=abc/chat/completions` — and
+/// a trailing slash is not doubled. A base the URL parser rejects falls back
+/// to mapping the whole trimmed base string, the behavior before the query
+/// was kept.
+fn url_from_base<F>(base_url: &str, path_for: F) -> String
+where
+    F: FnOnce(&str) -> String,
+{
+    match reqwest::Url::parse(base_url) {
+        Ok(mut url) => {
+            let path = url.path().trim_end_matches('/').to_string();
+            url.set_path(&path_for(&path));
+            url.to_string()
+        }
+        Err(_) => path_for(base_url.trim_end_matches('/')),
+    }
 }
 
 impl OpenAiCompatibleProvider {
@@ -237,7 +257,7 @@ impl OpenAiCompatibleProvider {
         if is_full_chat_endpoint(&self.base_url) {
             self.base_url.clone()
         } else {
-            format!("{}/chat/completions", self.base_url)
+            url_from_base(&self.base_url, |path| format!("{path}/chat/completions"))
         }
     }
 
@@ -264,20 +284,20 @@ impl OpenAiCompatibleProvider {
             return self.base_url.clone();
         }
 
-        let normalized_base = self.base_url.trim_end_matches('/');
+        url_from_base(&self.base_url, |path| {
+            // If chat endpoint is explicitly configured, derive sibling responses endpoint.
+            if let Some(prefix) = path.strip_suffix("/chat/completions") {
+                return format!("{prefix}/responses");
+            }
 
-        // If chat endpoint is explicitly configured, derive sibling responses endpoint.
-        if let Some(prefix) = normalized_base.strip_suffix("/chat/completions") {
-            return format!("{prefix}/responses");
-        }
-
-        // If an explicit API path already exists (e.g. /v1, /openai, /api/coding/v3),
-        // append responses directly to avoid duplicate /v1 segments.
-        if self.has_explicit_api_path() {
-            format!("{normalized_base}/responses")
-        } else {
-            format!("{normalized_base}/v1/responses")
-        }
+            // If an explicit API path already exists (e.g. /v1, /openai, /api/coding/v3),
+            // append responses directly to avoid duplicate /v1 segments.
+            if self.has_explicit_api_path() {
+                format!("{path}/responses")
+            } else {
+                format!("{path}/v1/responses")
+            }
+        })
     }
 
     fn tool_specs_to_openai_format(tools: &[crate::tools::ToolSpec]) -> Vec<serde_json::Value> {
@@ -2674,6 +2694,72 @@ mod tests {
         );
     }
 
+    /// A query in the base (`custom:http://host/v1?key=abc`) belongs to the
+    /// request, not to the path: `/v1/models?key=abc`, never
+    /// `/v1?key=abc/models`.
+    #[test]
+    fn models_url_for_base_keeps_a_query_out_of_the_path() {
+        assert_eq!(
+            models_url_for_base("http://127.0.0.1:8080/v1?key=abc"),
+            "http://127.0.0.1:8080/v1/models?key=abc"
+        );
+    }
+
+    #[test]
+    fn models_url_for_base_keeps_the_query_when_replacing_a_full_chat_endpoint() {
+        assert_eq!(
+            models_url_for_base("https://ark.example.com/api/coding/v3/chat/completions?key=abc"),
+            "https://ark.example.com/api/coding/v3/models?key=abc"
+        );
+    }
+
+    /// Userinfo in the base stays in the URL: reqwest sends it as HTTP Basic,
+    /// unchanged by how the path is joined.
+    #[test]
+    fn models_url_for_base_keeps_userinfo_and_query() {
+        assert_eq!(
+            models_url_for_base("http://user:pw@127.0.0.1:8080/v1?key=abc"),
+            "http://user:pw@127.0.0.1:8080/v1/models?key=abc"
+        );
+    }
+
+    #[test]
+    fn chat_completions_url_keeps_a_query_out_of_the_path() {
+        let p = make_provider("custom", "http://127.0.0.1:8080/v1?key=abc", None);
+        assert_eq!(
+            p.chat_completions_url(),
+            "http://127.0.0.1:8080/v1/chat/completions?key=abc"
+        );
+    }
+
+    /// Every `responses_url` branch keeps the query out of the path: the
+    /// sibling of a full chat endpoint, an explicit API path, and a bare
+    /// origin (which gets `/v1/responses`).
+    #[test]
+    fn responses_url_keeps_a_query_out_of_the_path() {
+        let full_chat = make_provider(
+            "custom",
+            "https://api.example.com/v1/chat/completions?key=abc",
+            None,
+        );
+        assert_eq!(
+            full_chat.responses_url(),
+            "https://api.example.com/v1/responses?key=abc"
+        );
+
+        let explicit_path = make_provider("custom", "https://api.example.com/v1?key=abc", None);
+        assert_eq!(
+            explicit_path.responses_url(),
+            "https://api.example.com/v1/responses?key=abc"
+        );
+
+        let bare_origin = make_provider("custom", "http://127.0.0.1:8080?key=abc", None);
+        assert_eq!(
+            bare_origin.responses_url(),
+            "http://127.0.0.1:8080/v1/responses?key=abc"
+        );
+    }
+
     /// The model list is the sibling of the chat endpoint for every base shape.
     #[test]
     fn models_url_for_base_is_the_sibling_of_the_chat_endpoint() {
@@ -3749,6 +3835,52 @@ mod tests {
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 5);
         assert_eq!(usage.total_tokens, 15);
+    }
+
+    /// A `custom:` base whose URL carries a query (`?key=abc`) reaches the
+    /// right path: the query is not part of the path, so the request goes to
+    /// `/v1/chat/completions?key=abc`, and it carries the SAME Bearer
+    /// credential a base without a query sends — the URL key must not become
+    /// (or replace) the Authorization header.
+    #[tokio::test]
+    async fn chat_reaches_the_path_of_a_base_whose_url_carries_a_query() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .and(wiremock::matchers::query_param("key", "abc"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(chat_completion_body(
+                    serde_json::json!({
+                        "role": "assistant",
+                        "content": "ok",
+                    }),
+                )),
+            )
+            .mount(&server)
+            .await;
+
+        let base = format!("{}/v1?key=abc", server.uri());
+        let provider = OpenAiCompatibleProvider::new_no_responses_fallback(
+            "custom",
+            &base,
+            Some("test-key"),
+            AuthStyle::Bearer,
+        );
+
+        chat_once(&provider)
+            .await
+            .text
+            .expect("the mock matched path and query");
+
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 1, "exactly one matched request");
+        let auth = requests[0]
+            .headers
+            .get("authorization")
+            .expect("the Authorization header is sent")
+            .to_str()
+            .expect("header is ascii");
+        assert_eq!(auth, "Bearer test-key", "the credential is unchanged");
     }
 
     #[tokio::test]

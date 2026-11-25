@@ -1341,7 +1341,157 @@ async fn kb_ingest_with_the_vision_service_down_prints_extractor_unavailable_and
     );
     assert_eq!(code, 1, "a dead extractor must exit 1: {stdout}");
     assert!(stdout.contains("extractor_unavailable"), "got: {stdout}");
+    assert!(
+        stdout.contains("the vision service upstream is unreachable"),
+        "the answer names the service: {stdout}"
+    );
     assert!(!stdout.contains("internal"), "got: {stdout}");
+    assert!(
+        !stdout.contains("VisionImageExtractor") && !stdout.contains(" extractor upstream"),
+        "a Rust type name must not reach the answer: {stdout}"
+    );
+    assert!(
+        !stdout.contains("http") && !stdout.contains("127.0.0.1"),
+        "the answer must not carry the endpoint URL: {stdout}"
+    );
+}
+
+/// An embedding endpoint that refused the key (HTTP 401) is the operator's
+/// to fix: `kb ingest` prints `provider_auth_failed` with the fixed sentence
+/// the HTTP ingest answers, exits 1, and leaves out the upstream body and
+/// URL — the same body shape the gateway's 502 carries.
+#[tokio::test]
+async fn kb_ingest_with_a_rejected_embedding_key_prints_provider_auth_failed_and_exits_1() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(401).set_body_string("the upstream echoes the credential"),
+        )
+        .mount(&server)
+        .await;
+
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("kb.db");
+    let md = tmp.path().join("doc.md");
+    std::fs::write(
+        &md,
+        "# Note\nOne short paragraph about lanterns, long enough to embed.",
+    )
+    .unwrap();
+    let uri = server.uri();
+    let mock_env = [("KB_EMBEDDING_BASE_URL", uri.as_str())];
+
+    let (code, stdout, _stderr) =
+        run_kb_with_env(&db, &["ingest", md.to_str().unwrap()], &mock_env);
+    assert_eq!(code, 1, "a rejected key must exit 1: {stdout}");
+    assert!(stdout.contains("provider_auth_failed"), "got: {stdout}");
+    assert!(
+        stdout.contains("the embedding provider rejected the API key"),
+        "the fixed sentence must be printed: {stdout}"
+    );
+    assert!(!stdout.contains("internal"), "got: {stdout}");
+    assert!(
+        !stdout.contains("echoes the credential"),
+        "the upstream body must never surface: {stdout}"
+    );
+    assert!(
+        !stdout.contains("http") && !stdout.contains("127.0.0.1"),
+        "the answer must not carry the endpoint URL: {stdout}"
+    );
+}
+
+/// An upstream error status that is not a rejected key (HTTP 500, after the
+/// client's own transient retries) is the upstream's failure: `kb ingest`
+/// names the service and the status, exits 1, and carries neither the
+/// upstream body — which can echo the credential back — nor the endpoint
+/// URL, the same words the HTTP ingest answers with.
+#[tokio::test]
+async fn kb_ingest_with_a_500_embedding_endpoint_prints_the_status_without_the_body() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(500).set_body_string("the upstream wrote a failure page"),
+        )
+        .mount(&server)
+        .await;
+
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("kb.db");
+    let md = tmp.path().join("doc.md");
+    std::fs::write(
+        &md,
+        "# Note\nOne short paragraph about lanterns, long enough to embed.",
+    )
+    .unwrap();
+    let uri = server.uri();
+    let mock_env = [("KB_EMBEDDING_BASE_URL", uri.as_str())];
+
+    let (code, stdout, _stderr) =
+        run_kb_with_env(&db, &["ingest", md.to_str().unwrap()], &mock_env);
+    assert_eq!(code, 1, "an upstream error must exit 1: {stdout}");
+    assert!(stdout.contains("embedding_upstream"), "got: {stdout}");
+    assert!(
+        stdout.contains("returned status 500"),
+        "the status is named: {stdout}"
+    );
+    assert!(!stdout.contains("internal"), "got: {stdout}");
+    assert!(
+        !stdout.contains("the upstream wrote a failure page"),
+        "the upstream body must never surface: {stdout}"
+    );
+    assert!(
+        !stdout.contains("http") && !stdout.contains("127.0.0.1"),
+        "the answer must not carry the endpoint URL: {stdout}"
+    );
+}
+
+/// A 2xx answer whose JSON is the wrong shape — compat layers serve
+/// `{"error": …}` with 200 — is the upstream's failure: `kb ingest` prints
+/// the fixed diagnostic, exits non-zero, and carries neither the upstream
+/// payload — which can echo the credential back — nor the endpoint URL.
+#[tokio::test]
+async fn kb_ingest_with_a_malformed_200_embedding_answer_prints_a_fixed_diagnostic() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "error": "the upstream echoed the credential" }),
+            ),
+        )
+        .mount(&server)
+        .await;
+
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("kb.db");
+    let md = tmp.path().join("doc.md");
+    std::fs::write(
+        &md,
+        "# Note\nOne short paragraph about lanterns, long enough to embed.",
+    )
+    .unwrap();
+    let uri = server.uri();
+    let mock_env = [("KB_EMBEDDING_BASE_URL", uri.as_str())];
+
+    let (code, stdout, _stderr) =
+        run_kb_with_env(&db, &["ingest", md.to_str().unwrap()], &mock_env);
+    assert_ne!(code, 0, "a malformed answer must exit non-zero: {stdout}");
+    assert!(
+        stdout.contains("Invalid embedding response structure"),
+        "the fixed diagnostic is printed: {stdout}"
+    );
+    assert!(
+        !stdout.contains("the upstream echoed the credential"),
+        "the upstream payload must never surface: {stdout}"
+    );
     assert!(
         !stdout.contains("http") && !stdout.contains("127.0.0.1"),
         "the answer must not carry the endpoint URL: {stdout}"

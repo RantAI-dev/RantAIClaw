@@ -68,10 +68,18 @@ pub enum KbError {
 pub const UPSTREAM_UNREACHABLE_DETAIL: &str =
     "the upstream model service did not answer; check its base URL and that it is running";
 
+/// Fixed sentences for a rejected API key, in a gateway answer or on the CLI.
+/// They name the service and the key and never the upstream body, which can
+/// echo the credential back.
+pub const EMBEDDING_KEY_REJECTED_DETAIL: &str =
+    "the embedding provider rejected the API key; check the key";
+pub const CHAT_KEY_REJECTED_DETAIL: &str = "the chat provider rejected the API key; check the key";
+
 /// Whether an upstream answer status means the service refused the API key it
-/// was sent. Those answers carry their own code, so the console can tell the
-/// operator to fix the key instead of reporting a generic upstream failure.
-pub(crate) fn is_auth_rejection_status(status: u16) -> bool {
+/// was sent. Those answers carry their own code, so the gateway and the
+/// console can tell the operator to fix the key instead of reporting a
+/// generic upstream failure.
+pub fn is_auth_rejection_status(status: u16) -> bool {
     matches!(status, 401 | 403)
 }
 

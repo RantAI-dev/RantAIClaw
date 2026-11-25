@@ -169,10 +169,10 @@ pub(in crate::kb::embed) async fn embed_via_http(
             .get("data")
             .and_then(|v| v.as_array())
             .ok_or_else(|| {
-                KbError::Other(format!(
-                    "Invalid embedding response structure: {}",
-                    truncate(&parsed.to_string(), 500)
-                ))
+                // The upstream body is never quoted here: a compat layer can
+                // echo the credential back, and this error reaches stdout and
+                // the gateway's internal_error detail. The shape says enough.
+                KbError::Other("Invalid embedding response structure: expected a data array".into())
             })?;
         let mut out = Vec::with_capacity(arr.len());
         for (i, item) in arr.iter().enumerate() {
@@ -181,8 +181,7 @@ pub(in crate::kb::embed) async fn embed_via_http(
                 .and_then(|v| v.as_array())
                 .ok_or_else(|| {
                     KbError::Other(format!(
-                        "Invalid embedding item at index {i}: {}",
-                        truncate(&item.to_string(), 200)
+                        "Invalid embedding item at index {i}: missing the embedding array"
                     ))
                 })?;
             // f64 → f32 truncation is intentional: embeddings are stored as
@@ -299,14 +298,6 @@ fn backoff_for(attempt: u32) -> Duration {
         .saturating_mul(1u64 << (attempt - 1))
         .min(RETRY_MAX_MS);
     Duration::from_millis(ms)
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..max])
-    }
 }
 
 #[cfg(test)]

@@ -126,17 +126,20 @@ impl EmbeddingProvider for OpenAiEmbedding {
             let status = resp.status();
             // A rejected credential is not an embedding failure the caller can
             // retry: the operator has to fix the key, and the upstream body
-            // can echo that key back. The marker carries the provider and the
+            // can echo that key back. The marker carries the role and the
             // status and nothing else, so no answer and no log line carries
             // the body.
             if status == reqwest::StatusCode::UNAUTHORIZED
                 || status == reqwest::StatusCode::FORBIDDEN
             {
-                return Err(crate::providers::provider_auth::ProviderAuthError::new(
-                    self.name(),
-                    status.as_u16(),
-                )
-                .into());
+                // The role, not the transport id: this store serves any
+                // configured endpoint through the one "openai" transport, so
+                // "openai" in the sentence would blame a service the
+                // operator may not use.
+                return Err(
+                    crate::providers::provider_auth::ProviderAuthError::embedding(status.as_u16())
+                        .into(),
+                );
             }
             let text = resp.text().await.unwrap_or_default();
             anyhow::bail!("Embedding API error {status}: {text}");
@@ -683,6 +686,43 @@ mod tests {
         let text = format!("{err:#}");
         assert!(!text.contains("echoes the key"), "{text}");
         assert!(!text.contains("rantaiclaw_test_key"), "{text}");
+    }
+
+    /// An OpenAI-compatible endpoint that rejects the key answers the marker
+    /// with the neutral role sentence. The store serves any configured
+    /// endpoint through one hardcoded transport, so naming the transport id
+    /// ("openai") would blame the wrong service; the sentence names the role.
+    /// The upstream body, the key and the endpoint URL reach neither the
+    /// error nor its text.
+    #[tokio::test]
+    async fn openai_embed_answers_a_neutral_role_sentence_on_401() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("the upstream echoes the key"))
+            .mount(&server)
+            .await;
+
+        let p = OpenAiEmbedding::new(&server.uri(), "rantaiclaw_test_key", "text-embed-test", 4);
+        let err = p
+            .embed(&["a note about the lantern"])
+            .await
+            .expect_err("a rejected key is an error, not an empty answer");
+
+        assert_eq!(
+            crate::providers::provider_auth_failure_sentence(&err).as_deref(),
+            Some("the embedding provider rejected the credential (HTTP 401)"),
+        );
+        let text = format!("{err:#}");
+        assert!(!text.contains("openai"), "{text}");
+        assert!(!text.contains("echoes the key"), "{text}");
+        assert!(!text.contains("rantaiclaw_test_key"), "{text}");
+        assert!(
+            !text.contains("http") && !text.contains("127.0.0.1"),
+            "the error must not carry the endpoint URL: {text}"
+        );
     }
 
     #[test]

@@ -230,10 +230,11 @@ fn is_transient(status: u16) -> bool {
     status >= 500 || status == 429
 }
 
-/// The name of the extractor in an upstream error. The endpoint URL stays
-/// out of every error built here: a reqwest error carries it, and the caller
-/// may print the error, so it is removed with `without_url` first.
-const VISION_EXTRACTOR: &str = "VisionImageExtractor";
+/// The name of the extractor in an upstream error: the service an operator
+/// can point at, not a Rust type name. The endpoint URL stays out of every
+/// error built here: a reqwest error carries it, and the caller may print
+/// the error, so it is removed with `without_url` first.
+const VISION_EXTRACTOR: &str = "vision service";
 
 fn vision_unavailable(message: String) -> KbError {
     KbError::ExtractorUnavailable {
