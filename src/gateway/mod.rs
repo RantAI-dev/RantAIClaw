@@ -1485,12 +1485,26 @@ pub async fn run_gateway(
     // to would be a different program. Best-effort: a gateway that cannot build
     // a channel runtime must still serve the console so the operator can fix the
     // configuration; inbound webhooks then answer 503 with the reason.
+    // Resolve the observer HERE, before the webhook dispatch and the router are
+    // built, so this fn owns the one handle both paths record through and the
+    // flush at the end of the shutdown below reaches both. `Some` (the daemon's
+    // shared observer) passes through; `None` — the standalone gateway IS the
+    // process — builds the same factory's observer one frame earlier. No
+    // caller-visible change: `build_gateway_router` and `build_channel_runtime`
+    // still build one for their own direct callers that pass `None`.
+    let observer: Arc<dyn crate::observability::Observer> = observer
+        .unwrap_or_else(|| Arc::from(crate::observability::create_observer(&config.observability)));
+
     let channel_bus = match channel_bus {
         Some(bus) => bus,
         None => {
             let bus = Arc::new(crate::channels::ChannelBus::default());
             match crate::channels::spawn_webhook_dispatch(
                 &config,
+                // The same observer the router records through and this fn
+                // flushes on shutdown. Without it the webhook dispatch builds
+                // its own registry that nobody ever flushes.
+                Some(Arc::clone(&observer)),
                 // A child token, so a supervisor restart of this gateway tears
                 // its dispatch loop down instead of leaving a second one behind.
                 shutdown.child_token(),
@@ -1508,7 +1522,8 @@ pub async fn run_gateway(
         }
     };
 
-    let (state, app) = build_gateway_router(config.clone(), observer, Some(channel_bus))?;
+    let (state, app) =
+        build_gateway_router(config.clone(), Some(observer.clone()), Some(channel_bus))?;
 
     // Hot-reload: reflect on-disk config edits (e.g. a provider changed in the
     // TUI, another process) in the running gateway + the web console it serves,
@@ -1649,6 +1664,15 @@ pub async fn run_gateway(
             }
         }
     }
+
+    // Graceful shutdown: serving has stopped, the reloader is cancelled and
+    // the tunnel is down, so nothing records through this observer anymore.
+    // Flush once here — next to the tunnel stop, on every path that reaches
+    // here (Ok or Err), BEFORE `serve_result?` so an error exit still ships
+    // what was recorded. Under the daemon this flushes the daemon's shared
+    // observer a second time (the daemon flushes after its drain too); a
+    // repeated OTel flush is harmless and a Prometheus flush is a no-op.
+    observer.flush();
 
     serve_result?;
 
@@ -4370,6 +4394,76 @@ mod tests {
         assert!(
             !process_is_alive(pid),
             "the tunnel child must be gone after the gateway returns: pid {pid}"
+        );
+    }
+
+    /// Counts `flush` calls only: the shutdown test below asserts on the
+    /// flush, and nothing else about the observer matters to it.
+    struct FlushCountingObserver {
+        flush_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::observability::Observer for FlushCountingObserver {
+        fn record_event(&self, _event: &crate::observability::ObserverEvent) {}
+        fn record_metric(&self, _metric: &crate::observability::traits::ObserverMetric) {}
+        fn flush(&self) {
+            self.flush_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn name(&self) -> &str {
+            "flush-counting"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// The standalone gateway IS the process and owns its observer, and a
+    /// cancel of the shutdown token is the graceful path: the observer must be
+    /// flushed at least once before `run_gateway` returns, or everything
+    /// recorded since the last OTel export interval is lost on every SIGTERM.
+    #[tokio::test]
+    async fn run_gateway_flushes_the_observer_when_the_shutdown_token_is_cancelled() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.path().to_path_buf();
+
+        let flush_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observer: std::sync::Arc<dyn crate::observability::Observer> =
+            std::sync::Arc::new(FlushCountingObserver {
+                flush_count: std::sync::Arc::clone(&flush_count),
+            });
+
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let ready = std::sync::Arc::new(tokio::sync::Notify::new());
+        let gateway = tokio::spawn(super::run_gateway(
+            "127.0.0.1",
+            0,
+            config,
+            shutdown.clone(),
+            Some(std::sync::Arc::clone(&ready)),
+            Some(observer),
+            None,
+        ));
+
+        // The daemon awaits this same notify before it prints its "started"
+        // banner: it fires on the first successful bind, so the cancel below
+        // reaches a serving gateway rather than a startup that never got
+        // there. A startup fatal would never fire it and time out here.
+        tokio::time::timeout(std::time::Duration::from_secs(30), ready.notified())
+            .await
+            .expect("run_gateway must bind and fire ready within 30 s");
+
+        shutdown.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), gateway)
+            .await
+            .expect("run_gateway must return after the shutdown token is cancelled")
+            .expect("the gateway task must not panic");
+        result.expect("a shutdown on request is a clean exit");
+
+        assert!(
+            flush_count.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "a graceful gateway shutdown must flush its observer"
         );
     }
 

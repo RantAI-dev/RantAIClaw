@@ -2002,14 +2002,20 @@ pub async fn start_channels_with_cancellation(
 /// NOT also spawn the listeners — a bare `gateway` command has never polled
 /// Telegram and starting to would be a different program.
 ///
+/// `observer` is the process's observer, owned and flushed by the caller (`run_gateway`).
+/// It must be passed through to `build_channel_runtime` instead of letting that
+/// function build a second one: the webhook dispatch records tool-call events
+/// through this observer, and a registry nobody flushes loses them on SIGTERM.
+///
 /// `Ok(None)` when no channel is configured; the bus then stays empty and an
 /// inbound webhook is refused rather than accepted into a queue nothing drains.
 pub(crate) async fn spawn_webhook_dispatch(
     config: &Config,
+    observer: Option<Arc<dyn Observer>>,
     shutdown: CancellationToken,
     bus: Arc<ChannelBus>,
 ) -> Result<Option<tokio::task::JoinHandle<()>>> {
-    let Some(runtime) = build_channel_runtime(config, None).await? else {
+    let Some(runtime) = build_channel_runtime(config, observer).await? else {
         return Ok(None);
     };
     Ok(Some(
@@ -2216,7 +2222,8 @@ pub(crate) async fn run_channel_runtime(
     // watches the shutdown token.
     drop(tx);
 
-    dispatch::run_message_dispatch_loop(rx, ctx, max_in_flight_messages, shutdown.clone()).await;
+    dispatch::run_message_dispatch_loop(rx, ctx.clone(), max_in_flight_messages, shutdown.clone())
+        .await;
 
     if let Some(ref bus) = bus {
         bus.clear().await;
@@ -2240,6 +2247,16 @@ pub(crate) async fn run_channel_runtime(
     for h in handles {
         let _ = h.await;
     }
+
+    // Every listener and the dispatch loop have stopped and been joined, so
+    // nothing records through the context anymore. Flush what this runtime
+    // recorded — the only flush the standalone `channels` server and the
+    // TUI-hosted runtime get, since neither owns an observer above this fn
+    // (the context is cloned into the dispatch loop above precisely so it
+    // survives to here). Under the daemon this flushes the shared daemon
+    // observer early, and the daemon flushes again after its drain: a
+    // repeated OTel flush is harmless and a Prometheus flush is a no-op.
+    ctx.observer.flush();
 
     Ok(())
 }

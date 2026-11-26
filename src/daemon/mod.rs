@@ -70,7 +70,15 @@ pub(crate) fn resolve_daemon_profile() -> DaemonProfile {
     }
 }
 
-pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
+pub async fn run(
+    config: Config,
+    host: String,
+    port: u16,
+    // The process's observer when a caller above owns one; `None` ⇒ build one.
+    // Mirrors `run_gateway`: the daemon is not the only way to supervise the
+    // components, and tests inject a counting observer here.
+    observer: Option<std::sync::Arc<dyn crate::observability::Observer>>,
+) -> Result<()> {
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config
         .reliability
@@ -131,7 +139,9 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     // those three do the actual work, which is why `/metrics` described almost
     // nothing. Passed down as an argument; no global, no static.
     let observer: std::sync::Arc<dyn crate::observability::Observer> =
-        std::sync::Arc::from(crate::observability::create_observer(&config.observability));
+        observer.unwrap_or_else(|| {
+            std::sync::Arc::from(crate::observability::create_observer(&config.observability))
+        });
 
     // ONE bus handle for this process. The channels supervisor publishes its
     // sender into it on every (re)start and clears it on exit; the gateway
@@ -287,6 +297,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 &services,
                 &daemon_profile,
                 &state_file,
+                &observer,
             )
             .await;
             return Err(e);
@@ -300,6 +311,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 &services,
                 &daemon_profile,
                 &state_file,
+                &observer,
             )
             .await;
             return Ok(());
@@ -334,6 +346,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         &services,
         &daemon_profile,
         &state_file,
+        &observer,
     )
     .await;
 
@@ -362,6 +375,7 @@ async fn drain_and_cleanup(
     services: &[Box<dyn crate::services::Service>],
     profile: &DaemonProfile,
     state_file_path: &Path,
+    observer: &std::sync::Arc<dyn crate::observability::Observer>,
 ) {
     // One deadline for both drains, so the time the gateway does not use is
     // left to channels instead of lost.
@@ -431,6 +445,16 @@ async fn drain_and_cleanup(
     if let Err(e) = crate::profile::sentinel::clear_sentinel(&profile.name) {
         tracing::warn!("Failed to clear daemon sentinel: {e}");
     }
+
+    // Every supervised component is down and awaited, so nothing records
+    // through this observer anymore. The heartbeat worker and the cron
+    // scheduler hold only clones the abort above killed, so they cannot
+    // flush themselves: this one flush is the only chance the process's
+    // telemetry gets. The gateway and the channel runtime may have flushed
+    // the same shared observer on their own way out already; a repeated OTel
+    // flush is harmless and a Prometheus flush is a no-op. A failed flush is
+    // logged inside the observer, never hides the shutdown outcome.
+    observer.flush();
 }
 
 /// How a failed gateway run should be treated by its supervisor.
@@ -993,6 +1017,8 @@ mod tests {
             }
         });
 
+        let noop_observer: std::sync::Arc<dyn crate::observability::Observer> =
+            std::sync::Arc::new(crate::observability::NoopObserver);
         drain_and_cleanup(
             gateway,
             Some(channels),
@@ -1003,6 +1029,7 @@ mod tests {
                 pinned: false,
             },
             &home.path().join("daemon_state.json"),
+            &noop_observer,
         )
         .await;
 
@@ -1025,6 +1052,8 @@ mod tests {
         let channels = tokio::spawn(tokio::time::sleep(Duration::from_mins(1)));
 
         let started = tokio::time::Instant::now();
+        let noop_observer: std::sync::Arc<dyn crate::observability::Observer> =
+            std::sync::Arc::new(crate::observability::NoopObserver);
         drain_and_cleanup(
             gateway,
             Some(channels),
@@ -1035,6 +1064,7 @@ mod tests {
                 pinned: false,
             },
             &home.path().join("daemon_state.json"),
+            &noop_observer,
         )
         .await;
 
@@ -1076,6 +1106,8 @@ mod tests {
             state_path.with_extension(format!("json.tmp.{}", std::process::id() + 7));
         std::fs::write(&other_pid_tmp, br#"{"other":true}"#).unwrap();
 
+        let noop_observer: std::sync::Arc<dyn crate::observability::Observer> =
+            std::sync::Arc::new(crate::observability::NoopObserver);
         drain_and_cleanup(
             tokio::spawn(async {}),
             None,
@@ -1086,6 +1118,7 @@ mod tests {
                 pinned: false,
             },
             &state_path,
+            &noop_observer,
         )
         .await;
 
@@ -1184,6 +1217,8 @@ mod tests {
         )
         .unwrap();
 
+        let noop_observer: std::sync::Arc<dyn crate::observability::Observer> =
+            std::sync::Arc::new(crate::observability::NoopObserver);
         drain_and_cleanup(
             tokio::spawn(async {}),
             None,
@@ -1191,6 +1226,7 @@ mod tests {
             &[],
             &identity,
             &tmp.path().join("daemon_state.json"),
+            &noop_observer,
         )
         .await;
 
@@ -1205,6 +1241,67 @@ mod tests {
                 .expect("a valid profile name")
                 .exists(),
             "the sentinel under the NEW marker's profile is not this daemon's to clear"
+        );
+    }
+
+    /// Counts `flush` calls only: the drain test below asserts on the flush,
+    /// and nothing else about the observer matters to it.
+    struct FlushCountingObserver {
+        flush_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::observability::Observer for FlushCountingObserver {
+        fn record_event(&self, _event: &crate::observability::ObserverEvent) {}
+        fn record_metric(&self, _metric: &crate::observability::traits::ObserverMetric) {}
+        fn flush(&self) {
+            self.flush_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn name(&self) -> &str {
+            "flush-counting"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// A graceful daemon stop drains the supervised components and then ends
+    /// with the process's ONE observer in hand. The heartbeat worker and the
+    /// cron scheduler hold only clones that the abort in the drain killed, so
+    /// they cannot flush themselves: the drain must flush the observer once
+    /// the components are down, or the last export interval of telemetry is
+    /// lost on every SIGTERM.
+    #[tokio::test]
+    async fn drain_and_cleanup_flushes_the_observer_once_the_components_are_down() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = TempDir::new().expect("temp home");
+        let _home = crate::test_env::HomeGuard::set(tmp.path());
+        let _profile = crate::test_env::EnvGuard::unset("RANTAICLAW_PROFILE");
+        crate::profile::ProfileManager::ensure("work").unwrap();
+
+        let flush_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observer: std::sync::Arc<dyn crate::observability::Observer> =
+            std::sync::Arc::new(FlushCountingObserver {
+                flush_count: std::sync::Arc::clone(&flush_count),
+            });
+
+        drain_and_cleanup(
+            tokio::spawn(async {}),
+            None,
+            vec![],
+            &[],
+            &DaemonProfile {
+                name: "work".to_string(),
+                pinned: false,
+            },
+            &tmp.path().join("daemon_state.json"),
+            &observer,
+        )
+        .await;
+
+        assert!(
+            flush_count.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the drain must flush the process observer once the components are down"
         );
     }
 
