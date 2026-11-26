@@ -1592,7 +1592,7 @@ async fn main() -> Result<()> {
             } else {
                 info!("🧠 Starting RantaiClaw Daemon on {host}:{port}");
             }
-            match rantaiclaw::daemon::run(config, host, port).await {
+            match rantaiclaw::daemon::run(config, host, port, None).await {
                 // A gateway startup error that follows from the config alone
                 // surfaced by the daemon supervisor exits EX_CONFIG so a
                 // systemd unit with RestartPreventExitStatus=78 leaves it
