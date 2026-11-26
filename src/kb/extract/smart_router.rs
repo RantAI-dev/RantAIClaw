@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 
 use crate::kb::extract::text_layer_signals::{is_unpdf_sufficient_with_size, RouterOpts};
-use crate::kb::extract::{ExtractionResult, Extractor};
+use crate::kb::extract::{failing_service_names, ExtractionResult, Extractor};
 use crate::kb::{KbError, KbResult};
 
 pub struct SmartRouterExtractor {
@@ -92,19 +92,20 @@ impl Extractor for SmartRouterExtractor {
             Err(e) => {
                 let fb_msg = e.to_string();
                 let fb_short: String = fb_msg.chars().take(150).collect();
+                let tl_names = text_layer_err.as_ref().map_or_else(
+                    || "insufficient output".to_string(),
+                    |err| failing_service_names(std::slice::from_ref(err)),
+                );
                 let tl_msg = text_layer_err
                     .as_ref()
                     .map_or_else(|| "insufficient output".to_string(), ToString::to_string);
                 let tl_short: String = tl_msg.chars().take(150).collect();
+                let fb_names = failing_service_names(std::slice::from_ref(&e));
                 let causes: Vec<KbError> = text_layer_err.into_iter().chain([e]).collect();
                 Err(KbError::extraction_failed(
-                    self.name.clone(),
+                    failing_service_names(&causes),
                     format!(
-                        "Both extractors failed — textLayer({}): {}; fallback({}): {}",
-                        self.text_layer.name(),
-                        tl_short,
-                        self.fallback.name(),
-                        fb_short
+                        "Both extractors failed — textLayer({tl_names}): {tl_short}; fallback({fb_names}): {fb_short}"
                     ),
                     causes,
                 ))
