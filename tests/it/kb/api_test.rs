@@ -1186,6 +1186,132 @@ async fn unlinking_a_document_that_is_not_in_the_group_404s() {
     assert_eq!(body["error"], "not_found", "{body}");
 }
 
+/// `GET /api/v1/kb/groups/{id}/documents` used to answer `200 []` for a group
+/// that does not exist, which reads as "an empty group" to a client that
+/// checks only the status. An unknown group is not an empty group.
+#[tokio::test]
+async fn documents_of_an_unknown_group_404s() {
+    let h = start_harness(|_store| Box::pin(async move {})).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!(
+            "{}/api/v1/kb/groups/no_such_group/documents",
+            h.base_url
+        ))
+        .send()
+        .await
+        .expect("request");
+
+    assert_eq!(resp.status(), 404, "an unknown group is not an empty one");
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["error"], "not_found", "{body}");
+    let text = body.to_string();
+    assert!(
+        text.contains("no_such_group"),
+        "the answer must name the group: {text}"
+    );
+}
+
+/// Control for the refusal above: a group that EXISTS but holds no documents
+/// still answers `200` with an empty list.
+#[tokio::test]
+async fn documents_of_a_known_empty_group_answer_an_empty_list() {
+    // The seed closure stashes the server-generated id for the request below.
+    let group_id_cell: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let cell_for_seed = group_id_cell.clone();
+
+    let h = start_harness(|store| {
+        Box::pin(async move {
+            let group = store
+                .create_group("Empty Group", None, None)
+                .await
+                .expect("create group");
+            *cell_for_seed.lock() = Some(group.id);
+        })
+    })
+    .await;
+
+    let group_id = group_id_cell.lock().clone().expect("group id captured");
+    let resp = reqwest::get(format!(
+        "{}/api/v1/kb/groups/{group_id}/documents",
+        h.base_url
+    ))
+    .await
+    .expect("request");
+
+    assert_eq!(resp.status(), 200, "a known empty group is not refused");
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(
+        body.as_array().map(Vec::len),
+        Some(0),
+        "the group exists and holds no documents: {body}"
+    );
+}
+
+/// `POST /api/v1/kb/search` with an unknown group id must answer 404 before
+/// the embedding call, the same answer `GET /groups/{id}` gives. The embedding
+/// endpoint is a closed port: if the handler ever reached retrieval, the answer
+/// would be 502 `upstream_unreachable` instead.
+#[tokio::test]
+async fn kb_search_with_an_unknown_group_404s() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let h = start_harness(|_store| Box::pin(async move {})).await;
+    let _env = ExtractorEnv::set(&[
+        (
+            "KB_EMBEDDING_BASE_URL",
+            format!("http://127.0.0.1:{port}/v1").as_str(),
+        ),
+        ("NO_PROXY", "127.0.0.1,localhost"),
+        ("no_proxy", "127.0.0.1,localhost"),
+    ]);
+
+    let resp = reqwest::Client::new()
+        .post(format!("{}/api/v1/kb/search", h.base_url))
+        .json(&serde_json::json!({
+            "query": "rantaiclaw_probe",
+            "groups": ["no_such_group"]
+        }))
+        .send()
+        .await
+        .expect("request");
+
+    assert_eq!(resp.status(), 404, "an unknown group is refused, not empty");
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["error"], "not_found", "{body}");
+    let text = body.to_string();
+    assert!(
+        text.contains("no_such_group"),
+        "the answer must name the group: {text}"
+    );
+}
+
+/// `GET /api/v1/kb/graph?group=<unknown id>` must answer 404 the same way
+/// instead of an empty graph with 200.
+#[tokio::test]
+async fn kb_graph_with_an_unknown_group_404s() {
+    let h = start_harness(|_store| Box::pin(async move {})).await;
+    let resp = reqwest::get(format!(
+        "{}/api/v1/kb/graph?group=no_such_group",
+        h.base_url
+    ))
+    .await
+    .expect("request");
+
+    assert_eq!(resp.status(), 404, "an unknown group is not an empty graph");
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["error"], "not_found", "{body}");
+    let text = body.to_string();
+    assert!(
+        text.contains("no_such_group"),
+        "the answer must name the group: {text}"
+    );
+}
+
 /// Sets the env vars that pick the PDF extractors and removes them on drop.
 /// Only meaningful while the harness holds `ENV_LOCK`.
 struct ExtractorEnv(Vec<&'static str>);

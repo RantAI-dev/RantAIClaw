@@ -248,7 +248,7 @@ impl KbCommand {
             }
             Self::Graph { group, limit, json } => {
                 let intel: Arc<dyn IntelligenceStore> = concrete;
-                cmd_graph(&cfg, intel, group, limit, json).await
+                cmd_graph(&cfg, store, intel, group, limit, json).await
             }
         }
     }
@@ -268,6 +268,12 @@ async fn cmd_search(
     category: Option<String>,
     json: bool,
 ) -> KbResult<i32> {
+    // An unknown `--group` id is refused before any work — the same
+    // `not_found` line the ingest door prints for an unknown name.
+    if let Err(missing) = ensure_group_ids_exist(store.as_ref(), &groups).await? {
+        print_error_toon("not_found", &format!("group {missing} not found"));
+        return Ok(1);
+    }
     let embedder = embed::make_provider(cfg)?;
     let reranker = rerank::make_reranker(cfg).map(Arc::from);
 
@@ -360,6 +366,31 @@ async fn resolve_group_names(
         }
     }
     Ok(Ok(ids))
+}
+
+/// Check every `--group` id names a group that exists. The search and graph
+/// doors take group IDS (unlike `ingest --group`, which takes names), so an
+/// id no group has is refused at the door instead of silently answering an
+/// empty result. The outer `Result` is the store failing; the inner `Err`
+/// carries the first unknown id.
+///
+/// # Errors
+///
+/// Returns a [`KbError`] when the group list cannot be read from the store.
+async fn ensure_group_ids_exist(
+    store: &dyn KbStore,
+    ids: &[String],
+) -> KbResult<Result<(), String>> {
+    if ids.is_empty() {
+        return Ok(Ok(()));
+    }
+    let groups = store.list_groups().await?;
+    for id in ids {
+        if !groups.iter().any(|g| &g.id == id) {
+            return Ok(Err(id.clone()));
+        }
+    }
+    Ok(Ok(()))
 }
 
 async fn cmd_ingest(
@@ -807,11 +838,22 @@ async fn cmd_intelligence(
 
 async fn cmd_graph(
     cfg: &KbConfig,
+    store: Arc<dyn KbStore>,
     intel: Arc<dyn IntelligenceStore>,
     group: Option<String>,
     limit: Option<usize>,
     json: bool,
 ) -> KbResult<i32> {
+    // An unknown `--group` id is refused before any work — the same
+    // `not_found` line the ingest door prints for an unknown name.
+    if let Some(group) = &group {
+        if let Err(missing) =
+            ensure_group_ids_exist(store.as_ref(), std::slice::from_ref(group)).await?
+        {
+            print_error_toon("not_found", &format!("group {missing} not found"));
+            return Ok(1);
+        }
+    }
     let limit = limit.unwrap_or(cfg.graph_max_nodes);
     let graph = intel.graph(group.as_deref(), limit).await?;
     if json {

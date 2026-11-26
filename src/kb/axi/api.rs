@@ -900,6 +900,23 @@ fn build_intelligence_extractor(cfg: &KbConfig) -> CombinedLlmExtractor {
 // Handlers.
 // ────────────────────────────────────────────────────────────────────────────
 
+/// 404 when a group id names no group, with the same `not_found` body the
+/// group CRUD routes answer. One check for the doors that take a group id in
+/// a query or body — `POST /search` `groups`, `GET /graph` `group`,
+/// `GET /groups/{id}/documents` — so an unknown id is refused at the door
+/// instead of silently reading as an empty group. (Ingest and the group CRUD
+/// routes carry the same check already.)
+///
+/// # Errors
+///
+/// Returns the store error when the group lookup fails.
+async fn ensure_group_exists(store: &dyn KbStore, id: &str) -> Result<(), ApiError> {
+    if store.get_group(id).await.map_err(ApiError::from)?.is_none() {
+        return Err(ApiError::not_found(format!("group {id} not found")));
+    }
+    Ok(())
+}
+
 async fn search(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -910,6 +927,11 @@ async fn search(
         return Err(ApiError::bad_request("query must not be empty".into()).into());
     }
     let ctx = ensure_kb_ctx(&state).await?;
+    // An unknown group id is a 404 at the door, before the embedding call —
+    // not an empty search answer.
+    for group_id in &body.groups {
+        ensure_group_exists(ctx.store.as_ref(), group_id).await?;
+    }
 
     let mut retriever = Retriever::new(
         ctx.cfg.clone(),
@@ -1116,6 +1138,9 @@ async fn get_graph(
 ) -> Result<Json<GraphResponse>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
     let ctx = ensure_kb_ctx(&state).await?;
+    if let Some(group) = q.group.as_deref() {
+        ensure_group_exists(ctx.store.as_ref(), group).await?;
+    }
     let limit = effective_graph_limit(q.limit, ctx.cfg.graph_max_nodes);
     let graph = ctx
         .intel
@@ -1339,6 +1364,7 @@ async fn list_group_documents(
 ) -> Result<Json<Vec<DocumentSummary>>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
     let ctx = ensure_kb_ctx(&state).await?;
+    ensure_group_exists(ctx.store.as_ref(), &id).await?;
     let docs = ctx
         .store
         .list_group_documents(&id)
