@@ -1293,6 +1293,112 @@ async fn kb_ingest_unknown_group_errors_before_embedding_and_stores_nothing() {
     assert!(docs.is_empty(), "no document may be stored: {docs:?}");
 }
 
+/// `kb search --group <unknown id>` must refuse the group instead of silently
+/// answering an empty result — the same `not_found` TOON block the ingest door
+/// prints, with exit 1. The embedder is a wiremock server, so its request
+/// count proves the refusal happens before any embedding call.
+#[tokio::test]
+async fn kb_search_unknown_group_errors_toon_and_exits_1() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [ { "embedding": [1.0, 0.0, 0.0, 0.0] } ]
+        })))
+        .mount(&server)
+        .await;
+
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("kb.db");
+    let _store = SqliteStore::open(&db, 4).await.unwrap();
+
+    let uri = server.uri();
+    let mock_env = [("KB_EMBEDDING_BASE_URL", uri.as_str())];
+    let (code, stdout, _stderr) = run_kb_with_env(
+        &db,
+        &[
+            "search",
+            "anything at all",
+            "--group",
+            "rantaiclaw_nosuchgroup",
+        ],
+        &mock_env,
+    );
+    assert_eq!(code, 1, "unknown group must exit 1: {stdout}");
+    assert!(
+        stdout.starts_with("error[1]{code,message}"),
+        "got: {stdout}"
+    );
+    assert!(stdout.contains("not_found"));
+    assert!(stdout.contains("rantaiclaw_nosuchgroup"));
+
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests.is_empty(),
+        "an unknown group must be refused before any embedding call; got {} calls",
+        requests.len()
+    );
+}
+
+/// `kb graph --group <unknown id>` must refuse the group the same way instead
+/// of printing an empty graph and exiting 0.
+#[tokio::test]
+async fn kb_graph_unknown_group_errors_toon_and_exits_1() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("kb.db");
+    let _store = SqliteStore::open(&db, 4).await.unwrap();
+
+    let (code, stdout, _stderr) = run_kb(&db, &["graph", "--group", "rantaiclaw_nosuchgroup"]);
+    assert_eq!(code, 1, "unknown group must exit 1: {stdout}");
+    assert!(
+        stdout.starts_with("error[1]{code,message}"),
+        "got: {stdout}"
+    );
+    assert!(stdout.contains("not_found"));
+    assert!(stdout.contains("rantaiclaw_nosuchgroup"));
+}
+
+/// Control for the two refusals above: a group that EXISTS but holds no
+/// documents is not refused — the search answers its empty scope normally with
+/// exit 0.
+#[tokio::test]
+async fn kb_search_with_a_known_empty_group_exits_0_with_an_empty_result() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [ { "embedding": [1.0, 0.0, 0.0, 0.0] } ]
+        })))
+        .mount(&server)
+        .await;
+
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("kb.db");
+    let store = SqliteStore::open(&db, 4).await.unwrap();
+    let group = store.create_group("Empty Group", None, None).await.unwrap();
+    drop(store);
+
+    let uri = server.uri();
+    let mock_env = [("KB_EMBEDDING_BASE_URL", uri.as_str())];
+    let (code, stdout, stderr) = run_kb_with_env(
+        &db,
+        &["search", "anything at all", "--group", &group.id],
+        &mock_env,
+    );
+    assert_eq!(
+        code, 0,
+        "a known empty group must still answer exit 0: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("No documents found in this knowledge-base scope."),
+        "the empty scope must be stated explicitly: {stdout}"
+    );
+}
+
 /// A corrupt file is the caller's own input: `kb ingest` prints
 /// `unprocessable_document` (as the gateway answers 422) and exits 1.
 #[tokio::test]
