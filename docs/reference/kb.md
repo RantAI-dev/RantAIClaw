@@ -166,20 +166,20 @@ The CLI is the "axi-cli" surface: idempotent, never interactive, defaults to TOO
 
 | Subcommand | Purpose |
 |---|---|
-| `kb search <query>` | Hybrid retrieval. `--top`, `--group`, `--category`, `--json` |
-| `kb ingest <path>` | Extract + chunk + embed + store a file. `--title`, `--category`, `--group`, `--json` |
+| `kb search <query>` | Hybrid retrieval. `--top`, `--group` (a group **ID**, repeatable — an unknown ID exits `1` with a TOON `error[not_found]` block), `--category`, `--json` |
+| `kb ingest <path>` | Extract + chunk + embed + store a file. `--title`, `--category`, `--group` (a group **name**, repeatable — an unknown name exits `1` with a TOON `error[not_found]` block), `--json` |
 | `kb list` | List documents. `--organization`, `--json` |
 | `kb get <id>` | Show one document by ID. `--json` |
 | `kb delete <id>` | Soft-delete a document (sets `deleted_at`). `--hard` for permanent |
 | `kb drift` | Report chunks embedded with a stale model. `--json` |
 | `kb re-embed` | Re-embed chunks. `--include-current`, `--dry-run` (counts only, no embedding calls), `--batch-size`, `--json` |
 | `kb intelligence <document_id>` | Per-document extracted entities + relations. `--json`. An unknown ID exits `1` with a TOON `error[not_found]` block |
-| `kb graph` | Cross-document knowledge graph. `--group`, `--limit`, `--json` |
+| `kb graph` | Cross-document knowledge graph. `--group` (a group **ID** — an unknown ID exits `1` with a TOON `error[not_found]` block), `--limit`, `--json` |
 
 Exit codes:
 
 - `0` — success
-- `1` — operational failure (document not found, empty extraction). A TOON `error[1]{code,message}:` block is printed to stdout.
+- `1` — operational failure (document not found, unknown group ID or name, empty extraction). A TOON `error[1]{code,message}:` block is printed to stdout.
 - non-zero (other) — internal failure (DB unreachable, bad config). Rendered as a TOON error block.
 
 Full flag list: [commands-reference.md](commands.md#kb-knowledge-base).
@@ -189,7 +189,7 @@ Full flag list: [commands-reference.md](commands.md#kb-knowledge-base).
 When the gateway runs with `--features kb`, the following routes are mounted under `/api/v1/kb/*`:
 
 ```
-POST   /api/v1/kb/search             # JSON body: { "query", "top", "group_ids?", "category?" }
+POST   /api/v1/kb/search             # JSON body: { "query", "top", "groups?", "category?" }
 POST   /api/v1/kb/documents          # multipart file upload + metadata
 GET    /api/v1/kb/documents          # list documents
 GET    /api/v1/kb/documents/{id}     # get one document
@@ -197,6 +197,8 @@ DELETE /api/v1/kb/documents/{id}     # ?hard=true for permanent delete; default 
 GET    /api/v1/kb/drift              # staleness report
 POST   /api/v1/kb/re-embed           # JSON body: { "include_current?", "dry_run?", "batch_size?" }
 ```
+
+Group IDs are validated at the door: a `groups` id on `POST /search`, a `group` id on `GET /graph?group=<id>`, or the `{id}` on `GET /api/v1/kb/groups/{id}/documents` that no group uses answers `404 not_found` with a detail naming the group, before any embedding call. A group that exists but holds no documents is not refused: those doors answer their normal empty result (`200` with empty `chunks`, an empty graph, or `[]`).
 
 `POST /api/v1/kb/re-embed` answers `total_chunks_examined`, `chunks_re_embedded`, `chunks_would_re_embed`, `dry_run`, `chunks_skipped`, `errors` and `elapsed_ms`. With `"dry_run": true` the gateway calls no embedding endpoint and writes nothing: `dry_run` is `true`, `chunks_would_re_embed` holds the count and `chunks_re_embedded` stays `0`.
 
@@ -374,7 +376,7 @@ Response shape:
 GET /api/v1/kb/graph?group=<g>&limit=<n>
 ```
 
-Returns the merged cross-document graph, optionally filtered to one group and capped to `limit` nodes (top-N by degree; default cap from `KB_GRAPH_MAX_NODES`). `group` is optional. A hard server ceiling of **5000 nodes** applies regardless of `limit`/`KB_GRAPH_MAX_NODES`.
+Returns the merged cross-document graph, optionally filtered to one group and capped to `limit` nodes (top-N by degree; default cap from `KB_GRAPH_MAX_NODES`). `group` is optional and takes a group **ID**: an id no group uses answers `404 not_found`. A hard server ceiling of **5000 nodes** applies regardless of `limit`/`KB_GRAPH_MAX_NODES`.
 
 Response shape:
 
