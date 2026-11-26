@@ -300,6 +300,17 @@ pub(super) fn dispatch_ctx(
     provider: Arc<dyn Provider>,
     runtime_config: routing::RuntimeConfigSlot,
 ) -> Arc<ChannelRuntimeContext> {
+    dispatch_ctx_with_observer(channels, provider, runtime_config, Arc::new(NoopObserver))
+}
+
+/// The same context with a caller-chosen observer — the runtime-teardown test
+/// counts flushes through it, the way the runtime itself flushes at shutdown.
+pub(super) fn dispatch_ctx_with_observer(
+    channels: Vec<Arc<dyn Channel>>,
+    provider: Arc<dyn Provider>,
+    runtime_config: routing::RuntimeConfigSlot,
+    observer: Arc<dyn Observer>,
+) -> Arc<ChannelRuntimeContext> {
     let channels_by_name: HashMap<String, Arc<dyn Channel>> = channels
         .into_iter()
         .map(|channel| (channel.name().to_string(), channel))
@@ -314,7 +325,7 @@ pub(super) fn dispatch_ctx(
         default_provider: Arc::new("test-provider".to_string()),
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(vec![]),
-        observer: Arc::new(NoopObserver),
+        observer,
         owner_prompt: crate::channels::prompt::fixed_owner_prompt("test-system-prompt".to_string()),
         guest_system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("default-model".to_string()),

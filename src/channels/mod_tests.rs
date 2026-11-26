@@ -6919,6 +6919,74 @@ async fn the_runtime_closes_channels_only_after_dispatch_has_finished() {
     );
 }
 
+/// Counts `flush` calls only: the runtime-teardown test below asserts on the
+/// flush, and nothing else about the observer matters to it.
+struct FlushCountingObserver {
+    flush_count: Arc<AtomicUsize>,
+}
+
+impl crate::observability::Observer for FlushCountingObserver {
+    fn record_event(&self, _event: &crate::observability::ObserverEvent) {}
+    fn record_metric(&self, _metric: &crate::observability::traits::ObserverMetric) {}
+    fn flush(&self) {
+        self.flush_count.fetch_add(1, Ordering::SeqCst);
+    }
+    fn name(&self) -> &str {
+        "flush-counting"
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// A graceful stop of the channel runtime — the token cancelled, dispatch
+/// returned, listeners joined — must flush the context's observer. The
+/// standalone `channels` server and the TUI-hosted runtime own no observer
+/// above [`run_channel_runtime`], so this flush is the only one they get.
+#[tokio::test(start_paused = true)]
+async fn run_channel_runtime_flushes_the_observer_after_the_listeners_stop() {
+    let _env = crate::test_env::ENV_LOCK.lock().await;
+    let home = TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+
+    let flush_count = Arc::new(AtomicUsize::new(0));
+    let ctx = dispatch_ctx_with_observer(
+        vec![],
+        Arc::new(SlowProvider {
+            delay: Duration::from_mins(10),
+        }),
+        routing::RuntimeConfigSlot::default(),
+        Arc::new(FlushCountingObserver {
+            flush_count: Arc::clone(&flush_count),
+        }),
+    );
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let runtime = ChannelRuntime {
+        ctx,
+        channels: vec![],
+        tx,
+        rx,
+        max_in_flight_messages: 4,
+        initial_backoff_secs: 1,
+        max_backoff_secs: 1,
+    };
+    let shutdown = CancellationToken::new();
+    let running = tokio::spawn(run_channel_runtime(runtime, shutdown.clone(), None));
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(16), running)
+        .await
+        .expect("the runtime must stop inside the 16-second drain")
+        .expect("the runtime must not panic")
+        .expect("the runtime must stop cleanly");
+
+    assert!(
+        flush_count.load(Ordering::SeqCst) >= 1,
+        "a graceful channel runtime shutdown must flush its observer"
+    );
+}
+
 /// Provider that holds every call on a `Notify` gate. Lets a test pin a worker
 /// inside `chat_with_history` for as long as the busy check needs.
 struct GateHeldProvider {
@@ -7193,6 +7261,94 @@ async fn webhook_dispatch_wiring_publishes_request_sender_for_gateway_to_use() {
         matches!(after, BusRequestRejection::Closed),
         "post-teardown request must take the Closed arm, not a stale reply"
     );
+}
+
+/// `spawn_webhook_dispatch` is the path the standalone gateway takes for its
+/// webhooks. It used to call `build_channel_runtime(config, None)`, so the
+/// dispatch loop recorded tool-call events through a private observer that
+/// nobody ever flushed. The gateway now owns one observer, hands it to this
+/// function, and flushes it on shutdown; this asserts the exact `Arc` handed
+/// in is the one the dispatch loop records through.
+///
+/// Mutation: pass `None` to `build_channel_runtime` inside
+/// `spawn_webhook_dispatch` (its pre-fix form) and the injected observer's
+/// event count stays zero — this test fails.
+#[tokio::test]
+async fn webhook_dispatch_records_through_the_injected_observer() {
+    let _env = crate::test_env::ENV_LOCK.lock().await;
+    let home = TempDir::new().expect("temp home");
+    let _home = crate::test_env::HomeGuard::set(home.path());
+
+    struct EventCountingObserver {
+        event_count: Arc<AtomicUsize>,
+    }
+    impl crate::observability::Observer for EventCountingObserver {
+        fn record_event(&self, _event: &crate::observability::ObserverEvent) {
+            self.event_count.fetch_add(1, Ordering::SeqCst);
+        }
+        fn record_metric(&self, _metric: &crate::observability::traits::ObserverMetric) {}
+        fn flush(&self) {}
+        fn name(&self) -> &str {
+            "event-counting"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = home.path().to_path_buf();
+    config.default_model = Some("test-model".into());
+    config.channels_config.telegram = Some(crate::config::schema::TelegramConfig {
+        bot_token: "123:TEST".into(),
+        allowed_users: vec!["*".into()],
+        stream_mode: crate::config::schema::StreamMode::Off,
+        draft_update_interval_ms: 1000,
+        interrupt_on_new_message: false,
+        mention_only: false,
+    });
+
+    let event_count = Arc::new(AtomicUsize::new(0));
+    let observer: Arc<dyn crate::observability::Observer> = Arc::new(EventCountingObserver {
+        event_count: Arc::clone(&event_count),
+    });
+
+    let bus = Arc::new(ChannelBus::default());
+    let shutdown = CancellationToken::new();
+    let handle =
+        spawn_webhook_dispatch(&config, Some(observer), shutdown.clone(), Arc::clone(&bus))
+            .await
+            .expect("build_channel_runtime must succeed")
+            .expect("a configured channel yields a webhook dispatch loop");
+
+    bus.try_send(traits::ChannelMessage {
+        id: "msg-webhook-observer".into(),
+        sender: "rantaiclaw_user".into(),
+        reply_target: "chat-webhook-observer".into(),
+        content: "hello".into(),
+        channel: "telegram".into(),
+        timestamp: 1,
+        thread_ts: None,
+        reply_anchor: None,
+        sender_aliases: Vec::new(),
+        is_direct: true,
+    })
+    .await
+    .expect("the dispatch loop must be reachable through the bus");
+
+    for _ in 0..200 {
+        if event_count.load(Ordering::SeqCst) >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        event_count.load(Ordering::SeqCst) >= 1,
+        "webhook dispatch must record through the observer the gateway injected and flushes"
+    );
+
+    shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
 }
 
 /// A worker that panics inside `process_channel_message` used to leak its
