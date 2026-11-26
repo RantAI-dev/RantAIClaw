@@ -162,17 +162,91 @@ pub async fn extract_with_fallback(
         Err(fallback_err) => {
             let p_msg: String = primary_err.to_string().chars().take(150).collect();
             let f_msg: String = fallback_err.to_string().chars().take(150).collect();
+            let p_names = failing_service_names(std::slice::from_ref(&primary_err));
+            let f_names = failing_service_names(std::slice::from_ref(&fallback_err));
+            let causes = vec![primary_err, fallback_err];
             Err(KbError::extraction_failed(
-                format!("Fallback({}+{})", primary.name(), fallback.name()),
+                failing_service_names(&causes),
                 format!(
-                    "Both extractors failed: primary({}): {}; fallback({}): {}",
-                    primary.name(),
-                    p_msg,
-                    fallback.name(),
-                    f_msg
+                    "Both extractors failed: primary({p_names}): {p_msg}; fallback({f_names}): {f_msg}"
                 ),
-                vec![primary_err, fallback_err],
+                causes,
             ))
         }
+    }
+}
+
+/// The plain, user-facing names of the extractors that failed, read back from
+/// the causes' own `extractor` fields instead of a composite's internal
+/// `name()` label: when an upstream service was unreachable, the services
+/// that were; otherwise the extractors that rejected the document. A leaf
+/// names its service and a composite carries the names of what failed inside
+/// it, so a nested chain never leaks a `Fallback(...)`-style label into
+/// user-facing text.
+pub(crate) fn failing_service_names(causes: &[KbError]) -> String {
+    let upstream = causes
+        .iter()
+        .any(|c| matches!(c, KbError::ExtractorUnavailable { .. }));
+    let mut names: Vec<&str> = Vec::new();
+    for cause in causes {
+        let name = match cause {
+            KbError::ExtractorUnavailable { extractor, .. } if upstream => extractor,
+            KbError::Extraction { extractor, .. } if !upstream => extractor,
+            _ => continue,
+        };
+        if !names.contains(&name.as_str()) {
+            names.push(name);
+        }
+    }
+    if names.is_empty() {
+        return "unknown".to_string();
+    }
+    names.join(" and ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::failing_service_names;
+    use crate::kb::KbError;
+
+    fn unavailable(extractor: &str) -> KbError {
+        KbError::ExtractorUnavailable {
+            extractor: extractor.to_string(),
+            message: "unreachable".into(),
+        }
+    }
+
+    fn bad_document(extractor: &str) -> KbError {
+        KbError::Extraction {
+            extractor: extractor.to_string(),
+            message: "corrupt".into(),
+        }
+    }
+
+    #[test]
+    fn failing_service_names_deduplicates_the_same_service() {
+        let causes = [unavailable("MinerU service"), unavailable("MinerU service")];
+        assert_eq!(failing_service_names(&causes), "MinerU service");
+    }
+
+    #[test]
+    fn failing_service_names_joins_distinct_services_with_and() {
+        let causes = [unavailable("MinerU service"), unavailable("OCR service")];
+        assert_eq!(
+            failing_service_names(&causes),
+            "MinerU service and OCR service"
+        );
+    }
+
+    #[test]
+    fn failing_service_names_names_only_the_unreachable_services_when_one_is_down() {
+        let causes = [bad_document("unpdf"), unavailable("MinerU service")];
+        assert_eq!(failing_service_names(&causes), "MinerU service");
+    }
+
+    #[test]
+    fn failing_service_names_names_the_document_extractors_when_no_upstream_failed() {
+        let causes = [bad_document("unpdf"), bad_document("unpdf")];
+        assert_eq!(failing_service_names(&causes), "unpdf");
     }
 }

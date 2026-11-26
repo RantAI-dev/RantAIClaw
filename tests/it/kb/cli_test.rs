@@ -1462,6 +1462,45 @@ async fn kb_ingest_with_the_vision_service_down_prints_extractor_unavailable_and
     );
 }
 
+/// MinerU is down for both the primary and the fallback slot: `kb ingest`
+/// prints `extractor_unavailable` naming the service alone — not the
+/// internal `Fallback(...)` chain label — and exits 1.
+#[tokio::test]
+async fn kb_ingest_with_the_mineru_primary_and_fallback_down_names_the_service_and_exits_1() {
+    // Bind, note the port, release it: nothing listens there afterwards.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("kb.db");
+    let pdf = tmp.path().join("scan.pdf");
+    std::fs::write(&pdf, b"%PDF-1.4 whatever").unwrap();
+    let mineru_url = format!("http://127.0.0.1:{port}");
+
+    let (code, stdout, _stderr) = run_kb_with_env(
+        &db,
+        &["ingest", pdf.to_str().unwrap()],
+        &[
+            ("KB_EXTRACT_PRIMARY", "mineru"),
+            ("KB_EXTRACT_FALLBACK", "mineru"),
+            ("KB_EXTRACT_MINERU_BASE_URL", mineru_url.as_str()),
+        ],
+    );
+    assert_eq!(code, 1, "a dead extractor must exit 1: {stdout}");
+    assert!(stdout.contains("extractor_unavailable"), "got: {stdout}");
+    assert!(
+        stdout.contains("the MinerU service upstream is unreachable"),
+        "the answer names the MinerU service alone: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Fallback(") && !stdout.contains("SmartRouter("),
+        "an internal composite label must not reach the answer: {stdout}"
+    );
+    assert!(!stdout.contains("internal"), "got: {stdout}");
+}
+
 /// An embedding endpoint that refused the key (HTTP 401) is the operator's
 /// to fix: `kb ingest` prints `provider_auth_failed` with the fixed sentence
 /// the HTTP ingest answers, exits 1, and leaves out the upstream body and

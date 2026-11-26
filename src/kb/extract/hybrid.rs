@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 
-use crate::kb::extract::{elapsed_ms, ExtractionResult, Extractor};
+use crate::kb::extract::{elapsed_ms, failing_service_names, ExtractionResult, Extractor};
 use crate::kb::{KbError, KbResult};
 
 pub struct HybridExtractor {
@@ -74,16 +74,15 @@ impl Extractor for HybridExtractor {
             (Err(s_err), Err(t_err)) => {
                 let s_msg: String = s_err.to_string().chars().take(150).collect();
                 let t_msg: String = t_err.to_string().chars().take(150).collect();
+                let s_names = failing_service_names(std::slice::from_ref(&s_err));
+                let t_names = failing_service_names(std::slice::from_ref(&t_err));
+                let causes = vec![s_err, t_err];
                 Err(KbError::extraction_failed(
-                    self.name.clone(),
+                    failing_service_names(&causes),
                     format!(
-                        "Both extractors failed — structural({}): {}; textLayer({}): {}",
-                        self.structural.name(),
-                        s_msg,
-                        self.text_layer.name(),
-                        t_msg
+                        "Both extractors failed — structural({s_names}): {s_msg}; textLayer({t_names}): {t_msg}"
                     ),
-                    vec![s_err, t_err],
+                    causes,
                 ))
             }
         }

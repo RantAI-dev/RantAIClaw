@@ -1385,11 +1385,16 @@ async fn kb_upload_answers_502_when_the_extractor_service_is_down() {
     assert_eq!(resp.status(), 502, "an extractor outage is a 502");
     let body: Value = resp.json().await.expect("json body");
     assert_eq!(body["error"], "extractor_unavailable", "{body}");
+    let detail = body["detail"].as_str().unwrap_or_default();
     assert!(
-        body["detail"]
-            .as_str()
-            .is_some_and(|d| d.contains("MinerU service") && d.contains("upstream is unreachable")),
-        "the answer names the MinerU service: {body}"
+        detail.contains("the MinerU service upstream is unreachable"),
+        "the answer names the MinerU service alone: {body}"
+    );
+    assert!(
+        !detail.contains("Fallback(")
+            && !detail.contains("SmartRouter(")
+            && !detail.contains("Hybrid("),
+        "an internal composite label must not reach the answer: {body}"
     );
     assert!(
         !body["detail"]
@@ -1397,6 +1402,43 @@ async fn kb_upload_answers_502_when_the_extractor_service_is_down() {
             .unwrap_or_default()
             .contains("MineruExtractor"),
         "a Rust type name must not reach the answer: {body}"
+    );
+}
+
+/// A `smart` primary whose inner fallback and the outer fallback are both
+/// down: 502, and the answer names the service that failed — not the
+/// internal `Fallback(SmartRouter(...)+...)` chain label.
+#[tokio::test]
+async fn kb_upload_answers_502_names_the_service_when_the_smart_router_chain_fails() {
+    // Bind, note the port, release it: nothing listens there afterwards.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let h = start_harness(|_store| Box::pin(async move {})).await;
+    let mineru_url = format!("http://127.0.0.1:{port}");
+    let _env = ExtractorEnv::set(&[
+        ("KB_EXTRACT_PRIMARY", "smart"),
+        ("KB_EXTRACT_SMART_FALLBACK", "mineru"),
+        ("KB_EXTRACT_FALLBACK", "mineru"),
+        ("KB_EXTRACT_MINERU_BASE_URL", mineru_url.as_str()),
+    ]);
+
+    let resp = upload_pdf(&h.base_url, b"%PDF-1.4 whatever").await;
+    assert_eq!(resp.status(), 502, "an extractor outage is a 502");
+    let body: Value = resp.json().await.expect("json body");
+    assert_eq!(body["error"], "extractor_unavailable", "{body}");
+    let detail = body["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("the MinerU service upstream is unreachable"),
+        "the answer names the MinerU service alone: {body}"
+    );
+    assert!(
+        !detail.contains("Fallback(")
+            && !detail.contains("SmartRouter(")
+            && !detail.contains("Hybrid("),
+        "an internal composite label must not reach the answer: {body}"
     );
 }
 
