@@ -292,6 +292,34 @@ pub fn apply_update(profile: &Profile, up: PersonaUpdate) -> Result<PersonaToml>
     Ok(next)
 }
 
+/// Remove one KB group id from `always_on_kbs` in the profile's
+/// `persona.toml`. Called by the KB group delete door in the same request as
+/// the delete: an id left behind rides back on every request that echoes the
+/// persona (the console sends the answered list as `groups` on each chat
+/// search), so the delete must not store a group that no longer exists.
+///
+/// A missing persona file or an id that is not stored is nothing to do: no
+/// file is written in either case, so a delete cannot create a persona that
+/// did not exist, and a delete of a group the persona never named rewrites
+/// nothing.
+///
+/// # Errors
+///
+/// Returns the read or write error when the persona file cannot be read or
+/// written; the caller decides how to surface it.
+pub fn remove_always_on_group(profile: &Profile, group_id: &str) -> Result<()> {
+    let Some(existing) = read_persona_toml(profile)? else {
+        return Ok(());
+    };
+    let held = existing.always_on_kbs.iter().any(|id| id == group_id);
+    if !held {
+        return Ok(());
+    }
+    let mut next = existing;
+    next.always_on_kbs.retain(|id| id != group_id);
+    write_persona_toml(profile, &next)
+}
+
 /// Persist `persona.toml` for the given profile. Creates the persona
 /// directory if missing.
 pub fn write_persona_toml(profile: &Profile, persona: &PersonaToml) -> Result<()> {

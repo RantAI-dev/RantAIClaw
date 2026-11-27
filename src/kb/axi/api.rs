@@ -251,6 +251,48 @@ pub async fn clear_kb_ctx() {
     *KB_CTX.lock().await = None;
 }
 
+/// The ids from `candidates` that name a group the store still holds, order
+/// preserved. `GET /api/v1/personality` answers `always_on_kbs` through this,
+/// so an id whose group was deleted before the delete door cleaned the persona
+/// (or whose cleanup failed) is not echoed back: a client that loads the
+/// persona — the console — would send it as `groups` on every chat search and
+/// lose all KB context to the `ensure_group_exists` door check.
+///
+/// The persona file is NOT rewritten here — a read must not write; the next
+/// persona save or group delete cleans the file.
+///
+/// When the KB cannot answer — turned off, unconfigured, or the store fails
+/// mid-check — the candidates come back unchanged: the personality read must
+/// not fail or lose stored ids because the KB is down, and the door checks
+/// keep their usual answers for whatever the client sends anyway.
+pub(crate) async fn filter_existing_group_ids(
+    state: &crate::gateway::AppState,
+    candidates: &[String],
+) -> Vec<String> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let Ok(ctx) = ensure_kb_ctx(state).await else {
+        return candidates.to_vec();
+    };
+    let mut kept = Vec::with_capacity(candidates.len());
+    for id in candidates {
+        match ctx.store.get_group(id).await {
+            Ok(Some(_)) => kept.push(id.clone()),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    target: "kb::api",
+                    %error,
+                    "persona always_on_kbs existence check failed; answering unfiltered"
+                );
+                return candidates.to_vec();
+            }
+        }
+    }
+    kept
+}
+
 async fn build_ctx(
     path: &std::path::Path,
     embedding_key: Option<String>,
@@ -370,6 +412,18 @@ impl ApiError {
             status: StatusCode::NOT_FOUND,
             body: ErrorBody {
                 error: "not_found".into(),
+                detail: Some(detail),
+            },
+        }
+    }
+
+    /// 500 for a failure the caller cannot fix. The detail names what did fail,
+    /// so an operator reading the body or the logs knows which side to look at.
+    fn internal(detail: String) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: ErrorBody {
+                error: "internal_error".into(),
                 detail: Some(detail),
             },
         }
@@ -1353,6 +1407,25 @@ async fn delete_group(
     // reads as done to a client that checks only the status.
     if !deleted {
         return Err(ApiError::not_found(format!("group {id} not found")).into());
+    }
+    // The persona can still carry this id in `always_on_kbs` (set via
+    // PUT /api/v1/personality). Left behind, it rides back on every request
+    // that echoes the persona — the console sends the list as `groups` on
+    // every chat search, and the door check would 404 the whole request, so
+    // the chat loses all KB context. Cleaned in the same request, writing
+    // persona.toml only when it actually held the id. The group is already
+    // gone at this point, so a cleanup failure is named as such instead of
+    // reading as "not deleted".
+    let profile = crate::profile::ProfileManager::active().map_err(|error| {
+        ApiError::internal(format!(
+            "group {id} was deleted, but resolving the active profile failed: {error:#}"
+        ))
+    })?;
+    if let Err(error) = crate::persona::remove_always_on_group(&profile, &id) {
+        return Err(ApiError::internal(format!(
+            "group {id} was deleted, but removing it from the persona's always_on_kbs failed: {error:#}"
+        ))
+        .into());
     }
     Ok(Json(DeleteGroupResponse { id, deleted }))
 }

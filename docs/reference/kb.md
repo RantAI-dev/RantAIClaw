@@ -200,6 +200,8 @@ POST   /api/v1/kb/re-embed           # JSON body: { "include_current?", "dry_run
 
 Group IDs are validated at the door: a `groups` id on `POST /search`, a `group` id on `GET /graph?group=<id>`, or the `{id}` on `GET /api/v1/kb/groups/{id}/documents` that no group uses answers `404 not_found` with a detail naming the group, before any embedding call. A group that exists but holds no documents is not refused: those doors answer their normal empty result (`200` with empty `chunks`, an empty graph, or `[]`).
 
+Deleting a group cleans up its references in the same request: `DELETE /api/v1/kb/groups/{id}` also removes the id from the persona's `always_on_kbs` (set via `PUT /api/v1/personality`), writing `persona.toml` only when it actually held the id, so a client that loads the persona never sends a deleted group as `groups`. If the persona cleanup itself fails, the delete answers `500 internal_error` naming the group as already deleted. `GET /api/v1/personality` answers `always_on_kbs` without ids whose group no longer exists — a read-only filter that also clears ids left behind by deletes from before this behavior — so the file is only rewritten by the next persona save or group delete. See `docs/reference/api-v1.md` for the personality bodies.
+
 `POST /api/v1/kb/re-embed` answers `total_chunks_examined`, `chunks_re_embedded`, `chunks_would_re_embed`, `dry_run`, `chunks_skipped`, `errors` and `elapsed_ms`. With `"dry_run": true` the gateway calls no embedding endpoint and writes nothing: `dry_run` is `true`, `chunks_would_re_embed` holds the count and `chunks_re_embedded` stays `0`.
 
 HTTP error codes specific to this surface (all 503):
