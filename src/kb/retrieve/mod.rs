@@ -151,7 +151,7 @@ impl Retriever {
         // Vector arm and BM25 arm run concurrently — max, not sum, of the two
         // latencies. tokio::join! polls both to completion before returning.
         let vector_fut = self.run_vector_arm(&expanded, fetch_limit, min_similarity, &filter);
-        let bm25_fut = self.run_bm25_arm(query, fetch_limit);
+        let bm25_fut = self.run_bm25_arm(query, fetch_limit, &filter);
 
         let (vector_chunks, bm25_chunks) = tokio::join!(vector_fut, bm25_fut);
         let vector_chunks = vector_chunks?;
@@ -167,7 +167,12 @@ impl Retriever {
         let graph_chunks: Vec<SearchResult> = if self.cfg.graphrag_enabled {
             match &self.intel {
                 Some(intel) => match intel
-                    .graph_expand_chunks(query, self.cfg.graphrag_max_neighbors, fetch_limit)
+                    .graph_expand_chunks(
+                        query,
+                        self.cfg.graphrag_max_neighbors,
+                        fetch_limit,
+                        &filter,
+                    )
                     .await
                 {
                     Ok(c) => c,
@@ -257,7 +262,7 @@ impl Retriever {
         // ("what's in here?") see the FULL document set, not just the retrieved
         // top-K. Returned even when no chunk matched so the agent still knows
         // what exists.
-        let inventory = self.build_document_inventory(&opts).await;
+        let inventory = self.build_document_inventory(&filter).await;
 
         if chunks.is_empty() {
             return Ok(RetrievalResult {
@@ -339,20 +344,15 @@ impl Retriever {
     }
 
     /// Build the document inventory (titles in scope) for the retrieval
-    /// context. Group-scoped when `opts.group_ids` is set, else the whole KB.
+    /// context. Uses the same resolver-backed store method as the search arms,
+    /// so a category-scoped chat cannot read another conversation's titles.
     /// Best-effort: store errors yield an empty inventory.
-    async fn build_document_inventory(&self, opts: &RetrieveOptions) -> String {
-        let docs = if opts.group_ids.is_empty() {
-            self.store.list_documents(None).await.unwrap_or_default()
-        } else {
-            let mut all = Vec::new();
-            for g in &opts.group_ids {
-                if let Ok(mut ds) = self.store.list_group_documents(g).await {
-                    all.append(&mut ds);
-                }
-            }
-            all
-        };
+    async fn build_document_inventory(&self, filter: &SearchFilter) -> String {
+        let docs = self
+            .store
+            .list_documents_for_filter(filter)
+            .await
+            .unwrap_or_default();
         let titles: Vec<String> = docs.into_iter().map(|d| d.title).collect();
         format_document_inventory(&titles, INVENTORY_MAX_LISTED)
     }
@@ -414,11 +414,12 @@ impl Retriever {
         &self,
         query: &str,
         fetch_limit: usize,
+        filter: &SearchFilter,
     ) -> KbResult<Vec<crate::kb::store::Bm25Hit>> {
         if !self.cfg.hybrid_bm25_enabled {
             return Ok(Vec::new());
         }
-        match self.store.bm25_search(query, fetch_limit).await {
+        match self.store.bm25_search(query, fetch_limit, filter).await {
             Ok(hits) => Ok(hits),
             Err(e) => {
                 tracing::warn!(target: "kb::retrieve", error = %e, "bm25 arm failed, falling back to vector-only");

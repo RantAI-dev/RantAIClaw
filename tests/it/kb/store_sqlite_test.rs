@@ -394,7 +394,10 @@ async fn bm25_search_returns_lexical_matches() {
         .await
         .unwrap();
 
-    let hits = store.bm25_search("fox", 10).await.unwrap();
+    let hits = store
+        .bm25_search("fox", 10, &SearchFilter::default())
+        .await
+        .unwrap();
     assert_eq!(hits.len(), 1);
     assert!(hits[0].content.contains("fox"));
     // Score is negated (higher = better) so a matching hit must be > 0.
@@ -906,7 +909,7 @@ async fn bm25_search_accepts_text_a_person_types() {
     ];
     for (query, word) in cases {
         let hits = store
-            .bm25_search(query, 10)
+            .bm25_search(query, 10, &SearchFilter::default())
             .await
             .unwrap_or_else(|e| panic!("query {query:?} must not error: {e}"));
         assert!(
@@ -930,7 +933,7 @@ async fn bm25_search_returns_empty_without_error_when_query_has_no_word() {
 
     for query in ["?!.,;:", "()\"'", "   ", "it's", "NOT"] {
         let hits = store
-            .bm25_search(query, 10)
+            .bm25_search(query, 10, &SearchFilter::default())
             .await
             .unwrap_or_else(|e| panic!("query {query:?} must not error: {e}"));
         assert!(hits.is_empty(), "query {query:?} must return no hits");

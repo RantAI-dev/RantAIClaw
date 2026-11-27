@@ -236,7 +236,7 @@ async fn graph_expand_chunks_surfaces_neighbor_only_chunks() {
     use rantaiclaw::kb::intelligence::extract::{EntityRelationExtractor, Extracted};
     use rantaiclaw::kb::intelligence::extract_document_intelligence;
     use rantaiclaw::kb::store::sqlite::SqliteStore;
-    use rantaiclaw::kb::store::{IntelligenceStore, KbStore};
+    use rantaiclaw::kb::store::{IntelligenceStore, KbStore, SearchFilter};
     use rantaiclaw::kb::{Chunk, ChunkMetadata, Document, DocumentId};
     use tempfile::TempDir;
 
@@ -341,7 +341,7 @@ async fn graph_expand_chunks_surfaces_neighbor_only_chunks() {
 
     // Query names only "Alice" → seed Alice → 1-hop neighbour TechCorp.
     let got = store
-        .graph_expand_chunks("What is Alice's role?", 10, 10)
+        .graph_expand_chunks("What is Alice's role?", 10, 10, &SearchFilter::default())
         .await
         .unwrap();
     let contents: Vec<String> = got.iter().map(|c| c.content.clone()).collect();
@@ -360,7 +360,7 @@ async fn graph_expand_chunks_surfaces_neighbor_only_chunks() {
 
     // A query naming no entity expands to nothing.
     let none = store
-        .graph_expand_chunks("totally unrelated zzz", 10, 10)
+        .graph_expand_chunks("totally unrelated zzz", 10, 10, &SearchFilter::default())
         .await
         .unwrap();
     assert!(

@@ -10,9 +10,10 @@
 use async_trait::async_trait;
 use rusqlite::{params, Row};
 
+use super::chunks::resolve_allowed_documents;
 use super::SqliteStore;
 use crate::kb::intelligence::types::{Entity, EntityMention, EntityType, Relation, RelationType};
-use crate::kb::store::{Graph, GraphEdge, GraphNode, IntelligenceStore};
+use crate::kb::store::{Graph, GraphEdge, GraphNode, IntelligenceStore, SearchFilter};
 use crate::kb::{ChunkId, ChunkMetadata, DocumentId, KbError, KbResult, SearchResult};
 
 fn map_entity(row: &Row<'_>) -> KbResult<Entity> {
@@ -460,12 +461,28 @@ impl IntelligenceStore for SqliteStore {
         query: &str,
         max_neighbors: usize,
         limit: usize,
+        filter: &SearchFilter,
     ) -> KbResult<Vec<SearchResult>> {
         let conn = self.conn.clone();
         let query = query.to_string();
         let max_neighbors = max_neighbors as i64;
+        let filter = filter.clone();
         tokio::task::spawn_blocking(move || -> KbResult<Vec<SearchResult>> {
             let conn = conn.blocking_lock();
+
+            // Scope is resolved once with the same helper as the other arms.
+            // An empty group resolves to no documents and yields no graph
+            // candidates instead of falling back to the whole KB.
+            let allowed = resolve_allowed_documents(&conn, &filter)?;
+            let allowed_ids: Option<Vec<String>> = match allowed {
+                None => None,
+                Some(ids) if ids.is_empty() => return Ok(Vec::new()),
+                Some(ids) => {
+                    let mut ids: Vec<String> = ids.into_iter().collect();
+                    ids.sort();
+                    Some(ids)
+                }
+            };
 
             // 1) Seeds: entities whose name (>= 3 chars, to avoid noise) appears
             //    as a case-insensitive substring of the query. `instr` returns a
@@ -522,6 +539,10 @@ impl IntelligenceStore for SqliteStore {
             //    `limit` is an internal usize (not user input), so it is inlined.
             let entity_vec: Vec<String> = entity_ids.into_iter().collect();
             let ph = vec!["?"; entity_vec.len()].join(",");
+            let scope_clause = match &allowed_ids {
+                Some(ids) => format!(" AND c.document_id IN ({})", vec!["?"; ids.len()].join(",")),
+                None => String::new(),
+            };
             let sql = format!(
                 "SELECT c.id, c.document_id, c.content, c.metadata_json,
                         c.contextual_prefix, d.title, d.categories_json, d.subcategory,
@@ -530,14 +551,21 @@ impl IntelligenceStore for SqliteStore {
                  JOIN entity_mention m
                        ON m.document_id = c.document_id AND m.chunk_index = c.chunk_index
                  JOIN document d ON d.id = c.document_id
-                 WHERE m.entity_id IN ({ph}) AND d.deleted_at IS NULL
+                 WHERE m.entity_id IN ({ph}) AND d.deleted_at IS NULL{scope_clause}
                  GROUP BY c.id
                  ORDER BY hits DESC, c.id ASC
                  LIMIT {limit}"
             );
+            let mut bind: Vec<&dyn rusqlite::ToSql> = entity_vec
+                .iter()
+                .map(|id| id as &dyn rusqlite::ToSql)
+                .collect();
+            if let Some(ids) = &allowed_ids {
+                bind.extend(ids.iter().map(|id| id as &dyn rusqlite::ToSql));
+            }
             let mut results: Vec<SearchResult> = Vec::new();
             let mut stmt = conn.prepare(&sql)?;
-            let mut rows = stmt.query(rusqlite::params_from_iter(entity_vec.iter()))?;
+            let mut rows = stmt.query(bind.as_slice())?;
             while let Some(r) = rows.next()? {
                 let chunk_id: String = r.get("id")?;
                 let document_id: String = r.get("document_id")?;
