@@ -933,7 +933,7 @@ fn persisted_enabled(home: &std::path::Path) -> bool {
 }
 
 /// A fake embedding endpoint that answers every POST with `dim`-sized vectors.
-async fn embedding_endpoint(dim: usize) -> wiremock::MockServer {
+pub(crate) async fn embedding_endpoint(dim: usize) -> wiremock::MockServer {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 

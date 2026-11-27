@@ -2912,6 +2912,23 @@ async fn memory_list(
 // personality
 // ────────────────────────────────────────────────────────────────────────────
 
+/// The `always_on_kbs` ids a persona read answers. When the KB is compiled in,
+/// ids whose group no longer exists are answered out so a console loading the
+/// persona cannot send them as `groups` on every chat search (the KB door
+/// check would 404 the whole request). Without the `kb` feature there is no
+/// group store to consult, so the stored ids are answered unchanged.
+async fn answered_always_on_kbs(state: &AppState, candidates: &[String]) -> Vec<String> {
+    #[cfg(feature = "kb")]
+    {
+        crate::kb::axi::api::filter_existing_group_ids(state, candidates).await
+    }
+    #[cfg(not(feature = "kb"))]
+    {
+        let _ = state;
+        candidates.to_vec()
+    }
+}
+
 async fn personality_get(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2927,7 +2944,12 @@ async fn personality_get(
             "role": p.role,
             "tone": p.tone,
             "avoid": p.avoid,
-            "always_on_kbs": p.always_on_kbs,
+            // Ids whose group no longer exists are answered out (not dropped
+            // from the file): a client that loads the persona — the console —
+            // would send them as `groups` on every chat search, and the KB
+            // door check would 404 the whole request. The file itself is only
+            // rewritten by a persona save or the next group delete.
+            "always_on_kbs": answered_always_on_kbs(&state, &p.always_on_kbs).await,
         }))),
         None => Ok(Json(serde_json::json!({
             "profile": profile.name,
@@ -5225,6 +5247,73 @@ mod tests {
         .await
         .expect("an empty timezone means unset");
         assert_eq!(resp.0["timezone"], "");
+    }
+
+    /// An id whose group was deleted — before the delete door cleaned the
+    /// persona, or whose cleanup failed — must not ride back on
+    /// GET /api/v1/personality: the console sends the answered list as
+    /// `groups` on every chat search, and the KB door check would 404 the
+    /// whole request, losing all KB context. The read answers the filtered
+    /// list WITHOUT rewriting persona.toml; the next persona save or group
+    /// delete cleans the file.
+    #[cfg(feature = "kb")]
+    #[tokio::test]
+    async fn personality_get_answers_always_on_kbs_without_deleted_group_ids() {
+        use crate::kb::store::sqlite::SqliteStore;
+        use crate::kb::store::KbStore;
+        use crate::test_env::EnvGuard;
+
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+        let _db_path = EnvGuard::set("KB_DB_PATH", tmp.path().join("kb.db"));
+        let _dim = EnvGuard::set("KB_EMBEDDING_DIM", "4");
+        let _key = EnvGuard::set("KB_EMBEDDING_API_KEY", "rantaiclaw_test_embedding_key");
+        let _openrouter = EnvGuard::unset("OPENROUTER_API_KEY");
+        let _profile = EnvGuard::unset("RANTAICLAW_PROFILE");
+
+        // One live group and one stale id — the state a pre-fix delete, or an
+        // older persona, leaves behind.
+        let live = {
+            let store = SqliteStore::open(&tmp.path().join("kb.db"), 4)
+                .await
+                .expect("open store");
+            store
+                .create_group("Live Group", None, None)
+                .await
+                .expect("create group")
+                .id
+        };
+        let stale = "rantaiclaw_group_deleted_before_the_fix".to_string();
+
+        let profile = crate::profile::ProfileManager::active().expect("active profile");
+        let mut persona = crate::persona::PersonaToml::default_for("RantaiClaw", "UTC");
+        persona.always_on_kbs = vec![live.clone(), stale.clone()];
+        crate::persona::write_persona_toml(&profile, &persona).expect("write persona");
+
+        let state = test_state();
+        state.config.lock().knowledge.enabled = true;
+
+        let resp = personality_get(State(state), HeaderMap::new())
+            .await
+            .expect("personality get ok");
+        assert_eq!(
+            resp.0["always_on_kbs"],
+            serde_json::json!([live]),
+            "the deleted id must not be answered: {}",
+            resp.0
+        );
+
+        // A read never rewrites persona.toml: the file still holds the stale
+        // id until the next persona save or group delete cleans it.
+        let on_disk = crate::persona::read_persona_toml(&profile)
+            .expect("read persona")
+            .expect("persona file exists");
+        assert_eq!(
+            on_disk.always_on_kbs,
+            vec![live, stale],
+            "the filtered answer must not rewrite the file"
+        );
     }
 
     #[tokio::test]

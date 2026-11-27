@@ -1026,6 +1026,12 @@ should check the encoded size and say so plainly rather than surfacing a bare
   Note the two response shapes for the same `200` differ by whether
   `configured` is present — a client must branch on that field rather than
   assuming a fixed shape.
+- `always_on_kbs` is answered without ids whose knowledge-base group no longer
+  exists, so a client that loads the persona never sends a deleted group as
+  `groups`. The filter is read-only: `persona.toml` itself is rewritten only
+  by the next persona save (`PUT /api/v1/personality`) or the next group
+  delete (`DELETE /api/v1/kb/groups/{id}`). When the knowledge base is turned
+  off or its store cannot answer, the stored list is returned as it is.
 - **Status codes**: `200`, `401`.
 
 ### PUT /api/v1/personality

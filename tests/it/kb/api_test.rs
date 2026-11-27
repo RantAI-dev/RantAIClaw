@@ -38,7 +38,7 @@ use rantaiclaw::gateway::{AppState, GatewayRateLimiter, IdempotencyStore};
 use rantaiclaw::kb::axi::api;
 use rantaiclaw::kb::store::sqlite::SqliteStore;
 use rantaiclaw::kb::store::KbStore;
-use rantaiclaw::kb::{Document, DocumentId};
+use rantaiclaw::kb::{Chunk, ChunkMetadata, Document, DocumentId};
 use rantaiclaw::memory::{Memory, MemoryCategory, MemoryEntry, SessionScope};
 use rantaiclaw::observability::NoopObserver;
 use rantaiclaw::providers::Provider;
@@ -2001,4 +2001,300 @@ async fn key_change_in_state_config_rebuilds_ctx_without_explicit_clear() {
         200,
         "a key change from any surface must invalidate the cached context"
     );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Persona cleanup on group delete.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Restore process-global env vars on drop — even when an assert panics — so a
+/// test that pins `HOME` or `RANTAICLAW_PROFILE` cannot leak them into a
+/// sibling in this one-process test binary. Hold `ENV_LOCK` for the guard's
+/// life; the KB harness already holds it for its own KB_* mutations.
+struct EnvRestore {
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl EnvRestore {
+    fn set(vars: Vec<(&'static str, Option<std::ffi::OsString>)>) -> Self {
+        let saved = vars
+            .into_iter()
+            .map(|(key, value)| {
+                let prev = std::env::var_os(key);
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+                (key, prev)
+            })
+            .collect();
+        Self { saved }
+    }
+}
+
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        for (key, prev) in self.saved.drain(..).rev() {
+            match prev {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
+/// Deleting a group must not leave its id in the persona's `always_on_kbs`
+/// (set via `PUT /api/v1/personality`): the console sends the persona's list
+/// as `groups` on every chat search, so a stale id makes the door check 404
+/// the whole request and the chat loses all KB context. The delete cleans the
+/// file in the same request, and writes it only when it actually held the id.
+#[tokio::test]
+async fn deleting_a_group_removes_it_from_the_persona_always_on_kbs() {
+    let group_ids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let ids_for_seed = group_ids.clone();
+
+    let h = start_harness(|store| {
+        Box::pin(async move {
+            let in_persona = store
+                .create_group("Persona KB", None, None)
+                .await
+                .expect("create group");
+            let unnamed = store
+                .create_group("Not In Persona", None, None)
+                .await
+                .expect("create group");
+            *ids_for_seed.lock() = vec![in_persona.id, unnamed.id];
+        })
+    })
+    .await;
+    let ids = group_ids.lock().clone();
+    let (in_persona, unnamed) = (ids[0].clone(), ids[1].clone());
+
+    // A fresh home so the persona file this test writes is its own. HOME is
+    // process-global; the harness holds ENV_LOCK for the whole test and the
+    // guard restores both variables even when an assert below panics.
+    let _env = EnvRestore::set(vec![
+        ("HOME", Some(h._tmp.path().to_path_buf().into_os_string())),
+        ("RANTAICLAW_PROFILE", None),
+    ]);
+
+    let profile = rantaiclaw::profile::ProfileManager::active().expect("active profile");
+    let mut persona = rantaiclaw::persona::PersonaToml::default_for("RantaiClaw", "UTC");
+    persona.always_on_kbs = vec![in_persona.clone()];
+    rantaiclaw::persona::write_persona_toml(&profile, &persona).expect("write persona");
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .delete(format!("{}/api/v1/kb/groups/{in_persona}", h.base_url))
+        .send()
+        .await
+        .expect("delete request");
+    let status = resp.status();
+    let body: Value = resp.json().await.expect("delete body");
+    assert_eq!(status, 200, "the seeded group is deleted: {body}");
+
+    let on_disk = rantaiclaw::persona::read_persona_toml(&profile)
+        .expect("read persona")
+        .expect("persona file exists");
+    assert!(
+        on_disk.always_on_kbs.is_empty(),
+        "the deleted id must be gone from persona.toml, got {:?}",
+        on_disk.always_on_kbs
+    );
+
+    // A delete of a group the persona never named must not create or rewrite
+    // a persona file. With the file gone, deleting the second group answers
+    // 200 and still no file exists.
+    std::fs::remove_file(profile.persona_dir().join("persona.toml")).expect("remove persona");
+    let resp = client
+        .delete(format!("{}/api/v1/kb/groups/{unnamed}", h.base_url))
+        .send()
+        .await
+        .expect("delete request");
+    let status = resp.status();
+    let body: Value = resp.json().await.expect("delete body");
+    assert_eq!(status, 200, "the second group is deleted: {body}");
+    assert!(
+        rantaiclaw::persona::read_persona_toml(&profile)
+            .expect("read persona")
+            .is_none(),
+        "a delete of a group the persona never named must not create a persona file"
+    );
+}
+
+/// The console-shaped flow end to end: the persona names a group in
+/// `always_on_kbs`, the console sends it as `groups` together with the
+/// conversation attachment's `category` on every chat search, and then the
+/// group is deleted. After the delete cleaned the persona, the search the
+/// console sends from the reloaded persona — the remaining ids plus the
+/// category — answers 200 with the attachment chunk again, while a stale or
+/// never-existing id is still refused (#1224 stays).
+#[tokio::test]
+async fn console_shaped_search_after_group_delete_still_answers_the_attachment_chunk() {
+    let group_id_cell: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let cell_for_seed = group_id_cell.clone();
+
+    let h = start_harness(|store| {
+        Box::pin(async move {
+            let group = store
+                .create_group("Persona KB", None, None)
+                .await
+                .expect("create group");
+            *cell_for_seed.lock() = Some(group.id.clone());
+
+            // The conversation attachment: in no group, found through
+            // `category` alone.
+            let attach = sample_doc("rantaiclaw_doc_attach", "Meeting Notes FAQ");
+            store
+                .create_document(&attach)
+                .await
+                .expect("create attach doc");
+            store
+                .store_chunks(
+                    &attach.id,
+                    &[Chunk {
+                        content: "faq attachment body about the meeting notes".into(),
+                        metadata: ChunkMetadata {
+                            document_title: attach.title.clone(),
+                            category: "FAQ".into(),
+                            subcategory: None,
+                            section: None,
+                            chunk_index: 0,
+                            contextual_prefix: None,
+                        },
+                    }],
+                    &[vec![0.5_f32; 4]],
+                    "rantaiclaw-test-model+meta1",
+                )
+                .await
+                .expect("store attach chunk");
+
+            // The knowledge-base document the persona's always-on group carries.
+            let kb_doc = sample_doc("rantaiclaw_doc_kb", "KB Reference FAQ");
+            store.create_document(&kb_doc).await.expect("create kb doc");
+            store
+                .store_chunks(
+                    &kb_doc.id,
+                    &[Chunk {
+                        content: "kb reference body".into(),
+                        metadata: ChunkMetadata {
+                            document_title: kb_doc.title.clone(),
+                            category: "FAQ".into(),
+                            subcategory: None,
+                            section: None,
+                            chunk_index: 0,
+                            contextual_prefix: None,
+                        },
+                    }],
+                    &[vec![0.5_f32; 4]],
+                    "rantaiclaw-test-model+meta1",
+                )
+                .await
+                .expect("store kb chunk");
+            store
+                .add_document_to_group("rantaiclaw_doc_kb", &group.id)
+                .await
+                .expect("attach kb doc to group");
+        })
+    })
+    .await;
+    let group_id = group_id_cell.lock().clone().expect("group id captured");
+
+    // The console's embedder: a local endpoint answering constant vectors, so
+    // every stored chunk and the query embed identically (similarity 1.0).
+    let embedder = crate::kb::cli_test::embedding_endpoint(4).await;
+    let _embedder_env = ExtractorEnv::set(&[
+        ("KB_EMBEDDING_BASE_URL", embedder.uri().as_str()),
+        ("NO_PROXY", "127.0.0.1,localhost"),
+        ("no_proxy", "127.0.0.1,localhost"),
+    ]);
+
+    // A fresh home with the persona the console loads at mount.
+    let _home = EnvRestore::set(vec![
+        ("HOME", Some(h._tmp.path().to_path_buf().into_os_string())),
+        ("RANTAICLAW_PROFILE", None),
+    ]);
+    let profile = rantaiclaw::profile::ProfileManager::active().expect("active profile");
+    let mut persona = rantaiclaw::persona::PersonaToml::default_for("RantaiClaw", "UTC");
+    persona.always_on_kbs = vec![group_id.clone()];
+    rantaiclaw::persona::write_persona_toml(&profile, &persona).expect("write persona");
+
+    let client = reqwest::Client::new();
+    let base_url = h.base_url.clone();
+    let console_search = |groups: Vec<String>| {
+        let client = &client;
+        let base_url = &base_url;
+        async move {
+            client
+                .post(format!("{base_url}/api/v1/kb/search"))
+                .json(&serde_json::json!({
+                    "query": "rantaiclaw_probe",
+                    "groups": groups,
+                    "category": "FAQ"
+                }))
+                .send()
+                .await
+                .expect("search request")
+        }
+    };
+
+    // Before the delete: the persona's group plus the attachment category
+    // answer 200 with chunks — the working console.
+    let resp = console_search(vec![group_id.clone()]).await;
+    let status = resp.status();
+    let body: Value = resp.json().await.expect("search body");
+    assert_eq!(status, 200, "pre-delete console search: {body}");
+    assert!(
+        !body["chunks"].as_array().expect("chunks array").is_empty(),
+        "the persona's group answers chunks: {body}"
+    );
+
+    // The delete: 200, and the persona file is cleaned in the same request —
+    // what the console's persona reload (a refetch after the delete) sees.
+    let resp = client
+        .delete(format!("{}/api/v1/kb/groups/{group_id}", h.base_url))
+        .send()
+        .await
+        .expect("delete request");
+    let status = resp.status();
+    let body: Value = resp.json().await.expect("delete body");
+    assert_eq!(status, 200, "the group is deleted: {body}");
+    let reloaded = rantaiclaw::persona::read_persona_toml(&profile)
+        .expect("read persona")
+        .expect("persona file exists");
+    assert!(
+        reloaded.always_on_kbs.is_empty(),
+        "the reloaded persona carries no stale id, got {:?}",
+        reloaded.always_on_kbs
+    );
+
+    // The console's search from the reloaded persona: the remaining (empty)
+    // id list plus the attachment category answers 200 with the chunk.
+    let resp = console_search(Vec::new()).await;
+    let status = resp.status();
+    let body: Value = resp.json().await.expect("search body");
+    assert_eq!(
+        status, 200,
+        "post-delete console search must not 404: {body}"
+    );
+    assert!(
+        !body["chunks"].as_array().expect("chunks array").is_empty(),
+        "the attachment chunk still answers: {body}"
+    );
+    assert!(
+        body.to_string().contains("faq attachment body"),
+        "the chunk is the attachment's: {body}"
+    );
+
+    // Control: a never-existing id typed by the client is still refused.
+    let resp = console_search(vec!["rantaiclaw_never_existed".into()]).await;
+    let status = resp.status();
+    let body: Value = resp.json().await.expect("control body");
+    assert_eq!(status, 404, "an unknown typed id stays a 404: {body}");
+    assert_eq!(body["error"], "not_found", "{body}");
+
+    // And the stale id a console that did NOT reload would send stays a 404
+    // too — the door check is not weakened by the cleanup.
+    let resp = console_search(vec![group_id]).await;
+    assert_eq!(resp.status(), 404, "the stale id is still refused (#1224)");
 }
