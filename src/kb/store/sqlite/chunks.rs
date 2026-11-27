@@ -516,7 +516,11 @@ impl SqliteStore {
 /// scope if it matches ANY of them), so a chat can search its conversation
 /// attachments (`category`) together with one or more selected knowledge bases
 /// (`group_ids`) in a single call.
-fn resolve_allowed_documents(
+///
+/// This is the ONE resolver for every retrieval candidate source: vector,
+/// BM25, graph expansion and the document inventory all call it so a filter
+/// cannot be honoured by one arm and ignored by another.
+pub(crate) fn resolve_allowed_documents(
     conn: &rusqlite::Connection,
     filter: &SearchFilter,
 ) -> KbResult<Option<std::collections::HashSet<String>>> {

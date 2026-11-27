@@ -10,10 +10,9 @@
 //! search. The text is reduced to its words first, and each word is a quoted
 //! FTS5 string, so no caller character reaches the parser as syntax.
 
-use rusqlite::params;
-
+use super::chunks::resolve_allowed_documents;
 use super::SqliteStore;
-use crate::kb::store::Bm25Hit;
+use crate::kb::store::{Bm25Hit, SearchFilter};
 use crate::kb::{ChunkId, DocumentId, KbError, KbResult};
 
 /// Most query words one keyword search scores. Same cap as the memory
@@ -232,25 +231,60 @@ impl SqliteStore {
         &self,
         query: &str,
         limit: usize,
+        filter: &SearchFilter,
     ) -> KbResult<Vec<Bm25Hit>> {
         let Some(expression) = build_match_expression(query) else {
             return Ok(Vec::new());
         };
         let conn = self.conn.clone();
         let limit_i = limit as i64;
+        let filter = filter.clone();
 
         tokio::task::spawn_blocking(move || -> KbResult<Vec<Bm25Hit>> {
             let conn = conn.blocking_lock();
-            let mut stmt = conn.prepare(
+            // Same resolver as the vector arm. Restrict in SQL: a search
+            // scoped to one conversation must never fetch another one's
+            // chunks, even to discard them afterwards.
+            let allowed = resolve_allowed_documents(&conn, &filter)?;
+            let mut allowed_ids: Vec<String> = match allowed {
+                None => Vec::new(),
+                Some(ids) if ids.is_empty() => return Ok(Vec::new()),
+                Some(ids) => {
+                    let mut ids: Vec<String> = ids.into_iter().collect();
+                    ids.sort();
+                    ids
+                }
+            };
+
+            let mut sql = String::from(
                 "SELECT c.id, c.document_id, c.content, bm25(chunk_fts) AS score
                  FROM chunk_fts
                  JOIN chunk c ON c.rowid = chunk_fts.rowid
                  JOIN document d ON d.id = c.document_id
-                 WHERE chunk_fts MATCH ?1 AND d.deleted_at IS NULL
-                 ORDER BY score
-                 LIMIT ?2",
-            )?;
-            let mut rows = stmt.query(params![expression, limit_i])?;
+                 WHERE chunk_fts MATCH ?1 AND d.deleted_at IS NULL",
+            );
+            let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> =
+                vec![Box::new(expression), Box::new(limit_i)];
+            if !allowed_ids.is_empty() {
+                // Numbered from ?3 so the existing ?1 (MATCH) and ?2 (LIMIT)
+                // keep their indices when anonymous and numbered parameters
+                // are mixed in one statement.
+                let placeholders = (0..allowed_ids.len())
+                    .map(|i| format!("?{}", i + 3))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                sql.push_str(" AND c.document_id IN (");
+                sql.push_str(&placeholders);
+                sql.push(')');
+                for id in allowed_ids.drain(..) {
+                    params_vec.push(Box::new(id));
+                }
+            }
+            sql.push_str(" ORDER BY score LIMIT ?2");
+            let param_refs: Vec<&dyn rusqlite::ToSql> =
+                params_vec.iter().map(|b| b.as_ref()).collect();
+            let mut stmt = conn.prepare(&sql)?;
+            let mut rows = stmt.query(param_refs.as_slice())?;
 
             let mut out = Vec::new();
             while let Some(row) = rows.next()? {

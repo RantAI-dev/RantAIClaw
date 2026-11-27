@@ -35,6 +35,10 @@ impl KbStore for SqliteStore {
         self.list_documents_impl(organization_id).await
     }
 
+    async fn list_documents_for_filter(&self, filter: &SearchFilter) -> KbResult<Vec<Document>> {
+        self.list_documents_for_filter_impl(filter).await
+    }
+
     async fn record_retrieval_hits(&self, ids: &[DocumentId]) -> KbResult<()> {
         self.record_retrieval_hits_impl(ids).await
     }
@@ -119,8 +123,13 @@ impl KbStore for SqliteStore {
         self.search_by_vector_impl(query, limit, filter).await
     }
 
-    async fn bm25_search(&self, query: &str, limit: usize) -> KbResult<Vec<Bm25Hit>> {
-        self.bm25_search_impl(query, limit).await
+    async fn bm25_search(
+        &self,
+        query: &str,
+        limit: usize,
+        filter: &SearchFilter,
+    ) -> KbResult<Vec<Bm25Hit>> {
+        self.bm25_search_impl(query, limit, filter).await
     }
 
     async fn count_by_embedding_model(&self) -> KbResult<Vec<(Option<String>, usize)>> {

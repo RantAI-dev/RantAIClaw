@@ -212,6 +212,9 @@ impl KbStore for FakeStore {
     async fn list_documents(&self, _organization_id: Option<&str>) -> KbResult<Vec<Document>> {
         Ok(Vec::new())
     }
+    async fn list_documents_for_filter(&self, _filter: &SearchFilter) -> KbResult<Vec<Document>> {
+        Ok(Vec::new())
+    }
     async fn record_retrieval_hits(&self, ids: &[DocumentId]) -> KbResult<()> {
         self.hits_recorded.fetch_add(ids.len(), Ordering::SeqCst);
         if self.panic_on_record {
@@ -299,7 +302,12 @@ impl KbStore for FakeStore {
         out.truncate(limit);
         Ok(out)
     }
-    async fn bm25_search(&self, _query: &str, limit: usize) -> KbResult<Vec<Bm25Hit>> {
+    async fn bm25_search(
+        &self,
+        _query: &str,
+        limit: usize,
+        _filter: &SearchFilter,
+    ) -> KbResult<Vec<Bm25Hit>> {
         let mut out = self.bm25_hits.clone();
         out.truncate(limit);
         Ok(out)
@@ -411,6 +419,7 @@ impl IntelligenceStore for FakeIntel {
         _query: &str,
         _max_neighbors: usize,
         _limit: usize,
+        _filter: &SearchFilter,
     ) -> KbResult<Vec<SearchResult>> {
         Ok(self.graph_chunks.clone())
     }
@@ -1162,5 +1171,275 @@ async fn keyword_arm_returns_hits_for_a_punctuated_question() {
             .any(|c| c.content.contains("refund window")),
         "keyword arm must return the chunk for a punctuated question; got {:?}",
         result.chunks.iter().map(|c| &c.content).collect::<Vec<_>>()
+    );
+}
+
+// ---- Scope isolation across conversations -------------------------------
+
+/// Two live documents in different conversation categories, each with one
+/// chunk that contains the word `cobalt`. With the vector arm silenced, a
+/// `cobalt` query can only match through BM25 and/or the graph arm, so the
+/// scope is the only thing that can keep one conversation's attachment out of
+/// the other's search answer. `TempDir` is returned so the DB outlives the
+/// store handle in each test.
+async fn seed_two_conversation_store() -> (
+    tempfile::TempDir,
+    Arc<rantaiclaw::kb::store::sqlite::SqliteStore>,
+) {
+    use rantaiclaw::kb::store::sqlite::SqliteStore;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Arc::new(
+        SqliteStore::open(tmp.path().join("kb.db"), 4)
+            .await
+            .unwrap(),
+    );
+    for (id, title, category, content) in [
+        (
+            "rantaiclaw_doc_conv_a",
+            "Conversation A notes",
+            "conv-a",
+            "Cobalt lattice geometry appears in conversation A.",
+        ),
+        (
+            "rantaiclaw_doc_conv_b",
+            "Conversation B notes",
+            "conv-b",
+            "Cobalt ember velocity appears in conversation B.",
+        ),
+    ] {
+        let doc = Document {
+            id: DocumentId(id.into()),
+            title: title.into(),
+            content: "body".into(),
+            categories: vec![category.into()],
+            subcategory: None,
+            metadata: serde_json::json!({}),
+            s3_key: None,
+            file_type: None,
+            mime_type: None,
+            file_size: None,
+            organization_id: None,
+            created_by: None,
+            session_id: None,
+            artifact_type: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            deleted_at: None,
+            retention_days: None,
+            retrieval_count: 0,
+            last_retrieved_at: None,
+        };
+        store.create_document(&doc).await.unwrap();
+        let chunk = Chunk {
+            content: content.into(),
+            metadata: rantaiclaw::kb::ChunkMetadata {
+                document_title: doc.title.clone(),
+                category: category.into(),
+                subcategory: None,
+                section: None,
+                chunk_index: 0,
+                contextual_prefix: None,
+            },
+        };
+        store
+            .store_chunks(
+                &doc.id,
+                &[chunk],
+                &[vec![1.0, 0.0, 0.0, 0.0]],
+                "rantaiclaw_test_model_a",
+            )
+            .await
+            .unwrap();
+    }
+    (tmp, store)
+}
+
+#[tokio::test]
+async fn bm25_scoped_search_returns_only_documents_in_the_requested_category() {
+    let (_tmp, store) = seed_two_conversation_store().await;
+    let mut cfg = test_cfg();
+    cfg.hybrid_bm25_enabled = true;
+    let retriever = Retriever::new(
+        cfg,
+        store.clone() as Arc<dyn KbStore>,
+        Arc::new(OrthogonalEmbedder),
+    );
+    let opts = RetrieveOptions {
+        min_similarity: Some(0.30),
+        ..RetrieveOptions::default()
+    };
+
+    // Control: an unscoped search still sees both conversations.
+    let both = retriever
+        .retrieve("cobalt", opts.clone())
+        .await
+        .expect("unscoped retrieve ok");
+    let ids: Vec<&str> = both
+        .chunks
+        .iter()
+        .map(|c| c.document_id.0.as_str())
+        .collect();
+    assert!(
+        ids.contains(&"rantaiclaw_doc_conv_a") && ids.contains(&"rantaiclaw_doc_conv_b"),
+        "unscoped control must surface both conversations: {ids:?}"
+    );
+
+    // A chat scoped to conversation A must not surface B's attachment, in
+    // chunks, sources, or the document inventory inside the context.
+    let scoped = retriever
+        .retrieve(
+            "cobalt",
+            RetrieveOptions {
+                category_filter: Some("conv-a".into()),
+                ..opts.clone()
+            },
+        )
+        .await
+        .expect("scoped retrieve ok");
+    assert!(
+        !scoped.chunks.is_empty(),
+        "BM25 must still find conversation A's chunk: {:?}",
+        scoped.chunks
+    );
+    assert!(
+        scoped
+            .chunks
+            .iter()
+            .all(|c| c.document_id.0 == "rantaiclaw_doc_conv_a"),
+        "scoped chunks must all belong to conversation A: {:?}",
+        scoped.chunks
+    );
+    // BM25-only hits are synthesized with an empty title by design, so the
+    // meaningful assertion is that B's title never reaches the source list.
+    assert_eq!(scoped.sources.len(), 1, "one source for one scoped chunk");
+    assert!(
+        scoped
+            .sources
+            .iter()
+            .all(|s| s.document_title != "Conversation B notes"),
+        "scoped sources must not name conversation B: {:?}",
+        scoped.sources
+    );
+    assert!(
+        !scoped.context.contains("Conversation B notes"),
+        "inventory in a scoped answer must not list the other conversation: {:?}",
+        scoped.context
+    );
+
+    // An existing group with no documents is a valid empty scope, not a
+    // request to fall back to the whole knowledge base.
+    let empty_group = store
+        .create_group("rantaiclaw_empty_scope_group", None, None)
+        .await
+        .unwrap();
+    let empty = retriever
+        .retrieve(
+            "cobalt",
+            RetrieveOptions {
+                group_ids: vec![empty_group.id],
+                ..opts
+            },
+        )
+        .await
+        .expect("empty-group retrieve ok");
+    assert!(
+        empty.chunks.is_empty() && empty.sources.is_empty(),
+        "an existing empty group must surface no chunks: {:?}",
+        empty.chunks
+    );
+}
+
+#[tokio::test]
+async fn graph_scoped_search_returns_only_documents_in_the_requested_category() {
+    use rantaiclaw::kb::intelligence::types::{Entity, EntityMention, EntityType, ExtractSource};
+    use rantaiclaw::kb::store::IntelligenceStore;
+
+    let (_tmp, store) = seed_two_conversation_store().await;
+    // One canonical entity, mentioned by one chunk in each conversation.
+    // Querying its name makes the graph arm the only candidate source (BM25
+    // is off, the vector arm is orthogonal), so a leak can only come from the
+    // graph arm or the inventory.
+    for (doc_id, mention_id) in [
+        ("rantaiclaw_doc_conv_a", "rantaiclaw_mention_a"),
+        ("rantaiclaw_doc_conv_b", "rantaiclaw_mention_b"),
+    ] {
+        let entity = Entity {
+            id: format!("rantaiclaw_entity_{doc_id}"),
+            canonical_key: "rantaiclaw_cobalt".into(),
+            name: "Cobalt".into(),
+            entity_type: EntityType::Organization,
+            confidence: 0.9,
+            metadata: serde_json::json!({}),
+        };
+        let mention = EntityMention {
+            id: mention_id.into(),
+            entity_id: entity.id.clone(),
+            document_id: doc_id.into(),
+            chunk_index: Some(0),
+            context: None,
+            source: ExtractSource::Llm,
+        };
+        store
+            .store_intelligence(doc_id, &[entity], &[mention], &[])
+            .await
+            .unwrap();
+    }
+
+    let mut cfg = test_cfg();
+    cfg.hybrid_bm25_enabled = false;
+    cfg.graphrag_enabled = true;
+    let retriever = Retriever::new(
+        cfg,
+        store.clone() as Arc<dyn KbStore>,
+        Arc::new(OrthogonalEmbedder),
+    )
+    .with_intelligence(store.clone() as Arc<dyn IntelligenceStore>);
+    let opts = RetrieveOptions {
+        min_similarity: Some(0.30),
+        ..RetrieveOptions::default()
+    };
+
+    let both = retriever
+        .retrieve("cobalt", opts.clone())
+        .await
+        .expect("unscoped graph retrieve ok");
+    let ids: Vec<&str> = both
+        .chunks
+        .iter()
+        .map(|c| c.document_id.0.as_str())
+        .collect();
+    assert!(
+        ids.contains(&"rantaiclaw_doc_conv_a") && ids.contains(&"rantaiclaw_doc_conv_b"),
+        "unscoped graph control must surface both conversations: {ids:?}"
+    );
+
+    let scoped = retriever
+        .retrieve(
+            "cobalt",
+            RetrieveOptions {
+                category_filter: Some("conv-b".into()),
+                ..opts
+            },
+        )
+        .await
+        .expect("scoped graph retrieve ok");
+    assert!(
+        !scoped.chunks.is_empty(),
+        "graph arm must still find conversation B's chunk: {:?}",
+        scoped.chunks
+    );
+    assert!(
+        scoped
+            .chunks
+            .iter()
+            .all(|c| c.document_id.0 == "rantaiclaw_doc_conv_b"),
+        "scoped graph chunks must all belong to conversation B: {:?}",
+        scoped.chunks
+    );
+    assert!(
+        !scoped.context.contains("Conversation A notes"),
+        "scoped graph answer must not inventory the other conversation: {:?}",
+        scoped.context
     );
 }

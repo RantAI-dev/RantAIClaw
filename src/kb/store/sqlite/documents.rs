@@ -8,7 +8,9 @@
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Row};
 
+use super::chunks::resolve_allowed_documents;
 use super::SqliteStore;
+use crate::kb::store::SearchFilter;
 use crate::kb::{Document, DocumentId, KbError, KbResult};
 
 #[allow(clippy::cast_sign_loss)]
@@ -267,6 +269,57 @@ impl SqliteStore {
                 let mut rows = stmt.query([])?;
                 while let Some(row) = rows.next()? {
                     docs.push(map_row(row)?);
+                }
+            }
+            Ok(docs)
+        })
+        .await
+        .map_err(|e| KbError::Other(format!("join: {e}")))?
+    }
+
+    /// Live documents allowed by a retrieval filter. Shares the resolver with
+    /// every search arm so the inventory in an answer cannot list titles from
+    /// another conversation. An unscoped filter takes the same query path as
+    /// `list_documents(None)`.
+    pub(crate) async fn list_documents_for_filter_impl(
+        &self,
+        filter: &SearchFilter,
+    ) -> KbResult<Vec<Document>> {
+        let conn = self.conn.clone();
+        let filter = filter.clone();
+        tokio::task::spawn_blocking(move || -> KbResult<Vec<Document>> {
+            let conn = conn.blocking_lock();
+            let allowed = resolve_allowed_documents(&conn, &filter)?;
+            let mut docs = Vec::new();
+            match allowed {
+                None => {
+                    let mut stmt = conn.prepare(
+                        "SELECT * FROM document
+                         WHERE deleted_at IS NULL
+                         ORDER BY created_at DESC",
+                    )?;
+                    let mut rows = stmt.query([])?;
+                    while let Some(row) = rows.next()? {
+                        docs.push(map_row(row)?);
+                    }
+                }
+                Some(ids) if ids.is_empty() => return Ok(Vec::new()),
+                Some(ids) => {
+                    let mut ids: Vec<String> = ids.into_iter().collect();
+                    ids.sort();
+                    let placeholders = vec!["?"; ids.len()].join(",");
+                    let sql = format!(
+                        "SELECT * FROM document
+                         WHERE deleted_at IS NULL AND id IN ({placeholders})
+                         ORDER BY created_at DESC"
+                    );
+                    let params: Vec<&dyn rusqlite::ToSql> =
+                        ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+                    let mut stmt = conn.prepare(&sql)?;
+                    let mut rows = stmt.query(params.as_slice())?;
+                    while let Some(row) = rows.next()? {
+                        docs.push(map_row(row)?);
+                    }
                 }
             }
             Ok(docs)

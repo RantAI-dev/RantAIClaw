@@ -154,7 +154,10 @@ async fn kb_db_from_previous_release_reads_back_seeded_chunks() {
     assert_eq!(by_vector[0].content, "alpha content");
 
     // The FTS5 table written by the old build answers keyword queries.
-    let by_keyword = store.bm25_search("alpha", 5).await.unwrap();
+    let by_keyword = store
+        .bm25_search("alpha", 5, &SearchFilter::default())
+        .await
+        .unwrap();
     let contents: Vec<&str> = by_keyword.iter().map(|h| h.content.as_str()).collect();
     assert_eq!(contents, vec!["alpha content"]);
 }

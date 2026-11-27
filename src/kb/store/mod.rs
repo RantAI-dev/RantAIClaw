@@ -51,6 +51,11 @@ pub trait KbStore: Send + Sync {
     /// unknown, or, for a soft delete, already soft-deleted.
     async fn delete_document(&self, id: &DocumentId, soft: bool) -> KbResult<bool>;
     async fn list_documents(&self, organization_id: Option<&str>) -> KbResult<Vec<Document>>;
+    /// List the live documents in scope for a retrieval [`SearchFilter`]. Uses
+    /// the same category/group/document union as every search arm, so the
+    /// document inventory in a search answer cannot list out-of-scope titles.
+    /// An empty filter behaves like `list_documents(None)`.
+    async fn list_documents_for_filter(&self, filter: &SearchFilter) -> KbResult<Vec<Document>>;
     async fn record_retrieval_hits(&self, ids: &[DocumentId]) -> KbResult<()>;
 
     // --- groups ---
@@ -111,7 +116,15 @@ pub trait KbStore: Send + Sync {
     ) -> KbResult<Vec<SearchResult>>;
 
     // --- BM25 search ---
-    async fn bm25_search(&self, query: &str, limit: usize) -> KbResult<Vec<Bm25Hit>>;
+    /// Keyword search restricted to the documents allowed by `filter`. The
+    /// scope is applied in the store query so a filtered search never fetches
+    /// out-of-scope hits to discard later.
+    async fn bm25_search(
+        &self,
+        query: &str,
+        limit: usize,
+        filter: &SearchFilter,
+    ) -> KbResult<Vec<Bm25Hit>>;
 
     // --- maintenance ---
     async fn count_by_embedding_model(&self) -> KbResult<Vec<(Option<String>, usize)>>;
@@ -235,12 +248,15 @@ pub trait IntelligenceStore: Send + Sync {
     /// to `limit` chunks that mention any seed-or-neighbour entity — as
     /// retrieval candidates for the RRF fusion. Ordered by how many matched
     /// entities each chunk mentions (desc). Returns an empty vec when no entity
-    /// name matches the query.
+    /// name matches the query or the filter resolves to no documents. `filter`
+    /// restricts candidate chunks to the same allowed document set as the
+    /// vector and BM25 arms.
     async fn graph_expand_chunks(
         &self,
         query: &str,
         max_neighbors: usize,
         limit: usize,
+        filter: &SearchFilter,
     ) -> KbResult<Vec<SearchResult>>;
 }
 
