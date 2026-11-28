@@ -456,17 +456,21 @@ impl Default for ChannelsRegistry {
 /// into. The WARN sentence names the on-host `channels pair` CLI and the
 /// in-chat `/bind` (guest) and `/claim` (owner) steps that grant access,
 /// without naming the sender's identifier, which a journal reader would
-/// otherwise learn.
+/// otherwise learn. On Slack the in-chat steps are printed without a slash:
+/// Slack swallows any message starting with `/` that is not a registered slash
+/// command, so the slash form is not a hint the sender can act on.
 ///
 /// `channel` is the CLI surface name (`whatsapp_web`, `discord`, `slack`,
 /// `lark`) the operator types into `rantaiclaw channels pair --channel`.
 /// The same keys are accepted by `commands.rs` and are the catalog entries
 /// the `ChannelSupport` enum enumerates.
 pub(crate) fn rejected_sender_warn(channel: &str, redacted_id: &str) -> String {
+    let bind = pairing::pairing_command_hint("/bind <code>", Some(channel));
+    let claim = pairing::pairing_command_hint("/claim <code>", Some(channel));
     format!(
         "{channel}: ignoring unauthorized sender ({redacted_id}); to allow them, mint a code \
          with `rantaiclaw channels pair --channel {channel} --no-owner` and have them DM \
-         `/bind <code>`, or mint without `--no-owner` and have them DM `/claim <code>`"
+         `{bind}`, or mint without `--no-owner` and have them DM `{claim}`"
     )
 }
 

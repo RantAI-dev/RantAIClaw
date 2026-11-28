@@ -219,7 +219,11 @@ pub(crate) fn pair_channel(
         None => "multi-use".to_string(),
     };
     println!("🔐 Pairing code for {channel}: {code}   (valid {ttl_minutes} min, {uses})");
-    println!("   DM the bot:  /bind {code}  (chat)  |  /claim {code}  (owner)");
+    // Slack cannot deliver a message starting with `/`, so its hint names the
+    // slash-free form the channel actually accepts. Every other channel keeps
+    // the slash form byte-for-byte.
+    let slash = crate::channels::pairing::pairing_command_hint("/", Some(channel));
+    println!("   DM the bot:  {slash}bind {code}  (chat)  |  {slash}claim {code}  (owner)");
     println!(
         "   No daemon restart needed — a running channel picks this up on the next pairing message."
     );

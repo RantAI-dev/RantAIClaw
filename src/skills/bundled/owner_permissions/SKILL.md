@@ -61,6 +61,9 @@ Forward the returned code to the recipient. They DM the bot:
 - `/claim <code>` — become an **owner** (only if the code grants owner), or
 - `/bind <code>`  — become an allowed **chat** user.
 
+On Slack the client never delivers a slash command, so the same two forms are `claim <code>` and
+`bind <code>`: exactly two tokens, with the verb case-insensitive.
+
 This is owner-only and authority-granting (an owner-capable code can promote its
 recipient), so it is hard-gated exactly like `manage_permissions` — a non-owner
 can never call it. Prefer the narrowest code that does the job: a short TTL,

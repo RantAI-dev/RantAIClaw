@@ -217,12 +217,16 @@ impl GuestGate {
     /// One-line trailing sentence every guest denial carries: the real path to
     /// becoming an owner, instead of the misleading "ask an owner to add you to
     /// the allowlist" wording some denials used to give. The channel name is
-    /// not in scope here, so it is left as the literal placeholder the operator
-    /// reads as "the channel they are chatting on".
-    fn how_to_become_owner_sentence() -> &'static str {
-        "To become an owner, ask a current owner to run \
-         `rantaiclaw channels pair --channel <channel>` on the host, \
-         then `/claim <code>` in this chat."
+    /// not in scope here, so the hint names both command forms: the slash form
+    /// every channel except Slack accepts, and the slash-free form Slack can
+    /// actually deliver.
+    fn how_to_become_owner_sentence() -> String {
+        format!(
+            "To become an owner, ask a current owner to run \
+             `rantaiclaw channels pair --channel <channel>` on the host, \
+             then {} in this chat.",
+            crate::channels::pairing::pairing_command_hint("/claim <code>", None)
+        )
     }
 }
 
@@ -475,6 +479,10 @@ mod tests {
                 reason.contains("/claim"),
                 "{tool}: not told how to become an owner: {reason}"
             );
+            assert!(
+                reason.contains("on Slack: `claim <code>`"),
+                "{tool}: Slack cannot send the slash form: {reason}"
+            );
         }
     }
 
@@ -502,6 +510,10 @@ mod tests {
             assert!(
                 reason.contains("/claim"),
                 "{tool}: not told how to become an owner: {reason}"
+            );
+            assert!(
+                reason.contains("on Slack: `claim <code>`"),
+                "{tool}: Slack cannot send the slash form: {reason}"
             );
         }
     }
@@ -534,6 +546,10 @@ mod tests {
             assert!(
                 reason.contains("/claim"),
                 "{tool}: not told how to become an owner: {reason}"
+            );
+            assert!(
+                reason.contains("on Slack: `claim <code>`"),
+                "{tool}: Slack cannot send the slash form: {reason}"
             );
         }
         // Read-only cron tools must remain usable by guests when allowlisted.

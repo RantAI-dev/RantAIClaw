@@ -141,15 +141,18 @@ fn mint_and_render(args: &PairArgs) -> Result<(String, String)> {
         "🔐 Pairing code for {}: {}   (valid {} min, single use)",
         args.channel, code, args.ttl_minutes
     );
+    // Slack's client never delivers a message starting with `/`, so the hint
+    // for a Slack code omits it. Other channels keep the slash form as before.
+    let slash = crate::channels::pairing::pairing_command_hint("/", Some(&args.channel));
     if args.grant_owner {
         let _ = write!(
             msg,
-            "\n   DM the bot:  /claim {code}  (owner)  |  /bind {code}  (chat)"
+            "\n   DM the bot:  {slash}claim {code}  (owner)  |  {slash}bind {code}  (chat)"
         );
     } else {
         let _ = write!(
             msg,
-            "\n   DM the bot:  /bind {code}  (chat — this code does not grant owner)"
+            "\n   DM the bot:  {slash}bind {code}  (chat — this code does not grant owner)"
         );
     }
     msg.push_str("\n   No daemon restart needed — a running channel picks this up automatically.");

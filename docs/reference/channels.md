@@ -343,6 +343,13 @@ Telegram, Discord, Lark, WhatsApp Cloud API and WhatsApp Web answer three more k
   fetched once per process on Telegram, whether or not `mention_only` is on, because the question
   comes up in every group rather than only where mentions are required.
 
+Slack pairs and approves with the same slash-free whole-message form it uses for runtime commands:
+`claim <code>` redeems an owner-capable code, `bind <code>` pairs as a chat user, and the verbs are
+case-insensitive. Only a whole message of those two tokens is a pairing attempt, so an ordinary
+sentence such as `claim the refund for order 12` still reaches the model. Hints printed for a Slack
+channel name the slash-free form; hints printed where the reader's channel is unknown name both
+forms.
+
 Approval replies (`/approve`, `/deny`, `/allow`) and pairing (`/bind`, `/claim`) are handled before
 any of these and behave as before. An approval reply that names a request handle is answered by the
 relay itself, whichever approval verb it uses (`approve`, `allow`, `y`, `n`, ...) and whether or
@@ -361,7 +368,8 @@ Two relays answer approval replies, and they resolve a name differently:
   it resolves nothing.
 - **Shell approvals** resolve a request by the command's basename. `/approve brew` answers the
   pending `brew` request. When several are pending in one chat, a bare verb does not pick one:
-  the reply lists them and asks for `/approve <name>`.
+  the reply lists them and asks for `/approve <name>` (`approve <name>` on Slack, whose client
+  swallows the slash).
 
 The forms each relay accepts, read from the reply parsers. The slash is optional everywhere, and
 verbs are matched without regard to case. The one exception is `y` against `Y` followed by a
@@ -401,7 +409,7 @@ covers one call only: the reply says `--persist` was ignored and, for an unallow
 session grant, or a grant for this run only at high risk; it does not change the allowlist and
 cannot be persisted.
 Deny needs no owner — stopping a pending action is always safe — while every kind of grant needs one,
-and a refused non-owner is told to ask an owner for `/approve`.
+and a refused non-owner is told to ask an owner for `/approve` (`approve` on Slack).
 
 Slack has no reset
 command: a new top-level message already starts a new conversation.
