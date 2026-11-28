@@ -120,8 +120,9 @@ pub fn try_handle_reply(
             return None;
         }
         if parsed.verb.is_grant() && !can_approve(owners, sender) {
+            let prefix = crate::channels::commands::command_prefix(channel);
             return Some(format!(
-                "You're not authorized to approve `{}`. Ask an owner to reply `/approve {}`.",
+                "You're not authorized to approve `{}`. Ask an owner to reply `{prefix}approve {}`.",
                 parsed.basename, parsed.basename
             ));
         }
@@ -171,13 +172,14 @@ pub fn try_handle_reply(
                 typed_flag: None,
             };
             if parsed.verb.is_grant() && !can_approve(owners, sender) {
+                let prefix = crate::channels::commands::command_prefix(channel);
                 return Some(format!(
-                    "You're not authorized to approve `{basename}`. Ask an owner to reply `/approve {basename}`."
+                    "You're not authorized to approve `{basename}`. Ask an owner to reply `{prefix}approve {basename}`."
                 ));
             }
             handle_parsed(&parsed, security, &pending)
         }
-        _ => Some(ambiguous_pending_message(&snapshot, false)),
+        _ => Some(ambiguous_pending_message(&snapshot, false, channel)),
     }
 }
 
@@ -743,6 +745,7 @@ pub fn try_handle_tool_reply(
                 parsed.verb,
                 sender,
                 owners,
+                channel,
             ));
         }
         // Exact tool basename match keeps the original behavior.
@@ -786,7 +789,7 @@ pub fn try_handle_tool_reply(
             channel,
             reply_target,
         )),
-        _ => Some(ambiguous_pending_message(&pending, true)),
+        _ => Some(ambiguous_pending_message(&pending, true, channel)),
     }
 }
 
@@ -806,12 +809,14 @@ fn resolve_handle(
     verb: ToolReplyVerb,
     sender: &str,
     owners: &[String],
+    channel: &str,
 ) -> String {
     match verb {
         ToolReplyVerb::Approve => {
             if !can_approve(owners, sender) {
+                let prefix = crate::channels::commands::command_prefix(channel);
                 return format!(
-                    "You're not authorized to approve `{basename}`. Ask an owner to reply `/approve {basename}`."
+                    "You're not authorized to approve `{basename}`. Ask an owner to reply `{prefix}approve {basename}`."
                 );
             }
             match relay.resolve_by_handle(handle, Decision::Once) {
@@ -840,8 +845,9 @@ fn resolve_tool(
     match verb {
         ToolReplyVerb::Approve => {
             if !can_approve(owners, sender) {
+                let prefix = crate::channels::commands::command_prefix(channel);
                 return format!(
-                    "You're not authorized to approve `{tool}`. Ask an owner to reply `/approve {tool}`."
+                    "You're not authorized to approve `{tool}`. Ask an owner to reply `{prefix}approve {tool}`."
                 );
             }
             match relay.resolve_by_basename_in(tool, channel, reply_target, Decision::Once) {
@@ -865,8 +871,11 @@ fn resolve_tool(
 /// Build a "which one?" message listing the pending requests so the owner can
 /// name a specific target rather than us guessing.
 ///
-/// The advice is always `/approve`: it answers one call. `/allow` grants every
-/// chat until restart, and a "which one?" prompt is no place to offer that.
+/// The advice is always `approve` (with `/` only where the client can send it):
+/// it answers one call. `/allow` grants every chat until restart, and a
+/// "which one?" prompt is no place to offer that. `channel` is the surface the
+/// owner is reading on; Slack's client swallows a leading `/`, so its advice
+/// is slash-free just like the approval prompt itself.
 ///
 /// `named_by_handle` selects the form the owner can actually use to answer:
 /// - `true` (Layer A, the tool-approval relay) — basenames AND short request
@@ -874,7 +883,11 @@ fn resolve_tool(
 /// - `false` (Layer B, the shell allowlist) — basenames only. The Layer B
 ///   registry resolves by basename only, so naming a handle would lead the
 ///   owner to "Nothing pending matches `<handle>`" and contradict the list.
-fn ambiguous_pending_message(pending: &[PendingRequest], named_by_handle: bool) -> String {
+fn ambiguous_pending_message(
+    pending: &[PendingRequest],
+    named_by_handle: bool,
+    channel: &str,
+) -> String {
     let names: Vec<String> = pending
         .iter()
         .map(|r| {
@@ -889,10 +902,11 @@ fn ambiguous_pending_message(pending: &[PendingRequest], named_by_handle: bool) 
             }
         })
         .collect();
+    let prefix = crate::channels::commands::command_prefix(channel);
     let advice = if named_by_handle {
-        "Reply `/approve <name or handle>` to pick one.".to_string()
+        format!("Reply `{prefix}approve <name or handle>` to pick one.")
     } else {
-        "Reply `/approve <name>` to pick one.".to_string()
+        format!("Reply `{prefix}approve <name>` to pick one.")
     };
     format!("Still pending here: {}. {advice}", names.join(", "))
 }
@@ -1006,11 +1020,11 @@ fn build_unmatched_ack(
         ack.push_str(" Still answerable in this chat:");
         if !layer_a.is_empty() {
             ack.push('\n');
-            ack.push_str(&ambiguous_pending_message(&layer_a, true));
+            ack.push_str(&ambiguous_pending_message(&layer_a, true, channel));
         }
         if !layer_b.is_empty() {
             ack.push('\n');
-            ack.push_str(&ambiguous_pending_message(&layer_b, false));
+            ack.push_str(&ambiguous_pending_message(&layer_b, false, channel));
         }
     }
     ack
@@ -2694,6 +2708,68 @@ mod tests {
         pending.resolve_by_basename("npm", Decision::Deny);
         let _ = t1.await;
         let _ = t2.await;
+    }
+
+    /// Slack's client swallows a leading `/`, and its own approval prompt
+    /// already says `approve <name>`. The "which one?" hint must use the same
+    /// sendable form; other channels keep `/approve`.
+    #[tokio::test]
+    async fn slack_ambiguity_hint_names_the_slashless_approve_reply() {
+        let security = supervised_only_echo();
+        let pending = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        security.set_pending(pending.clone());
+        let p1 = pending.clone();
+        let p2 = pending.clone();
+        let t1 = tokio::spawn(async move {
+            p1.request_decision_in(uuid::Uuid::new_v4(), "brew", "brew", "slack", "chat-1")
+                .await
+        });
+        let t2 = tokio::spawn(async move {
+            p2.request_decision_in(uuid::Uuid::new_v4(), "npm", "npm i", "slack", "chat-1")
+                .await
+        });
+        await_pending(&pending, 2).await;
+
+        let owners = vec!["owner1".to_string()];
+        let ack = try_handle_reply("yes", &security, "owner1", &owners, "slack", "chat-1")
+            .expect("consumed");
+        assert!(ack.contains("`approve <name>`"), "{ack}");
+        assert!(!ack.contains("/approve"), "Slack cannot send that: {ack}");
+
+        // Control: the same two requests on Telegram still say `/approve`.
+        let telegram_security = supervised_only_echo();
+        let telegram_pending = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        telegram_security.set_pending(telegram_pending.clone());
+        let p1 = telegram_pending.clone();
+        let p2 = telegram_pending.clone();
+        let t3 = tokio::spawn(async move {
+            p1.request_decision_in(uuid::Uuid::new_v4(), "brew", "brew", "telegram", "chat-1")
+                .await
+        });
+        let t4 = tokio::spawn(async move {
+            p2.request_decision_in(uuid::Uuid::new_v4(), "npm", "npm i", "telegram", "chat-1")
+                .await
+        });
+        await_pending(&telegram_pending, 2).await;
+        let tg_ack = try_handle_reply(
+            "yes",
+            &telegram_security,
+            "owner1",
+            &owners,
+            "telegram",
+            "chat-1",
+        )
+        .expect("consumed");
+        assert!(tg_ack.contains("`/approve <name>`"), "{tg_ack}");
+
+        pending.resolve_by_basename("brew", Decision::Deny);
+        pending.resolve_by_basename("npm", Decision::Deny);
+        telegram_pending.resolve_by_basename("brew", Decision::Deny);
+        telegram_pending.resolve_by_basename("npm", Decision::Deny);
+        let _ = t1.await;
+        let _ = t2.await;
+        let _ = t3.await;
+        let _ = t4.await;
     }
 
     /// A non-owner who typed `/allow brew` is told to ask an owner for the

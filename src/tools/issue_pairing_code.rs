@@ -9,6 +9,9 @@
 //!   * `/claim <code>` — become an **owner** (only if the code grants it), or
 //!   * `/bind <code>`  — become an allowed **chat** user.
 //!
+//! On Slack both forms drop the slash: its client never delivers a message
+//! starting with `/` unless it names a registered slash command.
+//!
 //! ## Why this is safe to expose
 //!
 //! Minting a code is an authority-granting action (a `/claim` code can promote
@@ -83,8 +86,9 @@ impl Tool for IssuePairingCodeTool {
         "Owner-only. Mint an on-demand pairing code so a new user or device can \
          self-onboard onto a channel (or the gateway) without a daemon restart. \
          Forward the returned code to the recipient: they DM the bot `/claim \
-         <code>` to become an owner (if the code grants it) or `/bind <code>` to \
-         become an allowed chat user. `channel` is the surface (e.g. telegram, \
+         <code>` (on Slack: `claim <code>`) to become an owner (if the code \
+         grants it) or `/bind <code>` (on Slack: `bind <code>`) to become an \
+         allowed chat user. `channel` is the surface (e.g. telegram, \
          discord, slack, whatsapp_web for WhatsApp Web, whatsapp for the WhatsApp \
          Cloud API, or gateway). `ttl_minutes` sets the validity \
          window (default 15). `max_uses` bounds claims (omit for unlimited within \
@@ -190,15 +194,27 @@ impl Tool for IssuePairingCodeTool {
 
         let mut output =
             format!("🔐 Pairing code for {channel}: {code}   (valid {ttl_minutes} min, {uses})\n");
+        // `channel` is in scope here, so the hint can name the form the
+        // recipient can actually send: slash-free on Slack, slash elsewhere.
+        let hint = |cmd: &str| {
+            crate::channels::pairing::pairing_command_hint(
+                &format!("{cmd} {code}"),
+                Some(channel.as_str()),
+            )
+        };
+        let claim_word = crate::channels::pairing::pairing_command_hint("/claim", Some(&channel));
         if grant_owner {
             let _ = write!(
                 output,
-                "Forward it to the recipient. They DM the bot:\n  /claim {code}   → become an owner\n  /bind {code}    → become an allowed chat user\n"
+                "Forward it to the recipient. They DM the bot:\n  {}   → become an owner\n  {}    → become an allowed chat user\n",
+                hint("/claim"),
+                hint("/bind")
             );
         } else {
             let _ = write!(
                 output,
-                "Forward it to the recipient. They DM the bot:\n  /bind {code}    → become an allowed chat user\n(This code does not grant owner — `/claim` will only bind them as a chat user.)\n"
+                "Forward it to the recipient. They DM the bot:\n  {}    → become an allowed chat user\n(This code does not grant owner — `{claim_word}` will only bind them as a chat user.)\n",
+                hint("/bind")
             );
         }
         output.push_str("No daemon restart needed — a running channel picks this up on the next pairing message.");

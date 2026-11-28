@@ -3,6 +3,7 @@ use crate::onboard::provision::validate::http::{probe_post, ProbeResult};
 use crate::onboard::provision::validate::verdict::ProbeVerdict;
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use std::borrow::Cow;
 use std::sync::{Arc, RwLock};
 
 /// Slack channel — polls conversations.history via Web API
@@ -214,6 +215,41 @@ impl SlackChannel {
         })
     }
 
+    /// The text the shared pairing parser should see for one inbound message.
+    ///
+    /// Slack refuses any message starting with `/` that is not a registered
+    /// slash command, so `/claim CODE` never arrives; `claim CODE` does. Only
+    /// a whole message of exactly two tokens, with a verb of `claim` or `bind`
+    /// (case-insensitive) and a code passing the shared plausibility check, is
+    /// rewritten to the form the shared parser accepts. An ordinary message
+    /// that merely begins with one of those words stays ordinary chat, on
+    /// Slack and on every other surface.
+    pub(crate) fn pairing_text_for<'a>(surface: &str, text: &'a str) -> Cow<'a, str> {
+        if surface != "slack" {
+            return Cow::Borrowed(text);
+        }
+        let trimmed = text.trim();
+        let mut tokens = trimmed.split_whitespace();
+        let Some(verb) = tokens.next() else {
+            return Cow::Borrowed(text);
+        };
+        let Some(code) = tokens.next() else {
+            return Cow::Borrowed(text);
+        };
+        if tokens.next().is_some() {
+            return Cow::Borrowed(text);
+        }
+        let verb = match verb.to_ascii_lowercase().as_str() {
+            "claim" => "claim",
+            "bind" => "bind",
+            _ => return Cow::Borrowed(text),
+        };
+        if !crate::channels::pairing::looks_like_code(code) {
+            return Cow::Borrowed(text);
+        }
+        Cow::Owned(format!("/{verb} {code}"))
+    }
+
     /// Handle one inbound message: classify it, deliver it, or let an
     /// unauthorized sender self-onboard with a pairing code.
     ///
@@ -266,14 +302,17 @@ impl SlackChannel {
         let (user, text, ts) = (user.as_str(), text.as_str(), ts.as_str());
 
         // Before rejecting, let a not-yet-allowed user self-onboard with a
-        // `/bind`/`/claim <code>` minted via `rantaiclaw channels pair`. On
-        // success the sender lands in `allowed_users` (and, for an owner
-        // `/claim`, `approval_owners`).
+        // `bind`/`claim <code>` minted via `rantaiclaw channels pair`. Slack
+        // cannot deliver a message starting with `/`, so the two-token
+        // slash-free form is rewritten for the shared parser here. On success
+        // the sender lands in `allowed_users` (and, for an owner `claim`,
+        // `approval_owners`).
         if !text.is_empty() && ts > last_ts.as_str() {
             if let Some(root) = crate::channels::pairing::profile_root("slack") {
                 let identities = vec![user.to_string()];
+                let pairing_text = Self::pairing_text_for("slack", text);
                 if let Some(reply) = crate::channels::pairing::try_handle_pairing(
-                    text,
+                    &pairing_text,
                     "slack",
                     crate::channels::pairing::AllowlistField::AllowedUsers,
                     &identities,
@@ -2704,5 +2743,207 @@ mod tests {
         assert!(users.contains(&"U999".to_string()), "users: {users:?}");
         let owners = &config.channels_config.approval_owners;
         assert!(owners.contains(&"U999".to_string()), "owners: {owners:?}");
+    }
+
+    /// A fresh profile root with a Slack section, so `apply_pairing` has a
+    /// target. Callers hold `ENV_LOCK` and set `RANTAICLAW_CONFIG_DIR` first.
+    async fn seed_slack_pairing_config() {
+        let mut seed = crate::config::Config::load_or_init().await.unwrap();
+        seed.channels_config.slack = Some(crate::config::SlackConfig {
+            bot_token: "x".into(),
+            app_token: None,
+            channel_id: Some("C1".into()),
+            allowed_users: vec![],
+        });
+        seed.save().await.unwrap();
+    }
+
+    fn pairing_now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+
+    /// Slack's client refuses any message starting with `/`, so the code hint
+    /// an operator reads must be a form a Slack user can actually send.
+    #[test]
+    fn slack_pairing_hints_name_the_slashless_command() {
+        let warn = crate::channels::rejected_sender_warn("slack", "U***");
+        assert!(
+            warn.contains("`bind <code>`") && warn.contains("`claim <code>`"),
+            "Slack's pairing hint must be sendable: {warn}"
+        );
+        assert!(
+            !warn.contains("/bind") && !warn.contains("/claim"),
+            "a leading slash would be swallowed by Slack: {warn}"
+        );
+
+        // Control: every other channel keeps the slash form byte-for-byte.
+        let other = crate::channels::rejected_sender_warn("discord", "u***");
+        assert!(other.contains("`/bind <code>`"), "{other}");
+        assert!(other.contains("`/claim <code>`"), "{other}");
+    }
+
+    /// A two-token `claim <code>` is rewritten to the form the shared parser
+    /// accepts, and redeems the code exactly as `/claim <code>` does. The
+    /// normalization is driven through the Slack surface, not the parser.
+    #[tokio::test]
+    async fn slack_slashless_claim_redeems_a_pairing_code() {
+        use crate::channels::pairing::{try_handle_pairing, AllowlistField};
+        use crate::security::pairing_store;
+
+        let _guard = crate::test_env::ENV_LOCK.lock().await;
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let _config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", root);
+        let _workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+        seed_slack_pairing_config().await;
+
+        let code = pairing_store::mint(root, "slack", 3_600, None, true, pairing_now()).unwrap();
+        let text = format!("claim {code}");
+        let normalized = SlackChannel::pairing_text_for("slack", &text);
+        assert_eq!(
+            normalized.as_ref(),
+            format!("/claim {code}"),
+            "the Slack rewrite must produce the form the shared parser reads"
+        );
+
+        let reply = try_handle_pairing(
+            &normalized,
+            "slack",
+            AllowlistField::AllowedUsers,
+            &["U999".to_string()],
+            root,
+        )
+        .await
+        .expect("a slash-free claim must be handled");
+        assert!(reply.contains("owner"), "reply was: {reply}");
+
+        let config = crate::config::Config::load_or_init().await.unwrap();
+        assert!(config
+            .channels_config
+            .slack
+            .as_ref()
+            .unwrap()
+            .allowed_users
+            .contains(&"U999".to_string()));
+        assert!(config
+            .channels_config
+            .approval_owners
+            .contains(&"U999".to_string()));
+    }
+
+    /// The bind form grants chat access only; no owner is appended.
+    #[tokio::test]
+    async fn slack_slashless_bind_pairs_a_chat_user() {
+        use crate::channels::pairing::{try_handle_pairing, AllowlistField};
+        use crate::security::pairing_store;
+
+        let _guard = crate::test_env::ENV_LOCK.lock().await;
+        let _proxy_state = crate::test_proxy::PROXY_STATE_LOCK.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let _config_dir = crate::test_env::EnvGuard::set("RANTAICLAW_CONFIG_DIR", root);
+        let _workspace = crate::test_env::EnvGuard::unset("RANTAICLAW_WORKSPACE");
+        seed_slack_pairing_config().await;
+
+        let code = pairing_store::mint(root, "slack", 3_600, None, false, pairing_now()).unwrap();
+        let text = format!("bInD {code}"); // the verb is case-insensitive
+        let normalized = SlackChannel::pairing_text_for("slack", &text);
+        assert_eq!(normalized.as_ref(), format!("/bind {code}"));
+
+        let reply = try_handle_pairing(
+            &normalized,
+            "slack",
+            AllowlistField::AllowedUsers,
+            &["U888".to_string()],
+            root,
+        )
+        .await
+        .expect("a slash-free bind must be handled");
+        assert!(reply.contains("paired"), "reply was: {reply}");
+
+        let config = crate::config::Config::load_or_init().await.unwrap();
+        assert!(config
+            .channels_config
+            .slack
+            .as_ref()
+            .unwrap()
+            .allowed_users
+            .contains(&"U888".to_string()));
+        assert!(
+            config.channels_config.approval_owners.is_empty(),
+            "bind must not grant owner"
+        );
+    }
+
+    /// An ordinary sentence that happens to begin with "claim" is not a
+    /// pairing attempt: it stays chat and gets no spurious code error.
+    #[tokio::test]
+    async fn slack_ordinary_message_starting_with_claim_is_not_pairing() {
+        use crate::channels::pairing::try_handle_pairing;
+
+        let text = "claim the refund for order 12";
+        let normalized = SlackChannel::pairing_text_for("slack", text);
+        assert_eq!(
+            normalized.as_ref(),
+            text,
+            "extra tokens must not be rewritten"
+        );
+
+        // No store is needed: a non-command short-circuits before any lookup.
+        let dir = tempfile::TempDir::new().unwrap();
+        let reply = try_handle_pairing(
+            &normalized,
+            "slack",
+            crate::channels::pairing::AllowlistField::AllowedUsers,
+            &["U999".to_string()],
+            dir.path(),
+        )
+        .await;
+        assert!(
+            reply.is_none(),
+            "ordinary chat must get no pairing reply: {reply:?}"
+        );
+    }
+
+    /// Controls: Telegram and the other channels keep the slash form, and a
+    /// bare `claim <code>` there is still ordinary chat.
+    #[tokio::test]
+    async fn telegram_keeps_its_slash_command_and_ignores_the_bare_form() {
+        use crate::channels::pairing::{parse_pairing_command, try_handle_pairing, AllowlistField};
+
+        for surface in ["telegram", "discord", "lark"] {
+            let slash = "/claim ABCD-EFGH";
+            assert_eq!(
+                SlackChannel::pairing_text_for(surface, slash).as_ref(),
+                slash,
+                "{surface} must keep the slash form byte-for-byte"
+            );
+            let bare = "claim ABCD-EFGH";
+            assert_eq!(
+                SlackChannel::pairing_text_for(surface, bare).as_ref(),
+                bare,
+                "{surface} must not gain the Slack shortcut"
+            );
+        }
+        assert!(parse_pairing_command("/claim ABCD-EFGH").is_some());
+        assert!(parse_pairing_command("claim ABCD-EFGH").is_none());
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let reply = try_handle_pairing(
+            "claim ABCD-EFGH",
+            "telegram",
+            AllowlistField::AllowedUsers,
+            &["123".to_string()],
+            dir.path(),
+        )
+        .await;
+        assert!(
+            reply.is_none(),
+            "Telegram bare claim must not be pairing: {reply:?}"
+        );
     }
 }

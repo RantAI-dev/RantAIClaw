@@ -60,7 +60,7 @@ fn now_unix() -> i64 {
 /// case and dashes (the store normalizes); rejects obvious non-codes so a
 /// normal message starting with `/bind`/`/claim` plus garbage doesn't mint a
 /// spurious store lookup with control characters.
-fn looks_like_code(code: &str) -> bool {
+pub(crate) fn looks_like_code(code: &str) -> bool {
     let stripped: String = code.chars().filter(|c| *c != '-').collect();
     let stripped = stripped.trim();
     !stripped.is_empty()
@@ -92,6 +92,25 @@ pub fn parse_pairing_command(text: &str) -> Option<PairingCommand> {
         owner,
         code: code.to_string(),
     })
+}
+
+/// One pairing command as the reader can actually type it.
+///
+/// `Some("slack")` drops the leading slash: Slack refuses any message that
+/// starts with `/` unless it names a registered slash command, so the slash
+/// form never reaches the bot there. `Some(other)` keeps the slash form every
+/// other channel has always used. `None` names both forms, for hints that can
+/// reach a user on any channel.
+///
+/// `command` is slash-bearing (`/claim <code>`); pass just `/` when the caller
+/// inserts the verb and the code separately.
+pub(crate) fn pairing_command_hint(command: &str, channel: Option<&str>) -> String {
+    let bare = command.trim_start_matches('/');
+    match channel {
+        Some("slack") => bare.to_string(),
+        Some(_) => command.to_string(),
+        None => format!("`{command}` (on Slack: `{bare}`)"),
+    }
 }
 
 /// Append `identity` to `list` if not already present (case-sensitive dedupe).
@@ -354,6 +373,22 @@ mod tests {
         // `/claimABCD` is a single token, not `/claim ABCD`.
         assert!(parse_pairing_command("/claimABCD").is_none());
         assert!(parse_pairing_command("/bindABCD").is_none());
+    }
+
+    #[test]
+    fn command_hint_follows_the_channel_the_reader_is_on() {
+        assert_eq!(
+            pairing_command_hint("/claim <code>", Some("slack")),
+            "claim <code>"
+        );
+        assert_eq!(
+            pairing_command_hint("/bind <code>", Some("telegram")),
+            "/bind <code>"
+        );
+        assert_eq!(
+            pairing_command_hint("/claim <code>", None),
+            "`/claim <code>` (on Slack: `claim <code>`)"
+        );
     }
 
     // ── apply_pairing ────────────────────────────────────────

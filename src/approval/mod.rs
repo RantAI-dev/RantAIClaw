@@ -411,10 +411,12 @@ and cannot approve commands.";
 /// (folded into the startup warning), so the two surfaces give the same
 /// instructions instead of drifting apart. `/claim` alone is not enough: it
 /// takes a pairing code minted by `rantaiclaw channels pair`, not a bare
-/// command (see `channels::pairing::parse_pairing_command`).
+/// command (see `channels::pairing::parse_pairing_command`). The reader's
+/// channel is not known here, so both spellings are named: Slack cannot
+/// deliver a message starting with `/`.
 pub const APPROVAL_OWNERS_EMPTY_HINT: &str = "set [channels_config] approval_owners in \
 config.toml, or run `rantaiclaw channels pair --channel <channel>` on the host and then \
-`/claim <code>` in your chat";
+`/claim <code>` (on Slack: `claim <code>`) in your chat";
 
 /// Whether `sender` is authorized to **approve** a tool call on a channel.
 ///
@@ -652,6 +654,17 @@ fn truncate_for_summary(input: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The empty-owners hint is read by the doctor and the startup warning,
+    /// where the reader's channel is unknown. Both spellings must be present:
+    /// Slack cannot deliver the slash form.
+    #[test]
+    fn empty_owners_hint_names_both_pairing_forms() {
+        assert!(
+            APPROVAL_OWNERS_EMPTY_HINT.contains("`/claim <code>` (on Slack: `claim <code>`)"),
+            "the hint must be actionable on Slack too: {APPROVAL_OWNERS_EMPTY_HINT}"
+        );
+    }
 
     /// `approval_owners = ["*"]` makes every sender on every channel an owner.
     /// It is honoured — removing it silently would lock out anyone relying on it

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Slack users can redeem pairing codes in a form their client can send.** Slack refuses any message starting with `/` that is not a registered slash command, so `/claim <code>` and `/bind <code>` never reached the bot. A whole Slack message of exactly two tokens, `claim <code>` or `bind <code>` with the verb case-insensitive and the code passing the existing plausibility check, is now rewritten to the shared parser's slash form on the Slack surface only; an ordinary sentence such as `claim the refund for order 12` stays chat, and no other channel gains the shortcut. Pairing hints printed for a Slack channel name the slash-free form, hints printed without a known channel name both forms, and the approval relay's "which one?" and refusal hints on Slack say `approve <name>` without a slash, matching the prompt Slack already sends. No code-minting or validation change, no config schema or dependency change, and no other channel's command form changed.
+
 ## [0.38.0-alpha] — 2026-11-27
 
 Paired with claw-ui `v0.3.35`.

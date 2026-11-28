@@ -308,7 +308,7 @@ A model missing from the list still works. Type its ID with `/model <id>` or set
 - `rantaiclaw channel remove <name>`
 - `rantaiclaw channel pair [--channel <surface>]`
 
-`pair` mints a one-time pairing code that a user claims in chat with `/claim <code>`. It refuses with a non-zero exit when the surface is one no channel or gateway listener consumes (the message lists the valid surfaces), or when the surface is a catalog channel this config does not configure (the message points at `rantaiclaw onboard --channels-only`). `channel add <type>` prints setup guidance and exits 0 for a catalog type; for a type that is not in the catalog it exits non-zero and names the unknown type. `channel remove <name>` follows the same rule for a name that is not in the catalog.
+`pair` mints a one-time pairing code that a user claims in chat with `/claim <code>`; a Slack user sends `claim <code>` instead, because that client never delivers a message starting with `/` (`bind <code>` pairs as a chat user there). It refuses with a non-zero exit when the surface is one no channel or gateway listener consumes (the message lists the valid surfaces), or when the surface is a catalog channel this config does not configure (the message points at `rantaiclaw onboard --channels-only`). `channel add <type>` prints setup guidance and exits 0 for a catalog type; for a type that is not in the catalog it exits non-zero and names the unknown type. `channel remove <name>` follows the same rule for a name that is not in the catalog.
 
 Runtime in-chat commands (Telegram/Discord while channel server is running):
 
