@@ -1020,6 +1020,8 @@ mod doctor_channels_tests {
 
     #[tokio::test]
     async fn a_session_file_without_a_linked_device_is_unhealthy_and_says_to_link() {
+        // The fixture is the real pre-pairing state: a device row with keys but
+        // no account identity, not an empty store.
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("session.db");
         crate::doctor::checks::channels::wa_session_fixture::create(&path, false);

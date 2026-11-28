@@ -573,7 +573,8 @@ pub(crate) enum ProbeWebResult {
     Ok,
     SessionMissing,
     /// The store exists but holds no linked device: the daemon creates the
-    /// schema before pairing, so a non-empty file alone proves nothing.
+    /// schema and a pre-pairing device row (fresh keys, but no identity) before
+    /// QR pairing, so a non-empty file or a bare `device` row proves nothing.
     SessionNotLinked,
     SessionPathBad(String),
 }
@@ -601,28 +602,50 @@ pub(crate) fn probe_whatsapp_web(path: &str) -> ProbeWebResult {
         Ok(conn) => conn,
         Err(e) => return ProbeWebResult::SessionPathBad(format!("cannot open session file: {e}")),
     };
-    // Same marker the production store's `exists()` uses after a successful
-    // link: the device row with id 1.
-    match conn.query_row("SELECT COUNT(*) FROM device WHERE id = 1", [], |row| {
-        row.get::<_, i64>(0)
-    }) {
+    // The device row with id 1 exists *before* pairing: the library creates it
+    // with generated keys and `pn`, `lid`, `account` all NULL. Only pair success
+    // writes the identity: wa-rs `pair.rs` sends
+    // `DeviceCommand::SetAccount(Some(signed_identity_for_event))`, and
+    // `apply_command_to_device` maps `SetAccount` to `device.account`. `SetId`
+    // (pn) is weaker because pair.rs can fall back to `Jid::default()` when the
+    // device node fails to parse. So require the account marker, not the row.
+    match conn.query_row(
+        "SELECT COUNT(*) FROM device WHERE id = 1 AND account IS NOT NULL",
+        [],
+        |row| row.get::<_, i64>(0),
+    ) {
         Ok(0) => ProbeWebResult::SessionNotLinked,
         Ok(_) => ProbeWebResult::Ok,
         Err(e) => ProbeWebResult::SessionPathBad(format!("cannot read linked device: {e}")),
     }
 }
 
-/// Session-store fixtures shared with the channel doctor tests. The DDL
-/// mirrors `RusqliteStore::init_schema`; only `device` is read by the probe,
-/// but creating the pre-pairing schema keeps the "daemon created this before
-/// linking" case honest. Kept here rather than in the store module so the
-/// probe tests also compile without the `whatsapp-web` feature.
+/// Session-store fixtures shared with the channel doctor tests. The DDL is
+/// copied from `RusqliteStore::init_schema`; only `device` is read by the probe,
+/// but creating the real schema keeps the pre-pairing case honest. Kept here
+/// rather than in the store module so the probe tests also compile without the
+/// `whatsapp-web` feature.
 #[cfg(test)]
 pub(crate) mod wa_session_fixture {
-    /// Create a session DB at `path`. With `link_device`, write the minimal
-    /// device row a successful pairing persists; without it, the store is the
-    /// schema-only state the daemon leaves before QR pairing.
-    pub(crate) fn create(path: &std::path::Path, link_device: bool) {
+    /// Deterministic stand-in for the key blobs the library generates. What the
+    /// store and probe care about is their length and non-NULLness, not their
+    /// cryptographic value, so no RNG dependency is needed in a test fixture.
+    fn key_bytes(len: usize) -> Vec<u8> {
+        let mut state: u32 = 0x1234_5678;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                u8::try_from((state >> 16) & 0xFF).unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// Create a session DB at `path`. With `linked`, write the row a successful
+    /// pairing persists: the same generated keys as before, plus the non-NULL
+    /// `account` identity `SetAccount` writes. Without it, write the real
+    /// pre-pairing row: the library has already saved generated key material,
+    /// but `pn`, `lid` and `account` are still NULL until a QR scan succeeds.
+    pub(crate) fn create(path: &std::path::Path, linked: bool) {
         let conn = rusqlite::Connection::open(path).expect("fixture db opens");
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -648,28 +671,42 @@ pub(crate) mod wa_session_fixture {
              );",
         )
         .expect("fixture schema");
-        if link_device {
-            conn.execute(
-                "INSERT INTO device (
-                     id, lid, pn, registration_id, noise_key, identity_key,
-                     signed_pre_key, signed_pre_key_id, signed_pre_key_signature,
-                     adv_secret_key, push_name, app_version_primary,
-                     app_version_secondary, app_version_tertiary,
-                     app_version_last_fetched_ms
-                 ) VALUES (
-                     1, '100@lid', '15550000001@s.whatsapp.net', 1, ?1, ?2, ?3, 1, ?4, ?5,
-                     'rantaiclaw_node', 0, 0, 0, 0
-                 )",
-                rusqlite::params![
-                    vec![0_u8; 32],
-                    vec![0_u8; 32],
-                    vec![0_u8; 32],
-                    vec![0_u8; 64],
-                    vec![0_u8; 32]
-                ],
+
+        // `save()` stores `device.account.map(encode_to_vec)`: NULL before
+        // pairing, an encoded blob once pair success ran `SetAccount`.
+        let (pn, lid, account) = if linked {
+            (
+                Some("15550000001@s.whatsapp.net"),
+                Some("100@lid"),
+                Some(key_bytes(32)),
             )
-            .expect("insert minimal linked device");
-        }
+        } else {
+            (None, None, None)
+        };
+        conn.execute(
+            "INSERT INTO device (
+                 id, lid, pn, registration_id, noise_key, identity_key,
+                 signed_pre_key, signed_pre_key_id, signed_pre_key_signature,
+                 adv_secret_key, account, push_name, app_version_primary,
+                 app_version_secondary, app_version_tertiary,
+                 app_version_last_fetched_ms, edge_routing_info, props_hash
+             ) VALUES (
+                 1, ?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8, ?9,
+                 'rantaiclaw_node', 0, 0, 0, 0, NULL, NULL
+             )",
+            rusqlite::params![
+                lid,
+                pn,
+                12345_i64,
+                key_bytes(64), // noise_key: 32-byte private + 32-byte public
+                key_bytes(64), // identity_key: same layout
+                key_bytes(64), // signed_pre_key: same layout
+                key_bytes(64), // signed_pre_key_signature
+                key_bytes(32), // adv_secret_key
+                account,
+            ],
+        )
+        .expect("insert device row");
     }
 }
 
@@ -904,8 +941,8 @@ mod tests {
 
     #[test]
     fn whatsapp_web_session_with_a_linked_device_is_ok() {
-        // A paired store has the device row the production store writes on
-        // link; the probe must still accept it.
+        // A paired store has the non-NULL account identity the production
+        // store writes on link; the probe must still accept it.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.db");
         wa_session_fixture::create(&path, true);
@@ -919,8 +956,9 @@ mod tests {
 
     #[test]
     fn whatsapp_web_session_without_a_linked_device_is_not_healthy() {
-        // The daemon creates the schema before pairing. A non-empty file in
-        // that state used to read healthy; it must report the missing link.
+        // A real pre-pairing store has a device row with generated keys and a
+        // NULL account, not an empty file. That row used to read healthy; it
+        // must report the missing link.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.db");
         wa_session_fixture::create(&path, false);
@@ -930,6 +968,26 @@ mod tests {
             ProbeWebResult::SessionMissing => panic!("the file exists, so it is not Missing"),
             ProbeWebResult::SessionPathBad(e) => panic!("unexpected error: {e}"),
         }
+    }
+
+    #[tokio::test]
+    async fn online_whatsapp_web_pre_pairing_row_warns_instead_of_reading_healthy() {
+        // The general doctor reaches the probe through `probe_channels`, not
+        // directly. A pre-pairing row must warn there too, not report a ready
+        // channel; no other channel is configured, so no network call is made.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.db");
+        wa_session_fixture::create(&path, false);
+        let mut cfg = Config::default();
+        cfg.channels_config.whatsapp_web = Some(crate::config::schema::WhatsAppWebConfig {
+            session_path: path.to_str().unwrap().to_string(),
+            pair_phone: None,
+            pair_code: None,
+            allowed_numbers: vec!["*".into()],
+        });
+        let s = probe_channels(&cfg).await;
+        assert_eq!(s.severity, Severity::Warn, "{}", s.message);
+        assert!(s.message.contains("no linked device"), "{}", s.message);
     }
 
     #[test]
