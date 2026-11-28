@@ -802,6 +802,10 @@ async fn whatsapp_web_doctor_state(config: &Config) -> (ChannelHealthState, Stri
             ChannelHealthState::Unhealthy,
             "no session file yet; run `rantaiclaw setup whatsapp-web` to link".to_string(),
         ),
+        Ok(Ok(ProbeWebResult::SessionNotLinked)) => (
+            ChannelHealthState::Unhealthy,
+            "session has no linked device; run `rantaiclaw setup whatsapp-web` to link".to_string(),
+        ),
         Ok(Ok(ProbeWebResult::SessionPathBad(e))) => (
             ChannelHealthState::Unhealthy,
             format!("session file unreadable: {e}"),
@@ -1001,10 +1005,10 @@ mod doctor_channels_tests {
     }
 
     #[tokio::test]
-    async fn a_readable_session_file_reads_healthy_and_says_so() {
+    async fn a_linked_session_file_reads_healthy_and_says_so() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("session.db");
-        std::fs::write(&path, b"not empty").expect("write a fixture session file");
+        crate::doctor::checks::channels::wa_session_fixture::create(&path, true);
 
         let (state, detail) =
             whatsapp_web_doctor_state(&config_with_session(path.to_str().expect("utf8 path")))
@@ -1012,6 +1016,23 @@ mod doctor_channels_tests {
 
         assert_eq!(state, ChannelHealthState::Healthy);
         assert_eq!(detail, "session present");
+    }
+
+    #[tokio::test]
+    async fn a_session_file_without_a_linked_device_is_unhealthy_and_says_to_link() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("session.db");
+        crate::doctor::checks::channels::wa_session_fixture::create(&path, false);
+
+        let (state, detail) =
+            whatsapp_web_doctor_state(&config_with_session(path.to_str().expect("utf8 path")))
+                .await;
+
+        assert_eq!(state, ChannelHealthState::Unhealthy, "{detail}");
+        assert!(
+            detail.contains("no linked device") && detail.contains("setup whatsapp-web"),
+            "must name the missing link and the same setup hint as a missing file: {detail}"
+        );
     }
 
     #[tokio::test]
@@ -1044,7 +1065,7 @@ mod doctor_channels_tests {
     async fn the_doctor_dispatch_reads_a_present_session_healthy_though_health_check_would_not() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("session.db");
-        std::fs::write(&path, b"not empty").expect("write a fixture session file");
+        crate::doctor::checks::channels::wa_session_fixture::create(&path, true);
         let config = config_with_session(path.to_str().expect("utf8 path"));
 
         let (key, _name, channel) = factory::build_configured_channels(&config)

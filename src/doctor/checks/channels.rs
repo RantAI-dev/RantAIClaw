@@ -12,8 +12,9 @@
 //! * **WhatsApp Cloud API** — `GET https://graph.facebook.com/v18.0/<phone_id>`
 //!   with `Bearer <access_token>`. 200 confirms the phone-number id resolves
 //!   under the configured token.
-//! * **WhatsApp Web** — non-network: confirm `session_path` exists and is
-//!   non-empty. Without that file the daemon has to re-pair on next run.
+//! * **WhatsApp Web** — non-network: confirm `session_path` exists and holds a
+//!   linked device row. A store the daemon created before pairing is not
+//!   healthy, and neither is a missing file — both need QR pairing.
 //! * **Lark/Feishu** — `POST <region>/open-apis/auth/v3/tenant_access_token/internal`
 //!   with `app_id`/`app_secret`, reusing the setup wizard's own probe
 //!   (`onboard/provision/channels/lark.rs`). A `code: 0` body with a
@@ -378,6 +379,12 @@ pub async fn probe_channels(config: &crate::config::Config) -> ChannelSummary {
                         "whatsapp web: no session — needs QR pairing on next run".to_string(),
                     );
                 }
+                ProbeWebResult::SessionNotLinked => {
+                    warn.push(
+                        "whatsapp web: session has no linked device — needs QR pairing on next run"
+                            .to_string(),
+                    );
+                }
                 ProbeWebResult::SessionPathBad(e) => bad.push(format!("whatsapp web session: {e}")),
             }
         }
@@ -565,6 +572,9 @@ async fn probe_lark(
 pub(crate) enum ProbeWebResult {
     Ok,
     SessionMissing,
+    /// The store exists but holds no linked device: the daemon creates the
+    /// schema before pairing, so a non-empty file alone proves nothing.
+    SessionNotLinked,
     SessionPathBad(String),
 }
 
@@ -572,10 +582,94 @@ pub(crate) fn probe_whatsapp_web(path: &str) -> ProbeWebResult {
     let expanded = shellexpand::tilde(path).to_string();
     let p = std::path::Path::new(&expanded);
     match std::fs::metadata(p) {
-        Ok(m) if m.is_file() && m.len() > 0 => ProbeWebResult::Ok,
-        Ok(_) => ProbeWebResult::SessionMissing,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ProbeWebResult::SessionMissing,
-        Err(e) => ProbeWebResult::SessionPathBad(format!("{e}")),
+        Ok(m) if m.is_file() && m.len() > 0 => {}
+        Ok(_) => return ProbeWebResult::SessionMissing,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return ProbeWebResult::SessionMissing
+        }
+        Err(e) => return ProbeWebResult::SessionPathBad(format!("{e}")),
+    }
+
+    // Read-only: never create, migrate or write the session file. A WAL reader
+    // takes only shared locks, so a running daemon keeps writing while the
+    // doctor reads. The table and column names are hardcoded because the probe
+    // also compiles without the `whatsapp-web` feature that owns the store.
+    let conn = match rusqlite::Connection::open_with_flags(
+        p,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) {
+        Ok(conn) => conn,
+        Err(e) => return ProbeWebResult::SessionPathBad(format!("cannot open session file: {e}")),
+    };
+    // Same marker the production store's `exists()` uses after a successful
+    // link: the device row with id 1.
+    match conn.query_row("SELECT COUNT(*) FROM device WHERE id = 1", [], |row| {
+        row.get::<_, i64>(0)
+    }) {
+        Ok(0) => ProbeWebResult::SessionNotLinked,
+        Ok(_) => ProbeWebResult::Ok,
+        Err(e) => ProbeWebResult::SessionPathBad(format!("cannot read linked device: {e}")),
+    }
+}
+
+/// Session-store fixtures shared with the channel doctor tests. The DDL
+/// mirrors `RusqliteStore::init_schema`; only `device` is read by the probe,
+/// but creating the pre-pairing schema keeps the "daemon created this before
+/// linking" case honest. Kept here rather than in the store module so the
+/// probe tests also compile without the `whatsapp-web` feature.
+#[cfg(test)]
+pub(crate) mod wa_session_fixture {
+    /// Create a session DB at `path`. With `link_device`, write the minimal
+    /// device row a successful pairing persists; without it, the store is the
+    /// schema-only state the daemon leaves before QR pairing.
+    pub(crate) fn create(path: &std::path::Path, link_device: bool) {
+        let conn = rusqlite::Connection::open(path).expect("fixture db opens");
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             CREATE TABLE IF NOT EXISTS device (
+                 id INTEGER PRIMARY KEY,
+                 lid TEXT,
+                 pn TEXT,
+                 registration_id INTEGER NOT NULL,
+                 noise_key BLOB NOT NULL,
+                 identity_key BLOB NOT NULL,
+                 signed_pre_key BLOB NOT NULL,
+                 signed_pre_key_id INTEGER NOT NULL,
+                 signed_pre_key_signature BLOB NOT NULL,
+                 adv_secret_key BLOB NOT NULL,
+                 account BLOB,
+                 push_name TEXT NOT NULL,
+                 app_version_primary INTEGER NOT NULL,
+                 app_version_secondary INTEGER NOT NULL,
+                 app_version_tertiary INTEGER NOT NULL,
+                 app_version_last_fetched_ms INTEGER NOT NULL,
+                 edge_routing_info BLOB,
+                 props_hash TEXT
+             );",
+        )
+        .expect("fixture schema");
+        if link_device {
+            conn.execute(
+                "INSERT INTO device (
+                     id, lid, pn, registration_id, noise_key, identity_key,
+                     signed_pre_key, signed_pre_key_id, signed_pre_key_signature,
+                     adv_secret_key, push_name, app_version_primary,
+                     app_version_secondary, app_version_tertiary,
+                     app_version_last_fetched_ms
+                 ) VALUES (
+                     1, '100@lid', '15550000001@s.whatsapp.net', 1, ?1, ?2, ?3, 1, ?4, ?5,
+                     'rantaiclaw_node', 0, 0, 0, 0
+                 )",
+                rusqlite::params![
+                    vec![0_u8; 32],
+                    vec![0_u8; 32],
+                    vec![0_u8; 32],
+                    vec![0_u8; 64],
+                    vec![0_u8; 32]
+                ],
+            )
+            .expect("insert minimal linked device");
+        }
     }
 }
 
@@ -809,14 +903,31 @@ mod tests {
     }
 
     #[test]
-    fn whatsapp_web_session_present() {
-        // Real file → Ok.
+    fn whatsapp_web_session_with_a_linked_device_is_ok() {
+        // A paired store has the device row the production store writes on
+        // link; the probe must still accept it.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.db");
-        std::fs::write(&path, b"some bytes").unwrap();
+        wa_session_fixture::create(&path, true);
         match probe_whatsapp_web(path.to_str().unwrap()) {
             ProbeWebResult::Ok => {}
-            ProbeWebResult::SessionMissing => panic!("file with bytes should not be Missing"),
+            ProbeWebResult::SessionMissing => panic!("linked session should not be Missing"),
+            ProbeWebResult::SessionNotLinked => panic!("linked device row should be accepted"),
+            ProbeWebResult::SessionPathBad(e) => panic!("unexpected error: {e}"),
+        }
+    }
+
+    #[test]
+    fn whatsapp_web_session_without_a_linked_device_is_not_healthy() {
+        // The daemon creates the schema before pairing. A non-empty file in
+        // that state used to read healthy; it must report the missing link.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.db");
+        wa_session_fixture::create(&path, false);
+        match probe_whatsapp_web(path.to_str().unwrap()) {
+            ProbeWebResult::SessionNotLinked => {}
+            ProbeWebResult::Ok => panic!("a pre-pairing store must not read Ok"),
+            ProbeWebResult::SessionMissing => panic!("the file exists, so it is not Missing"),
             ProbeWebResult::SessionPathBad(e) => panic!("unexpected error: {e}"),
         }
     }
@@ -826,6 +937,7 @@ mod tests {
         match probe_whatsapp_web("/nonexistent/path/to/session.db") {
             ProbeWebResult::SessionMissing => {}
             ProbeWebResult::Ok => panic!("missing file should not be Ok"),
+            ProbeWebResult::SessionNotLinked => panic!("missing file has no store to inspect"),
             ProbeWebResult::SessionPathBad(e) => panic!("unexpected error: {e}"),
         }
     }
@@ -841,6 +953,7 @@ mod tests {
         match probe_whatsapp_web(path.to_str().unwrap()) {
             ProbeWebResult::SessionMissing => {}
             ProbeWebResult::Ok => panic!("zero-byte file should be Missing"),
+            ProbeWebResult::SessionNotLinked => panic!("zero-byte file is still Missing"),
             ProbeWebResult::SessionPathBad(e) => panic!("unexpected error: {e}"),
         }
     }
